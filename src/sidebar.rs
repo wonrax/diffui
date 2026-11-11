@@ -408,16 +408,9 @@ pub(crate) fn build_sidebar(
         })
         // The revset / revision-range filter sits at the very top of the pane.
         .child(
-            div()
-                .pt(px(field::PANEL_HEADER_PADDING.top))
-                .pb(px(field::PANEL_HEADER_PADDING.bottom))
+            ui::panel_header()
                 .pl(px(field::list_field_insets().0))
                 .pr(px(field::list_field_insets().1))
-                .w_full()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
                 .gap(px(field::PANEL_TOGGLE_INSET))
                 .child(
                     div()

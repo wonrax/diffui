@@ -11,33 +11,20 @@ use gpui_kit::{AnyElement, Bounds, Div, MouseButton, Pixels, Window, canvas, div
 
 use crate::root::PaneSet;
 use crate::theme::{self, ThemeSpec};
-use crate::theme::{Color, Font, Padding};
+use crate::theme::{Color, Font};
 use crate::{Cx, Diffui, icons, input};
 use crate::{HoverTarget, ToolbarMenu};
 
 /// Fixed height of the field well; the caret square derives from it.
 pub const FIELD_HEIGHT: f32 = theme::control::COMPACT;
-/// Equal breathing room around a panel header's controls, on all four sides.
-pub const PANEL_TOGGLE_INSET: f32 = theme::space::XS;
+/// Equal breathing room around a panel header's controls, above and below:
+/// a compact control centred in [`theme::PANE_HEADER_HEIGHT`].
+pub const PANEL_TOGGLE_INSET: f32 = (theme::PANE_HEADER_HEIGHT - theme::control::COMPACT) / 2.0;
 
-/// Inset of a panel header's leading content (a filter field's left edge) —
-/// the toolbar's edge inset, so the header's field lines up under the
-/// toolbar's first control.
-pub const PANEL_HEADER_LEAD: f32 = theme::space::MD;
-
-/// Padding of a panel header: the controls' square inset on top/right/bottom,
-/// the lead on the left.
-pub const PANEL_HEADER_PADDING: Padding = Padding {
-    top: PANEL_TOGGLE_INSET,
-    right: PANEL_TOGGLE_INSET,
-    bottom: PANEL_TOGGLE_INSET,
-    left: PANEL_HEADER_LEAD,
-};
-
-/// Height of a panel header row: one control step and its toggle inset
-/// above and below. Strips that sit beside panel headers (the source
-/// browser's info bar) take the same height so their text shares a line.
-pub const PANEL_HEADER_HEIGHT: f32 = theme::control::COMPACT + 2.0 * PANEL_TOGGLE_INSET;
+/// Height of a panel header row. Strips that sit beside panel headers (the
+/// source browser's info bar) take the same height so their text shares a
+/// line.
+pub const PANEL_HEADER_HEIGHT: f32 = theme::PANE_HEADER_HEIGHT;
 
 /// Gap between the caret square and the field's top/right/bottom edges —
 /// equal on all three sides so the caret reads as a centered inset button.
@@ -99,7 +86,8 @@ pub(crate) fn filter_field(
         field = field.on_submit(move |window, cx| on_submit(&(), window, cx));
     }
     // No vertical padding: the kit's 8px would push the line off its row.
-    let text = input::single_line(field, font, window, cx)
+    let (text, focused) = input::single_line_with_focus(field, font, window, cx);
+    let text = text
         .appearance(false)
         .px(px(TEXT_INSET))
         .py(px(0.0))
@@ -114,12 +102,14 @@ pub(crate) fn filter_field(
         .items_center()
         .w_full()
         .h(px(FIELD_HEIGHT))
+        // The dialog field's well: the border takes the accent while the
+        // field has the keyboard.
         .map(|bar| {
             theme::squircle(
                 bar,
-                theme::radius::CARD,
+                theme::radius::CONTROL,
                 Some(theme.panel_background),
-                Some(theme.border),
+                Some(if focused { theme.accent } else { theme.border }),
             )
         })
         .font(font.gpui());
@@ -217,7 +207,7 @@ pub(crate) fn panel_strip() -> Div {
         .pl(px(lead))
         .pr(px(trail))
         .pt(px(crate::revision_list::ROW_CARD_INSET_Y))
-        .pb(px(PANEL_HEADER_PADDING.bottom))
+        .pb(px(PANEL_TOGGLE_INSET))
 }
 
 /// The fade a panel's header casts over its list once the list has scrolled
@@ -253,10 +243,7 @@ pub(crate) fn sidebar_filter_field(
     cx: &mut Cx,
 ) -> AnyElement {
     let (lead, trail) = list_field_insets();
-    div()
-        .w_full()
-        .pt(px(PANEL_HEADER_PADDING.top))
-        .pb(px(PANEL_HEADER_PADDING.bottom))
+    crate::ui::panel_header()
         .pl(px(lead))
         .pr(px(trail))
         .child(filter_field(theme, font, spec, window, cx))

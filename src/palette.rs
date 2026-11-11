@@ -88,10 +88,6 @@ const GLYPH_ICON_SIZE: f32 = 14.0;
 const TAIL_MAX_WIDTH: f32 = COLUMN_WIDTH * 0.45;
 /// The band of scope tabs under the input.
 const SCOPES_HEIGHT: f32 = 40.0;
-const SEGMENT_HEIGHT: f32 = 20.0;
-const SEGMENT_PAD_X: f32 = 8.0;
-/// The well a run of segments sits in: its inset around them.
-const SEGMENT_WELL_PAD: f32 = 2.0;
 
 /// Cap on rows rendered per column. Beyond this the column would still
 /// scroll, but for big repos (10k+ commits) capping keeps the layout pass
@@ -1193,7 +1189,6 @@ fn build_column(
             .child(scope_tabs(ui, theme, column, cx))
             .child(rule())
             .child(body(results))
-            .child(rule())
             .child(footer)
             .into_any_element()
     } else {
@@ -1207,7 +1202,6 @@ fn build_column(
                 card.child(scope_tabs(ui, theme, column, cx)).child(rule())
             })
             .child(body(results))
-            .child(rule())
             .child(footer)
             .into_any_element()
     }
@@ -1234,7 +1228,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
         ("Files", "@", Mode::Files, Some(counts.files)),
         ("Revisions", ":", Mode::Revisions, counts.revisions),
     ];
-    let mut well = segment_well(theme);
+    let mut well = ui::segmented(theme);
     for (index, (label, prefix, scope, count)) in scopes.into_iter().enumerate() {
         let query = format!("{prefix}{needle}");
         // The counts are the search's: a command line has none to give. They
@@ -1256,7 +1250,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
             })),
         );
     }
-    let jj = segment_well(theme).child(
+    let jj = ui::segmented(theme).child(
         segment(
             "palette-scope-jj",
             Some(icons::TERMINAL),
@@ -1295,20 +1289,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
         .into_any_element()
 }
 
-/// The well a run of segmented tabs sits in.
-fn segment_well(theme: ThemeSpec) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .p(px(SEGMENT_WELL_PAD))
-        .gap(px(SEGMENT_WELL_PAD))
-        .map(|well| theme::squircle(well, theme::radius::MD, Some(theme::well_wash(theme)), None))
-}
-
-/// One segmented tab: an optional glyph, its label and an optional count,
-/// drawn or only keeping its room (the label centred in it). A pressed one stands out of the well as a
-/// raised face, ringed with shadows so pressing it moves nothing.
+/// One scope tab: [`ui::segment`] at the card's small step.
 #[allow(clippy::too_many_arguments)]
 fn segment(
     id: impl Into<ElementId>,
@@ -1320,45 +1301,20 @@ fn segment(
     theme: ThemeSpec,
     cx: &mut Cx,
 ) -> ui::Button {
-    let label_font = theme::emphasis_font(font, Weight::MEDIUM);
-    let ink = if pressed {
-        theme.text
-    } else {
-        theme.muted_text
-    };
-    let mut line = Vec::new();
-    if let Some(glyph) = glyph {
-        line.push(Aligned::glyph(icons::icon(glyph, 12.0, ink), 12.0));
-        line.push(Aligned::gap(theme::space::SM));
-    }
-    line.push(Aligned::text(
-        typography::line(label, label_font, text_size::CAPTION, ink),
-        label_font,
-        text_size::CAPTION,
-    ));
-    // A hidden count's room goes half to each side, so the tab keeps its width
-    // and its label sits centred in it.
-    let mut pad_x = SEGMENT_PAD_X;
-    if let Some((count, shown)) = count {
-        let count = count.to_string();
-        if shown {
-            line.push(Aligned::gap(theme::space::SM));
-            line.push(Aligned::text(
-                typography::line(count, font, text_size::CAPTION, theme.subtle_text),
-                font,
-                text_size::CAPTION,
-            ));
-        } else {
-            let room =
-                theme::space::SM + crate::measure::line_width(&count, text_size::CAPTION, font);
-            pad_x += room / 2.0;
-        }
-    }
-    ui::button(id, ui::Variant::Ghost, ui::Size::Compact, theme, cx)
-        .h(px(SEGMENT_HEIGHT))
-        .px(px(pad_x))
-        .when(pressed, |segment| segment.raised(theme))
-        .child(typography::baseline_row(line, 0.0))
+    ui::segment(
+        id,
+        ui::Segment {
+            icon: glyph,
+            label: label.into(),
+            count,
+            active: pressed,
+            enabled: true,
+        },
+        ui::Segmented::Small,
+        font,
+        theme,
+        cx,
+    )
 }
 
 /// The strip under the results: the keys that act on the highlight, and on
@@ -1368,7 +1324,20 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
     let font = ui.config.ui_font;
     let hint =
         |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, font, theme);
-    let strip = crate::overlay_kit::footer_strip(theme);
+    let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
+        crate::overlay_kit::bound_hint(
+            ui,
+            crate::commands::Context::Palette,
+            commands,
+            label,
+            theme,
+        )
+    };
+    let strip = crate::overlay_kit::footer(
+        crate::overlay_kit::Density::Strip,
+        crate::overlay_kit::MODAL_FOOT,
+        theme,
+    );
     match &column.source {
         ColumnSource::Root => {
             let searching = revision_mode_needle(&column.query).is_some() && !column.searched;
@@ -1378,9 +1347,9 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
                 Some(_) => "Open",
             };
             strip
-                .child(hint(&["\u{2191}", "\u{2193}"], "Navigate"))
+                .children(bound(&["palette.previous", "palette.next"], "Select"))
                 .child(hint(&["\u{21b5}"], enter))
-                .child(hint(&["\u{21e5}"], "Actions"))
+                .children(bound(&["palette.actions"], "Actions"))
                 .child(
                     div()
                         .ml_auto()
@@ -1402,7 +1371,7 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
         ColumnSource::Actions(target) => {
             let font = theme::emphasis_font(font, Weight::MEDIUM);
             strip
-                .child(hint(&["esc"], "Back"))
+                .children(bound(&["palette.back"], "Back"))
                 .child(hint(&["\u{21b5}"], "Run"))
                 .child(
                     div()
@@ -1697,19 +1666,14 @@ pub(crate) fn group_heading(label: &'static str, font: Font, theme: ThemeSpec) -
 
 /// What a results list says when it has no rows.
 pub(crate) fn empty_results(ui: &Diffui, theme: ThemeSpec, label: String) -> Div {
-    div()
-        .size_full()
-        .flex()
-        .justify_center()
-        .px(px(16.0))
-        .py(px(24.0))
-        .bg(theme.panel_background_elevated)
-        .child(typography::line(
-            label,
-            ui.config.ui_font,
-            text_size::BODY,
-            theme.subtle_text,
-        ))
+    ui::empty_state(
+        label,
+        ui::Placement::Top,
+        ui.config.ui_font,
+        theme.subtle_text,
+    )
+    .size_full()
+    .bg(theme.panel_background_elevated)
 }
 
 /// A result row's cell: fixed height, the label inset on the content edge,

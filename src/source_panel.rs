@@ -25,7 +25,6 @@ use diffui_core::{
 };
 
 // Matches the diff panel's code size — both panes render "code".
-const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 const BAR_TEXT_SIZE: f32 = text_size::BODY;
 
 /// View-time memo for the source tree, mirroring
@@ -386,15 +385,17 @@ pub(crate) fn build_source_sidebar(
 
     if let Some(error) = &source.tree_error {
         body = body.child(
-            div()
-                .w_full()
-                .flex_none()
-                .py(px(8.0))
-                .px(px(12.0))
-                .font(ui.config.ui_font.gpui())
-                .text_size(px(text_size::BODY))
-                .text_color(theme.removed_text)
-                .child(format!("Failed to list files: {error}")),
+            crate::field::panel_strip().child(
+                crate::ui::Banner::new(crate::ui::Tone::Danger)
+                    .icon(icons::ALERT_TRIANGLE)
+                    .child(
+                        div()
+                            .font(ui.config.ui_font.gpui())
+                            .text_color(theme.text)
+                            .child(format!("Couldn't list files: {error}")),
+                    )
+                    .build(ui.config.ui_font, theme),
+            ),
         );
     }
 
@@ -627,18 +628,13 @@ fn source_code(
 }
 
 fn centered_note(ui: &Diffui, message: String, color: Color) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(typography::line(
-            message,
-            ui.config.ui_font,
-            EMPTY_STATE_TEXT_SIZE,
-            color,
-        ))
-        .into_any_element()
+    crate::ui::empty_state(
+        message,
+        crate::ui::Placement::Centered,
+        ui.config.ui_font,
+        color,
+    )
+    .into_any_element()
 }
 
 /// The strip above the code: the selected path on the left (directory
@@ -707,13 +703,7 @@ fn build_info_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut C
         right.push(caption("Loading…".to_owned(), theme.subtle_text));
     }
 
-    let mut bar = div()
-        .flex_none()
-        .w_full()
-        .h(px(crate::field::PANEL_HEADER_HEIGHT))
-        .flex()
-        .flex_row()
-        .items_center()
+    let mut bar = crate::ui::panel_header()
         .gap(px(8.0))
         .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
         .bg(theme.panel_background);

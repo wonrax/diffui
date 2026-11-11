@@ -8,8 +8,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, Weight, chip_background, emphasis_font, text_size};
-use crate::typography::{self, Aligned};
+use crate::theme::{self, ThemeSpec, Weight, emphasis_font, text_size};
+use crate::typography;
 use crate::{Action, Cx, Diffui, icons, ui};
 
 /// The prefixes jj-lib's revset errors arrive with once the actor has
@@ -147,34 +147,13 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
         ("Couldn't load the history", error)
     };
     let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-    let card = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme::space::SM))
-        .px(px(theme::space::LG))
-        .py(px(theme::space::MD))
-        .map(|card| {
-            theme::squircle(
-                card,
-                theme::radius::CONTROL,
-                Some(chip_background(theme.removed_text)),
-                None,
-            )
-        })
-        .child(typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
-                    ui::ICON_SIZE,
-                ),
-                Aligned::text(
-                    typography::line(title, title_font, text_size::BODY, theme.removed_text),
-                    title_font,
-                    text_size::BODY,
-                ),
-            ],
-            theme::space::SM,
+    let card = ui::Banner::new(ui::Tone::Danger)
+        .icon(icons::ALERT_TRIANGLE)
+        .child(typography::line(
+            title,
+            title_font,
+            text_size::BODY,
+            theme.removed_text,
         ))
         .child(
             div()
@@ -190,21 +169,19 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
                 .text_color(theme.text)
                 .child(detail.to_owned()),
         )
-        .when_some(
+        .children(
             if revset {
                 reset_button(ui, theme, cx)
             } else {
                 None
-            },
-            // A column stretches its children; the button keeps its own width.
-            |card, reset| card.child(div().flex().child(reset)),
-        );
-    div()
-        .w_full()
-        .px(px(8.0))
-        .py(px(6.0))
-        .child(card)
-        .into_any_element()
+            }
+            .map(
+                // A column stretches its children; the button keeps its own width.
+                |reset| div().flex().pt(px(theme::space::XS)).child(reset),
+            ),
+        )
+        .build(ui.config.ui_font, theme);
+    crate::field::panel_strip().child(card).into_any_element()
 }
 
 /// A strip over the diff saying so, when [`selection_outside_view`].
@@ -223,31 +200,18 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
         theme,
     );
     Some(
-        div()
-            .w_full()
-            .px(px(theme::space::LG))
-            .py(px(theme::space::SM))
-            .bg(chip_background(theme.info))
-            .child(typography::baseline_row(
-                [
-                    Aligned::glyph(
-                        icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.info),
-                        ui::ICON_SIZE,
-                    ),
-                    Aligned::text(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(text_size::BODY))
-                            .child(sentence),
-                        ui.config.ui_font,
-                        text_size::BODY,
-                    ),
-                ],
-                theme::space::MD,
-            ))
+        ui::Banner::new(ui::Tone::Info)
+            .shape(ui::BannerShape::Strip)
+            .icon(icons::ALERT_TRIANGLE)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(sentence),
+            )
+            .build(ui.config.ui_font, theme)
             .into_any_element(),
     )
 }

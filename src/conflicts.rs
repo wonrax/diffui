@@ -1221,7 +1221,9 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
             this.on_conflict(ConflictMsg::EditorSave, cx);
         }));
     }
-    crate::overlay_kit::well_footer(
+    crate::overlay_kit::footer_with_buttons(
+        crate::overlay_kit::Density::Well,
+        crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
         vec![
             crate::overlay_kit::key_hint(&["\u{2318}", "\u{21b5}"], "Save", font, theme)
                 .into_any_element(),

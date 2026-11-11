@@ -210,7 +210,7 @@ pub(crate) fn build_toolbar(
         toggles = toggles.child(toolbar_toggle_button(
             "toolbar-lines",
             icons::LIST_CHECKS,
-            "Select lines (v)".into(),
+            with_shortcut(ui, "Select lines", "lines.toggle"),
             crate::changes::live_line_select(ui.active()).is_some(),
             Action::Changes(crate::changes::ChangesMsg::Lines(
                 crate::changes::LineMsg::Toggle,
@@ -349,9 +349,8 @@ fn svg_switcher(
     )
 }
 
-/// A segmented control, for switching between views of one thing: a recessed well
-/// (window-background fill) holding the tabs, the active one raised as a ringed
-/// pill.
+/// A segmented control, for switching between views of one thing:
+/// [`ui::segmented`] at the bar's control height.
 pub(crate) fn segmented(
     segments: Vec<Segment>,
     font: Font,
@@ -359,23 +358,7 @@ pub(crate) fn segmented(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    // The well is one control step tall; the raised pill sits inside it on an even
-    // 2px inset, so its corners stay concentric with the well's.
-    const INSET: f32 = 2.0;
-    const SEGMENT_HEIGHT: f32 = theme::control::COMPACT - 2.0 * INSET;
-    let mut well = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap(px(theme::space::XXS))
-        .p(px(INSET))
-        // A step into the chrome it sits on.
-        .child(crate::squircle::background(
-            crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
-                .background(theme::well_wash(theme)),
-            0.0,
-        ));
+    let mut well = ui::segmented(theme);
     for segment in segments {
         let Segment {
             icon,
@@ -383,43 +366,22 @@ pub(crate) fn segmented(
             active,
             on_press,
         } = segment;
-        let enabled = on_press.is_some();
-        let icon_color = if active {
-            theme.accent
-        } else {
-            theme.subtle_text
-        };
-        let text_color = if active {
-            theme.text
-        } else if enabled {
-            theme.muted_text
-        } else {
-            theme.subtle_text
-        };
-        let id = ElementId::Name(SharedString::from(format!("segment-{label}")));
-        // Only the active segment carries a fill: inactive segments stay quiet
-        // even under the cursor; the pointer + label color are enough affordance
-        // inside a two-option control.
-        let mut tab = div()
-            .id(id)
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(SEGMENT_HEIGHT))
-            .px(px(10.0 - INSET))
-            .when(active, |tab| {
-                theme::raised(tab, radius::CONTROL - INSET, theme)
-            })
-            .children(icon.map(|icon| icons::icon(icon, ui::ICON_SIZE, icon_color)))
-            .child(typography::centered(
-                typography::line(label, font, text_size::BODY, text_color),
-                font,
-                text_size::BODY,
-            ));
+        let mut tab = ui::segment(
+            ElementId::Name(SharedString::from(format!("segment-{label}"))),
+            ui::Segment {
+                icon,
+                label: label.into(),
+                count: None,
+                active,
+                enabled: on_press.is_some(),
+            },
+            ui::Segmented::Compact,
+            font,
+            theme,
+            cx,
+        );
         if let Some(action) = on_press {
-            tab = tab.cursor_pointer().on_click(Diffui::on_action(action, cx));
+            tab = tab.on_click(Diffui::on_action(action, cx));
         }
         well = well.child(tab);
     }

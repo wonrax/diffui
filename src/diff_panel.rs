@@ -15,7 +15,6 @@ use gpui_kit::{AnyElement, Window, div, px};
 use jj_lib::graph::GraphEdgeType;
 use std::rc::Rc;
 
-const EMPTY_STATE_TEXT_SIZE: f32 = text_size::BODY_LG;
 pub(crate) const DESCRIPTION_EDITOR_ID: &str = "revision-description-editor";
 // Wide enough for the stat columns at CoreText's 13pt SF.
 pub const DEFAULT_FILE_NAV_WIDTH: f32 = 248.0;
@@ -342,27 +341,20 @@ fn build_file_navigator_surface(
     if files.is_empty() {
         return div().into_any_element();
     }
-    let title_font = crate::theme::emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-    // A section's count rides in its title, as in "Changed commits (2)".
-    let title = crate::typography::centered(
-        crate::typography::line(
-            format!("Changed files ({})", files.len()),
-            title_font,
-            text_size::BODY,
-            theme.subtle_text,
-        ),
-        title_font,
-        text_size::BODY,
+    // On the same line as the other panes' headers. The toolbar's toggle hides
+    // the panel.
+    let header = ui::panel_header().px(px(crate::theme::space::LG)).child(
+        crate::typography::baseline_row(
+            [ui::panel_title(
+                "Changed files",
+                Some(files.len().to_string()),
+                ui.config.ui_font,
+                theme,
+            )],
+            0.0,
+        )
+        .min_w_0(),
     );
-    // One control step tall, so the label sits on the same line as the other
-    // panels' headers. The toolbar's toggle hides the panel.
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(crate::theme::control::COMPACT))
-        .child(title)
-        .child(div().flex_1());
     div()
         .flex()
         .flex_col()
@@ -372,15 +364,7 @@ fn build_file_navigator_surface(
         })
         .h_full()
         .bg(theme.panel_background)
-        .child(
-            div()
-                .flex_none()
-                .pt(px(crate::field::PANEL_TOGGLE_INSET))
-                .pb(px(crate::field::PANEL_TOGGLE_INSET))
-                .pl(px(crate::theme::space::LG))
-                .pr(px(crate::theme::space::LG))
-                .child(header),
-        )
+        .child(header)
         .child(
             div()
                 .flex_1()
@@ -648,14 +632,14 @@ fn build_diff_panel_body(
     }
     if session.document.files.is_empty() && session.revision_details.is_none() && range.is_none() {
         let message = match &session.status {
-            LoadStatus::Failed(_) => "Failed to load changes",
+            LoadStatus::Failed(_) => "Couldn't load changes",
             _ => "No file changes in this revision",
         };
         return panel
-            .child(centered_fill().child(crate::typography::line(
+            .child(div().flex_1().min_h_0().child(ui::empty_state(
                 message,
+                ui::Placement::Centered,
                 ui.config.ui_font,
-                EMPTY_STATE_TEXT_SIZE,
                 theme.subtle_text,
             )))
             .into_any_element();
@@ -675,14 +659,12 @@ fn build_diff_panel_body(
                 panel = panel.child(header_only_view(ui, theme, lines, window, cx));
             }
             return panel
-                .child(centered_fill().p(px(crate::theme::space::XXL)).child(
-                    crate::typography::line(
-                        crate::range::empty_message(ui, range),
-                        title_font,
-                        text_size::TITLE,
-                        theme.muted_text,
-                    ),
-                ))
+                .child(div().flex_1().min_h_0().child(ui::empty_state(
+                    crate::range::empty_message(ui, range),
+                    ui::Placement::Centered,
+                    title_font,
+                    theme.muted_text,
+                )))
                 .children(crate::mode_hints::strip(ui, theme, window, cx))
                 .into_any_element();
         }
@@ -1047,11 +1029,23 @@ fn build_description_editor(
     .on_click(Diffui::on_action(Action::SaveDescription, cx));
 
     let font = ui.config.ui_font;
-    let mut hints = vec![
-        crate::overlay_kit::key_hint(&["\u{2318}", "\u{21b5}"], save_label, font, theme)
-            .into_any_element(),
-        crate::overlay_kit::key_hint(&["esc"], "Cancel", font, theme).into_any_element(),
-    ];
+    let bound = |command: crate::commands::CommandId, label: &'static str| {
+        crate::overlay_kit::bound_hint(
+            ui,
+            crate::commands::Context::Description,
+            &[command],
+            label,
+            theme,
+        )
+        .map(IntoElement::into_any_element)
+    };
+    let mut hints: Vec<AnyElement> = [
+        bound("description.save", save_label),
+        bound("description.cancel", "Cancel"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     // Speaks up when the editor is holding a revision switch back, or what a commit does
     // after.
     let note = if editor.switch_blocked {
@@ -1064,7 +1058,9 @@ fn build_description_editor(
     if let Some((text, color)) = note {
         hints.push(crate::overlay_kit::hint_note(text, color, font));
     }
-    let footer = crate::overlay_kit::well_footer(
+    let footer = crate::overlay_kit::footer_with_buttons(
+        crate::overlay_kit::Density::Well,
+        crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
         hints,
         [cancel.into_any_element(), save.into_any_element()],
         theme,

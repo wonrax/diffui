@@ -36,12 +36,11 @@ use crate::diff_view::{AnnotationLabel, DiffProps, DocSource};
 use crate::ellipsis::{Line, Span};
 use crate::prose::Prose;
 use crate::revision_list::{
-    CAPTION_TEXT_SIZE, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING, REVISION_ROW_HEIGHT,
-    ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_LINE_GAP, SMALL_TEXT_SIZE,
+    AGE_TEXT_SIZE, CAPTION_TEXT_SIZE, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING,
+    REVISION_ROW_HEIGHT, ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_LINE_GAP, SMALL_TEXT_SIZE,
 };
 use crate::theme::{
-    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, emphasis_font, list, radius,
-    space, text_size,
+    Color, Font, ThemeSpec, Weight, diff_palette, emphasis_font, list, radius, space, text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::{Action, ConfirmDialog, Diffui, MainView, TabId, icons, meta_line, ui};
@@ -1007,12 +1006,11 @@ enum OpRow<'a> {
 
 /// Width of the chevron column in a snapshot run's row.
 const RUN_CHEVRON: f32 = 12.0;
-/// An operation's age on its row's title line: a revision's.
-use crate::revision_list::AGE_TEXT_SIZE;
+/// The detail pane's left and right edge: the diff header's under it, and
+/// the commit bar's in the Diff view.
+const DETAIL_EDGE: f32 = crate::diff_view::HEADER_HORIZONTAL_PADDING;
 /// The op detail's title.
 const DETAIL_TITLE_SIZE: f32 = 18.0;
-/// A section label: "Changed revisions 1".
-const SECTION_LABEL_SIZE: f32 = 12.5;
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {
@@ -1221,50 +1219,20 @@ pub(crate) fn file_filter_banner(
     let close = ui::close_button("file-filter-close", theme.muted_text, theme, cx).on_click(
         Diffui::on_action(Action::History(HistoryAction::ClearFileFilter), cx),
     );
-    // The icon and the title share a line; the close button is a control,
-    // centred in the banner's box with an even inset, not hung off the text.
-    let line = typography::centered(
-        typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::FILE_CLOCK, ui::ICON_SIZE, theme.accent),
-                    ui::ICON_SIZE,
-                ),
-                Aligned::text(title, ui.config.ui_font, text_size::BODY).fill(),
-            ],
-            space::SM,
-        ),
-        ui.config.ui_font,
-        text_size::BODY,
-    );
     Some(
         crate::field::panel_strip()
             .child(
-                div()
-                    .w_full()
-                    .h(px(crate::theme::control::COMPACT))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::SM))
-                    .pl(px(space::MD))
-                    .pr(px(ui::BANNER_INSET))
-                    .map(|banner| {
-                        crate::theme::squircle(
-                            banner,
-                            radius::CONTROL,
-                            Some(chip_background(theme.accent)),
-                            None,
-                        )
-                    })
-                    .child(div().flex_1().min_w_0().child(line))
-                    .child(with_tooltip(
+                ui::Banner::new(ui::Tone::Info)
+                    .icon(icons::FILE_CLOCK)
+                    .child(title)
+                    .end(with_tooltip(
                         "file-filter-close-tip",
                         close,
                         "Show the whole graph again",
                         ui,
                         theme,
-                    )),
+                    ))
+                    .build(ui.config.ui_font, theme),
             )
             .into_any_element(),
     )
@@ -1701,12 +1669,7 @@ fn summary_line(commit: &CommitBrief, size: f32, font: Font, theme: ThemeSpec) -
 /// header starts with an icon button, whose glyph sits centred in it.
 fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec) -> Div {
     let glyph_inset = (ui::Size::Compact.height() - ui::ICON_SIZE) / 2.0;
-    div()
-        .w_full()
-        .flex_none()
-        .h(px(crate::field::PANEL_HEADER_HEIGHT))
-        .flex()
-        .items_center()
+    ui::panel_header()
         .pl(px(
             ROW_CONTENT_LEFT - if leading_button { glyph_inset } else { 0.0 }
         ))
@@ -1716,15 +1679,7 @@ fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec)
 }
 
 fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
-    div()
-        .w_full()
-        .flex_none()
-        .px(px(space::LG))
-        .py(px(space::SM))
-        .font(ui.config.ui_font.gpui())
-        .text_size(px(text_size::BODY))
-        .text_color(color)
-        .child(message.into())
+    ui::empty_state(message, ui::Placement::Inline, ui.config.ui_font, color)
 }
 
 /// The History view's left pane: the op log, or the evolog it was switched to.
@@ -1754,8 +1709,6 @@ pub(crate) fn build_history_sidebar(
         ui,
         theme,
     );
-    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-
     let (header, list): (Div, AnyElement) = match &history.kind {
         HistoryKind::OpLog => {
             let header = div()
@@ -1769,10 +1722,14 @@ pub(crate) fn build_history_sidebar(
                     ui::ICON_SIZE,
                     theme.subtle_text,
                 ))
-                .child(div().flex_1().child(typography::centered(
-                    typography::line("Operations", title_font, text_size::BODY, theme.text),
-                    title_font,
-                    text_size::BODY,
+                .child(div().flex_1().child(typography::baseline_row(
+                    [ui::panel_title(
+                        "Operations",
+                        None,
+                        ui.config.ui_font,
+                        theme,
+                    )],
+                    0.0,
                 )))
                 .child(reload);
             (header, op_log_list(ui, cx))
@@ -1805,19 +1762,10 @@ pub(crate) fn build_history_sidebar(
                 .child(back)
                 .child(div().flex_1().min_w_0().child(typography::baseline_row(
                     [
-                        Aligned::text(
-                            typography::line(
-                                "Evolution of ",
-                                title_font,
-                                text_size::BODY,
-                                theme.text,
-                            ),
-                            title_font,
-                            text_size::BODY,
-                        ),
+                        ui::panel_title("Evolution of", None, ui.config.ui_font, theme),
                         mono_on_line(label.clone(), theme.accent, ui),
                     ],
-                    0.0,
+                    space::XS,
                 )))
                 .child(reload);
             (header, evolog_list(ui, now, cx))
@@ -2321,23 +2269,38 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
         .items_center()
         .gap(px(space::SM))
         .px(px(space::LG))
-        .child(typography::baseline_row(
-            [
-                marker.map(|marker| {
-                    div()
-                        .flex_none()
-                        .w(px(12.0))
-                        .child(marker)
-                        .into_any_element()
-                }),
-                mono_on_line(change.name.clone(), theme.text, ui),
-                side(&change.from, theme.removed_text),
-                glyph(icons::ARROW_RIGHT),
-                side(&change.to, theme.added_text),
-            ],
-            space::SM,
-        ))
-        .child(div().flex_1())
+        .child(
+            typography::baseline_row(
+                [
+                    marker.map(|marker| {
+                        div()
+                            .flex_none()
+                            .w(px(12.0))
+                            .child(marker)
+                            .into_any_element()
+                    }),
+                    // A long name ellipsises before it pushes the kind out.
+                    Aligned::text(
+                        typography::line(
+                            change.name.clone(),
+                            ui.config.mono_font,
+                            CAPTION_TEXT_SIZE,
+                            theme.text,
+                        )
+                        .text_ellipsis(),
+                        ui.config.mono_font,
+                        CAPTION_TEXT_SIZE,
+                    )
+                    .shrink(),
+                    side(&change.from, theme.removed_text),
+                    glyph(icons::ARROW_RIGHT),
+                    side(&change.to, theme.added_text),
+                ],
+                space::SM,
+            )
+            .flex_1()
+            .min_w_0(),
+        )
         .child(typography::baseline_row(
             [caption_on_line(caption(kind, theme.subtle_text, ui), ui)],
             0.0,
@@ -2346,29 +2309,20 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
         .into_any_element()
 }
 
-/// A section's label, sentence case and semibold, with its count in subtle
-/// text after it: "Changed revisions 1".
+/// A section's label with its count: "Changed revisions 1".
 fn section_title(label: &str, count: String, ui: &Diffui, theme: ThemeSpec) -> Div {
-    let font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
-    let plain = ui.config.ui_font;
     div()
         .flex_none()
         .pt(px(space::LG))
         .pb(px(space::MD))
         .child(typography::baseline_row(
-            [
-                Aligned::text(
-                    typography::line(label.to_owned(), font, SECTION_LABEL_SIZE, theme.text),
-                    font,
-                    SECTION_LABEL_SIZE,
-                ),
-                Aligned::text(
-                    typography::line(count, plain, SECTION_LABEL_SIZE, theme.subtle_text),
-                    plain,
-                    SECTION_LABEL_SIZE,
-                ),
-            ],
-            space::SM,
+            [ui::section_label(
+                label.to_owned(),
+                Some(count),
+                ui.config.ui_font,
+                theme,
+            )],
+            0.0,
         ))
 }
 
@@ -2481,7 +2435,7 @@ fn operation_header(
         .flex()
         .flex_col()
         .gap(px(space::MD))
-        .px(px(space::XXL))
+        .px(px(DETAIL_EDGE))
         .pt(px(space::XL))
         .pb(px(space::XS))
         .child(
@@ -2565,7 +2519,7 @@ fn operation_changes(
         .w_full()
         .flex()
         .flex_col()
-        .px(px(space::XXL))
+        .px(px(DETAIL_EDGE))
         .pb(px(space::LG));
     if changes.is_merge {
         list = list.child(note(
@@ -2734,7 +2688,7 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
             .flex()
             .flex_col()
             .gap(px(space::XS))
-            .px(px(space::LG))
+            .px(px(DETAIL_EDGE))
             .py(px(space::MD))
             .child(typography::baseline_row(
                 [
@@ -2758,22 +2712,18 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
 }
 
 /// A message filling the diff's slot.
-fn diff_message(message: String, padded: bool, ui: &Diffui, theme: ThemeSpec) -> AnyElement {
-    let mut slot = div()
+fn diff_message(message: String, ui: &Diffui, theme: ThemeSpec) -> AnyElement {
+    div()
         .w_full()
         .flex_1()
         .min_h_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .font(ui.config.ui_font.gpui())
-        .text_size(px(text_size::BODY_LG))
-        .text_color(theme.subtle_text)
-        .child(message);
-    if padded {
-        slot = slot.p(px(space::XXL));
-    }
-    slot.into_any_element()
+        .child(ui::empty_state(
+            message,
+            ui::Placement::Centered,
+            ui.config.ui_font,
+            theme.subtle_text,
+        ))
+        .into_any_element()
 }
 
 fn history_diff_view(
@@ -2794,7 +2744,7 @@ fn history_diff_view(
         } else {
             "Select a change to see its diff"
         };
-        return diff_message(message.to_owned(), false, ui, theme);
+        return diff_message(message.to_owned(), ui, theme);
     };
     if diff.document.files.is_empty() {
         let message = match description_change(history) {
@@ -2803,7 +2753,7 @@ fn history_diff_view(
             ),
             None => "No file changes".to_owned(),
         };
-        return diff_message(message, true, ui, theme);
+        return diff_message(message, ui, theme);
     }
     history_diff(ui, theme, window, cx)
 }
@@ -2923,7 +2873,7 @@ pub(crate) fn build_history_panel(
                 } else {
                     "Select an operation"
                 };
-                body = body.child(diff_message(message.to_owned(), false, ui, theme));
+                body = body.child(diff_message(message.to_owned(), ui, theme));
             }
         },
         HistoryKind::Evolog { .. } => {

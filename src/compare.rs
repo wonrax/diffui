@@ -15,7 +15,7 @@ use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::action::Action;
 use crate::commit_info::with_tooltip;
-use crate::theme::{Color, ThemeSpec, Weight, text_size};
+use crate::theme::{ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Cx, Diffui, ellipsis, icons, ui};
 
@@ -157,38 +157,14 @@ impl Diffui {
 pub(crate) fn banner_strip(
     sides: gpui_kit::Div,
     controls: gpui_kit::Div,
+    font: crate::theme::Font,
     theme: ThemeSpec,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .py(px(8.0))
-        .px(px(crate::theme::space::XL))
-        .bg(Color {
-            a: 0.10,
-            ..theme.accent
-        })
-        .child(
-            sides
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .flex()
-                .flex_col()
-                .gap(px(3.0)),
-        )
-        .child(
-            controls
-                .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0)),
-        )
+    ui::Banner::new(ui::Tone::Info)
+        .shape(ui::BannerShape::Strip)
+        .child(sides.overflow_hidden().flex().flex_col().gap(px(3.0)))
+        .end(controls.flex().flex_row().items_center().gap(px(4.0)))
+        .build(font, theme)
         .into_any_element()
 }
 
@@ -315,5 +291,5 @@ pub(crate) fn build_compare_banner(
                 .on_click(Diffui::on_action(Action::Compare(CompareAction::Exit), cx)),
         ));
 
-    Some(banner_strip(sides, controls, theme))
+    Some(banner_strip(sides, controls, font, theme))
 }

@@ -361,10 +361,206 @@ pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx
 
 /// Side of [`close_button`]'s square.
 pub const CLOSE_SIDE: f32 = 20.0;
-/// A banner's inset around its [`close_button`] on the top, right and
-/// bottom, so the ✕ sits in an even frame on a compact-control-tall banner.
-pub const BANNER_INSET: f32 = (theme::control::COMPACT - CLOSE_SIDE) / 2.0;
 const CLOSE_ICON_SIZE: f32 = 12.0;
+
+// ── Segmented control ───────────────────────────────────────────────────
+
+/// A segmented control's height step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segmented {
+    /// On a bar, beside compact controls: the toolbar's view switcher.
+    Compact,
+    /// Inside a card, under its input: the palette's scope tabs.
+    Small,
+}
+
+impl Segmented {
+    fn segment_height(self) -> f32 {
+        self.well_height() - 2.0 * SEGMENT_INSET
+    }
+
+    fn well_height(self) -> f32 {
+        match self {
+            Self::Compact => theme::control::COMPACT,
+            Self::Small => 24.0,
+        }
+    }
+
+    fn text_size(self) -> f32 {
+        match self {
+            Self::Compact => text_size::BODY,
+            Self::Small => text_size::CAPTION,
+        }
+    }
+
+    fn icon_size(self) -> f32 {
+        match self {
+            Self::Compact => theme::icon::MD,
+            Self::Small => theme::icon::SM,
+        }
+    }
+}
+
+/// The well's inset around its segments, and the gap between them.
+const SEGMENT_INSET: f32 = theme::space::XXS;
+/// A segment's text inset from its face.
+const SEGMENT_PAD_X: f32 = theme::space::MD;
+
+/// The well a run of segments sits in, a step into the surface under it. Add
+/// [`segment`]s as its children.
+pub fn segmented(theme: ThemeSpec) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .p(px(SEGMENT_INSET))
+        .gap(px(SEGMENT_INSET))
+        .map(|well| {
+            theme::squircle(
+                well,
+                theme::radius::CARD,
+                Some(theme::well_wash(theme)),
+                None,
+            )
+        })
+}
+
+/// One segment of a [`segmented`] control.
+pub struct Segment {
+    pub icon: Option<&'static str>,
+    pub label: SharedString,
+    /// A count after the label, and whether it shows: a hidden one keeps
+    /// its room, so the segments don't move when it comes and goes.
+    pub count: Option<(usize, bool)>,
+    pub active: bool,
+    pub enabled: bool,
+}
+
+/// A segment: a quiet label in the well, raised out of it as a ringed face
+/// while `active`. Add the action with `.on_click`.
+pub fn segment(
+    id: impl Into<ElementId>,
+    segment: Segment,
+    size: Segmented,
+    font: Font,
+    theme: ThemeSpec,
+    cx: &App,
+) -> Button {
+    let label_font = theme::emphasis_font(font, Weight::MEDIUM);
+    let text = size.text_size();
+    let ink = if segment.active {
+        theme.text
+    } else if segment.enabled {
+        theme.muted_text
+    } else {
+        theme.subtle_text
+    };
+    let mut line = Vec::new();
+    if let Some(icon) = segment.icon {
+        line.push(typography::Aligned::glyph(
+            icons::icon(icon, size.icon_size(), ink),
+            size.icon_size(),
+        ));
+        line.push(typography::Aligned::gap(ICON_GAP));
+    }
+    line.push(typography::Aligned::text(
+        typography::line(segment.label, label_font, text, ink),
+        label_font,
+        text,
+    ));
+    let mut pad_x = SEGMENT_PAD_X;
+    if let Some((count, shown)) = segment.count {
+        let count = count.to_string();
+        if shown {
+            line.push(typography::Aligned::gap(ICON_GAP));
+            line.push(typography::Aligned::text(
+                typography::line(count, font, text, theme.subtle_text),
+                font,
+                text,
+            ));
+        } else {
+            // Half the room to each side, the label centred in it.
+            pad_x += (ICON_GAP + crate::measure::line_width(&count, text, font)) / 2.0;
+        }
+    }
+    let face = theme::radius::inner(theme::radius::CARD, SEGMENT_INSET);
+    button(id, Variant::Ghost, Size::Compact, theme, cx)
+        .h(px(size.segment_height()))
+        .px(px(pad_x))
+        .corner_radius(face)
+        .disabled(!segment.enabled)
+        .when(segment.active, |segment| segment.raised(theme))
+        .child(typography::baseline_row(line, 0.0))
+}
+
+// ── Panes ───────────────────────────────────────────────────────────────
+
+/// A pane's header row: [`theme::PANE_HEADER_HEIGHT`] tall, its content in
+/// one centred row. The caller sets the insets, which line its content up
+/// with the pane's own, and a ground where the list scrolls under it.
+pub fn panel_header() -> Div {
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(theme::PANE_HEADER_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+}
+
+/// A pane header's title, on its baseline: semibold in the text's ink, and
+/// the count after it, if any, in regular subtle text ("Changed files 12").
+pub fn panel_title(
+    title: impl Into<SharedString>,
+    count: Option<String>,
+    font: Font,
+    theme: ThemeSpec,
+) -> typography::Aligned {
+    let title_font = theme::emphasis_font(font, Weight::SEMIBOLD);
+    let size = text_size::BODY;
+    let mut items = vec![
+        typography::Aligned::text(
+            typography::line(title, title_font, size, theme.text).text_ellipsis(),
+            title_font,
+            size,
+        )
+        .shrink(),
+    ];
+    if let Some(count) = count {
+        items.push(typography::Aligned::text(
+            typography::line(count, font, size, theme.subtle_text),
+            font,
+            size,
+        ));
+    }
+    typography::group(items, theme::space::SM)
+}
+
+/// A section's label inside a pane, a list or a sheet: sentence case,
+/// semibold, muted, with an optional count in regular subtle text.
+pub fn section_label(
+    label: impl Into<SharedString>,
+    count: Option<String>,
+    font: Font,
+    theme: ThemeSpec,
+) -> typography::Aligned {
+    let label_font = theme::emphasis_font(font, Weight::SEMIBOLD);
+    let size = text_size::BODY;
+    let mut items = vec![typography::Aligned::text(
+        typography::line(label, label_font, size, theme.muted_text),
+        label_font,
+        size,
+    )];
+    if let Some(count) = count {
+        items.push(typography::Aligned::text(
+            typography::line(count, font, size, theme.subtle_text),
+            font,
+            size,
+        ));
+    }
+    typography::group(items, theme::space::SM)
+}
 
 // ── Lists ───────────────────────────────────────────────────────────────
 
@@ -445,6 +641,221 @@ pub fn list_row(row: ListRow, selected: bool, theme: ThemeSpec) -> Div {
         ))
     } else {
         shell
+    }
+}
+
+// ── Empty states ────────────────────────────────────────────────────────
+
+/// Where an [`empty_state`] sits in the box it stands in for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// In the middle of a pane.
+    Centered,
+    /// Centred across a list, near its top.
+    Top,
+    /// A line in a list, on its text edge.
+    Inline,
+}
+
+/// What a pane or a list says when it has nothing to show: one quiet
+/// message, wrapping in a narrow box rather than running out of it. Callers
+/// add actions or detail with `.child`.
+pub fn empty_state(
+    message: impl Into<SharedString>,
+    placement: Placement,
+    font: Font,
+    color: Color,
+) -> Div {
+    let text = div()
+        .font(font.gpui())
+        .text_size(px(text_size::BODY))
+        .line_height(px(text_size::BODY * typography::DEFAULT_LINE_HEIGHT))
+        .text_color(color)
+        .child(message.into());
+    match placement {
+        Placement::Centered => div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(theme::space::SM))
+            .p(px(theme::space::XXL))
+            .child(text.text_center()),
+        Placement::Top => div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(theme::space::SM))
+            .px(px(theme::space::XL))
+            .py(px(theme::space::XXL))
+            .child(text.text_center()),
+        Placement::Inline => div()
+            .w_full()
+            .flex_none()
+            .px(px(theme::space::LG))
+            .py(px(theme::space::SM))
+            .child(text),
+    }
+}
+
+// ── Banners ─────────────────────────────────────────────────────────────
+
+/// What a [`Banner`] says about its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// A mode or a scope the view is in: a comparison, a file's history.
+    Info,
+    /// Worth knowing before going on, but nothing stops it.
+    Warning,
+    /// Something failed.
+    Danger,
+}
+
+impl Tone {
+    /// The tone's ink (its glyph, a title) and its wash.
+    pub fn colors(self, theme: ThemeSpec) -> (Color, Color) {
+        match self {
+            Self::Info => (
+                theme.info,
+                Color {
+                    a: 0.10,
+                    ..theme.info
+                },
+            ),
+            Self::Warning => (theme.note_text, theme.note_background),
+            Self::Danger => (
+                theme.removed_text,
+                Color {
+                    a: 0.10,
+                    ..theme.removed_text
+                },
+            ),
+        }
+    }
+}
+
+/// Where a [`Banner`] sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerShape {
+    /// Edge to edge across a pane, atop its content.
+    Strip,
+    /// A rounded card inside a pane, a list or a dialog.
+    Card,
+}
+
+/// A tinted message: an optional glyph on its first line, the message, and
+/// controls at the end. Every banner and callout in the app is one, so they
+/// stack with one inset and one strength.
+pub struct Banner {
+    tone: Tone,
+    shape: BannerShape,
+    icon: Option<&'static str>,
+    body: Vec<gpui_kit::AnyElement>,
+    end: Vec<gpui_kit::AnyElement>,
+}
+
+impl Banner {
+    pub fn new(tone: Tone) -> Self {
+        Self {
+            tone,
+            shape: BannerShape::Card,
+            icon: None,
+            body: Vec::new(),
+            end: Vec::new(),
+        }
+    }
+
+    pub fn shape(mut self, shape: BannerShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// A glyph in the tone's ink, centred on the first line's caps.
+    pub fn icon(mut self, icon: &'static str) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// A line or block of the message, stacked under the ones before it.
+    pub fn child(mut self, child: impl IntoElement) -> Self {
+        self.body.push(child.into_any_element());
+        self
+    }
+
+    /// [`Banner::child`] for each of `children`.
+    pub fn children(mut self, children: impl IntoIterator<Item = impl IntoElement>) -> Self {
+        self.body
+            .extend(children.into_iter().map(IntoElement::into_any_element));
+        self
+    }
+
+    /// A control at the banner's end, centred on its height.
+    pub fn end(mut self, control: impl IntoElement) -> Self {
+        self.end.push(control.into_any_element());
+        self
+    }
+
+    pub fn build(self, font: Font, theme: ThemeSpec) -> Div {
+        let (ink, wash) = self.tone.colors(theme);
+        let banner = div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(theme::space::MD))
+            .py(px(theme::space::MD))
+            .text_size(px(text_size::BODY));
+        let banner = match self.shape {
+            BannerShape::Strip => banner.px(px(theme::space::XL)).bg(wash),
+            BannerShape::Card => theme::squircle(
+                banner.px(px(theme::space::LG)),
+                theme::radius::CARD,
+                Some(wash),
+                None,
+            ),
+        };
+        let banner = match self.icon {
+            Some(icon) => {
+                let line = typography::TextBox::default_line(font, text_size::BODY);
+                let top =
+                    ((line.cap_top() + line.baseline()) / 2.0 - theme::icon::MD / 2.0).max(0.0);
+                banner.child(div().flex_none().pt(px(top)).child(icons::icon(
+                    icon,
+                    theme::icon::MD,
+                    ink,
+                )))
+            }
+            None => banner,
+        };
+        let banner = banner.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XXS))
+                .children(self.body),
+        );
+        if self.end.is_empty() {
+            banner
+        } else {
+            banner.child(
+                div()
+                    .flex_none()
+                    .self_center()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::space::XS))
+                    // A button's wash reaches past its glyph: the glyph, not
+                    // the wash, keeps to the banner's inset.
+                    .mr(px(-theme::space::XS))
+                    .children(self.end),
+            )
+        }
     }
 }
 

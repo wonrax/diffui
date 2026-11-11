@@ -1600,7 +1600,7 @@ fn open_repo_footer(
     dialog: &crate::OpenRepoDialog,
     status: Option<&crate::path_browse::Status>,
 ) -> Div {
-    use crate::overlay_kit::{footer_note, footer_strip, key_hint, keycap};
+    use crate::overlay_kit::{Density, MODAL_FOOT, footer, footer_note, key_hint, keycap};
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let path = dialog.path.trim();
@@ -1613,7 +1613,16 @@ fn open_repo_footer(
             .items_center()
             .gap(px(theme::space::SM))
     };
-    let strip = footer_strip(theme);
+    let strip = footer(Density::Strip, MODAL_FOOT, theme);
+    let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
+        crate::overlay_kit::bound_hint(
+            ui,
+            crate::commands::Context::OpenRepo,
+            commands,
+            label,
+            theme,
+        )
+    };
     if path.is_empty() {
         let remove = ui
             .keymap
@@ -1622,7 +1631,10 @@ fn open_repo_footer(
             .unwrap_or_default();
         let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
         return strip
-            .child(key_hint(&["\u{2191}", "\u{2193}"], "Select", font, theme))
+            .children(bound(
+                &["repo.previous-folder", "repo.next-folder"],
+                "Select",
+            ))
             .child(key_hint(&["\u{21b5}"], "Open", font, theme))
             .when(!remove.is_empty(), |strip| {
                 strip.child(key_hint(&remove, "Remove", font, theme))
@@ -1641,8 +1653,11 @@ fn open_repo_footer(
         && !matches!(status, Some(crate::path_browse::Status::PullRequest(_)));
     if browsing {
         return strip
-            .child(key_hint(&["\u{2191}", "\u{2193}"], "Select", font, theme))
-            .child(key_hint(&["\u{21e5}"], "Complete", font, theme))
+            .children(bound(
+                &["repo.previous-folder", "repo.next-folder"],
+                "Select",
+            ))
+            .children(bound(&["repo.complete-folder"], "Complete"))
             .child(key_hint(&["\u{21b5}"], "Open", font, theme))
             .child(key_hint(&["\u{232b}"], "Up a folder", font, theme))
             .child(
@@ -1653,7 +1668,7 @@ fn open_repo_footer(
     }
     strip
         .child(key_hint(&["\u{21b5}"], "Open", font, theme))
-        .child(end().child(key_hint(&["esc"], "Close", font, theme)))
+        .child(end().children(bound(&["repo.close-dialog"], "Close")))
 }
 
 /// A list's group heading with an action at its far end, both on the rows'

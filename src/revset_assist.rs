@@ -464,9 +464,10 @@ pub(crate) fn dropdown(
     // The keys the field answers while the list is open, as the palette's
     // footer tells its own.
     let font = ui.config.ui_font;
-    let footer = crate::overlay_kit::footer_strip_rounded(
-        theme,
+    let footer = crate::overlay_kit::footer(
+        crate::overlay_kit::Density::Strip,
         theme::radius::inner(CARD_RADIUS, theme::HAIRLINE),
+        theme,
     )
     .child(crate::overlay_kit::key_hint(
         &["\u{21e5}"],

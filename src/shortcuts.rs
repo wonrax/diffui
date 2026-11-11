@@ -315,12 +315,14 @@ fn section(
         .flex()
         .flex_col()
         .w_full()
-        .child(div().pb(px(theme::space::XS)).child(typography::line(
-            title,
-            emphasis_font(ui.config.ui_font, Weight::SEMIBOLD),
-            text_size::CAPTION,
-            theme.subtle_text,
-        )))
+        .child(
+            div()
+                .pb(px(theme::space::XS))
+                .child(typography::baseline_row(
+                    [ui::section_label(title, None, ui.config.ui_font, theme)],
+                    0.0,
+                )),
+        )
         .children(rows)
 }
 

@@ -359,7 +359,7 @@ pub(crate) fn banner(
         )),
     ));
 
-    Some(crate::compare::banner_strip(sides, controls, theme))
+    Some(crate::compare::banner_strip(sides, controls, font, theme))
 }
 
 /// The pane when the marked rows can't be one diff: jj's reason, with the

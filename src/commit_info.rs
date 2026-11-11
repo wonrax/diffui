@@ -23,8 +23,6 @@ use crate::typography::Aligned;
 use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, icons, typography, ui};
 
-/// The header bar's height: a pane header's.
-pub(crate) const BAR_HEIGHT: f32 = 40.0;
 /// The title's step: the revision list's description size.
 const TITLE_SIZE: f32 = text_size::BODY;
 /// Between the header's title and what follows it.
@@ -468,7 +466,13 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
 /// Where the bar's first text starts: the diff header's own inset, so the
 /// title sits over the description under it.
 const BAR_LEAD: f32 = crate::diff_view::HEADER_HORIZONTAL_PADDING;
+/// The bar's inset after its last button: the button's glyph, not its wash,
+/// ends on the diff pane's trailing edge, the file headers' glyphs' line.
+const BAR_TRAIL: f32 =
+    crate::diff_view::HEADER_HORIZONTAL_PADDING - (theme::control::COMPACT - ui::ICON_SIZE) / 2.0;
 
+/// The bar's ground. No rule under it: the sticky file header's own edge
+/// separates the diff scrolling under it, as the side panes' fades do theirs.
 fn block(theme: ThemeSpec) -> gpui_kit::Div {
     div()
         .w_full()
@@ -476,23 +480,15 @@ fn block(theme: ThemeSpec) -> gpui_kit::Div {
         .flex()
         .flex_col()
         .bg(theme.panel_background)
-        .border_b_1()
-        .border_color(theme.border)
 }
 
 /// One row: `line` on one baseline, cut where it runs out of room, then the
 /// buttons.
 fn bar(line: Vec<Aligned>, actions: Vec<AnyElement>) -> gpui_kit::Div {
-    div()
-        .w_full()
-        .h(px(BAR_HEIGHT))
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
+    ui::panel_header()
         .gap(px(space::XXS))
         .pl(px(BAR_LEAD))
-        .pr(px(space::SM))
+        .pr(px(BAR_TRAIL))
         .child(
             div()
                 .flex_1()

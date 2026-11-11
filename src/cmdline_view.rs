@@ -677,12 +677,22 @@ pub(crate) fn footer(
     };
     let hint =
         |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, font, theme);
-    crate::overlay_kit::footer_strip(theme)
-        .child(hint(&["\u{21e5}"], "Complete"))
-        .child(hint(&["\u{21b5}"], enter))
-        .child(hint(&["\u{232b}"], "Back to commands"))
-        .child(crate::overlay_kit::footer_note(lands, font, theme).ml_auto())
-        .into_any_element()
+    crate::overlay_kit::footer(
+        crate::overlay_kit::Density::Strip,
+        crate::overlay_kit::MODAL_FOOT,
+        theme,
+    )
+    .child(hint(&["\u{21e5}"], "Complete"))
+    .child(hint(&["\u{21b5}"], enter))
+    .children(crate::overlay_kit::bound_hint(
+        ui,
+        crate::commands::Context::Palette,
+        &["palette.leave-command-line"],
+        "Back to commands",
+        theme,
+    ))
+    .child(crate::overlay_kit::footer_note(lands, font, theme).ml_auto())
+    .into_any_element()
 }
 
 /// A one-line sentence that shares the row's baseline with its badge or
