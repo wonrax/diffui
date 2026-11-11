@@ -1194,8 +1194,16 @@ impl Session {
         };
         // A snapshot under an edited mid-stack commit rebased its children:
         // every one of them has a new id, and the rows still name the old
-        // ones, which no mutation can act on any more.
-        let origin = if external_op || snapshot.rewrote_descendants {
+        // ones, which no mutation can act on any more. A git working copy
+        // that turned clean or dirty gains or loses its graph row.
+        let dirty_flipped = matches!(
+            (
+                reflected.and_then(|s| s.working_copy_dirty),
+                snapshot.working_copy_dirty
+            ),
+            (Some(before), Some(now)) if before != now
+        );
+        let origin = if external_op || snapshot.rewrote_descendants || dirty_flipped {
             RefreshOrigin::Focus
         } else {
             origin

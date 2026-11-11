@@ -40,6 +40,10 @@ pub struct RepositorySnapshot {
     /// screen address commits that are no longer visible and the graph has to
     /// be reloaded rather than patched.
     pub rewrote_descendants: bool,
+    /// Whether the tree differs from `HEAD`, which decides whether a git
+    /// graph carries its synthetic working-copy row. `None` for jj, where `@`
+    /// is always a row of its own.
+    pub working_copy_dirty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

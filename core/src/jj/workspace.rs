@@ -999,6 +999,7 @@ pub(crate) async fn snapshot_working_copy(
                         parent_fingerprint: Some(repo.op_id().hex()),
                         working_copy_commit_id: wc_commit.map(|commit| commit.id().hex()),
                         rewrote_descendants: false,
+                        working_copy_dirty: None,
                     },
                     repo,
                     warnings: Vec::new(),
@@ -1025,6 +1026,7 @@ pub(crate) async fn snapshot_working_copy(
                 parent_fingerprint: Some(repo.op_id().hex()),
                 working_copy_commit_id: Some(wc_commit.id().hex()),
                 rewrote_descendants: false,
+                working_copy_dirty: None,
             };
             return Ok(SnapshotOutcome {
                 snapshot,
@@ -1069,6 +1071,7 @@ async fn absorb_snapshot(
                 parent_fingerprint: Some(repo.op_id().hex()),
                 working_copy_commit_id: Some(locked.wc_commit.id().hex()),
                 rewrote_descendants: false,
+                working_copy_dirty: None,
             },
             repo,
             warnings,
@@ -1144,6 +1147,7 @@ async fn absorb_snapshot(
             parent_fingerprint: Some(base_op_id),
             working_copy_commit_id: Some(new_commit.id().hex()),
             rewrote_descendants: rebased > 0,
+            working_copy_dirty: None,
         },
         repo: new_repo,
         warnings,

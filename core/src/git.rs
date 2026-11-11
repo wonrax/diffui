@@ -293,7 +293,8 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     // change, re-diffed per save. The size and mtime of each path status
     // lists move on a save just the same, for a stat per dirty path.
     let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
-    for path in status_paths(&output) {
+    let paths = status_paths(&output);
+    for path in &paths {
         path.hash(&mut fingerprint);
         path_stamp(&repository_root.join(path)).hash(&mut fingerprint);
     }
@@ -303,6 +304,7 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
+        working_copy_dirty: Some(!paths.is_empty()),
         ..RepositorySnapshot::default()
     })
 }

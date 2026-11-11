@@ -312,7 +312,9 @@ fn the_git_actor_starts_and_forwards_its_watch() {
                 write(&root, "file.txt", b"edit\n");
                 tokio::select! {
                     event = events.next() => {
-                        assert!(matches!(event.unwrap().payload, Payload::RepositoryChanged));
+                        // A save in the worktree asks for a snapshot, not a
+                        // reload of the history.
+                        assert!(matches!(event.unwrap().payload, Payload::WorkingCopyChanged));
                         break;
                     }
                     () = tokio::time::sleep(Duration::from_millis(100)) => {}
