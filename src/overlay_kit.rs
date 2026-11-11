@@ -246,7 +246,7 @@ pub(crate) fn callout(
             .line_height(px(text_size::BODY * typography::DEFAULT_LINE_HEIGHT))
             .child(prose.view(font, mono, color, theme))
     };
-    let mut banner = crate::ui::Banner::new(crate::ui::BannerTone::Warning)
+    let mut banner = crate::ui::Banner::new(crate::ui::Tone::Warn)
         .icon(icons::ALERT_TRIANGLE)
         .child(text(lead, theme.note_text));
     if let Some(detail) = detail {

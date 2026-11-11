@@ -1202,7 +1202,7 @@ pub(crate) fn file_filter_banner(
     Some(
         crate::field::panel_strip()
             .child(
-                ui::Banner::new(ui::BannerTone::Info)
+                ui::Banner::new(ui::Tone::Accent)
                     .icon(icons::FILE_CLOCK)
                     .child(title)
                     .end(close.tip("Show the whole graph again", ui.config.ui_font, theme))

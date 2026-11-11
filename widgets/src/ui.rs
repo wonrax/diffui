@@ -744,40 +744,6 @@ pub fn empty_state(
 
 // ── Banners ─────────────────────────────────────────────────────────────
 
-/// What a [`Banner`] says about its message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BannerTone {
-    /// A mode or a scope the view is in: a comparison, a file's history.
-    Info,
-    /// Worth knowing before going on, but nothing stops it.
-    Warning,
-    /// Something failed.
-    Danger,
-}
-
-impl BannerTone {
-    /// The tone's ink (its glyph, a title) and its wash.
-    pub fn colors(self, theme: ThemeSpec) -> (Color, Color) {
-        match self {
-            Self::Info => (
-                theme.info,
-                Color {
-                    a: 0.10,
-                    ..theme.info
-                },
-            ),
-            Self::Warning => (theme.note_text, theme.note_background),
-            Self::Danger => (
-                theme.removed_text,
-                Color {
-                    a: 0.10,
-                    ..theme.removed_text
-                },
-            ),
-        }
-    }
-}
-
 /// Where a [`Banner`] sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerShape {
@@ -791,7 +757,7 @@ pub enum BannerShape {
 /// controls at the end. Every banner and callout in the app is one, so they
 /// stack with one inset and one strength.
 pub struct Banner {
-    tone: BannerTone,
+    tone: Tone,
     shape: BannerShape,
     icon: Option<&'static str>,
     body: Vec<gpui_kit::AnyElement>,
@@ -799,7 +765,7 @@ pub struct Banner {
 }
 
 impl Banner {
-    pub fn new(tone: BannerTone) -> Self {
+    pub fn new(tone: Tone) -> Self {
         Self {
             tone,
             shape: BannerShape::Card,
@@ -840,7 +806,7 @@ impl Banner {
     }
 
     pub fn build(self, font: Font, theme: ThemeSpec) -> Div {
-        let (ink, wash) = self.tone.colors(theme);
+        let (ink, wash) = (self.tone.ink(theme), self.tone.wash(theme));
         let banner = div()
             .w_full()
             .flex_none()
@@ -903,13 +869,17 @@ impl Banner {
 
 // ── Tags ────────────────────────────────────────────────────────────────
 
-/// What a status word or count says, by colour.
+/// What a message, a status word or a count says, by colour: a [`Banner`]'s
+/// glyph and wash, a [`tag`]'s ink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
+    /// A mode or scope the view is in, or where Enter leads.
     Accent,
     Muted,
     Ok,
+    /// Worth knowing before going on, but nothing stops it.
     Warn,
+    /// Something failed.
     Danger,
 }
 
@@ -921,6 +891,18 @@ impl Tone {
             Tone::Ok => theme.added_text,
             Tone::Warn => theme.note_text,
             Tone::Danger => theme.removed_text,
+        }
+    }
+
+    /// A banner's ground: a wash of the ink, the theme's note ground for a
+    /// warning.
+    pub fn wash(self, theme: ThemeSpec) -> Color {
+        match self {
+            Tone::Warn => theme.note_background,
+            _ => Color {
+                a: 0.10,
+                ..self.ink(theme)
+            },
         }
     }
 }

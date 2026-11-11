@@ -386,7 +386,7 @@ pub(crate) fn build_source_sidebar(
     if let Some(error) = &source.tree_error {
         body = body.child(
             crate::field::panel_strip().child(
-                crate::ui::Banner::new(crate::ui::BannerTone::Danger)
+                crate::ui::Banner::new(crate::ui::Tone::Danger)
                     .icon(icons::ALERT_TRIANGLE)
                     .child(
                         div()

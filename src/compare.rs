@@ -159,7 +159,7 @@ pub(crate) fn banner_strip(
     font: crate::theme::Font,
     theme: ThemeSpec,
 ) -> AnyElement {
-    ui::Banner::new(ui::BannerTone::Info)
+    ui::Banner::new(ui::Tone::Accent)
         .shape(ui::BannerShape::Strip)
         .child(sides.overflow_hidden().flex().flex_col().gap(px(3.0)))
         .end(controls.flex().flex_row().items_center().gap(px(4.0)))
