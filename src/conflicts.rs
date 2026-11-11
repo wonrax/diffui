@@ -1220,12 +1220,23 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
     crate::overlay_kit::footer_with_buttons(
         crate::overlay_kit::Density::Well,
         crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
-        vec![
-            crate::overlay_kit::key_hint(&["\u{2318}", "\u{21b5}"], "Save", font, theme)
-                .into_any_element(),
-            crate::overlay_kit::key_hint(&["esc"], "Cancel", font, theme).into_any_element(),
-            crate::overlay_kit::hint_note(hint, theme.subtle_text, font),
-        ],
+        [
+            ("conflict.edit.save", "Save"),
+            ("conflict.edit.cancel", "Cancel"),
+        ]
+        .into_iter()
+        .filter_map(|(id, label)| {
+            crate::overlay_kit::bound_hint(
+                ui,
+                crate::commands::Context::ConflictEdit,
+                &[id],
+                label,
+                theme,
+            )
+        })
+        .map(IntoElement::into_any_element)
+        .chain([crate::overlay_kit::hint_note(hint, theme.subtle_text, font)])
+        .collect(),
         [cancel.into_any_element(), save.into_any_element()],
         theme,
     )

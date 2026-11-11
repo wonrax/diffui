@@ -114,16 +114,26 @@ pub(crate) fn bound_hint(
     label: impl Into<SharedString>,
     theme: ThemeSpec,
 ) -> Option<Div> {
-    let keys: Vec<String> = commands
-        .iter()
-        .filter_map(|id| ui.keymap.live_chords(context, id).first().copied())
-        .flat_map(|chord| chord_keys(&chord.display()))
-        .collect();
+    let keys = bound_keys(ui, context, commands);
     if keys.is_empty() {
         return None;
     }
     let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     Some(key_hint(&keys, label, ui.config.ui_font, theme))
+}
+
+/// The keys of `commands` in `context`: each command's first live chord, one
+/// entry per key. Empty when none of them is bound.
+pub(crate) fn bound_keys(
+    ui: &crate::Diffui,
+    context: crate::commands::Context,
+    commands: &[crate::commands::CommandId],
+) -> Vec<String> {
+    commands
+        .iter()
+        .filter_map(|id| ui.keymap.live_chords(context, id).first().copied())
+        .flat_map(|chord| chord_keys(&chord.display()))
+        .collect()
 }
 
 /// Quiet text in a footer, without keys (the far end's note).
@@ -342,6 +352,21 @@ impl Dialog {
     pub(crate) fn hint(mut self, keys: &[&str], label: impl Into<SharedString>) -> Self {
         self.hints
             .push(key_hint(keys, label, self.font, self.theme).into_any_element());
+        self
+    }
+
+    /// [`bound_hint`] in the footer's left end: nothing when `commands`
+    /// aren't bound.
+    pub(crate) fn bound_hint(
+        mut self,
+        ui: &crate::Diffui,
+        context: crate::commands::Context,
+        commands: &[crate::commands::CommandId],
+        label: impl Into<SharedString>,
+    ) -> Self {
+        self.hints.extend(
+            bound_hint(ui, context, commands, label, self.theme).map(IntoElement::into_any_element),
+        );
         self
     }
 

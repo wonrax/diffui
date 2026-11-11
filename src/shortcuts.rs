@@ -293,7 +293,12 @@ pub(crate) fn build_overlay(
             .size_full()
             .child(ui::scrollable("shortcuts-list", columns)),
     )
-    .hint(&["esc"], "Close")
+    .bound_hint(
+        ui,
+        crate::commands::Context::Shortcuts,
+        &["shortcuts.close"],
+        "Close",
+    )
     .build();
     let dismiss = Diffui::on_action::<()>(Action::CloseShortcuts, cx);
     ui::modal(

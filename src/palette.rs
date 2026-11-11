@@ -1295,7 +1295,7 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
             };
             strip
                 .children(bound(&["palette.previous", "palette.next"], "Select"))
-                .child(hint(&["\u{21b5}"], enter))
+                .child(hint(&[crate::keymap::key_label("enter")], enter))
                 .children(bound(&["palette.actions"], "Actions"))
                 .child(
                     div()
@@ -1319,7 +1319,7 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
             let font = theme::emphasis_font(font, Weight::MEDIUM);
             strip
                 .children(bound(&["palette.back"], "Back"))
-                .child(hint(&["\u{21b5}"], "Run"))
+                .child(hint(&[crate::keymap::key_label("enter")], "Run"))
                 .child(
                     div()
                         .ml_auto()
@@ -1372,7 +1372,11 @@ fn build_input(
         .child(glyph_box(
             icons::icon(icons::SEARCH, 16.0, theme.subtle_text).into_any_element(),
         ));
-    let esc = ui::keycap("esc", font, theme).view();
+    let esc = ui::chord(
+        crate::overlay_kit::bound_keys(ui, crate::commands::Context::Palette, &["palette.back"]),
+        font,
+        theme,
+    );
     if !focused {
         // Older (left-of-center) columns are read-only previews. Only the rightmost
         // holds the input: a field's state is keyed by its id.

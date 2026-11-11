@@ -1003,10 +1003,20 @@ pub(crate) fn build_confirm_dialog(
         ));
     }
     if dialog.look.routine {
-        card = card.hint(&["\u{21b5}"], dialog.confirm_label.clone());
+        card = card.bound_hint(
+            ui,
+            crate::commands::Context::Confirm,
+            &["confirm.accept"],
+            dialog.confirm_label.clone(),
+        );
     }
     let card = card
-        .hint(&["esc"], "Cancel")
+        .bound_hint(
+            ui,
+            crate::commands::Context::Confirm,
+            &["confirm.cancel"],
+            "Cancel",
+        )
         .buttons([cancel.into_any_element(), accept.into_any_element()])
         .build();
     let dismiss = Diffui::on_action::<()>(Action::ConfirmCancel, cx);
@@ -1443,7 +1453,7 @@ fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Statu
     let mut banner = banner.child(typography::baseline_row(words, 0.0).min_w_0());
     if let Some(enter) = enter {
         banner = banner.end(crate::overlay_kit::key_hint(
-            &["\u{21b5}"],
+            &[crate::keymap::key_label("enter")],
             enter,
             font,
             theme,
@@ -1579,7 +1589,12 @@ fn open_repo_footer(
                 &["repo.previous-folder", "repo.next-folder"],
                 "Select",
             ))
-            .child(key_hint(&["\u{21b5}"], "Open", font, theme))
+            .child(key_hint(
+                &[crate::keymap::key_label("enter")],
+                "Open",
+                font,
+                theme,
+            ))
             .when(!remove.is_empty(), |strip| {
                 strip.child(key_hint(&remove, "Remove", font, theme))
             })
@@ -1602,8 +1617,18 @@ fn open_repo_footer(
                 "Select",
             ))
             .children(bound(&["repo.complete-folder"], "Complete"))
-            .child(key_hint(&["\u{21b5}"], "Open", font, theme))
-            .child(key_hint(&["\u{232b}"], "Up a folder", font, theme))
+            .child(key_hint(
+                &[crate::keymap::key_label("enter")],
+                "Open",
+                font,
+                theme,
+            ))
+            .child(key_hint(
+                &[crate::keymap::key_label("backspace")],
+                "Up a folder",
+                font,
+                theme,
+            ))
             .child(
                 end()
                     .child(footer_note("Hidden folders: type", font, theme))
@@ -1611,7 +1636,12 @@ fn open_repo_footer(
             );
     }
     strip
-        .child(key_hint(&["\u{21b5}"], "Open", font, theme))
+        .child(key_hint(
+            &[crate::keymap::key_label("enter")],
+            "Open",
+            font,
+            theme,
+        ))
         .child(end().children(bound(&["repo.close-dialog"], "Close")))
 }
 
@@ -1974,10 +2004,20 @@ fn folder_row(
     )
     .flex_1()
     .min_w_0();
-    let (hint, key) = match (repo, open) {
-        (true, true) => ("switch to tab", "\u{21b5}"),
-        (true, false) => ("open", "\u{21b5}"),
-        (false, _) => ("go in", "\u{21e5}"),
+    let (hint, keys) = match (repo, open) {
+        (true, true) => (
+            "Switch to tab",
+            vec![crate::keymap::key_label("enter").to_owned()],
+        ),
+        (true, false) => ("Open", vec![crate::keymap::key_label("enter").to_owned()]),
+        (false, _) => (
+            "Go in",
+            crate::overlay_kit::bound_keys(
+                ui,
+                crate::commands::Context::OpenRepo,
+                &["repo.complete-folder"],
+            ),
+        ),
     };
     let end = div()
         .flex()
@@ -1988,7 +2028,7 @@ fn folder_row(
         .when(open, |end| end.child(open_chip(font, theme)))
         .when(selected, |end| {
             end.child(row_hint(hint, font, theme))
-                .child(ui::keycap(key, font, theme).view())
+                .child(ui::chord(keys, font, theme))
         });
     list_row(
         ("open-repo-folder-row", index).into(),
@@ -2086,7 +2126,7 @@ fn recent_repo_row(
         .when(recent.open, |end| end.child(open_chip(font, theme)))
         .when(selected, |end| {
             end.child(row_hint(
-                if recent.open { "switch to tab" } else { "open" },
+                if recent.open { "Switch to tab" } else { "Open" },
                 font,
                 theme,
             ))

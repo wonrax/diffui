@@ -244,6 +244,13 @@ fn named_key(name: &str) -> Option<Named> {
     })
 }
 
+/// How the named key `name` (`"enter"`, `"backspace"`) is spelled in a hint,
+/// for a key a text input answers itself, which no binding names. Empty for a
+/// name that isn't a key.
+pub(crate) fn key_label(name: &str) -> &'static str {
+    named_key(name).map_or("", named_label)
+}
+
 /// How a named key is spelled in a shortcut hint. Every key
 /// [`named_key`] accepts has one: a binding the user is allowed to write is a
 /// binding the menus and the palette have to be able to show, and an empty

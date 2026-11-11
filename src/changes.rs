@@ -1763,9 +1763,17 @@ pub(crate) fn action_bar(
         ));
     }
     if !selection.is_empty() {
-        let keycap = ui::keycap("esc", font, theme)
-            .colors(faded, theme::TRANSPARENT, Color { a: 0.6, ..ink })
-            .view();
+        let keycaps = crate::overlay_kit::bound_keys(
+            ui,
+            crate::commands::Context::Base,
+            &["selection.clear"],
+        )
+        .into_iter()
+        .map(|key| {
+            ui::keycap(key, font, theme)
+                .colors(faded, theme::TRANSPARENT, Color { a: 0.6, ..ink })
+                .view()
+        });
         let clear = div()
             .id("picks-clear")
             .test_support()
@@ -1789,7 +1797,7 @@ pub(crate) fn action_bar(
                 font,
                 text_size::BODY,
             ))
-            .child(keycap);
+            .children(keycaps);
         items.push(clear.into_any_element());
     }
 
@@ -1913,8 +1921,18 @@ pub(crate) fn split_modal(
             .lede(&prompt.summary, mono)
             .child(first)
             .child(second)
-            .hint(&["\u{2318}", "\u{21b5}"], "Split")
-            .hint(&["esc"], "Cancel")
+            .bound_hint(
+                ui,
+                crate::commands::Context::Split,
+                &["split.confirm"],
+                "Split",
+            )
+            .bound_hint(
+                ui,
+                crate::commands::Context::Split,
+                &["split.cancel"],
+                "Cancel",
+            )
             .buttons([cancel.into_any_element(), split.into_any_element()])
             .build();
     ui::input_modal("split-modal", card, crate::toolbar::modal_top()).into_any_element()

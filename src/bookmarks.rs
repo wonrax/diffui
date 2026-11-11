@@ -770,8 +770,13 @@ pub(crate) fn build_name_prompt(
             .on_click(Diffui::on_action(cancel, cx));
 
     let card = card
-        .hint(&["\u{21b5}"], verb)
-        .hint(&["esc"], "Cancel")
+        .hint(&[crate::keymap::key_label("enter")], verb)
+        .bound_hint(
+            ui,
+            crate::commands::Context::Prompt,
+            &["bookmark.prompt-cancel"],
+            "Cancel",
+        )
         .buttons([cancel_button.into_any_element(), accept.into_any_element()])
         .build();
     ui::input_modal("name-prompt-modal", card, crate::toolbar::modal_top()).into_any_element()

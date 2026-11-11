@@ -262,7 +262,12 @@ pub(crate) fn build_overlay(
     };
 
     if let Some(label) = accept_label {
-        card = card.hint(&["\u{21b5}"], label);
+        card = card.bound_hint(
+            ui,
+            crate::commands::Context::Credential,
+            &["credential.accept"],
+            label,
+        );
     }
     let raised = |label: &'static str, cx: &mut Cx| {
         ui::text_button(
@@ -285,7 +290,12 @@ pub(crate) fn build_overlay(
             "Cancel",
         ),
     };
-    card = card.hint(&["esc"], decline_label);
+    card = card.bound_hint(
+        ui,
+        crate::commands::Context::Credential,
+        &["credential.cancel"],
+        decline_label,
+    );
     let queued = dialog.queue.len();
     if queued > 0 {
         card = card.note(crate::overlay_kit::footer_note(

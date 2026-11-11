@@ -395,8 +395,18 @@ pub(crate) fn build_overlay(
         crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), font, mono, theme)
             .width(OUTPUT_WIDTH)
             .child(output)
-            .hint(&["\u{2318}", "C"], "Copy")
-            .hint(&["esc"], "Close")
+            .bound_hint(
+                ui,
+                crate::commands::Context::Output,
+                &["output.copy"],
+                "Copy",
+            )
+            .bound_hint(
+                ui,
+                crate::commands::Context::Output,
+                &["output.close"],
+                "Close",
+            )
             .note(status)
             .buttons(buttons)
             .build();

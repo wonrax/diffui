@@ -250,7 +250,15 @@ pub(crate) fn input(
                         .h(px(line_height)),
                 ),
         )
-        .child(ui::keycap("esc", font, theme).view())
+        .child(ui::chord(
+            crate::overlay_kit::bound_keys(
+                ui,
+                crate::commands::Context::Palette,
+                &["palette.back"],
+            ),
+            font,
+            theme,
+        ))
         .into_any_element()
 }
 
@@ -644,7 +652,15 @@ fn candidate_row(
         .gap(px(theme::space::LG))
         .child(text)
         .when(selected, |row| {
-            row.child(ui::keycap("\u{21e5}", font, theme).view())
+            row.child(ui::chord(
+                crate::overlay_kit::bound_keys(
+                    ui,
+                    crate::commands::Context::Palette,
+                    &["palette.actions"],
+                ),
+                font,
+                theme,
+            ))
         })
         .into_any_element()
 }
@@ -676,8 +692,14 @@ pub(crate) fn footer(
         crate::overlay_kit::MODAL_FOOT,
         theme,
     )
-    .child(hint(&["\u{21e5}"], "Complete"))
-    .child(hint(&["\u{21b5}"], enter))
+    .children(crate::overlay_kit::bound_hint(
+        ui,
+        crate::commands::Context::Palette,
+        &["palette.actions"],
+        "Complete",
+        theme,
+    ))
+    .child(hint(&[crate::keymap::key_label("enter")], enter))
     .children(crate::overlay_kit::bound_hint(
         ui,
         crate::commands::Context::Palette,

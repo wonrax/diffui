@@ -469,18 +469,23 @@ pub(crate) fn dropdown(
         theme,
     )
     .child(crate::overlay_kit::key_hint(
-        &["\u{21e5}"],
+        &[crate::keymap::key_label("tab")],
         "Complete",
         font,
         theme,
     ))
     .child(crate::overlay_kit::key_hint(
-        &["\u{21b5}"],
+        &[crate::keymap::key_label("enter")],
         "Apply",
         font,
         theme,
     ))
-    .child(crate::overlay_kit::key_hint(&["esc"], "Close", font, theme));
+    .child(crate::overlay_kit::key_hint(
+        &[crate::keymap::key_label("esc")],
+        "Close",
+        font,
+        theme,
+    ));
     Some(
         div()
             .w_full()
