@@ -17,7 +17,6 @@ use crate::theme::{
     text_size,
 };
 use crate::typography::{self, Aligned};
-use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, FetchTarget, MainView, ToolbarMenu, activity, icons, sidebar, ui};
 
 /// Every control in the bar is one [`ui::Size::Compact`] step tall.
@@ -443,25 +442,20 @@ fn toggle_button(
     font: Font,
     cx: &mut Cx,
 ) -> AnyElement {
-    let icon_color = match (&action, active) {
-        (None, _) => theme.subtle_text,
-        (Some(_), true) => theme.accent,
-        (Some(_), false) => theme.muted_text,
+    let icon_color = if active {
+        theme.accent
+    } else {
+        theme.muted_text
     };
     let mut button = ui::icon_button(id, icon, icon_color, CONTROL, theme, cx);
     if active {
-        button = button.resting(chip_background(theme.accent), None);
+        button = button.resting(theme::press_wash(theme), None);
     }
     button = match action {
         Some(action) => button.on_click(Diffui::on_action(action, cx)),
         None => button.disabled(true),
     };
-    div()
-        .id(ElementId::Name(SharedString::from(format!("{id}-tip"))))
-        .flex_none()
-        .tip(label, font, theme)
-        .child(button)
-        .into_any_element()
+    button.tip(label, font, theme).into_any_element()
 }
 
 /// `label`, with the first key bound to `command` in parentheses.
@@ -626,11 +620,8 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
             Action::Bookmark(crate::bookmarks::BookmarkAction::PushTracked),
             cx,
         ));
-    div()
-        .id("toolbar-push-tip")
-        .flex_none()
+    button
         .tip(with_shortcut(ui, &tip, "repo.push"), font, theme)
-        .child(button)
         .into_any_element()
 }
 

@@ -13,7 +13,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::action::Action;
-use crate::commit_info::with_tooltip;
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, Weight, emphasis_font, text_size};
@@ -328,11 +327,7 @@ pub(crate) fn banner(
 
     let mut controls = div();
     if refused.is_none() {
-        controls = controls.child(with_tooltip(
-            "range-edit-tip",
-            "Edit as a jj command",
-            font,
-            theme,
+        controls = controls.child(
             ui::icon_button(
                 "range-edit",
                 icons::PENCIL,
@@ -341,23 +336,26 @@ pub(crate) fn banner(
                 theme,
                 cx,
             )
-            .on_click(Diffui::on_action(Action::Range(RangeAction::Edit), cx)),
-        ));
+            .on_click(Diffui::on_action(Action::Range(RangeAction::Edit), cx))
+            .tip("Edit as a jj command", font, theme),
+        );
     }
-    controls = controls.child(with_tooltip(
-        "range-exit-tip",
-        match mode {
-            RangeMode::Since => "Stop diffing since trunk",
-            RangeMode::Span(_) => "Clear the marks",
-            RangeMode::Fixed => "Leave the range",
-        },
-        font,
-        theme,
-        ui::close_button("range-exit", theme.muted_text, theme, cx).on_click(Diffui::on_action(
-            Action::Compare(crate::compare::CompareAction::Exit),
-            cx,
-        )),
-    ));
+    controls = controls.child(
+        ui::close_button("range-exit", theme.muted_text, theme, cx)
+            .on_click(Diffui::on_action(
+                Action::Compare(crate::compare::CompareAction::Exit),
+                cx,
+            ))
+            .tip(
+                match mode {
+                    RangeMode::Since => "Stop diffing since trunk",
+                    RangeMode::Span(_) => "Clear the marks",
+                    RangeMode::Fixed => "Leave the range",
+                },
+                font,
+                theme,
+            ),
+    );
 
     Some(crate::compare::banner_strip(sides, controls, font, theme))
 }

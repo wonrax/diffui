@@ -14,7 +14,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::action::Action;
-use crate::commit_info::with_tooltip;
 use crate::theme::{ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
 use crate::{Cx, Diffui, ellipsis, icons, ui};
@@ -243,11 +242,7 @@ pub(crate) fn build_compare_banner(
     );
 
     let controls = div()
-        .child(with_tooltip(
-            "compare-swap-tip",
-            "Swap the two sides",
-            font,
-            theme,
+        .child(
             ui::icon_button(
                 "compare-swap",
                 icons::ARROW_LEFT_RIGHT,
@@ -256,17 +251,10 @@ pub(crate) fn build_compare_banner(
                 theme,
                 cx,
             )
-            .on_click(Diffui::on_action(Action::Compare(CompareAction::Swap), cx)),
-        ))
-        .child(with_tooltip(
-            "compare-mode-tip",
-            if interdiff {
-                "Diff the two trees (jj diff --from)"
-            } else {
-                "Diff the two versions of the change itself (jj interdiff)"
-            },
-            font,
-            theme,
+            .on_click(Diffui::on_action(Action::Compare(CompareAction::Swap), cx))
+            .tip("Swap the two sides", font, theme),
+        )
+        .child(
             ui::text_button(
                 "compare-mode",
                 None,
@@ -280,16 +268,22 @@ pub(crate) fn build_compare_banner(
             .on_click(Diffui::on_action(
                 Action::Compare(CompareAction::SetInterdiff(!interdiff)),
                 cx,
-            )),
-        ))
-        .child(with_tooltip(
-            "compare-exit-tip",
-            "Stop comparing",
-            font,
-            theme,
+            ))
+            .tip(
+                if interdiff {
+                    "Diff the two trees (jj diff --from)"
+                } else {
+                    "Diff the two versions of the change itself (jj interdiff)"
+                },
+                font,
+                theme,
+            ),
+        )
+        .child(
             ui::close_button("compare-exit", theme.muted_text, theme, cx)
-                .on_click(Diffui::on_action(Action::Compare(CompareAction::Exit), cx)),
-        ));
+                .on_click(Diffui::on_action(Action::Compare(CompareAction::Exit), cx))
+                .tip("Stop comparing", font, theme),
+        );
 
     Some(banner_strip(sides, controls, font, theme))
 }

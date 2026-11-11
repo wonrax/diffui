@@ -27,6 +27,9 @@ use crate::typography;
 /// Control height step. Everything sharing a row should share a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
+    /// Controls inside a row, a banner or a card: close and remove marks,
+    /// a toast's or an activity row's actions.
+    Small,
     /// Toolbars, panel headers, inline editors, find bar.
     Compact,
     /// Dialog footers, empty-state actions.
@@ -36,6 +39,7 @@ pub enum Size {
 impl Size {
     pub fn height(self) -> f32 {
         match self {
+            Size::Small => theme::control::SMALL,
             Size::Compact => theme::control::COMPACT,
             Size::Standard => theme::control::STANDARD,
         }
@@ -44,6 +48,7 @@ impl Size {
     /// Horizontal inset of a labelled button.
     pub fn pad_x(self) -> f32 {
         match self {
+            Size::Small => theme::space::MD,
             Size::Compact => 10.0,
             Size::Standard => 14.0,
         }
@@ -51,8 +56,25 @@ impl Size {
 
     pub fn text_size(self) -> f32 {
         match self {
+            Size::Small => text_size::CAPTION,
             Size::Compact => text_size::BODY,
             Size::Standard => text_size::BODY,
+        }
+    }
+
+    /// Glyph size of a leading icon or an icon button's mark.
+    pub fn icon_size(self) -> f32 {
+        match self {
+            Size::Small => SMALL_ICON_SIZE,
+            Size::Compact | Size::Standard => ICON_SIZE,
+        }
+    }
+
+    /// Corner radius: a small control is rounded like a chip.
+    pub fn radius(self) -> f32 {
+        match self {
+            Size::Small => theme::radius::XS,
+            Size::Compact | Size::Standard => theme::radius::CONTROL,
         }
     }
 }
@@ -61,6 +83,10 @@ impl Size {
 /// over the 12px label because Lucide's 24px grid carries ~2px of internal
 /// padding, so at equal size the mark reads smaller than the text beside it.
 pub const ICON_SIZE: f32 = 14.0;
+/// [`ICON_SIZE`] for a [`Size::Small`] control, a step over its 11px label.
+const SMALL_ICON_SIZE: f32 = 12.0;
+/// How much of a disabled button's label and icon shows.
+const DISABLED_OPACITY: f32 = 0.45;
 /// Gap between a leading icon and its label.
 const ICON_GAP: f32 = 6.0;
 
@@ -95,12 +121,12 @@ pub fn button(
     theme: ThemeSpec,
     cx: &App,
 ) -> Button {
-    frame(id, style(variant, theme), cx)
+    frame(id, style(variant, theme), size, cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
 }
 
-fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Button {
+fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, size: Size, cx: &App) -> Button {
     let id = id.into();
     // kit paints nothing of its own: its fill would be a circular quad. The
     // squircle behind the label paints each state instead.
@@ -114,12 +140,12 @@ fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Butto
         .custom(colors)
         .bg(theme::TRANSPARENT)
         // The lift's shape: a shadow's blur hides its circular corner.
-        .rounded(px(theme::radius::CONTROL));
+        .rounded(px(size.radius()));
     if let Some(lift) = style.lift {
         inner = inner.shadow(vec![lift]);
     }
     let fill = |color: Option<Color>| {
-        let mut fill = squircle::Fill::new(squircle::Corners::all(theme::radius::CONTROL));
+        let mut fill = squircle::Fill::new(squircle::Corners::all(size.radius()));
         if let Some(color) = color {
             fill = fill.background(color);
         }
@@ -137,6 +163,7 @@ fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, cx: &App) -> Butto
             active: fill(Some(style.active)),
         },
         disabled: false,
+        tip: None,
         children: Vec::new(),
     }
 }
@@ -152,6 +179,7 @@ pub struct Button {
     id: ElementId,
     states: squircle::States,
     disabled: bool,
+    tip: Option<(SharedString, Font, ThemeSpec)>,
     children: Vec<gpui_kit::AnyElement>,
 }
 
@@ -170,8 +198,20 @@ impl Button {
         self
     }
 
-    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        self.inner = self.inner.tooltip(tooltip);
+    /// The app's hover label ([`Tip`]) on this button.
+    pub fn tip(mut self, label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Self {
+        self.tip = Some((label.into(), font, theme));
+        self
+    }
+
+    /// Rounds the button by `radius` in place of its size's: a segment's face,
+    /// concentric with its track.
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        let corners = squircle::Corners::all(radius);
+        self.states.rest.corners = corners;
+        self.states.hover.corners = corners;
+        self.states.active.corners = corners;
+        self.inner = self.inner.rounded(px(radius));
         self
     }
 
@@ -183,17 +223,6 @@ impl Button {
             rest = rest.border(1.0, ring);
         }
         self.states.rest = rest;
-        self
-    }
-
-    /// Rounds the button by `radius` in place of [`theme::radius::CONTROL`]: a
-    /// smaller control.
-    pub fn corner_radius(mut self, radius: f32) -> Self {
-        let corners = squircle::Corners::all(radius);
-        self.states.rest.corners = corners;
-        self.states.hover.corners = corners;
-        self.states.active.corners = corners;
-        self.inner = self.inner.rounded(px(radius));
         self
     }
 
@@ -235,7 +264,11 @@ impl RenderOnce for Button {
             .gap_2()
             .children(self.children);
         row.style().padding = padding;
-        // A disabled button doesn't answer the pointer.
+        // A disabled button doesn't answer the pointer, and its label and
+        // icon fade.
+        if self.disabled {
+            row = row.opacity(DISABLED_OPACITY);
+        }
         let states = if self.disabled {
             squircle::States {
                 hover: self.states.rest,
@@ -245,13 +278,25 @@ impl RenderOnce for Button {
         } else {
             self.states
         };
-        inner
+        let id = std::sync::Arc::new(self.id);
+        let button = inner
             .child(squircle::interactive_background(
-                ElementId::NamedChild(std::sync::Arc::new(self.id), "squircle".into()),
+                ElementId::NamedChild(id.clone(), "squircle".into()),
                 states,
                 0.0,
             ))
-            .child(row)
+            .child(row);
+        // kit's button takes only kit's tooltip, so the app's hangs off a
+        // wrapper the size of the button.
+        match self.tip {
+            Some((label, font, theme)) => div()
+                .id(ElementId::NamedChild(id, "tip".into()))
+                .flex_none()
+                .tip(label, font, theme)
+                .child(button)
+                .into_any_element(),
+            None => button.into_any_element(),
+        }
     }
 }
 
@@ -275,7 +320,9 @@ pub fn label(
     let text = typography::centered(text, font, size.text_size());
     let row = div().flex().flex_row().items_center().gap(px(ICON_GAP));
     match icon {
-        Some((glyph, color)) => row.child(icons::icon(glyph, ICON_SIZE, color)).child(text),
+        Some((glyph, color)) => row
+            .child(icons::icon(glyph, size.icon_size(), color))
+            .child(text),
         None => row.child(text),
     }
 }
@@ -311,7 +358,7 @@ pub fn primary_button(
     } else {
         theme::disabled_button_style(theme)
     };
-    frame(id, colors, cx)
+    frame(id, colors, size, cx)
         .h(px(size.height()))
         .px(px(size.pad_x()))
         .disabled(!enabled)
@@ -342,26 +389,21 @@ pub fn icon_button(
     theme: ThemeSpec,
     cx: &App,
 ) -> Button {
-    let side = px(size.height());
-    frame(id, theme::ghost_button_style(theme), cx)
-        .size(side)
+    frame(id, theme::ghost_button_style(theme), size, cx)
+        .size(px(size.height()))
         .p(px(0.0))
-        .child(icons::icon(glyph, ICON_SIZE, color))
+        .child(icons::icon(glyph, size.icon_size(), color))
 }
 
-/// The close (or clear) ✕ at the end of a banner or strip: a small square
-/// wash, so it sits inside the banner with even insets instead of filling
-/// its height.
+/// The close (or clear) ✕ at the end of a banner, strip or row: a
+/// [`Size::Small`] square wash, so it sits inside the banner with even
+/// insets instead of filling its height.
 pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx: &App) -> Button {
-    frame(id, theme::ghost_button_style(theme), cx)
-        .size(px(CLOSE_SIDE))
-        .p(px(0.0))
-        .child(icons::icon(icons::CLOSE, CLOSE_ICON_SIZE, color))
+    icon_button(id, icons::CLOSE, color, Size::Small, theme, cx)
 }
 
 /// Side of [`close_button`]'s square.
-pub const CLOSE_SIDE: f32 = 20.0;
-const CLOSE_ICON_SIZE: f32 = 12.0;
+pub const CLOSE_SIDE: f32 = theme::control::SMALL;
 
 // ── Segmented control ───────────────────────────────────────────────────
 

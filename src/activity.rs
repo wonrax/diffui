@@ -817,8 +817,8 @@ pub(crate) fn toast_layer(
                 // A warning triangle, deliberately not an ✕: that glyph reads as
                 // a dismiss button, not severity.
                 Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, 15.0, theme.removed_text),
-                    15.0,
+                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
+                    ui::ICON_SIZE,
                 ),
                 Aligned::text(
                     div()
@@ -885,28 +885,29 @@ fn row_button(
 ) -> Div {
     let font = ui.config.ui_font;
     let ink = theme.muted_text;
+    let size = ui::Size::Small;
     let mut line = Vec::new();
     if let Some(glyph) = glyph {
-        line.push(Aligned::glyph(icons::icon(glyph, 12.0, ink), 12.0));
+        line.push(Aligned::glyph(
+            icons::icon(glyph, size.icon_size(), ink),
+            size.icon_size(),
+        ));
         line.push(Aligned::gap(5.0));
     }
     line.push(Aligned::text(
-        typography::line(label, font, text_size::CAPTION, theme.text),
+        typography::line(label, font, size.text_size(), theme.text),
         font,
-        text_size::CAPTION,
+        size.text_size(),
     ));
     press_stays(
-        ui::button((id.0, id.1 as usize), variant, ui::Size::Compact, theme, cx)
-            .h(px(SMALL_BUTTON))
-            .px(px(7.0))
-            .corner_radius(theme::radius::XS + 2.0)
+        ui::button((id.0, id.1 as usize), variant, size, theme, cx)
             .child(typography::baseline_row(line, 0.0))
             .on_click(Diffui::on_action(on_press, cx)),
     )
 }
 
 /// Height of a row's small buttons.
-const SMALL_BUTTON: f32 = 22.0;
+const SMALL_BUTTON: f32 = theme::control::SMALL;
 
 /// A control inside a row that toggles on press: the press is the control's alone.
 fn press_stays(control: impl IntoElement) -> Div {
@@ -1363,38 +1364,24 @@ fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
             ActivityStatus::Done | ActivityStatus::Cancelled | ActivityStatus::Error
         )
     });
-    let color = if enabled {
-        theme.muted_text
-    } else {
-        theme.subtle_text
-    };
-    let mut button = ui::button(
+    ui::text_button(
         "activity-clear",
+        None,
+        "Clear finished",
         ui::Variant::Ghost,
-        ui::Size::Compact,
+        ui::Size::Small,
+        ui.config.ui_font,
         theme,
         cx,
     )
-    .h(px(24.0))
-    .px(px(theme::space::MD))
-    .child(typography::centered(
-        typography::line("Clear finished", ui.config.ui_font, text_size::BODY, color),
+    .disabled(!enabled)
+    .on_click(Diffui::on_action(Action::ClearActivities, cx))
+    .tip(
+        "Remove finished entries. Running and queued work stays.",
         ui.config.ui_font,
-        text_size::BODY,
-    ));
-    if enabled {
-        button = button.on_click(Diffui::on_action(Action::ClearActivities, cx));
-    }
-    div()
-        .id("activity-clear-tip")
-        .flex_none()
-        .tip(
-            "Remove finished entries. Running and queued work stays.",
-            ui.config.ui_font,
-            theme,
-        )
-        .child(button)
-        .into_any_element()
+        theme,
+    )
+    .into_any_element()
 }
 
 const POPOVER_WIDTH: f32 = 470.0;

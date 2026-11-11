@@ -689,14 +689,15 @@ pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
     }
 }
 
-/// The primary button while it can't be pressed.
+/// The primary button while it can't be pressed: grey instead of the accent.
+/// The button fades the label itself ([`crate::ui::Button::disabled`]).
 pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
     let fill = raised_fill(theme, 0.2);
     ButtonStyle {
         rest: Some(fill),
         hover: fill,
         active: fill,
-        label: theme.subtle_text,
+        label: theme.text,
         ring: Some(theme.border),
         lift: None,
     }
@@ -719,8 +720,8 @@ pub fn inset_ring(color: Color) -> BoxShadow {
 pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
     ButtonStyle {
         rest: Some(theme.removed_text),
-        hover: theme.removed_text,
-        active: theme.removed_text,
+        hover: mix(theme.removed_text, theme.text, 0.10),
+        active: mix(theme.removed_text, theme.text, 0.18),
         label: theme.background,
         ring: Some(Color { a: 0.10, ..BLACK }),
         lift: Some(lift(0.08, 1.0)),
@@ -919,9 +920,10 @@ pub fn apply_to_kit(resolved: ResolvedTheme, cx: &mut App) {
         c.secondary_hover = hsla(raised.hover);
         c.secondary_active = hsla(raised.active);
         c.secondary_foreground = hsla(raised.label);
+        let destructive = destructive_button_style(spec);
         c.danger = hsla(spec.removed_text);
-        c.danger_hover = hsla(spec.removed_text);
-        c.danger_active = hsla(spec.removed_text);
+        c.danger_hover = hsla(destructive.hover);
+        c.danger_active = hsla(destructive.active);
         c.danger_foreground = hsla(spec.background);
         c.scrollbar = hsla(TRANSPARENT);
         c.scrollbar_thumb = hsla(thumb);

@@ -563,8 +563,12 @@ pub(crate) fn error_strip(
                     .w(px(LEADING_ICON_SIZE))
                     .flex()
                     .justify_center()
-                    .child(icons::icon(icons::ALERT_TRIANGLE, 12.0, theme.removed_text)),
-                12.0,
+                    .child(icons::icon(
+                        icons::ALERT_TRIANGLE,
+                        ui::ICON_SIZE,
+                        theme.removed_text,
+                    )),
+                ui::ICON_SIZE,
             ),
             Aligned::gap(LEADING_TEXT_X - LEADING_ICON_INSET - LEADING_ICON_SIZE),
             Aligned::text(

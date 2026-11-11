@@ -1129,16 +1129,15 @@ pub(crate) fn source_bar_actions(
             if on { theme.accent } else { theme.muted_text },
         )),
         "Blame",
-        if on {
-            ui::Variant::Raised
-        } else {
-            ui::Variant::Ghost
-        },
+        ui::Variant::Ghost,
         ui::Size::Compact,
         ui.config.ui_font,
         theme,
         cx,
     )
+    .when(on, |button| {
+        button.resting(crate::theme::press_wash(theme), None)
+    })
     .on_click(Diffui::on_action(
         Action::History(HistoryAction::ToggleAnnotate),
         cx,
@@ -1162,36 +1161,17 @@ pub(crate) fn source_bar_actions(
         .flex_row()
         .items_center()
         .gap(px(space::XS))
-        .child(with_tooltip(
-            "source-blame-tip",
-            blame,
+        .child(blame.tip(
             "Show which change last touched each line",
-            ui,
+            ui.config.ui_font,
             theme,
         ))
-        .child(with_tooltip(
-            "source-file-history-tip",
-            history,
+        .child(history.tip(
             "Show the revisions that touched this file",
-            ui,
+            ui.config.ui_font,
             theme,
         ))
         .into_any_element()
-}
-
-/// `control` with the app's hover label.
-fn with_tooltip(
-    id: &'static str,
-    control: impl IntoElement,
-    label: &'static str,
-    ui: &Diffui,
-    theme: ThemeSpec,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .tip(label, ui.config.ui_font, theme)
-        .child(control)
 }
 
 /// The banner above the revision list while the graph shows one file's
@@ -1225,13 +1205,7 @@ pub(crate) fn file_filter_banner(
                 ui::Banner::new(ui::Tone::Info)
                     .icon(icons::FILE_CLOCK)
                     .child(title)
-                    .end(with_tooltip(
-                        "file-filter-close-tip",
-                        close,
-                        "Show the whole graph again",
-                        ui,
-                        theme,
-                    ))
+                    .end(close.tip("Show the whole graph again", ui.config.ui_font, theme))
                     .build(ui.config.ui_font, theme),
             )
             .into_any_element(),
@@ -1691,24 +1665,19 @@ pub(crate) fn build_history_sidebar(
 ) -> AnyElement {
     let history = &ui.active().history;
     let now = now_millis();
-    let reload = with_tooltip(
-        "history-reload-tip",
-        ui::icon_button(
-            "history-reload",
-            icons::REFRESH,
-            theme.muted_text,
-            ui::Size::Compact,
-            theme,
-            cx,
-        )
-        .on_click(Diffui::on_action(
-            Action::History(HistoryAction::Reload),
-            cx,
-        )),
-        "Reload",
-        ui,
+    let reload = ui::icon_button(
+        "history-reload",
+        icons::REFRESH,
+        theme.muted_text,
+        ui::Size::Compact,
         theme,
-    );
+        cx,
+    )
+    .on_click(Diffui::on_action(
+        Action::History(HistoryAction::Reload),
+        cx,
+    ))
+    .tip("Reload", ui.config.ui_font, theme);
     let (header, list): (Div, AnyElement) = match &history.kind {
         HistoryKind::OpLog => {
             let header = div()
@@ -1735,24 +1704,19 @@ pub(crate) fn build_history_sidebar(
             (header, op_log_list(ui, cx))
         }
         HistoryKind::Evolog { label, .. } => {
-            let back = with_tooltip(
-                "history-back-tip",
-                ui::icon_button(
-                    "history-back",
-                    icons::ARROW_LEFT,
-                    theme.muted_text,
-                    ui::Size::Compact,
-                    theme,
-                    cx,
-                )
-                .on_click(Diffui::on_action(
-                    Action::History(HistoryAction::ShowOpLog),
-                    cx,
-                )),
-                "Back to the operation log",
-                ui,
+            let back = ui::icon_button(
+                "history-back",
+                icons::ARROW_LEFT,
+                theme.muted_text,
+                ui::Size::Compact,
                 theme,
-            );
+                cx,
+            )
+            .on_click(Diffui::on_action(
+                Action::History(HistoryAction::ShowOpLog),
+                cx,
+            ))
+            .tip("Back to the operation log", ui.config.ui_font, theme);
             let header = div()
                 .w_full()
                 .flex()
@@ -2459,20 +2423,8 @@ fn operation_header(
                     title_font,
                     DETAIL_TITLE_SIZE,
                 )))
-                .child(with_tooltip(
-                    "op-restore-tip",
-                    restore,
-                    "Put every revision and bookmark back to how this operation left them (jj op restore)",
-                    ui,
-                    theme,
-                ))
-                .child(with_tooltip(
-                    "op-revert-tip",
-                    revert,
-                    "Undo just this operation, keeping later work (jj op revert)",
-                    ui,
-                    theme,
-                )),
+                .child(restore.tip("Put every revision and bookmark back to how this operation left them (jj op restore)", ui.config.ui_font, theme))
+                .child(revert.tip("Undo just this operation, keeping later work (jj op revert)", ui.config.ui_font, theme)),
         )
         .child(meta);
     if let Some(args) = &op.args {

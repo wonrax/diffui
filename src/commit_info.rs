@@ -18,7 +18,7 @@ use gpui_kit::{AnyElement, Window, div, px};
 use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::meta_line;
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
-use crate::theme::{self, Color, Font, ThemeSpec, Weight, emphasis_font, radius, space, text_size};
+use crate::theme::{self, Color, ThemeSpec, Weight, emphasis_font, radius, space, text_size};
 use crate::typography::Aligned;
 use crate::ui::Tip as _;
 use crate::{Action, Cx, Diffui, icons, typography, ui};
@@ -353,22 +353,6 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
     field
 }
 
-/// `child` with the app's hover label, for a control in a banner or a title row.
-pub(crate) fn with_tooltip(
-    id: &'static str,
-    label: impl Into<gpui_kit::SharedString>,
-    font: Font,
-    theme: ThemeSpec,
-    child: impl IntoElement,
-) -> AnyElement {
-    div()
-        .id(id)
-        .flex_none()
-        .tip(label, font, theme)
-        .child(child)
-        .into_any_element()
-}
-
 /// The header bar over the diff: which revision it is (its ids), how big the
 /// change is, and what can be done to it. With a panel hidden, the
 /// ids and the file count open it over the diff (see [`crate::root`]).
@@ -411,11 +395,7 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
 
     let mut actions = Vec::new();
     if session.capabilities.mutate {
-        actions.push(with_tooltip(
-            "commit-edit-tip",
-            crate::toolbar::with_shortcut(ui, "Edit description", "revision.edit-description"),
-            font,
-            theme,
+        actions.push(
             ui::text_button(
                 "commit-edit",
                 Some((icons::PENCIL, theme.muted_text)),
@@ -429,19 +409,17 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
             .on_click(Diffui::on_action(
                 Action::EditDescription { target: None },
                 cx,
-            )),
-        ));
+            ))
+            .tip(
+                crate::toolbar::with_shortcut(ui, "Edit description", "revision.edit-description"),
+                font,
+                theme,
+            )
+            .into_any_element(),
+        );
     }
     let folded = ui.commit_details_collapsed;
-    actions.push(with_tooltip(
-        "commit-fold-tip",
-        if folded {
-            "Show the description and details"
-        } else {
-            "Show just the title"
-        },
-        font,
-        theme,
+    actions.push(
         ui::icon_button(
             "commit-fold",
             if folded {
@@ -454,8 +432,18 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
             theme,
             cx,
         )
-        .on_click(Diffui::on_action(Action::ToggleCommitDetails, cx)),
-    ));
+        .on_click(Diffui::on_action(Action::ToggleCommitDetails, cx))
+        .tip(
+            if folded {
+                "Show the description and details"
+            } else {
+                "Show just the title"
+            },
+            font,
+            theme,
+        )
+        .into_any_element(),
+    );
     if let Some(more) = more_button(ui, theme, cx) {
         actions.push(more);
     }
@@ -728,23 +716,24 @@ fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement>
         let cursor = crate::geometry::Point::new(rect.x, rect.y + rect.height);
         this.open_revision_menu(key.clone(), rect, cursor, cx);
     });
-    Some(with_tooltip(
-        "commit-more-tip",
-        "More revision actions",
-        ui.config.ui_font,
-        theme,
-        div().relative().child(tracker).child(
-            ui::icon_button(
-                "commit-more",
-                icons::ELLIPSIS,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme,
-                cx,
+    Some(
+        div()
+            .relative()
+            .child(tracker)
+            .child(
+                ui::icon_button(
+                    "commit-more",
+                    icons::ELLIPSIS,
+                    theme.muted_text,
+                    ui::Size::Compact,
+                    theme,
+                    cx,
+                )
+                .on_click(open)
+                .tip("More revision actions", ui.config.ui_font, theme),
             )
-            .on_click(open),
-        ),
-    ))
+            .into_any_element(),
+    )
 }
 
 /// The revision's title as header lines, wrapped at spaces to the pane so

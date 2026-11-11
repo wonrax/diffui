@@ -1200,27 +1200,23 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
         1 => "1 conflict left: saving keeps it conflicted".to_owned(),
         n => format!("{n} conflicts left: saving keeps them conflicted"),
     };
-    let mut cancel = ui::cancel_button("marker-cancel", ui::Size::Compact, font, theme, cx);
-    if !saving {
-        cancel = cancel.on_click(Diffui::listen(cx, |this, _, _, cx| {
+    let cancel = ui::cancel_button("marker-cancel", ui::Size::Compact, font, theme, cx)
+        .disabled(saving)
+        .on_click(Diffui::listen(cx, |this, _, _, cx| {
             this.on_conflict(ConflictMsg::EditorCancel, cx);
         }));
-    }
-    let mut save = ui::text_button(
+    let save = ui::primary_button(
         "marker-save",
-        None,
         if saving { "Saving\u{2026}" } else { "Save" },
-        ui::Variant::Primary,
+        !saving,
         ui::Size::Compact,
         font,
         theme,
         cx,
-    );
-    if !saving {
-        save = save.on_click(Diffui::listen(cx, |this, _, _, cx| {
-            this.on_conflict(ConflictMsg::EditorSave, cx);
-        }));
-    }
+    )
+    .on_click(Diffui::listen(cx, |this, _, _, cx| {
+        this.on_conflict(ConflictMsg::EditorSave, cx);
+    }));
     crate::overlay_kit::footer_with_buttons(
         crate::overlay_kit::Density::Well,
         crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),

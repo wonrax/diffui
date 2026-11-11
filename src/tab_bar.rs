@@ -63,7 +63,7 @@ const LABEL_PAD_X: f32 = 8.0;
 const TAB_MIN_WIDTH: f32 = 96.0;
 
 /// The close button's square, which also holds the dirty dot.
-const CLOSE_SIDE: f32 = 18.0;
+const CLOSE_SIDE: f32 = ui::CLOSE_SIDE;
 
 /// Horizontal travel before a press on a tab becomes a drag — the revision
 /// list's threshold, so a click that wobbles stays a click in both places.
@@ -105,7 +105,7 @@ const OPEN_LIST_ROWS: usize = 8;
 /// The column a row's badge or folder glyph is centred in.
 const OPEN_LEAD_BOX: f32 = 22.0;
 const OPEN_GLYPH_GAP: f32 = 10.0;
-const OPEN_REMOVE_SIDE: f32 = 22.0;
+const OPEN_REMOVE_SIDE: f32 = ui::CLOSE_SIDE;
 
 /// The strip's height: the title-bar height where it stands in for one,
 /// otherwise the same height on its own.
@@ -763,19 +763,10 @@ fn tab_widget(
             .child(dirty_dot(theme))
             .into_any_element()
     } else {
-        ui::button(
-            ("tab-close", element),
-            ui::Variant::Ghost,
-            ui::Size::Compact,
-            theme,
-            cx,
-        )
-        .size(px(CLOSE_SIDE))
-        .p(px(0.0))
-        .flex_none()
-        .child(icons::icon(icons::CLOSE, 13.0, theme.subtle_text))
-        .on_click(Diffui::on_action(Action::CloseTab(id), cx))
-        .into_any_element()
+        ui::close_button(("tab-close", element), theme.subtle_text, theme, cx)
+            .flex_none()
+            .on_click(Diffui::on_action(Action::CloseTab(id), cx))
+            .into_any_element()
     };
 
     // Inactive tabs stay quiet; hovering one washes it. The label sits in the
@@ -1198,22 +1189,18 @@ pub(crate) fn open_repo_card(
     #[cfg(target_os = "macos")]
     {
         band = band.child(
-            div()
-                .id("open-repo-folder-tip")
-                .tip("Choose a folder in Finder", font, theme)
-                .child(
-                    ui::text_button(
-                        "open-repo-folder",
-                        None,
-                        "Browse\u{2026}",
-                        ui::Variant::Raised,
-                        ui::Size::Compact,
-                        font,
-                        theme,
-                        cx,
-                    )
-                    .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx)),
-                ),
+            ui::text_button(
+                "open-repo-folder",
+                None,
+                "Browse\u{2026}",
+                ui::Variant::Raised,
+                ui::Size::Compact,
+                font,
+                theme,
+                cx,
+            )
+            .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx))
+            .tip("Choose a folder in Finder", font, theme),
         );
     }
 
@@ -2160,21 +2147,10 @@ fn recent_repo_row(
     .flex_1()
     .min_w_0();
     let group: gpui_kit::SharedString = format!("open-repo-recent-{index}").into();
-    let remove = ui::button(
-        ("open-repo-remove", index),
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        theme,
-        cx,
-    )
-    .size(px(OPEN_REMOVE_SIDE))
-    .p(px(0.0))
-    .corner_radius(radius::XS)
-    .child(icons::icon(icons::CLOSE, 12.0, theme.subtle_text))
-    .on_click(Diffui::on_action(
-        Action::RemoveRecentRepo(recent.root.clone()),
-        cx,
-    ));
+    let remove =
+        ui::close_button(("open-repo-remove", index), theme.subtle_text, theme, cx).on_click(
+            Diffui::on_action(Action::RemoveRecentRepo(recent.root.clone()), cx),
+        );
     let end = div()
         .flex()
         .flex_row()

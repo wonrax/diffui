@@ -300,8 +300,12 @@ pub(crate) fn args_strip(
         typography::baseline_row(
             [
                 Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, 12.0, theme.removed_text),
-                    12.0,
+                    icons::icon(
+                        icons::ALERT_TRIANGLE,
+                        crate::ui::ICON_SIZE,
+                        theme.removed_text,
+                    ),
+                    crate::ui::ICON_SIZE,
                 ),
                 Aligned::gap(theme::space::SM),
                 sentence(
