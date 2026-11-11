@@ -39,9 +39,6 @@ pub const LEADING_ICON_SIZE: f32 = 13.0;
 const INPUT_ROW: f32 = 32.0;
 /// The text's inset from what precedes it, the field's edge or its icon.
 const TEXT_INSET: f32 = 9.0;
-/// Where the text of a field with a leading icon starts, from the field's
-/// left edge: the column what hangs under the field (its error) lines up on.
-pub const LEADING_TEXT_X: f32 = LEADING_ICON_INSET + LEADING_ICON_SIZE + TEXT_INSET;
 
 /// The trailing in-field caret of a [`filter_field`]: opens `menu` on press,
 /// with its hover wash driven by app-tracked state (`hovered` / `target`).

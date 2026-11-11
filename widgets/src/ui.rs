@@ -753,6 +753,16 @@ pub enum BannerShape {
     Card,
 }
 
+impl BannerShape {
+    /// The inset from the banner's sides to its glyph and its controls.
+    fn inset_x(self) -> f32 {
+        match self {
+            BannerShape::Strip => theme::space::XL,
+            BannerShape::Card => theme::space::LG,
+        }
+    }
+}
+
 /// A tinted message: an optional glyph on its first line, the message, and
 /// controls at the end. Every banner and callout in the app is one, so they
 /// stack with one inset and one strength.
@@ -805,6 +815,12 @@ impl Banner {
         self
     }
 
+    /// How wide the message runs in a banner `width` wide with a glyph and
+    /// nothing at its end: for a caller cutting a line to fit.
+    pub fn message_width(shape: BannerShape, width: f32) -> f32 {
+        width - 2.0 * shape.inset_x() - theme::icon::MD - theme::space::MD
+    }
+
     pub fn build(self, font: Font, theme: ThemeSpec) -> Div {
         let (ink, wash) = (self.tone.ink(theme), self.tone.wash(theme));
         let banner = div()
@@ -816,14 +832,10 @@ impl Banner {
             .gap(px(theme::space::MD))
             .py(px(theme::space::MD))
             .text_size(px(text_size::BODY));
+        let banner = banner.px(px(self.shape.inset_x()));
         let banner = match self.shape {
-            BannerShape::Strip => banner.px(px(theme::space::XL)).bg(wash),
-            BannerShape::Card => theme::squircle(
-                banner.px(px(theme::space::LG)),
-                theme::radius::CARD,
-                Some(wash),
-                None,
-            ),
+            BannerShape::Strip => banner.bg(wash),
+            BannerShape::Card => theme::squircle(banner, theme::radius::CARD, Some(wash), None),
         };
         let banner = match self.icon {
             Some(icon) => {

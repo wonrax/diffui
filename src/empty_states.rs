@@ -50,61 +50,49 @@ pub(crate) fn revision_list_placeholder(
         return None;
     }
     let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let body = match &tab.session.status {
+    let state = match &tab.session.status {
         LoadStatus::Failed(_) => return None,
-        LoadStatus::Loading => div().child(typography::line(
+        LoadStatus::Loading => ui::empty_state(
             "Loading revisions\u{2026}",
+            ui::Placement::Top,
             ui_font,
-            text_size::BODY,
             theme.subtle_text,
-        )),
+        ),
         LoadStatus::Loaded => {
             let revset = tab.session.revset.trim();
             let revset = if revset.is_empty() { "(empty)" } else { revset };
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(theme::space::SM))
-                .child(typography::line(
-                    "No revisions match",
-                    emphasis_font(ui_font, Weight::MEDIUM),
-                    text_size::BODY,
-                    theme.text,
-                ))
-                // The expression can be long: this one wraps.
-                .child(
-                    div()
-                        .w_full()
-                        .text_center()
-                        .font(mono.gpui())
-                        .text_size(px(text_size::BODY))
-                        .text_color(theme.accent)
-                        .child(revset.to_owned()),
-                )
-                .child(typography::line(
-                    "Try another, or pick one from the presets menu on the filter.",
-                    ui_font,
-                    text_size::CAPTION,
-                    theme.subtle_text,
-                ))
-                .children(
-                    reset_button(ui, theme, cx)
-                        .map(|reset| div().pt(px(theme::space::XS)).child(reset)),
-                )
+            ui::empty_state(
+                "No revisions match",
+                ui::Placement::Top,
+                emphasis_font(ui_font, Weight::MEDIUM),
+                theme.text,
+            )
+            // The expression can be long: this one wraps.
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .font(mono.gpui())
+                    .text_size(px(text_size::BODY))
+                    .text_color(theme.accent)
+                    .child(revset.to_owned()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .font(ui_font.gpui())
+                    .text_size(px(text_size::CAPTION))
+                    .text_color(theme.subtle_text)
+                    .child("Try another, or pick one from the presets menu on the filter."),
+            )
+            .children(
+                reset_button(ui, theme, cx)
+                    .map(|reset| div().pt(px(theme::space::XS)).child(reset)),
+            )
         }
     };
-    Some(
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(theme::space::XXL * 2.0))
-            .px(px(theme::space::XL))
-            .child(body)
-            .into_any_element(),
-    )
+    Some(state.into_any_element())
 }
 
 /// "Reset to default" (the repo's own `revsets.log`, or jj's default), unless

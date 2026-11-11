@@ -296,29 +296,28 @@ pub(crate) fn args_strip(
         }
         _ => None,
     };
-    let content = if let Some(reason) = blocked {
-        typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(
-                        icons::ALERT_TRIANGLE,
-                        crate::ui::ICON_SIZE,
-                        theme.removed_text,
-                    ),
-                    crate::ui::ICON_SIZE,
-                ),
-                Aligned::gap(theme::space::SM),
-                sentence(
-                    &crate::prose::Prose::from_backticks(&reason),
-                    font,
-                    mono,
-                    theme.removed_text,
-                    theme,
-                ),
-            ],
+    if let Some(reason) = blocked {
+        // One line, cut rather than wrapped.
+        let line = typography::baseline_row(
+            [sentence(
+                &crate::prose::Prose::from_backticks(&reason),
+                font,
+                mono,
+                theme.removed_text,
+                theme,
+            )],
             0.0,
-        )
-    } else {
+        );
+        return Some(
+            ui::Banner::new(ui::Tone::Danger)
+                .shape(ui::BannerShape::Strip)
+                .icon(icons::ALERT_TRIANGLE)
+                .child(line)
+                .build(font, theme)
+                .into_any_element(),
+        );
+    }
+    let content = {
         let slots = command.slots();
         if slots.is_empty() {
             return None;

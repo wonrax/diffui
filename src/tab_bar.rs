@@ -87,14 +87,11 @@ const OPEN_DIALOG_WIDTH: f32 = crate::palette::COLUMN_WIDTH;
 const OPEN_INPUT_BAND: f32 = crate::palette::INPUT_BAND;
 /// The input band's inset: the kind square sits as far in as the rows' leads.
 const OPEN_BAND_X: f32 = OPEN_LIST_INSET + OPEN_ROW_PAD_X - (OPEN_KIND_SIDE - OPEN_LEAD_BOX) / 2.0;
-/// The status line's text edge.
-const OPEN_CONTENT_X: f32 = theme::space::XL;
 /// Inset of the list's hover washes inside the card.
 const OPEN_LIST_INSET: f32 = theme::list::INSET;
 /// A row's inset from its wash to its lead.
 const OPEN_ROW_PAD_X: f32 = theme::list::PAD_X;
 const OPEN_KIND_SIDE: f32 = 30.0;
-const OPEN_STATUS_HEIGHT: f32 = 40.0;
 const OPEN_SECTION_PILL: f32 = 22.0;
 const OPEN_SECTION_PILL_PAD_X: f32 = theme::space::SM;
 const OPEN_ROW_HEIGHT: f32 = theme::list::height::DIALOG;
@@ -1408,45 +1405,23 @@ fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> im
         .child(icons::icon(glyph, ui::ICON_SIZE, ink))
 }
 
-/// The line under the input saying what Enter will do with it, updated as it's
-/// typed. An open that failed for a reason only the open found says why here.
+/// The banner under the input saying what Enter will do with it, updated as
+/// it's typed. An open that failed for a reason only the open found says why
+/// here.
 fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Status) -> Div {
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
     let (tone, glyph, runs, enter) = status_parts(status);
-    let ink = tone.ink(theme);
-    let line = div()
-        .w_full()
-        .min_h(px(OPEN_STATUS_HEIGHT))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::space::MD))
-        .px(px(OPEN_CONTENT_X))
-        .py(px(theme::space::SM))
-        .when(tone == Tone::Warn, |line| line.bg(theme.note_background))
-        .when(tone == Tone::Danger, |line| {
-            line.bg(chip_background(theme.removed_text))
-        });
+    let banner = ui::Banner::new(tone)
+        .shape(ui::BannerShape::Strip)
+        .icon(glyph);
     if let crate::path_browse::Status::Failed(error) = status {
         // jj's and the OS's reasons run long: wrap them.
-        return line
-            .items_start()
-            .child(icons::icon(glyph, ui::ICON_SIZE, ink))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .font(font.gpui())
-                    .text_size(px(text_size::BODY))
-                    .text_color(theme.removed_text)
-                    .child(error.clone()),
-            );
+        return banner
+            .child(div().text_color(theme.removed_text).child(error.clone()))
+            .build(font, theme);
     }
     let strong_font = emphasis_font(font, Weight::SEMIBOLD);
-    let mut words: Vec<Aligned> = vec![
-        Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, ink), ui::ICON_SIZE),
-        Aligned::gap(theme::space::MD),
-    ];
+    let mut words: Vec<Aligned> = Vec::new();
     for run in runs {
         let code = matches!(run, Run::Code(_));
         let (text, run_font, size, color) = match run {
@@ -1465,16 +1440,16 @@ fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Statu
         // around it stay whole.
         words.push(if code { item.shrink() } else { item });
     }
-    let mut line = line.child(typography::baseline_row(words, 0.0).flex_1().min_w_0());
+    let mut banner = banner.child(typography::baseline_row(words, 0.0).min_w_0());
     if let Some(enter) = enter {
-        line = line.child(crate::overlay_kit::key_hint(
+        banner = banner.end(crate::overlay_kit::key_hint(
             &["\u{21b5}"],
             enter,
             font,
             theme,
         ));
     }
-    line
+    banner.build(font, theme)
 }
 
 /// The pull request a reference names, and what opening it does.
@@ -1660,18 +1635,13 @@ fn recents_section(
     let font = ui.config.ui_font;
     if recents.is_empty() {
         return Some(
-            div()
-                .w_full()
-                .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
-                .pr(px(OPEN_ROW_PAD_X))
-                .py(px(theme::space::XL))
-                .child(typography::line(
-                    "Nothing opened yet. Type a path to browse folders.",
-                    font,
-                    text_size::BODY,
-                    theme.subtle_text,
-                ))
-                .into_any_element(),
+            open_note(
+                "Nothing opened yet. Type a path to browse folders.",
+                font,
+                theme,
+            )
+            .py(px(theme::space::XL))
+            .into_any_element(),
         );
     }
     let clear = ui::button(
@@ -1865,19 +1835,6 @@ fn folder_section(
             cx,
         ));
     }
-    let note = |text: String| {
-        div()
-            .w_full()
-            .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
-            .pr(px(OPEN_ROW_PAD_X))
-            .py(px(theme::space::SM))
-            .child(typography::line(
-                text,
-                font,
-                text_size::BODY,
-                theme.subtle_text,
-            ))
-    };
     let list = scrolling(
         list,
         shown,
@@ -1888,9 +1845,17 @@ fn folder_section(
     );
     let mut section = div().w_full().flex().flex_col().child(header).child(list);
     if listing.is_some_and(|listing| listing.entries.is_empty()) {
-        section = section.child(note("This folder has no subfolders.".to_owned()));
+        section = section.child(open_note("This folder has no subfolders.", font, theme));
     }
     section.into_any_element()
+}
+
+/// What one of the open prompt's lists says in place of rows, on the rows'
+/// text column.
+fn open_note(text: &'static str, font: Font, theme: ThemeSpec) -> Div {
+    ui::empty_state(text, ui::Placement::Inline, font, theme.subtle_text)
+        .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
+        .pr(px(OPEN_ROW_PAD_X))
 }
 
 /// A row's lead: the jj/git badge of a repository, or a folder.

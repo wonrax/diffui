@@ -7,7 +7,6 @@ use crate::Cx;
 use crate::keys::{self as keyboard, Named};
 use crate::root::PaneSet;
 use crate::theme::{self, Font, text_size};
-use crate::typography::{self, Aligned};
 use crate::{icons, ui};
 use gpui_kit::Window as GpuiWindow;
 use gpui_kit::prelude::*;
@@ -537,76 +536,48 @@ fn row_shell(body: AnyElement, selected: bool, theme: ThemeSpec) -> gpui_kit::Di
     .child(body)
 }
 
-/// jj's error under the field: the message, the revset with the bad part
-/// underlined, and the way back to the default. The icon hangs in the
-/// field's icon column and the rest starts where the field's text does.
+/// jj's error under the field, a banner the field's width: the message, the
+/// revset with the bad part underlined, and the way back to the default.
 pub(crate) fn error_strip(
     ui: &Diffui,
     theme: ThemeSpec,
     _window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    use crate::field::{LEADING_ICON_INSET, LEADING_ICON_SIZE, LEADING_TEXT_X};
     let (lead, trail) = crate::field::list_field_insets();
     let error = shown_error(ui)?;
     let value = &ui.active().session.revset;
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
-    let message = typography::baseline_row(
-        [
-            Aligned::glyph(
-                div()
-                    .w(px(LEADING_ICON_SIZE))
-                    .flex()
-                    .justify_center()
-                    .child(icons::icon(
-                        icons::ALERT_TRIANGLE,
-                        ui::ICON_SIZE,
-                        theme.removed_text,
-                    )),
-                ui::ICON_SIZE,
-            ),
-            Aligned::gap(LEADING_TEXT_X - LEADING_ICON_INSET - LEADING_ICON_SIZE),
-            Aligned::text(
-                div().w_full().text_size(px(text_size::BODY)).child(
-                    crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
-                        &error.message,
-                        error.hint.as_deref(),
-                    ))
-                    .view(font, mono, theme.removed_text, theme),
-                ),
-                font,
-                text_size::BODY,
-            )
-            .fill(),
-        ],
-        0.0,
+    let message = div().w_full().text_size(px(text_size::BODY)).child(
+        crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
+            &error.message,
+            error.hint.as_deref(),
+        ))
+        .view(font, mono, theme.removed_text, theme),
     );
-    let column_inset = LEADING_TEXT_X - LEADING_ICON_INSET;
-    let mut body = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme::space::SM))
+    let mut banner = ui::Banner::new(ui::Tone::Danger)
+        .icon(icons::ALERT_TRIANGLE)
         .child(message);
     if let Some(span) = error.span.clone() {
-        let room = ui.sidebar_width - lead - LEADING_TEXT_X - trail;
+        let room =
+            ui::Banner::message_width(ui::BannerShape::Card, ui.sidebar_width - lead - trail);
         if let Some(echo) = echo(value, span, room, mono, theme) {
-            body = body.child(div().pl(px(column_inset)).overflow_hidden().child(echo));
+            banner = banner.child(div().overflow_hidden().child(echo));
         }
     }
     // The way back, beside the only place the error is told.
     if let Some(reset) = crate::empty_states::reset_button(ui, theme, cx) {
         // A column stretches its children; the button keeps its own width.
-        body = body.child(div().pl(px(column_inset)).flex().child(reset));
+        banner = banner.child(div().pt(px(theme::space::XS)).flex().child(reset));
     }
     Some(
         div()
             .w_full()
+            .pl(px(lead))
             .pr(px(trail))
             .pb(px(theme::space::SM))
-            .pl(px(lead + LEADING_ICON_INSET))
-            .child(body)
+            .child(banner.build(font, theme))
             .into_any_element(),
     )
 }
