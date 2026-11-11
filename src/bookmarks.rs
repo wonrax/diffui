@@ -653,7 +653,7 @@ pub(crate) fn push_label(request: &PushRequest) -> Prose {
             }
             PushTarget::DeleteBookmark(name) => label.text("deletion of ").bookmark(name),
             PushTarget::Change(_) => label.text("new bookmark"),
-            PushTarget::Tracked => label.text("tracked bookmarks"),
+            PushTarget::Tracked => label.text("tracked bookmarks and tags"),
         };
     }
     label.text(" to ").remote(&request.remote)
