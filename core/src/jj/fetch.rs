@@ -69,9 +69,8 @@ pub(crate) async fn fetch_jj(
     let workspace_name = workspace.workspace_name().to_owned();
     let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
     let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
+        match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
             LockOutcome::Locked(locked) => locked,
             // A recovered checkout already finished its own lock at the merged
             // operation; the caller refreshes and the user can fetch again.

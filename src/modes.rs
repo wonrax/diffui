@@ -518,6 +518,7 @@ mod stack_tests {
                     saving_activity: None,
                     switch_blocked: false,
                     commit: false,
+                    wc_change: None,
                 }));
 
             ui.activate_tab(second, cx);

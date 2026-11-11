@@ -179,6 +179,7 @@ async fn run_mutation(
         op,
         allow_immutable,
         seen_op: None,
+        seen_wc: None,
     })
     .await;
     match events.into_iter().next_back() {
@@ -687,6 +688,12 @@ fn secondary_workspace_resolves_and_labels() {
 /// Returns the two workspace roots.
 fn stale_workspace_pair(test: &str) -> (PathBuf, PathBuf) {
     let root = scratch_repo(test);
+    // Recovery is opt-in, as in jj-cli.
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[snapshot]\nauto-update-stale = true\n",
+    )
+    .expect("write repo config");
     write(&root, "shared.txt", "base\n");
     commit(&root, "base");
     let base = commit_id(&root, "description(glob:\"base*\")");

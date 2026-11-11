@@ -514,6 +514,10 @@ pub(crate) struct DescriptionEditor {
     /// Commit mode ("Commit…"): saving runs `jj commit` — describe `@` and
     /// start a new change on top — instead of a plain describe.
     pub(crate) commit: bool,
+    /// The change `@` was on when the editor opened. A save that addresses
+    /// `@` is refused once `@` has moved to another change, so the text never
+    /// lands on a change the user wasn't describing.
+    pub(crate) wc_change: Option<String>,
 }
 
 impl DescriptionEditor {

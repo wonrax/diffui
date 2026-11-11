@@ -988,6 +988,7 @@ fn undoing_a_push_asks_first() {
         op: undo,
         allow_immutable: true,
         seen_op: None,
+        seen_wc: None,
     });
     assert!(
         matches!(events.last(), Some(Payload::MutationDone { .. })),

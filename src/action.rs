@@ -122,6 +122,9 @@ pub(crate) enum Action {
     Fetch(FetchTarget),
     Undo,
     Redo,
+    /// `jj workspace update-stale`, through the jj CLI: bring a stale
+    /// checkout's files up to date.
+    UpdateStaleWorkingCopy,
     /// Revert exactly this jj operation (an activity row's "Revert").
     UndoOperation(activity::ActivityId, String),
     /// Replace the revset and re-evaluate.

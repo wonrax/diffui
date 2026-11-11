@@ -91,8 +91,9 @@ pub enum RepoError {
     /// The user's revset failed to parse or resolve.
     Revset(String),
     Io(String),
-    /// The workspace's checkout is behind the repo and recovery failed.
-    StaleWorkspace,
+    /// The workspace's checkout is stale and was left alone (or recovering
+    /// it failed): what to tell the user, with the jj command that fixes it.
+    StaleWorkspace(String),
     /// The working-copy lock could not be taken.
     Lock,
     /// The op refused to rewrite an immutable commit; `short_id` names it so
@@ -122,9 +123,7 @@ impl fmt::Display for RepoError {
         match self {
             Self::Revset(message) => write!(f, "{message}"),
             Self::Io(message) => write!(f, "{message}"),
-            Self::StaleWorkspace => {
-                f.write_str("the working copy is stale and could not be recovered automatically")
-            }
+            Self::StaleWorkspace(message) => f.write_str(message),
             Self::Lock => f.write_str("another process holds the working-copy lock"),
             Self::Immutable { short_id } => write!(f, "{short_id} is immutable"),
             Self::Unsupported => f.write_str("this repository does not support that operation"),
@@ -211,6 +210,9 @@ pub enum Command {
         /// visible there is a stale row and follows its change; one already
         /// hidden there was picked as is and stays that commit.
         seen_op: Option<String>,
+        /// The change id of `@` as the sender's rows show it. A target that
+        /// names `@` is refused when `@` has moved to another change since.
+        seen_wc: Option<String>,
     },
     Preview {
         job: JobId,
@@ -521,6 +523,12 @@ pub enum Payload {
     /// `jj workspace update-stale`. Edits on disk were snapshotted first.
     /// Unsolicited: it rides alongside the snapshot or mutation that hit it.
     StaleWorkingCopyRecovered,
+    /// The jj checkout is stale and `snapshot.auto-update-stale` is off, so
+    /// the files on disk were left alone and the graph shows the repo at head.
+    /// Sent once per distinct state, not on every refresh.
+    StaleWorkingCopy {
+        message: String,
+    },
     ConflictInfoLoaded {
         job: JobId,
         revision: RevisionSelection,
@@ -604,7 +612,8 @@ impl Payload {
             | Self::OpHeadChanged { .. }
             | Self::WorkingCopyChanged
             | Self::RepositoryChanged
-            | Self::StaleWorkingCopyRecovered => None,
+            | Self::StaleWorkingCopyRecovered
+            | Self::StaleWorkingCopy { .. } => None,
         }
     }
 
@@ -623,6 +632,7 @@ impl Payload {
                 | Self::WorkingCopyChanged
                 | Self::RepositoryChanged
                 | Self::StaleWorkingCopyRecovered
+                | Self::StaleWorkingCopy { .. }
         )
     }
 }

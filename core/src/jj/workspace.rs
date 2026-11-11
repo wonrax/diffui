@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use jj_cli::ui::Ui;
+use jj_cli::{cli_util::short_operation_hash, ui::Ui};
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
@@ -14,7 +14,7 @@ use jj_lib::{
     matchers::{Matcher, NothingMatcher},
     merged_tree::MergedTree,
     object_id::ObjectId,
-    op_store::OperationId,
+    op_store::{OpStoreError, OperationId},
     ref_name::WorkspaceName,
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader},
     revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension},
@@ -28,6 +28,21 @@ use super::settings::*;
 use super::walk::parse_user_revset;
 use crate::model::RevisionSelection;
 use crate::repository::{Repository, RepositorySnapshot};
+
+/// A stale working copy the user has to update, worded like jj-cli's error
+/// with the command that fixes it. With `snapshot.auto-update-stale` unset (its
+/// default) the CLI stops here rather than rewrite files under the user's
+/// editors, and so does diffui.
+#[derive(Debug)]
+pub(crate) struct StaleWorkingCopy(pub(crate) String);
+
+impl std::fmt::Display for StaleWorkingCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleWorkingCopy {}
 
 /// What [`lock_working_copy`] leaves behind: either a locked working copy
 /// whose disk has been snapshotted, or a recovered one whose lock is already
@@ -119,8 +134,9 @@ impl Drop for LockedWorkingCopy<'_> {
 }
 
 /// Lock the working copy, resolve the repo and `@` the disk is actually synced
-/// with, and snapshot the on-disk tree. A stale checkout is recovered rather
-/// than snapshotted.
+/// with, and snapshot the on-disk tree. A stale checkout is never snapshotted:
+/// with `snapshot.auto-update-stale` it is recovered, otherwise refused with
+/// [`StaleWorkingCopy`], as jj-cli does.
 ///
 /// Both prologues that fold the disk into `@` start here (the refresh path,
 /// [`load_jj_repository_snapshot`], and the mutation path, [`apply_mutation`]),
@@ -131,8 +147,9 @@ pub(crate) async fn lock_working_copy<'a>(
     workspace: &'a mut Workspace,
     repo_loader: &RepoLoader,
     workspace_name: &WorkspaceName,
-    snapshot_options: &SnapshotOptions<'_>,
+    context: &SnapshotContext,
 ) -> Result<LockOutcome<'a>> {
+    let snapshot_options = &context.options();
     // Take the working-copy lock *before* reading the repo head. Otherwise a
     // jj-cli command running between `load_at_head` and the lock can rewrite
     // the wc commit out from under us, and our snapshot tx — still parented on
@@ -168,11 +185,14 @@ pub(crate) async fn lock_working_copy<'a>(
         .load_at_head()
         .await
         .context("failed to load jj repo")?;
-    let wc_commit_id = base_repo
-        .view()
-        .get_wc_commit_id(workspace_name)
-        .context("jj workspace has no working-copy commit")?
-        .clone();
+    let Some(wc_commit_id) = base_repo.view().get_wc_commit_id(workspace_name).cloned() else {
+        return Err(StaleWorkingCopy(
+            "This workspace was forgotten in another workspace (`jj workspace forget`), so it has \
+             no working copy any more."
+                .to_owned(),
+        )
+        .into());
+    };
     let wc_commit = base_repo
         .store()
         .get_commit_async(&wc_commit_id)
@@ -192,10 +212,46 @@ pub(crate) async fn lock_working_copy<'a>(
     // other workspace's changes inside it — the exact rewrite the jj CLI's
     // "working copy is stale" error exists to prevent. Check first; recover
     // a stale copy like `jj workspace update-stale` instead of snapshotting.
-    let freshness =
-        WorkingCopyFreshness::check_stale(locked_ws.locked_wc(), &wc_commit, &base_repo)
-            .await
-            .context("failed to check jj working-copy freshness")?;
+    let old_op_id = locked_ws.locked_wc().old_operation_id().clone();
+    let freshness = match WorkingCopyFreshness::check_stale(
+        locked_ws.locked_wc(),
+        &wc_commit,
+        &base_repo,
+    )
+    .await
+    {
+        Ok(freshness) => freshness,
+        Err(OpStoreError::ObjectNotFound { .. }) => {
+            return Err(StaleWorkingCopy(
+                "The operation the working copy was last updated at is gone (garbage \
+                     collected). Run `jj workspace update-stale` to recover it."
+                    .to_owned(),
+            )
+            .into());
+        }
+        Err(error) => {
+            return Err(error).context("failed to check jj working-copy freshness");
+        }
+    };
+    match freshness {
+        WorkingCopyFreshness::WorkingCopyStale if !context.auto_update_stale => {
+            return Err(StaleWorkingCopy(format!(
+                "The working copy is stale (not updated since operation {}). Run \
+                 `jj workspace update-stale` to update it.",
+                short_operation_hash(&old_op_id)
+            ))
+            .into());
+        }
+        WorkingCopyFreshness::SiblingOperation if !context.auto_update_stale => {
+            let short = short_operation_hash(&old_op_id);
+            return Err(StaleWorkingCopy(format!(
+                "The working copy was updated at operation {short}, which the operation log \
+                 doesn't contain. Run `jj op integrate {short}` to add it."
+            ))
+            .into());
+        }
+        _ => {}
+    }
     let (base_repo, _wc_commit_id, wc_commit) = match freshness {
         WorkingCopyFreshness::Fresh => (base_repo, wc_commit_id, wc_commit),
         // The working copy was updated under an operation newer than the
@@ -218,8 +274,9 @@ pub(crate) async fn lock_working_copy<'a>(
             (repo, id, commit)
         }
         WorkingCopyFreshness::WorkingCopyStale | WorkingCopyFreshness::SiblingOperation => {
-            // `jj workspace update-stale` parity, run automatically (the
-            // CLI's `recover_stale_working_copy`, single-lock edition):
+            // `snapshot.auto-update-stale`: `jj workspace update-stale`
+            // parity, run automatically (the CLI's
+            // `recover_stale_working_copy`, single-lock edition):
             //
             // 1. Snapshot the disk against the operation it was actually
             //    checked out at, so local edits land in the op graph first
@@ -684,7 +741,22 @@ pub(crate) async fn resolve_revision(
 pub(crate) struct TargetContext {
     pub(crate) wc_id: CommitId,
     seen: Option<SeenOp>,
+    /// The change `@` was on when the sender picked its targets.
+    seen_wc: Option<String>,
 }
+
+/// A command addressed `@`, and `@` is on another change than the one the
+/// sender saw: a terminal `jj new` or an agent moved it in between.
+#[derive(Debug)]
+pub(crate) struct WorkingCopyMoved;
+
+impl std::fmt::Display for WorkingCopyMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The working copy moved. Check the selection and try again.")
+    }
+}
+
+impl std::error::Error for WorkingCopyMoved {}
 
 /// The operation a command's sender last saw, with the repo at it loaded on
 /// first use: only a hidden target ever needs it.
@@ -705,7 +777,34 @@ impl TargetContext {
                 id,
                 repo: OnceCell::new(),
             });
-        Self { wc_id, seen }
+        Self {
+            wc_id,
+            seen,
+            seen_wc: None,
+        }
+    }
+
+    /// `seen_wc` is the change id (jj's reverse hex) of `@` as the sender saw
+    /// it; `None` takes whatever `@` is now.
+    pub(crate) fn seeing_working_copy(mut self, seen_wc: Option<&str>) -> Self {
+        self.seen_wc = seen_wc.map(str::to_owned);
+        self
+    }
+
+    /// The commit `@` stands for — refused when it is on another change than
+    /// the one the sender saw, rather than acting on whatever `@` is now.
+    pub(crate) async fn working_copy(&self, repo: &dyn Repo) -> Result<Commit> {
+        let commit = repo
+            .store()
+            .get_commit_async(&self.wc_id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", self.wc_id.hex()))?;
+        if let Some(seen) = &self.seen_wc
+            && commit.change_id().to_string() != *seen
+        {
+            return Err(WorkingCopyMoved.into());
+        }
+        Ok(commit)
     }
 
     /// Whether `commit` was visible at the seen operation. `None` when there
@@ -792,6 +891,9 @@ pub(crate) struct SnapshotContext {
     base_ignores: Arc<GitIgnoreFile>,
     auto_track: Box<dyn Matcher>,
     max_new_file_size: u64,
+    /// `snapshot.auto-update-stale`: recover a stale checkout instead of
+    /// refusing it.
+    auto_update_stale: bool,
 }
 
 impl SnapshotContext {
@@ -800,6 +902,9 @@ impl SnapshotContext {
             base_ignores: snapshot_base_ignores(root)?,
             auto_track: snapshot_auto_track_matcher(settings, root)?,
             max_new_file_size: snapshot_max_new_file_size(settings)?,
+            auto_update_stale: settings
+                .get_bool("snapshot.auto-update-stale")
+                .context("invalid snapshot.auto-update-stale")?,
         })
     }
 
@@ -836,6 +941,9 @@ pub(crate) struct SnapshotOutcome {
     /// The checkout was stale and got updated instead of snapshotted — worth
     /// telling the user, since files changed on disk under them.
     pub(crate) recovered_stale: bool,
+    /// The checkout is stale and was left alone: what to tell the user, with
+    /// the command that updates it.
+    pub(crate) stale: Option<String>,
 }
 
 /// Fold the on-disk tree into `@` and finish the lock.
@@ -851,34 +959,72 @@ pub(crate) async fn snapshot_working_copy(
     let workspace_name = workspace.workspace_name().to_owned();
     let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
 
-    let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
-            LockOutcome::Locked(locked) => locked,
-            LockOutcome::Recovered {
-                repo, wc_commit, ..
-            } => {
-                let working_copy_empty = wc_commit.is_empty(repo.as_ref()).await.ok();
-                let snapshot = RepositorySnapshot {
-                    fingerprint: repo.op_id().hex(),
-                    working_copy_empty,
-                    // Deliberately equal to `fingerprint`: the graph on screen
-                    // reflects some pre-recovery op, so the mismatch escalates
-                    // the refresh to a full reload — external ops (the rebase
-                    // that made us stale, the recovery itself) always landed.
-                    parent_fingerprint: Some(repo.op_id().hex()),
-                    working_copy_commit_id: Some(wc_commit.id().hex()),
-                    rewrote_descendants: false,
+    let outcome = match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await {
+        Ok(outcome) => outcome,
+        Err(error) => match error.downcast::<StaleWorkingCopy>() {
+            // Shown read-only at head, the way `--ignore-working-copy` would:
+            // the files on disk stay as they are until the user updates them.
+            Ok(stale) => {
+                let repo = repo_loader
+                    .load_at_head()
+                    .await
+                    .context("failed to load jj repo")?;
+                let wc_commit = match repo.view().get_wc_commit_id(&workspace_name) {
+                    Some(id) => {
+                        Some(repo.store().get_commit_async(id).await.with_context(|| {
+                            format!("failed to load jj working-copy commit {}", id.hex())
+                        })?)
+                    }
+                    None => None,
+                };
+                let working_copy_empty = match &wc_commit {
+                    Some(commit) => commit.is_empty(repo.as_ref()).await.ok(),
+                    None => None,
                 };
                 return Ok(SnapshotOutcome {
-                    snapshot,
+                    snapshot: RepositorySnapshot {
+                        fingerprint: repo.op_id().hex(),
+                        working_copy_empty,
+                        parent_fingerprint: Some(repo.op_id().hex()),
+                        working_copy_commit_id: wc_commit.map(|commit| commit.id().hex()),
+                        rewrote_descendants: false,
+                    },
                     repo,
                     warnings: Vec::new(),
-                    recovered_stale: true,
+                    recovered_stale: false,
+                    stale: Some(stale.0),
                 });
             }
-        };
+            Err(error) => return Err(error),
+        },
+    };
+    let mut locked = match outcome {
+        LockOutcome::Locked(locked) => locked,
+        LockOutcome::Recovered {
+            repo, wc_commit, ..
+        } => {
+            let working_copy_empty = wc_commit.is_empty(repo.as_ref()).await.ok();
+            let snapshot = RepositorySnapshot {
+                fingerprint: repo.op_id().hex(),
+                working_copy_empty,
+                // Deliberately equal to `fingerprint`: the graph on screen
+                // reflects some pre-recovery op, so the mismatch escalates
+                // the refresh to a full reload — external ops (the rebase
+                // that made us stale, the recovery itself) always landed.
+                parent_fingerprint: Some(repo.op_id().hex()),
+                working_copy_commit_id: Some(wc_commit.id().hex()),
+                rewrote_descendants: false,
+            };
+            return Ok(SnapshotOutcome {
+                snapshot,
+                repo,
+                warnings: Vec::new(),
+                recovered_stale: true,
+                stale: None,
+            });
+        }
+    };
 
     let result = absorb_snapshot(&mut locked, &workspace_name, &workspace_root).await;
     match result {
@@ -917,6 +1063,7 @@ async fn absorb_snapshot(
             repo,
             warnings,
             recovered_stale: false,
+            stale: None,
         });
     }
 
@@ -991,6 +1138,7 @@ async fn absorb_snapshot(
         repo: new_repo,
         warnings,
         recovered_stale: false,
+        stale: None,
     })
 }
 

@@ -211,6 +211,7 @@ fn a_mutation_lands_on_the_tab_that_asked_for_it() {
         },
         allow_immutable: false,
         seen_op: None,
+        seen_wc: None,
     });
     for payload in repo.drain(job) {
         let event = Event::new(repo_id(&root), payload);
@@ -245,6 +246,7 @@ fn a_fetch_queues_behind_a_mutation() {
         },
         allow_immutable: false,
         seen_op: None,
+        seen_wc: None,
     });
     let fetch = repo.send(|job| Command::Fetch {
         job,
@@ -405,12 +407,18 @@ fn an_empty_status_sweep_survives_a_working_copy_chip_flip() {
 }
 
 /// The other workspace rebases this one's working-copy commit, so this
-/// checkout is synced with a commit the repo has moved past. A mutation must
-/// recover the checkout rather than snapshot the stale tree over the rebased
+/// checkout is synced with a commit the repo has moved past. With
+/// `snapshot.auto-update-stale` set, a mutation must recover the checkout rather than snapshot the stale tree over the rebased
 /// commit, which would silently revert the other workspace's work.
 #[test]
 fn a_mutation_on_a_stale_workspace_recovers() {
     let root = scratch_repo("stale-workspace");
+    // Recovery is opt-in, as in jj-cli.
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[snapshot]\nauto-update-stale = true\n",
+    )
+    .expect("write repo config");
     let mut main = TestRepo::open(&root);
     main.snapshot();
     commit_file(&mut main, "shared.txt", "base\n", "base");
@@ -962,6 +970,107 @@ fn a_cli_run_announces_the_operation_it_wrote() {
         unreachable!()
     };
     assert_eq!(fingerprint, harness::operation_log(&root)[0].1);
+}
+
+/// A command that addresses `@` names the change the sender saw. When a
+/// terminal `jj new` or an agent moved `@` in between, it is refused instead
+/// of acting on whatever `@` is now.
+#[test]
+fn a_mutation_on_a_working_copy_that_moved_is_refused() {
+    let root = scratch_repo("wc-moved");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    let seen = repo
+        .graph("@")
+        .first()
+        .expect("the @ row")
+        .summary
+        .change_id
+        .clone();
+    let describe = |seen_wc: String| {
+        move |job| Command::Mutate {
+            job,
+            op: MutationOp::Describe {
+                target: RevisionSelection::WorkingCopy,
+                description: "typed for the old @".to_owned(),
+            },
+            allow_immutable: false,
+            seen_op: None,
+            seen_wc: Some(seen_wc),
+        }
+    };
+    // `@` moves behind the sender's back.
+    repo.mutate(MutationOp::New {
+        parent: RevisionSelection::WorkingCopy,
+    })
+    .expect("move @");
+
+    let events = repo.run(describe(seen.clone()));
+    match events.last() {
+        Some(Payload::Failed { error, .. }) => {
+            assert!(error.to_string().contains("working copy moved"), "{error}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let now = repo.graph("@").first().expect("the @ row").summary.clone();
+    assert!(!now.has_description, "the new @ is left alone");
+
+    let current = now.change_id;
+    let events = repo.run(describe(current));
+    assert!(
+        matches!(events.last(), Some(Payload::MutationDone { .. })),
+        "{events:?}"
+    );
+}
+
+/// A stale checkout is left alone unless `snapshot.auto-update-stale` says
+/// otherwise, as in jj-cli: a refresh shows the repo at head without touching
+/// the files and says once how to update; a mutation is refused.
+#[test]
+fn a_stale_workspace_is_left_alone_by_default() {
+    let root = scratch_repo("stale-left-alone");
+    let mut main = TestRepo::open(&root);
+    main.snapshot();
+    commit_file(&mut main, "shared.txt", "base\n", "base");
+    let side = harness::add_workspace(&root, "side");
+    let mut other = TestRepo::open(&side);
+    let heads: Vec<RevisionSelection> = commit_ids(&root)
+        .into_iter()
+        .take(2)
+        .map(RevisionSelection::Commit)
+        .collect();
+    main.mutate(MutationOp::Merge { parents: heads })
+        .expect("merge the two workspaces' heads");
+    write(&side, "side.txt", "side-work\n");
+    other.snapshot();
+    write(&root, "local.txt", "unsaved\n");
+
+    main.snapshot();
+    main.snapshot();
+    let notices = main
+        .parked()
+        .iter()
+        .filter(|event| matches!(event.payload, Payload::StaleWorkingCopy { .. }))
+        .count();
+    assert_eq!(notices, 1, "told once, not on every refresh");
+    assert!(
+        !root.join("side.txt").exists(),
+        "the files on disk are left as they are"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).ok(),
+        Some("unsaved\n".to_owned())
+    );
+
+    match main.mutate(MutationOp::New {
+        parent: RevisionSelection::WorkingCopy,
+    }) {
+        Err(RepoError::StaleWorkspace(message)) => {
+            assert!(message.contains("jj workspace update-stale"), "{message}")
+        }
+        other => panic!("expected the stale refusal, got {other:?}"),
+    }
 }
 
 /// jj-cli imports a colocated repo's git `HEAD` and refs before every

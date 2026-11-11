@@ -111,6 +111,7 @@ pub(crate) async fn apply_mutation(
     progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<(MutationOutcome, bool)> {
     if is_view_only(op) {
         return Ok((
@@ -122,6 +123,7 @@ pub(crate) async fn apply_mutation(
                 op,
                 progress,
                 seen_op,
+                seen_wc,
             )
             .await?,
             false,
@@ -141,6 +143,7 @@ pub(crate) async fn apply_mutation(
             progress,
             allow_immutable,
             seen_op,
+            seen_wc,
         )
         .await?
         {
@@ -175,6 +178,7 @@ fn is_view_only(op: &MutationOp) -> bool {
 /// signed first, in an operation of their own under the working-copy lock
 /// ([`sign_before_push`]), and the push is then planned again over the signed
 /// commits. A push that fails after that keeps the signatures, as in the CLI.
+#[allow(clippy::too_many_arguments)]
 async fn apply_view_only(
     workspace: &mut Workspace,
     settings: &UserSettings,
@@ -183,6 +187,7 @@ async fn apply_view_only(
     op: &MutationOp,
     progress: &LoadProgress,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<MutationOutcome> {
     let workspace_name = workspace.workspace_name().to_owned();
     let mut signed: Option<Signed> = None;
@@ -203,7 +208,8 @@ async fn apply_view_only(
             "args".to_owned(),
             super::op_args::op_args(base_repo.as_ref(), op, false).await,
         );
-        let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
+        let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op)
+            .seeing_working_copy(seen_wc);
         let push_context = PushContext {
             settings,
             repo_root,
@@ -224,8 +230,10 @@ async fn apply_view_only(
                     }
                     drop(tx);
                     signed = Some(
-                        sign_before_push(workspace, settings, context, repo_root, op, seen_op)
-                            .await?,
+                        sign_before_push(
+                            workspace, settings, context, repo_root, op, seen_op, seen_wc,
+                        )
+                        .await?,
                     );
                     continue;
                 }
@@ -385,15 +393,15 @@ async fn sign_before_push(
     repo_root: &Path,
     op: &MutationOp,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<Signed> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
     // A stale checkout is recovered instead of locked; the retry signs against
     // the recovered `@`, as `apply_mutation` does.
     for _ in 0..2 {
         let mut locked =
-            match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
+            match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
                 LockOutcome::Locked(locked) => locked,
                 LockOutcome::Recovered { .. } => continue,
             };
@@ -404,6 +412,7 @@ async fn sign_before_push(
             &workspace_name,
             op,
             seen_op,
+            seen_wc,
         )
         .await;
         if result.is_err() {
@@ -422,6 +431,7 @@ async fn sign_locked(
     workspace_name: &WorkspaceName,
     op: &MutationOp,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<Signed> {
     let base_repo = locked.repo.clone();
     let place = Place {
@@ -437,7 +447,8 @@ async fn sign_locked(
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
+    let targets =
+        TargetContext::new(base_repo.loader(), wc_commit_id, seen_op).seeing_working_copy(seen_wc);
     let push_context = PushContext {
         settings,
         repo_root,
@@ -532,13 +543,13 @@ async fn apply_mutation_attempt(
     progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<Option<MutationOutcome>> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
 
     let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
+        match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
             LockOutcome::Locked(locked) => locked,
             LockOutcome::Recovered { .. } => return Ok(None),
         };
@@ -553,6 +564,7 @@ async fn apply_mutation_attempt(
         progress,
         allow_immutable,
         seen_op,
+        seen_wc,
     )
     .await;
     match result {
@@ -581,6 +593,7 @@ async fn mutate_locked(
     _progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<MutationOutcome> {
     let base_repo = locked.repo.clone();
     let workspace_name = workspace_name.to_owned();
@@ -673,7 +686,8 @@ async fn mutate_locked(
         .with_context(|| format!("failed to load jj commit {}", current_wc_id.hex()))?
         .change_id()
         .clone();
-    let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op);
+    let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op)
+        .seeing_working_copy(seen_wc);
 
     // Captured side output: remote sideband for push, skipped/absorbed notes
     // for absorb; empty for the other mutations.
@@ -1718,7 +1732,8 @@ pub(super) async fn squash_whole(
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
-/// `context.wc_id` (the post-snapshot `@`); a commit the caller still names by
+/// `context.wc_id` (the post-snapshot `@`), refused when `@` moved to another
+/// change since the sender looked; a commit the caller still names by
 /// an id that has since been rewritten resolves to its visible successor (see
 /// [`follow_rewritten`]).
 pub(super) async fn resolve_mutation_target(
@@ -1727,7 +1742,7 @@ pub(super) async fn resolve_mutation_target(
     target: &RevisionSelection,
 ) -> Result<Commit> {
     let commit_id = match target {
-        RevisionSelection::WorkingCopy => context.wc_id.clone(),
+        RevisionSelection::WorkingCopy => return context.working_copy(repo).await,
         RevisionSelection::Commit(hex) => {
             CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
         }
@@ -1737,9 +1752,6 @@ pub(super) async fn resolve_mutation_target(
         .get_commit_async(&commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-    if matches!(target, RevisionSelection::WorkingCopy) {
-        return Ok(commit);
-    }
     follow_rewritten(repo, commit, Some(context)).await
 }
 

@@ -43,7 +43,7 @@ pub(super) fn spawn(
                         Err(_) => CancelFlag::default(),
                     };
                     let span = tracing::info_span!("pr_command", repo = %id, job = job.0);
-                    let work = run(&id, &spec, command, &cancel, &events);
+                    let work = run(&id, &spec, *command, &cancel, &events);
                     if let Err(message) = catch_panic(work).instrument(span.clone()).await {
                         span.in_scope(|| tracing::error!("command panicked: {message}"));
                         let _ = events.send(Event::new(

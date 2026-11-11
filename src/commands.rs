@@ -787,6 +787,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "repo.update-stale",
+        label: "Update stale working copy",
+        hint: "Put the latest working copy on disk (jj workspace update-stale)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, _arg| Some(Action::UpdateStaleWorkingCopy),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "repo.set-revset",
         label: "Set revset",
         hint: "Filter the log with this expression",

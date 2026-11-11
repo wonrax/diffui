@@ -997,6 +997,9 @@ impl Diffui {
             Action::Fetch(target) => self.start_fetch(target),
             Action::Undo => self.start_undo(),
             Action::Redo => self.start_redo(),
+            Action::UpdateStaleWorkingCopy => {
+                self.start_cli_run(vec!["workspace".to_owned(), "update-stale".to_owned()])
+            }
             Action::UndoOperation(activity_id, operation_id) => {
                 let Some(tab_id) = self.active_tab_id() else {
                     return;
@@ -2177,6 +2180,11 @@ impl Diffui {
             saving_activity: None,
             switch_blocked: false,
             commit: false,
+            wc_change: target
+                .session
+                .commits
+                .working_copy()
+                .map(|row| row.change_id().to_owned()),
         };
         target.push_mode(TabMode::Description(editor));
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
@@ -2210,6 +2218,20 @@ impl Diffui {
         // A commit may keep the description as it stands.
         if editor.saving_activity.is_some() || !(editor.is_dirty() || editor.commit) {
             return;
+        }
+        let shown_wc = self
+            .active()
+            .session
+            .commits
+            .working_copy()
+            .map(|row| row.change_id());
+        if (editor.commit || editor.target == RevisionSelection::WorkingCopy)
+            && editor.wc_change.as_deref() != shown_wc
+        {
+            return self.push_error_toast(
+                "Description not saved",
+                "The working copy moved. Check the selection and try again.",
+            );
         }
         let (op, label) = crate::revops::description_save_op(editor);
         let (activity_id, _) = self.begin_activity(tab_id, label, false);

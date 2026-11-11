@@ -88,6 +88,7 @@ pub(super) fn spawn(
                         repo: None,
                         op_head: None,
                         jobs,
+                        stale_notice: None,
                     }
                     .run(work_rx)
                     .await;
@@ -109,6 +110,9 @@ struct Actor {
     repo: Option<Arc<ReadonlyRepo>>,
     op_head: Option<String>,
     jobs: Jobs,
+    /// The stale-checkout notice last reported, so a refresh on every save
+    /// doesn't raise it again until it changes or the checkout is updated.
+    stale_notice: Option<String>,
 }
 
 impl Actor {
@@ -157,7 +161,7 @@ impl Actor {
                     let work = async {
                         #[cfg(feature = "fault-injection")]
                         super::fault::trip(&repository.root);
-                        self.dispatch(&repository, command, &cancel).await
+                        self.dispatch(&repository, *command, &cancel).await
                     };
                     let error = match catch_panic(work).instrument(span.clone()).await {
                         Ok(Ok(())) => None,
@@ -419,6 +423,14 @@ impl Actor {
                 if outcome.recovered_stale {
                     self.emit(Payload::StaleWorkingCopyRecovered);
                 }
+                if outcome.stale != self.stale_notice {
+                    if let Some(message) = &outcome.stale {
+                        self.emit(Payload::StaleWorkingCopy {
+                            message: message.clone(),
+                        });
+                    }
+                    self.stale_notice = outcome.stale;
+                }
                 self.emit(Payload::SnapshotDone {
                     job,
                     origin,
@@ -432,9 +444,17 @@ impl Actor {
                 op,
                 allow_immutable,
                 seen_op,
+                seen_wc,
             } => {
-                self.mutate(repository, job, &op, allow_immutable, seen_op.as_deref())
-                    .await
+                self.mutate(
+                    repository,
+                    job,
+                    &op,
+                    allow_immutable,
+                    seen_op.as_deref(),
+                    seen_wc.as_deref(),
+                )
+                .await
             }
             Command::Preview {
                 job,
@@ -781,6 +801,7 @@ impl Actor {
         op: &MutationOp,
         allow_immutable: bool,
         seen_op: Option<&str>,
+        seen_wc: Option<&str>,
     ) -> Result<()> {
         self.reload_settings_if_changed(repository);
         let progress = LoadProgress::default();
@@ -801,6 +822,7 @@ impl Actor {
                 &progress,
                 allow_immutable,
                 seen_op,
+                seen_wc,
             )
             .await?
         };
@@ -1021,6 +1043,9 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
             short_id: immutable.short_id.clone(),
         };
     }
+    if let Some(stale) = error.downcast_ref::<jj::workspace::StaleWorkingCopy>() {
+        return RepoError::StaleWorkspace(stale.0.clone());
+    }
     if let Some(undo) = error.downcast_ref::<jj::undo::UndoesPush>() {
         return RepoError::UndoesPush {
             summary: undo.summary.clone(),
@@ -1049,7 +1074,7 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
         return RepoError::Lock;
     }
     if message.contains("stale") {
-        return RepoError::StaleWorkspace;
+        return RepoError::StaleWorkspace(message);
     }
     RepoError::Other(message)
 }

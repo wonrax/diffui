@@ -53,7 +53,7 @@ pub(super) fn spawn(
                     let work = async {
                         #[cfg(feature = "fault-injection")]
                         super::fault::trip(&repository.root);
-                        run(&repository, command, &cancel).await
+                        run(&repository, *command, &cancel).await
                     };
                     let payloads = match catch_panic(work).instrument(span.clone()).await {
                         Ok(payloads) => payloads,

@@ -133,7 +133,8 @@ pub mod fault {
 pub(crate) enum Envelope {
     Run {
         repository: Repository,
-        command: Command,
+        /// Boxed: a mutation's command is far larger than the control traffic.
+        command: Box<Command>,
     },
     Watch(WatchBatch),
     Shutdown,
@@ -158,10 +159,8 @@ pub(crate) async fn route_commands(
     jobs: Jobs,
 ) {
     while let Some(envelope) = commands.recv().await {
-        if let Envelope::Run {
-            command: Command::Cancel { job },
-            ..
-        } = &envelope
+        if let Envelope::Run { command, .. } = &envelope
+            && let Command::Cancel { job } = command.as_ref()
         {
             if let Ok(mut jobs) = jobs.lock() {
                 jobs.cancel(*job);
@@ -221,7 +220,7 @@ impl RepoHandle {
     pub fn send(&self, command: Command) {
         let _ = self.tx.send(Envelope::Run {
             repository: self.repository.clone(),
-            command,
+            command: Box::new(command),
         });
     }
 }

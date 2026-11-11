@@ -824,6 +824,10 @@ impl Session {
                 op,
                 allow_immutable,
                 seen_op: self.graph_fingerprint.clone(),
+                seen_wc: self
+                    .commits
+                    .working_copy()
+                    .map(|row| row.change_id().to_owned()),
             })],
         )
     }
@@ -925,6 +929,14 @@ impl Session {
                     Effect::Activity(Activity::Note(NOTICE.to_owned())),
                 ]
             }
+            Payload::StaleWorkingCopy { message } => vec![
+                Effect::Activity(Activity::Toast {
+                    repo,
+                    title: "Working copy is stale".to_owned(),
+                    body: message.clone(),
+                }),
+                Effect::Activity(Activity::Note(message)),
+            ],
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::DiffResolved {
