@@ -196,7 +196,6 @@ pub(crate) struct CommandLine {
     pub(crate) settled: bool,
     /// Enter was refused: the error shows even mid-word.
     pub(crate) insisted: bool,
-    pub(crate) version: u64,
     pub(crate) resolved: HashMap<String, Resolution>,
     /// The repository operation `resolved` answers for. jj evaluates a
     /// revset when the command runs, so answers from before a save, fetch or
@@ -222,7 +221,6 @@ impl CommandLine {
             navigated: false,
             settled: false,
             insisted: false,
-            version: 0,
             resolved: HashMap::new(),
             resolved_at: None,
             in_flight: Vec::new(),
@@ -585,7 +583,7 @@ impl Diffui {
         command.navigated = false;
         command.settled = false;
         command.run_when_ready = false;
-        self.schedule_settle(command, cx);
+        self.schedule_settle(cx);
         Some(())
     }
 
@@ -617,20 +615,18 @@ impl Diffui {
                     }
                     column.dirty = true;
                     column.query_version = column.query_version.wrapping_add(1);
-                    let version = column.query_version;
                     crate::input::focus(palette::PALETTE_INPUT_ID, cx);
                     place_caret(palette::PALETTE_INPUT_ID, &line, cursor, cx);
-                    Self::later(cx, move |this, _| this.palette_on_recompute(0, version));
+                    Self::later(cx, |this, _| this.palette_on_recompute(0));
                 }
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
     }
 
-    fn schedule_settle(&self, command: &mut CommandLine, cx: &mut Cx) {
-        command.version = command.version.wrapping_add(1);
-        let version = command.version;
-        Self::after(SETTLE, cx, move |this, _| this.settle_command_line(version));
+    fn schedule_settle(&mut self, cx: &mut Cx) {
+        self.command_line_settle
+            .arm(SETTLE, cx, |this, _| this.settle_command_line());
     }
 
     /// The operation the active tab's repository is at, as far as it knows.
@@ -641,7 +637,7 @@ impl Diffui {
 
     /// Typing paused: show errors, and resolve the revsets nobody has yet
     /// (all of them again if the repository moved since).
-    pub(crate) fn settle_command_line(&mut self, version: u64) {
+    pub(crate) fn settle_command_line(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -649,9 +645,6 @@ impl Diffui {
         let Some(command) = self.command_line() else {
             return;
         };
-        if command.version != version {
-            return;
-        }
         let moved = command.resolved_at != op;
         let wanted: Vec<String> = command.slots().iter().map(|slot| slot.revset.clone()).fold(
             Vec::new(),
@@ -781,8 +774,8 @@ impl Diffui {
             column.query = line.clone();
             column.matches.clear();
             self.refresh_command_line(column, line.len());
-            if let Some(command) = column.command.as_mut() {
-                self.schedule_settle(command, cx);
+            if column.command.is_some() {
+                self.schedule_settle(cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
@@ -865,7 +858,7 @@ impl Diffui {
                 command.history = walk;
                 command.navigated = false;
                 command.settled = false;
-                self.schedule_settle(command, cx);
+                self.schedule_settle(cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
@@ -915,7 +908,7 @@ impl Diffui {
                 command.history = None;
                 command.navigated = false;
                 command.settled = false;
-                self.schedule_settle(command, cx);
+                self.schedule_settle(cx);
             }
         }
         self.push_mode(crate::modes::Mode::Palette(state));
@@ -951,14 +944,13 @@ impl Diffui {
         };
         // Errors show at once on Enter, settled or not.
         let pending_settle = !command.settled;
-        let version = command.version;
         // The repository moved since the revsets resolved: ask again and run
         // on the new answers, as jj would evaluate them now.
         if !command.slots().is_empty() && command.resolved_at != self.repository_op() {
             if let Some(command) = self.command_line_mut() {
                 command.run_when_ready = true;
             }
-            return self.settle_command_line(version);
+            return self.settle_command_line();
         }
         let plan = self.plan(command);
         match plan.state {
@@ -973,7 +965,7 @@ impl Diffui {
                     command.run_when_ready = true;
                 }
                 if pending_settle {
-                    self.settle_command_line(version);
+                    self.settle_command_line();
                 }
             }
             PlanState::Ready(run) => {
@@ -1412,8 +1404,7 @@ mod tests {
         ui.refresh_command_line(column, end);
         ui.push_mode(crate::modes::Mode::Palette(state));
         let settle = |ui: &mut Diffui| {
-            let version = ui.command_line().unwrap().version;
-            ui.settle_command_line(version);
+            ui.settle_command_line();
             let command = ui.command_line().unwrap();
             command
                 .in_flight

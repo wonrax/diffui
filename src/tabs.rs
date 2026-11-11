@@ -465,6 +465,8 @@ pub(crate) mod tests {
             next_toast_id: 0,
             window: None,
             background: Default::default(),
+            palette_query: Default::default(),
+            command_line_settle: Default::default(),
             panes: None,
             #[cfg(test)]
             renders: 0,

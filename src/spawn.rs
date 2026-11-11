@@ -9,6 +9,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use gpui_kit::Task;
 use tokio::runtime::Runtime;
 
 use crate::root::PaneSet;
@@ -60,7 +61,8 @@ impl Diffui {
         .detach();
     }
 
-    /// `run` after `delay`, inside `act`.
+    /// `run` after `delay`, inside `act`. Something the user can supersede
+    /// before it fires wants a [`Debounce`] instead.
     pub(crate) fn after(
         delay: Duration,
         cx: &mut Cx,
@@ -97,5 +99,42 @@ impl Diffui {
         cx.defer(move |cx| {
             let _ = handle.update(cx, |_, window, cx| f(window, cx));
         });
+    }
+}
+
+/// A timer that re-arming restarts. The pending run lives in the task held
+/// here, so a superseded one is dropped before it fires rather than firing
+/// and finding itself stale.
+///
+/// It waits on the tokio runtime, not GPUI's timer: the harness runs GPUI on
+/// a simulated clock that only moves when told to.
+#[derive(Default)]
+pub(crate) struct Debounce(Option<Task<()>>);
+
+impl std::fmt::Debug for Debounce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Debounce").field(&self.0.is_some()).finish()
+    }
+}
+
+impl Debounce {
+    /// `run` after `delay`, inside `act`, unless this is armed or cancelled
+    /// again first.
+    pub(crate) fn arm(
+        &mut self,
+        delay: Duration,
+        cx: &mut Cx,
+        run: impl FnOnce(&mut Diffui, &mut Cx) + 'static,
+    ) {
+        let wait = runtime().spawn(async move { tokio::time::sleep(delay).await });
+        self.0 = Some(cx.spawn(async move |this, cx| {
+            if wait.await.is_ok() {
+                let _ = this.update(cx, |this, cx| this.act(cx, run));
+            }
+        }));
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.0 = None;
     }
 }

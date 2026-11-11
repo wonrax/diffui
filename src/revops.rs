@@ -9,7 +9,6 @@
 //! with the original ops.
 
 use crate::Cx;
-use std::time::Duration;
 
 use crate::modes::{ModeKind, TabMode};
 use crate::{Diffui, PreviewRequest, TabState};
@@ -85,7 +84,7 @@ impl Diffui {
 
     /// The parallelize draft's preview depends on its sources alone, so it
     /// skips the destination plumbing [`Diffui::kick_draft_preview`] does for
-    /// the other kinds. Debounced and version-guarded the same way.
+    /// the other kinds. Debounced the same way.
     pub(crate) fn kick_parallelize_preview(&mut self, cx: &mut Cx) {
         let Some(ui) = self.active_mut().op_draft_mut() else {
             return;
@@ -102,8 +101,6 @@ impl Diffui {
             .iter()
             .map(|source| source.selection.clone())
             .collect();
-        ui.preview_version = ui.preview_version.wrapping_add(1);
-        let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
         // The request is destination-shaped for rebases; parallelize ignores
         // the slot (see `parked_preview_request`).
@@ -113,9 +110,7 @@ impl Diffui {
             sources,
             selection: None,
         }));
-        Diffui::after(Duration::from_millis(250), cx, move |this, _| {
-            this.on_draft_preview_kick(version);
-        });
+        self.arm_draft_preview(cx);
     }
 }
 

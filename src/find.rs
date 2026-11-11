@@ -5,11 +5,9 @@
 //! "scroll to" affordance, so search needs to find hits the user couldn't
 //! reach by selecting a single file.
 //!
-//! Recomputation is debounced 50 ms per keystroke via a monotonically
-//! incrementing `query_version` — the scheduled `FindRecompute(version)`
-//! checks the live version against its captured one and bails if the user
-//! has typed past it. This keeps regex over large diffs (50k+ lines) from
-//! re-running on every char.
+//! Recomputation waits for a 50 ms pause in typing (`TabState::find_debounce`),
+//! which keeps regex over large diffs (50k+ lines) from re-running on every
+//! char.
 
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
@@ -43,10 +41,6 @@ pub struct FindState {
     pub scroll_token: u64,
     /// Compile error for the current regex (only set when `regex` is on).
     pub error: Option<String>,
-    /// Monotonic counter. Bumped on every query/toggle change; the
-    /// debounced recompute carries a snapshot and drops itself if the
-    /// version has moved past it.
-    pub query_version: u64,
 }
 
 /// Compute matches for `state.query` across every line of `files` (the diff

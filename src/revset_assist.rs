@@ -53,7 +53,8 @@ pub(crate) struct FieldAssist {
     pub(crate) selected: usize,
     /// ↑/↓ moved through the list since the last edit.
     pub(crate) navigated: bool,
-    pub(crate) version: u64,
+    /// The check against jj, waiting for typing to pause.
+    pub(crate) settle: crate::spawn::Debounce,
     /// jj's verdict on `checked`, when it refused it.
     pub(crate) error: Option<RevsetError>,
     pub(crate) checked: Option<String>,
@@ -71,9 +72,22 @@ impl Diffui {
         field.navigated = false;
         field.error = None;
         field.checked = None;
-        field.version = field.version.wrapping_add(1);
-        let version = field.version;
-        Diffui::after(SETTLE, cx, move |this, _| this.settle_revset_field(version));
+        self.arm_revset_field_settle(cx);
+    }
+
+    fn arm_revset_field_settle(&mut self, cx: &mut Cx) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        self.active_mut()
+            .cmdline
+            .field
+            .settle
+            .arm(SETTLE, cx, move |this, _| {
+                if this.is_active(tab) {
+                    this.settle_revset_field();
+                }
+            });
     }
 
     fn refresh_revset_field(&mut self, cursor: usize) {
@@ -93,13 +107,11 @@ impl Diffui {
     }
 
     /// Typing paused: ask jj whether the revset holds up.
-    pub(crate) fn settle_revset_field(&mut self, version: u64) {
+    pub(crate) fn settle_revset_field(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
-        if self.active().cmdline.field.version != version
-            || !self.active().session.capabilities.range_diff
-        {
+        if !self.active().session.capabilities.range_diff {
             return;
         }
         let value = self.active().session.revset.clone();
@@ -212,13 +224,9 @@ impl Diffui {
         field.navigated = false;
         field.error = None;
         field.checked = None;
-        field.version = field.version.wrapping_add(1);
-        let version = field.version;
-        {
-            crate::input::focus(crate::sidebar::REVSET_INPUT_ID, cx);
-            place_caret(crate::sidebar::REVSET_INPUT_ID, &value, cursor, cx);
-            Diffui::after(SETTLE, cx, move |this, _| this.settle_revset_field(version));
-        }
+        crate::input::focus(crate::sidebar::REVSET_INPUT_ID, cx);
+        place_caret(crate::sidebar::REVSET_INPUT_ID, &value, cursor, cx);
+        self.arm_revset_field_settle(cx);
     }
 
     /// Enter in the field: take the candidate the user went looking for,
@@ -236,8 +244,8 @@ impl Diffui {
         // Check it now rather than after the typing pause, so a bad revset
         // is explained by the field, under it, as soon as it is run.
         if self.active().cmdline.field.checked.as_deref() != Some(revset.as_str()) {
-            let version = self.active().cmdline.field.version;
-            self.settle_revset_field(version);
+            self.active_mut().cmdline.field.settle.cancel();
+            self.settle_revset_field();
         }
         {
             self.evaluate_revset();

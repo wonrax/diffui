@@ -257,6 +257,8 @@ impl Diffui {
             next_toast_id: 0,
             window: None,
             background: Default::default(),
+            palette_query: Default::default(),
+            command_line_settle: Default::default(),
             panes: None,
             #[cfg(test)]
             renders: 0,
@@ -1460,10 +1462,6 @@ impl Diffui {
         self.kick_draft_preview(cx);
     }
 
-    pub(crate) fn on_draft_preview_kick(&mut self, version: u64) {
-        self.run_parked_preview(version);
-    }
-
     pub(crate) fn on_file_highlighted(
         &mut self,
         document_id: u64,
@@ -1698,22 +1696,24 @@ impl Diffui {
             // prompt (the prior results are for a stale query).
             column.searched = false;
             column.query_version = column.query_version.wrapping_add(1);
-            let version = column.query_version;
             // Debounce: the matcher scans every commit, so coalesce
             // fast typing rather than re-matching on each keystroke.
-            Self::after(PALETTE_QUERY_DEBOUNCE, cx, move |this, _| {
-                this.palette_on_recompute(depth, version);
-            });
+            self.palette_query
+                .arm(PALETTE_QUERY_DEBOUNCE, cx, move |this, _| {
+                    this.palette_on_recompute(depth);
+                });
         }
         self.push_mode(Mode::Palette(state));
     }
 
-    pub(crate) fn palette_on_recompute(&mut self, depth: usize, version: u64) {
+    /// Re-run the matcher for column `depth`, unless something else already
+    /// did since its query last changed.
+    pub(crate) fn palette_on_recompute(&mut self, depth: usize) {
         let Some(mut state) = self.take_palette() else {
             return;
         };
         if let Some(column) = state.stack.get_mut(depth)
-            && column.query_version == version
+            && column.dirty
         {
             column.selected = 0;
             // Re-running the matcher invalidates row positions; jump
@@ -1774,19 +1774,22 @@ impl Diffui {
         if let Some(state) = self.active_mut().find_mut() {
             state.query = query;
             state.error = None;
-            state.query_version = state.query_version.wrapping_add(1);
-            let version = state.query_version;
-            Self::after(find::DEBOUNCE, cx, move |this, _| {
-                this.find_on_recompute(version);
-            });
+            let Some(tab) = self.active_tab_id() else {
+                return;
+            };
+            self.active_mut()
+                .find_debounce
+                .arm(find::DEBOUNCE, cx, move |this, _| {
+                    if this.is_active(tab) {
+                        this.find_on_recompute();
+                    }
+                });
         }
     }
 
-    pub(crate) fn find_on_recompute(&mut self, version: u64) {
+    pub(crate) fn find_on_recompute(&mut self) {
         let target = self.active_mut();
-        if let Some(state) = target.find()
-            && state.query_version == version
-        {
+        if let Some(state) = target.find() {
             let (matches, error) = find::compute_matches(state, target.find_files());
             if let Some(state) = self.active_mut().find_mut() {
                 state.matches = matches;
@@ -2453,15 +2456,11 @@ impl Diffui {
     }
 
     /// The preview debounce timer fired: run the simulation that was parked at
-    /// kick time, unless a newer kick (or an Idle transition, which clears the
-    /// request) superseded it.
-    fn run_parked_preview(&mut self, version: u64) {
+    /// kick time, unless an Idle transition cleared the request.
+    fn run_parked_preview(&mut self) {
         let Some(draft) = self.active_mut().op_draft_mut() else {
             return;
         };
-        if draft.preview_version != version {
-            return;
-        }
         let Some(request) = draft.preview_request.take().map(|request| *request) else {
             return;
         };
@@ -3364,9 +3363,7 @@ impl Diffui {
     /// presses where the user's intent is immediate.
     pub(crate) fn refind_now(&mut self) {
         let target = self.active_mut();
-        if let Some(state) = target.find_mut() {
-            state.query_version = state.query_version.wrapping_add(1);
-        }
+        target.find_debounce.cancel();
         let Some(state) = target.find() else {
             return;
         };
@@ -3449,8 +3446,8 @@ impl Diffui {
                 column.dirty = false;
                 column.selected = 0;
                 column.scroll_y = 0.0;
-                // Invalidate the pending debounced recompute so it can't wipe
-                // the results we're about to compute.
+                // Back to the top for the new results. The pending debounced
+                // recompute finds the column clean and leaves them be.
                 column.query_version = column.query_version.wrapping_add(1);
                 // The palette is out of the mode stack here (taken above), so
                 // this borrows `self` cleanly while mutating the detached
@@ -3487,8 +3484,8 @@ impl Diffui {
             column.dirty = false;
             column.selected = 0;
             column.scroll_y = 0.0;
-            // Drop the debounced recompute still in flight; it would land on
-            // a closed palette or re-sort what we just settled.
+            // The debounced recompute still in flight finds the column clean
+            // and leaves what we just settled alone.
             column.query_version = column.query_version.wrapping_add(1);
             palette::recompute_matches(column, self, false);
         }
@@ -4083,8 +4080,6 @@ impl Diffui {
         if selected_merge_target.is_some() {
             let _ = sources.pop();
         }
-        ui.preview_version = ui.preview_version.wrapping_add(1);
-        let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
         ui.preview_request = Some(Box::new(crate::PreviewRequest {
             kind: ui.draft.kind,
@@ -4092,12 +4087,22 @@ impl Diffui {
             destination,
             selection: ui.draft.selection.clone(),
         }));
-        // Debounce: only the version crosses the timer. `DraftPreviewKick`
-        // spawns the parked simulation iff the version is still current, so
-        // rapid j/j/j candidate hops expire without touching the backend.
-        Self::after(Duration::from_millis(250), cx, move |this, _| {
-            this.on_draft_preview_kick(version);
-        });
+        self.arm_draft_preview(cx);
+    }
+
+    /// Run the parked simulation once candidate hops pause, so rapid j/j/j
+    /// hops expire without touching the backend.
+    pub(crate) fn arm_draft_preview(&mut self, cx: &mut Cx) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        self.active_mut()
+            .preview_debounce
+            .arm(Duration::from_millis(250), cx, move |this, _| {
+                if this.is_active(tab) {
+                    this.run_parked_preview();
+                }
+            });
     }
 
     /// Send `pending` to the repository actor.

@@ -18,8 +18,8 @@
 //! the two worlds. [`Harness::settle`] pumps the dispatcher, sleeps a real moment
 //! so the actor and the tokio runtime can make progress, and repeats until nothing
 //! has changed for a while; [`Harness::wait_until`] does the same until a condition
-//! on the app holds. Timers built on [`Diffui::after`] run on real time (tokio), so
-//! debounces fire without touching the simulated clock.
+//! on the app holds. Timers ([`Diffui::after`], [`crate::spawn::Debounce`]) run on
+//! real time (tokio), so debounces fire without touching the simulated clock.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;

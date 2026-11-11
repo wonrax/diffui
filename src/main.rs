@@ -409,6 +409,10 @@ pub(crate) struct Diffui {
     pub(crate) window: Option<gpui_kit::AnyWindowHandle>,
     /// The loops that run while their condition holds.
     pub(crate) background: root::Background,
+    /// The palette's matcher, waiting for typing to pause.
+    pub(crate) palette_query: spawn::Debounce,
+    /// The command line's check, waiting for typing to pause.
+    pub(crate) command_line_settle: spawn::Debounce,
     /// The window's regions as cached views, once it has a window.
     pub(crate) panes: Option<root::Panes>,
     /// How many times the root has rendered.
@@ -417,8 +421,7 @@ pub(crate) struct Diffui {
 }
 
 /// Frontend wrapper around the core [`diffui_core::OpDraft`]: the draft
-/// itself plus the preview bookkeeping (version-guarded like every async
-/// load).
+/// itself plus the preview bookkeeping.
 #[derive(Debug, Clone)]
 pub(crate) struct DraftUi {
     pub(crate) draft: diffui_core::OpDraft,
@@ -426,18 +429,14 @@ pub(crate) struct DraftUi {
     /// `Some`, the widget draws the drop indicators itself and the keyboard
     /// candidate's marker is suppressed.
     pub(crate) hover_spot: Option<revision_list::DropSpot>,
-    /// Bumped on every candidate/placement change; `DraftPreview` results
-    /// carrying an older version are dropped.
-    pub(crate) preview_version: u64,
     pub(crate) preview: DraftPreviewState,
     /// Commit ids (hex) of the moved set the last rebase simulation resolved
     /// — the sidebar washes these rows so a branch-mode draft shows exactly
     /// which branch is coming along. Kept until the next simulation lands
     /// (so it doesn't flicker per candidate hop); dropped with the draft.
     pub(crate) moved_highlight: HashSet<String>,
-    /// The derived simulation parked while the debounce timer runs.
-    /// `DraftPreviewKick` takes it only if `preview_version` still matches,
-    /// so rapid candidate hops expire here without ever reaching the
+    /// The derived simulation parked while [`TabState::preview_debounce`]
+    /// runs, so rapid candidate hops expire here without ever reaching the
     /// backend (each stale hop would otherwise run a full simulation and
     /// write throwaway objects).
     pub(crate) preview_request: Option<Box<PreviewRequest>>,
@@ -475,7 +474,6 @@ impl DraftUi {
         Self {
             draft,
             hover_spot: None,
-            preview_version: 0,
             preview: DraftPreviewState::Idle,
             moved_highlight: HashSet::new(),
             preview_request: None,
@@ -761,6 +759,10 @@ pub(crate) struct TabState {
     /// The command line's per-repository state: its grammar, CLI runs and
     /// the revset field's completion.
     pub(crate) cmdline: cmdline::TabCommandLine,
+    /// The find bar's matcher, waiting for typing to pause.
+    pub(crate) find_debounce: spawn::Debounce,
+    /// The draft's simulation, waiting for candidate hops to pause.
+    pub(crate) preview_debounce: spawn::Debounce,
 }
 
 impl TabState {
@@ -802,6 +804,8 @@ impl TabState {
             history: Default::default(),
             graph_preview: Default::default(),
             cmdline: Default::default(),
+            find_debounce: Default::default(),
+            preview_debounce: Default::default(),
         }
     }
 

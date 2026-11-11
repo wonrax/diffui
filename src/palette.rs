@@ -191,8 +191,8 @@ pub struct PaletteColumn {
     /// keyboard move pushes the selected row out of the visible window; the
     /// wheel moves the list without touching it.
     pub scroll_y: f32,
-    /// Bumped on every query edit; the debounced recompute carries the value
-    /// it was scheduled for and is dropped if the user has typed past it.
+    /// Bumped on every query edit and every recompute: the results list
+    /// scrolls back to the top when it moves.
     pub query_version: u64,
     /// True while a query edit is awaiting its debounced recompute — drives
     /// the palette's "searching…" hint.
