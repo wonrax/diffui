@@ -565,6 +565,7 @@ impl Render for Diffui {
                 .size_full()
                 .child(empty_states::welcome(self, look, window, cx))
                 .child(crate::shortcuts::build_overlay(self, look, window, cx))
+                .child(crate::settings::build_overlay(self, look, window, cx))
         } else {
             let panes = self.panes.clone().expect("a drawn app has its panes");
             self.shell(&panes, theme, window, cx)
@@ -840,6 +841,8 @@ fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Any
         .child(panel_peek(ui, look, cx))
         .child(palette::build_overlay(ui, look, window, cx))
         .child(activity::activity_popover(ui, look, window, cx))
+        // Under the menu, which its font buttons open over it.
+        .child(crate::settings::build_overlay(ui, look, window, cx))
         .child(menu::build_overlay(ui, look, window, cx))
         .child(tab_bar::build_open_repo_dialog(ui, look, window, cx))
         .child(crate::bookmarks::build_name_prompt(ui, look, window, cx))

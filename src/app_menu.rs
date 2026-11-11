@@ -76,44 +76,6 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
     let _ = ui;
 }
 
-/// Open `config.toml` in the user's text editor, creating it (with a pointer
-/// to what can go in it) when there isn't one yet. Behind Settings… in the
-/// app menu and "Open settings file" in the palette.
-pub(crate) fn open_config_file() {
-    let Some(path) = crate::config::config_path() else {
-        return;
-    };
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, CONFIG_TEMPLATE);
-    }
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .spawn();
-    #[cfg(not(target_os = "macos"))]
-    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-}
-
-const CONFIG_TEMPLATE: &str = "\
-# diffui settings. Read at launch; restart diffui after editing.
-#
-# theme = \"System\"        # System | Light | Dark | Contrast
-# ui_font = \"Inter\"
-# mono_font = \"JetBrains Mono\"
-# code_font_size = 12
-#
-# [keys.base]
-# \"file.next\" = \"n\"      # rebind; \"none\" unbinds. Ids are listed by `?`.
-#
-# [[revset_presets]]
-# name = \"My stack\"
-# revset = \"trunk()..@\"
-";
-
 /// The registry position of `id`, which is what a menu item's tag carries.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tag_of(id: CommandId) -> Option<u32> {
@@ -249,7 +211,7 @@ mod mac {
                         None,
                     ),
                     sep(),
-                    command(ui, "Settings\u{2026}", "app.open-config"),
+                    command(ui, "Settings\u{2026}", "app.settings"),
                     sep(),
                     standard(&format!("Hide {app_name}"), sel!(hide:), Some(("h", false))),
                     standard(

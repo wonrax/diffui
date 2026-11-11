@@ -64,6 +64,10 @@ impl Scene {
         self.config = config;
         self
     }
+    fn settings(mut self, settings: &'static str) -> Self {
+        self.settings = settings;
+        self
+    }
     fn no_repo(mut self) -> Self {
         self.open_repo = false;
         self
@@ -1730,6 +1734,39 @@ fn all() -> Vec<Scene> {
             },
         )
         .no_repo(),
+    );
+
+    t.group("Settings");
+    t.add(s(
+        "settings-dialog",
+        "The settings dialog over the window, every row editable.",
+        "Press cmd+,.",
+        |c| {
+            c.key("cmd+,");
+        },
+    ));
+    t.add(
+        s(
+            "settings-dialog-dark",
+            "The settings dialog in dark.",
+            "Press cmd+,, theme Dark.",
+            |c| {
+                c.key("cmd+,");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "settings-locked-broken",
+            "Rows config.toml sets are locked; a settings.toml that doesn't parse shows its banner.",
+            "Launch with config.toml setting theme, refresh and code_font_size, and a broken settings.toml; press cmd+,.",
+            |c| {
+                c.key("cmd+,");
+            },
+        )
+        .config("theme = \"Light\"\nrefresh = \"Manual\"\ncode_font_size = 14\n")
+        .settings("multi_click_ms = = 400\n"),
     );
 
     t.group("Credential prompt");

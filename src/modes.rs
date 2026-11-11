@@ -107,6 +107,8 @@ modes! {
         NamePrompt(crate::bookmarks::NamePrompt) => Prompt,
         /// The keyboard-shortcut cheat sheet.
         Shortcuts => Shortcuts,
+        /// The settings dialog.
+        Settings => Settings,
         /// git or ssh asking for a credential.
         Credential(crate::credentials::CredentialDialog) => Credential,
         /// A jj CLI run's output.

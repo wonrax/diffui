@@ -237,6 +237,15 @@ impl Locked {
     fn insert(&mut self, key: Key) {
         self.0 |= key.bit();
     }
+
+    #[cfg(test)]
+    pub fn of(keys: &[Key]) -> Self {
+        let mut set = Self::default();
+        for key in keys {
+            set.insert(*key);
+        }
+        set
+    }
 }
 
 /// A new value for one setting, as the settings dialog and the palette ask
@@ -265,6 +274,26 @@ impl Setting {
             Setting::CodeLineHeight(_) => Key::CodeLineHeight,
             Setting::CodeBaselineOffset(_) => Key::CodeBaselineOffset,
             Setting::MultiClickMs(_) => Key::MultiClickMs,
+        }
+    }
+
+    /// Put the value in `config`, resolved and clamped as loading would.
+    /// Theme and refresh live elsewhere at runtime and are left alone.
+    pub fn apply(&self, config: &mut AppConfig) {
+        match self {
+            Setting::Theme(_) | Setting::Refresh(_) => {}
+            Setting::UiFont(name) => config.ui_font = ui_font(name.as_deref()),
+            Setting::MonoFont(name) => config.mono_font = mono_font(name.as_deref()),
+            Setting::CodeFontSize(size) => {
+                config.code_type.size = clamp(f64::from(*size), CODE_FONT_SIZE);
+            }
+            Setting::CodeLineHeight(factor) => {
+                config.code_type.line_height = clamp(f64::from(*factor), CODE_LINE_HEIGHT);
+            }
+            Setting::CodeBaselineOffset(px) => {
+                config.code_type.baseline_offset = clamp(f64::from(*px), CODE_BASELINE_OFFSET);
+            }
+            Setting::MultiClickMs(ms) => config.multi_click_ms = *ms,
         }
     }
 
@@ -545,6 +574,19 @@ fn font_from_name(name: &str) -> Font {
         }
     };
     Font::new(family)
+}
+
+/// The installed families a font setting can name, sorted, without the
+/// platform's hidden ones (`.SF NS`, …).
+pub(crate) fn font_families() -> Vec<String> {
+    let mut families: Vec<String> = crate::measure::text_system()
+        .all_font_names()
+        .into_iter()
+        .filter(|family| !family.starts_with('.'))
+        .collect();
+    families.sort_by_key(|family| family.to_lowercase());
+    families.dedup();
+    families
 }
 
 /// Resolve a configured family name against the installed fonts, falling

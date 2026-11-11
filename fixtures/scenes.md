@@ -933,6 +933,27 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - Steps: Welcome, click Keyboard shortcuts (the card's input has focus, so ? types).
 
 
+## Settings
+
+### `settings-dialog`
+
+- Window: 1440x900, light
+- State: The settings dialog over the window, every row editable.
+- Steps: Press cmd+,.
+
+### `settings-dialog-dark`
+
+- Window: 1440x900, dark
+- State: The settings dialog in dark.
+- Steps: Press cmd+,, theme Dark.
+
+### `settings-locked-broken`
+
+- Window: 1440x900, light
+- State: Rows config.toml sets are locked; a settings.toml that doesn't parse shows its banner.
+- Steps: Launch with config.toml setting theme, refresh and code_font_size, and a broken settings.toml; press cmd+,.
+
+
 ## Credential prompt
 
 ### `credential-password`

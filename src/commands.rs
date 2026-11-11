@@ -76,6 +76,8 @@ contexts! {
     Prompt = "prompt",
     /// The keyboard-shortcut cheat sheet.
     Shortcuts = "shortcuts",
+    /// The settings dialog.
+    Settings = "settings",
     /// Line-select mode in the diff pane.
     Lines = "lines",
     /// The split prompt's two description editors.
@@ -278,6 +280,18 @@ impl Command {
 
 fn lines_action(message: crate::changes::LineMsg) -> Action {
     Action::Changes(crate::changes::ChangesMsg::Lines(message))
+}
+
+/// A font menu row's family, `None` being the platform's `default`.
+fn font_arg(arg: CommandArg, default: crate::theme::Font) -> Option<Option<String>> {
+    let CommandArg::Text(family) = arg else {
+        return None;
+    };
+    Some((family != default.family).then_some(family))
+}
+
+fn font_unlocked(ui: &Diffui, key: crate::config::Key) -> Availability {
+    require(!ui.config.locked.contains(key), "Set in config.toml")
 }
 
 fn always(_: &Diffui, _: &CommandArg) -> Availability {
@@ -2927,15 +2941,71 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
-        id: "app.open-config",
-        label: "Open settings file",
-        hint: "Edit config.toml (fonts, theme, keys, revset presets)",
+        id: "app.settings",
+        label: "Settings\u{2026}",
+        hint: "Theme, refresh, fonts and code text",
         contexts: &[Context::Base],
         chords: &["cmd+,"],
         mac_chords: &[],
         enabled: always,
-        build: |_ui, _arg| Some(Action::OpenConfigFile),
+        build: |_ui, _arg| Some(Action::OpenSettings),
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.reveal-config",
+        label: if cfg!(target_os = "macos") {
+            "Reveal config.toml in Finder"
+        } else {
+            "Reveal config.toml"
+        },
+        hint: "Keys and revset presets are set there, and it wins over Settings",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::RevealConfigFile),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "settings.close",
+        label: "Close settings",
+        hint: "Dismiss the settings",
+        contexts: &[Context::Settings],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CloseSettings),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.ui-font",
+        label: "Set UI font",
+        hint: "The family chrome and lists are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::UiFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::UiFont(
+                font_arg(arg, crate::theme::Font::DEFAULT)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.mono-font",
+        label: "Set mono font",
+        hint: "The family code and ids are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::MonoFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::MonoFont(
+                font_arg(arg, crate::theme::Font::MONOSPACE)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
     },
     Command {
         id: "shortcuts.close",

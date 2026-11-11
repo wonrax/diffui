@@ -217,15 +217,21 @@ impl Harness {
     }
 
     pub(crate) fn open_sized(repo: Option<&Path>, size: (f32, f32)) -> Self {
+        Self::open_with_settings(repo, size, "")
+    }
+
+    /// [`Self::open_sized`] with `settings` as its `settings.toml`. What an
+    /// earlier harness's theme or refresh change saved there would otherwise
+    /// carry into this one.
+    pub(crate) fn open_with_settings(
+        repo: Option<&Path>,
+        size: (f32, f32),
+        settings: &str,
+    ) -> Self {
         let turn = turn();
-        // What an earlier harness's theme or refresh change saved there would
-        // otherwise carry into this one.
-        let settings = scratch_home().join(".config/diffui/settings.toml");
-        if let Err(error) = std::fs::remove_file(&settings)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            panic!("clear {}: {error}", settings.display());
-        }
+        let dir = scratch_home().join(".config/diffui");
+        std::fs::create_dir_all(&dir).expect("make the config directory");
+        std::fs::write(dir.join("settings.toml"), settings).expect("write the settings");
         Self::start(turn, repo, size)
     }
 

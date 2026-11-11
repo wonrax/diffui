@@ -987,6 +987,10 @@ impl Diffui {
             Action::CloseShortcuts => {
                 self.pop_mode(ModeKind::Shortcuts);
             }
+            Action::OpenSettings => self.open_settings(),
+            Action::CloseSettings => {
+                self.pop_mode(ModeKind::Settings);
+            }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
                     return;
@@ -1101,6 +1105,7 @@ impl Diffui {
                 self.set_refresh_mode(mode);
                 self.persist_setting(config::Setting::Refresh(mode));
             }
+            Action::ChangeSetting(setting) => self.change_setting(setting),
             Action::SetMainView(mode) => self.set_main_view(mode, cx),
 
             // ── Tabs ────────────────────────────────────────────────────
@@ -1163,7 +1168,7 @@ impl Diffui {
             Action::RevealLogFile => {
                 crate::logging::reveal_log_file();
             }
-            Action::OpenConfigFile => crate::app_menu::open_config_file(),
+            Action::RevealConfigFile => self.reveal_config_file(),
             Action::Compare(action) => self.perform_compare(action),
             Action::Range(action) => self.perform_range(action, cx),
             Action::ExpandFile(index) => self.expand_collapsed_file(index),
@@ -2561,8 +2566,12 @@ impl Diffui {
         // holding the keyboard from behind a surface that never draws it.
         if self.tabs.is_empty() {
             self.cancel_credentials();
-            self.modes
-                .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
+            self.modes.retain(|mode| {
+                matches!(
+                    mode.kind(),
+                    ModeKind::OpenRepo | ModeKind::Shortcuts | ModeKind::Settings
+                )
+            });
             self.no_tab.modes.clear();
             return;
         }

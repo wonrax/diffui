@@ -112,6 +112,8 @@ pub(crate) enum Action {
     /// Open or close the keyboard-shortcut cheat sheet.
     ToggleShortcuts,
     CloseShortcuts,
+    OpenSettings,
+    CloseSettings,
     ConfirmAccept,
     ConfirmCancel,
 
@@ -145,6 +147,9 @@ pub(crate) enum Action {
     SetTheme(ThemePreference),
     /// Keep up with the disk on its own, or only when Refresh is pressed.
     SetRefreshMode(diffui_core::RefreshMode),
+    /// A font or code text setting from the settings dialog: applied now and
+    /// saved.
+    ChangeSetting(crate::config::Setting),
     SetMainView(MainView),
 
     // ── Tabs ────────────────────────────────────────────────────────────
@@ -200,8 +205,8 @@ pub(crate) enum Action {
     // ── Diagnostics ─────────────────────────────────────────────────────
     /// Show diffui's log file in the file manager.
     RevealLogFile,
-    /// Open `config.toml` in a text editor, creating it if missing.
-    OpenConfigFile,
+    /// Show `config.toml` in the file manager.
+    RevealConfigFile,
 
     // ── Comparing ───────────────────────────────────────────────────────
     /// Diff two revisions against each other (see [`crate::compare`]).
