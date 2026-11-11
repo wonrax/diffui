@@ -330,12 +330,23 @@ pub fn parse(config: &CliConfig, input: &str) -> Result<ParsedCommand, ParseErro
     } else {
         classify(&view)
     };
+    let revsets = view.revset_slots();
+    // diffui's resolver reads a blank revset as the whole graph; jj refuses it.
+    if let Some(blank) = revsets.iter().find(|slot| slot.revset.trim().is_empty())
+        && let Err(error) = jj_lib::revset::parse_program(&blank.revset)
+    {
+        return Err(ParseError {
+            message: format!("Failed to parse revset: {}", error.kind()),
+            span: blank.span.clone(),
+            hint: None,
+        });
+    }
     Ok(ParsedCommand {
         command,
         path: scan.path().iter().map(|s| (*s).to_owned()).collect(),
         args,
         passthrough_args,
-        revsets: view.revset_slots(),
+        revsets,
         ignore_immutable: view.flag("ignore_immutable"),
     })
 }
@@ -587,7 +598,13 @@ impl ArgsView<'_> {
         })
     }
 
+    /// The revsets to resolve and tint. None for a line that runs against
+    /// another repository or operation (`-R`, `--at-op`): the current graph
+    /// can't say what they mean there, so they're left to the CLI.
     fn revset_slots(&self) -> Vec<RevsetSlot> {
+        if self.flag("repository") || self.flag("at_operation") {
+            return Vec::new();
+        }
         self.value_slots()
             .into_iter()
             .filter(|(_, slot)| slot.kind == ValueKind::Revset)
@@ -1374,6 +1391,22 @@ mod tests {
         assert_eq!(command("jj -R ../other new"), CliCommand::Passthrough);
         // The leading `jj` is optional.
         assert_eq!(parse_ok("new").path, ["new"]);
+    }
+
+    #[test]
+    fn revsets_elsewhere_are_the_clis() {
+        // Another operation or repository: nothing to resolve here, and the
+        // line runs as typed.
+        for line in ["jj --at-op abc log -r xyz", "jj -R ../other log -r xyz"] {
+            let parsed = parse_ok(line);
+            assert!(parsed.revsets.is_empty(), "{line}");
+            assert_eq!(parsed.command, CliCommand::Passthrough, "{line}");
+            assert!(revset_slots(&CliConfig::builtin(), line).is_empty());
+        }
+        // A blank revset is jj's syntax error, not the whole graph.
+        let blank = error("jj log -r ' '");
+        assert_eq!(blank.message, "Failed to parse revset: Syntax error");
+        assert_eq!(blank.span, 11..12);
     }
 
     #[test]

@@ -18,6 +18,8 @@ use futures::StreamExt as _;
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
+    config::ConfigGetResultExt as _,
+    id_prefix::IdPrefixContext,
     merged_tree::MergedTree,
     object_id::ObjectId as _,
     ref_name::WorkspaceName,
@@ -73,13 +75,40 @@ impl RevsetScope<'_> {
         src: &str,
         expression: &Arc<UserRevsetExpression>,
     ) -> Result<Arc<ResolvedRevsetExpression>, RevsetError> {
+        let id_prefixes = self.id_prefix_context();
         let resolver = SymbolResolver::new(
             self.repo,
             &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
-        );
+        )
+        .with_id_prefix_context(&id_prefixes);
         expression
             .resolve_user_expression(self.repo, &resolver)
             .map_err(|error| resolution_error(src, error))
+    }
+
+    /// jj-cli's id prefix context: change and commit id prefixes are
+    /// disambiguated within `revsets.short-prefixes` (else `revsets.log`)
+    /// first, so a prefix `jj log` shows as unique resolves here too. A
+    /// setting that doesn't parse disambiguates over the whole repo, where
+    /// jj would refuse to run.
+    fn id_prefix_context(&self) -> IdPrefixContext {
+        let context = IdPrefixContext::new(Arc::default());
+        let settings = self.repo.settings();
+        let text = settings
+            .get_string("revsets.short-prefixes")
+            .optional()
+            .transpose()
+            .unwrap_or_else(|| settings.get_string("revsets.log"));
+        let Ok(text) = text else {
+            return context;
+        };
+        if text.trim().is_empty() {
+            return context;
+        }
+        match parse_revset_raw(self.repo_root, settings, self.workspace_name, &text) {
+            Ok(Ok(expression)) => context.disambiguate_within(expression),
+            _ => context,
+        }
     }
 
     /// The commit ids `expression` evaluates to, newest first.
