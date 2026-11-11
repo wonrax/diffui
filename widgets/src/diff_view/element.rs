@@ -247,6 +247,20 @@ impl State {
             .map(|(_, control)| control)
     }
 
+    /// Nothing a move away from the view could change: no drag, no hover.
+    fn idle(&self) -> bool {
+        !self.is_selecting
+            && self.line_drag.is_none()
+            && self.hovered_file_header.is_none()
+            && self.hovered_hunk.is_none()
+            && self.hovered_note_button.is_none()
+            && self.hovered_annotation.is_none()
+            && !self.hovered_description
+            && self.hovered_header_action.is_none()
+            && self.hovered_line.is_none()
+            && self.hovered_hunk_action.is_none()
+    }
+
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
@@ -686,7 +700,11 @@ impl State {
 
         let prev_horizontal = self.horizontal_offset;
         let mut owed = false;
-        if movement.y != 0.0 {
+        // Momentum into an edge the view already rests on moves nothing: drawing it
+        // would repaint the same frame for the whole tail.
+        let against_edge = (movement.y < 0.0 && self.vertical_offset <= 0.0)
+            || (movement.y > 0.0 && self.vertical_offset >= max_vertical);
+        if movement.y != 0.0 && !against_edge {
             if scroll_resample::delay().is_zero() {
                 self.vertical_offset = (self.vertical_offset + movement.y).clamp(0.0, max_vertical);
                 self.publish_file(view, out);
@@ -1105,6 +1123,10 @@ impl DiffView {
                 let (max_vertical, _) = state.limits(&view, bounds);
                 let before = state.vertical_offset;
                 state.vertical_offset = (before + step).clamp(0.0, max_vertical);
+                if state.vertical_offset != before + step {
+                    // Reached an edge: the rest of the motion has nowhere to go.
+                    state.wheel.reset();
+                }
                 if state.vertical_offset != before {
                     state.publish_file(&view, &mut out);
                     // Rows slid under a still cursor: its hover moves with them.
@@ -1281,6 +1303,11 @@ impl Element for DiffElement {
                 return;
             }
             let point: Point = event.position.into();
+            // Moves anywhere in the window land here: one away from the view matters
+            // only to end a drag or clear a hover.
+            if !rect.contains(point) && entity.read(cx).state.idle() {
+                return;
+            }
             let held = event.pressed_button == Some(MouseButton::Left);
             DiffView::handle(&entity, window, cx, |view, state, out| {
                 state.on_move(view, rect, point, held, out)
