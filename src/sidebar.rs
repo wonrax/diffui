@@ -336,11 +336,7 @@ impl SidebarFileCache {
     }
 }
 
-pub(crate) fn revision_list_style(
-    theme: ThemeSpec,
-    config: AppConfig,
-    file_badge_width: f32,
-) -> RevisionListStyle {
+pub(crate) fn revision_list_style(theme: ThemeSpec, config: AppConfig) -> RevisionListStyle {
     RevisionListStyle {
         graph: revision_graph_style(theme),
         background: theme.panel_background,
@@ -355,7 +351,6 @@ pub(crate) fn revision_list_style(
         accent_foreground: theme.panel_background,
         primary_font: config.ui_font,
         mono_font: config.mono_font,
-        file_badge_width,
         floating: theme,
     }
 }

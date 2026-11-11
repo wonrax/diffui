@@ -6,7 +6,7 @@ use crate::geometry::{Point, Rectangle};
 use crate::revision_list::{self, FileRowView, RevisionListProps};
 use crate::root::PaneSet;
 use crate::theme::{
-    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
+    Color, ThemeSpec, Weight, chip_background, diff_palette, file_status_color, text_size,
 };
 use crate::{Action, Cx, Diffui, LoadStatus, icons, ui};
 use diffui_core::FileTreeRow;
@@ -27,13 +27,6 @@ pub(crate) fn stat_color(count: usize, color: Color, theme: ThemeSpec) -> Color 
     if count == 0 { theme.subtle_text } else { color }
 }
 
-/// A stat column exactly as wide as its widest count. The counts are drawn
-/// right-aligned in it, so the even gaps between the columns come from the
-/// row's own gap, not from padding baked in here.
-fn changed_file_stat_width(sign: char, value: usize, font: Font) -> f32 {
-    crate::measure::line_width(&format!("{sign}{value}"), text_size::CAPTION, font).ceil()
-}
-
 #[derive(Default)]
 struct EmptyFileTreeLanes {
     continuation: Rc<[Option<GraphEdgeType>]>,
@@ -46,11 +39,9 @@ fn changed_file_row(
     row: &FileTreeRow,
     files: &[diffui_core::DiffFile],
     theme: ThemeSpec,
-    additions_width: f32,
-    deletions_width: f32,
     lanes: &EmptyFileTreeLanes,
 ) -> FileRowView {
-    let indent_step = crate::revision_list::CHANGES_TREE_INDENT;
+    let indent_step = crate::revision_list::FILE_TREE_INDENT;
     let (
         primary,
         raw_path,
@@ -110,7 +101,6 @@ fn changed_file_row(
         primary,
         raw_path,
         status_label,
-        status_background: chip_background(status_color),
         status_text: status_color,
         additions,
         deletions,
@@ -118,8 +108,6 @@ fn changed_file_row(
         deletions_text: stat_color(deletions, theme.removed_text, theme),
         continuation: Rc::clone(&lanes.continuation),
         columns: Rc::clone(&lanes.columns),
-        additions_width,
-        deletions_width,
         // A directory recedes behind its files; a deleted file is gone.
         primary_color: if chevron.is_some() {
             theme.muted_text
@@ -389,24 +377,12 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     let selected_display = tree_rows.iter().position(|row| {
         matches!(row, FileTreeRow::File { file_index, .. } if *file_index == tab.selected_file)
     });
-    let max_additions = files.iter().map(|file| file.additions).max().unwrap_or(0);
-    let max_deletions = files.iter().map(|file| file.deletions).max().unwrap_or(0);
-    let additions_width = changed_file_stat_width('+', max_additions, ui.config.ui_font);
-    let deletions_width = changed_file_stat_width('\u{2212}', max_deletions, ui.config.ui_font);
-    let badge_width = diffui_widgets::status_badge::SIZE;
     let lanes = EmptyFileTreeLanes::default();
     let this = cx.entity();
     let build_file = Rc::new(move |display: usize, cx: &gpui_kit::App| {
         let ui = this.read(cx);
         let row = &tree_rows[display];
-        let mut view = changed_file_row(
-            row,
-            &ui.active().session.document.files,
-            theme,
-            additions_width,
-            deletions_width,
-            &lanes,
-        );
+        let mut view = changed_file_row(row, &ui.active().session.document.files, theme, &lanes);
         view.check = match row {
             FileTreeRow::File { file_index, .. } => {
                 crate::changes::tree_check(ui, Some(*file_index), None)
@@ -422,11 +398,9 @@ fn file_tree(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
     let props = RevisionListProps::new(
         0,
         Some((0, row_count)),
-        crate::sidebar::revision_list_style(theme, ui.config, badge_width),
+        crate::sidebar::revision_list_style(theme, ui.config),
     )
-    .file_layout(revision_list::FileRowLayout::Changes {
-        picking: crate::changes::has_selection(ui),
-    })
+    .file_picking(crate::changes::has_selection(ui))
     .files(
         build_file,
         Some(tab.selected_file),

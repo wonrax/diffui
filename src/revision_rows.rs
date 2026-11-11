@@ -49,7 +49,7 @@ pub(crate) fn build_revision_list(
 
     // The list fills its own background, so the target-mode wash has to reach
     // it too: a tinted container alone would be painted over.
-    let mut list_style = revision_list_style(theme, ui.config, 0.0);
+    let mut list_style = revision_list_style(theme, ui.config);
     if tab.op_draft().is_some() {
         list_style.background = draft_panel_background(theme);
         // The rings that cut nodes out of their strokes are the pane's colour.
@@ -1028,7 +1028,7 @@ pub(crate) mod scenes {
         let mut h = open("");
         let seen = log.clone();
         h.show(move |ui, theme, window, cx| {
-            let style = revision_list_style(theme, ui.config, 24.0);
+            let style = revision_list_style(theme, ui.config);
             let added = theme.added_text;
             let build = Rc::new(move |row: usize, _: &App| FileRowView {
                 primary: if row == 0 {
@@ -1042,7 +1042,6 @@ pub(crate) mod scenes {
                 } else {
                     "M".to_owned()
                 },
-                status_background: crate::theme::chip_background(added),
                 status_text: added,
                 additions: row * 3,
                 deletions: row,
@@ -1050,8 +1049,6 @@ pub(crate) mod scenes {
                 deletions_text: added,
                 continuation: Rc::from(Vec::new()),
                 columns: Rc::from(Vec::new()),
-                additions_width: 30.0,
-                deletions_width: 24.0,
                 primary_color: added,
                 icon_color: added,
                 indent: if row == 0 {
@@ -1096,13 +1093,9 @@ pub(crate) mod scenes {
         let y = |row: f32| px(LIST_TOP + (row + 0.5) * FILE_ROW_HEIGHT);
         h.click_point(point(px(200.0), y(2.0)));
         assert_eq!(log.borrow().selected, vec![2], "by display row");
-        // The icon column: the gutter's padding, one indent and the chevron's.
-        let icon_x = revision_list::GUTTER_LEFT_PADDING
-            + revision_list::GUTTER_PADDING
-            + revision_list::FILE_TREE_INDENT
-            + 14.0
-            + 9.0;
-        h.click_point(point(px(icon_x), y(3.0)));
+        // The pick box, in its column at the row's end.
+        let check_x = 320.0 - crate::theme::list::PAD_END - 7.0;
+        h.click_point(point(px(check_x), y(3.0)));
         assert_eq!(log.borrow().checked, vec![3]);
         assert_eq!(log.borrow().selected, vec![2], "the box isn't a selection");
         h.with_window(|window, cx| {

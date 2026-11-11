@@ -63,28 +63,19 @@ pub const ROW_CARD_INSET_Y: f32 = 1.0;
 const ROW_CARD_RADIUS: f32 = crate::theme::list::radius(REVISION_ROW_HEIGHT);
 /// The same for a file row's shorter card.
 const FILE_ROW_CARD_RADIUS: f32 = crate::theme::list::radius(FILE_ROW_HEIGHT);
-/// Horizontal indent per tree depth level for file/directory rows.
-pub const FILE_TREE_INDENT: f32 = 14.0;
-/// [`FileRowLayout::Changes`]: the column a directory's chevron and a file's
-/// status badge share, and the gap after it and before the pick box.
-const CHANGES_MARK_COL: f32 = crate::status_badge::SIZE;
-const CHANGES_GAP: f32 = 5.0;
-/// The changed-files tree's indent per level (see [`FileRowLayout::Changes`]):
-/// a child's chevron or badge starts where its parent's name does.
-pub const CHANGES_TREE_INDENT: f32 = CHANGES_MARK_COL + CHANGES_GAP;
-/// [`FileRowLayout::Changes`]: the pick box's column at the right edge.
-const CHANGES_CHECK_COL: f32 = 14.0;
-/// [`FileRowLayout::Changes`]: the gap between the two stat counts.
-const CHANGES_STAT_GAP: f32 = 4.0;
-/// [`FileRowLayout::Changes`]: the label standing in for counts ("binary").
-const CHANGES_TAG_SIZE: f32 = 10.5;
-/// Width of the collapse-chevron column in file/directory rows (empty for
-/// files). Indent guides center under it.
-const FILE_CHEVRON_COL: f32 = 14.0;
-/// Width of the file/folder icon column that follows the chevron column.
-const FILE_ICON_COL: f32 = 18.0;
-/// Glyph size of the file/folder icon.
-const FILE_ICON_SIZE: f32 = 12.0;
+/// The column a directory's chevron and a file's status badge share, and the
+/// gap after it and before the pick box.
+const FILE_MARK_COL: f32 = crate::status_badge::SIZE;
+const FILE_MARK_GAP: f32 = 5.0;
+/// A file tree's indent per level: a child's chevron or badge starts where
+/// its parent's name does.
+pub const FILE_TREE_INDENT: f32 = FILE_MARK_COL + FILE_MARK_GAP;
+/// The pick box's column at the right edge.
+const FILE_CHECK_COL: f32 = 14.0;
+/// The gap between the two stat counts.
+const FILE_STAT_GAP: f32 = 4.0;
+/// The label standing in for counts ("binary").
+const FILE_TAG_SIZE: f32 = 10.5;
 const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
@@ -158,7 +149,6 @@ pub struct RevisionListStyle {
     pub accent_foreground: Color,
     pub primary_font: Font,
     pub mono_font: Font,
-    pub file_badge_width: f32,
     /// The palette of what floats over the list: the hover tooltip and the
     /// drag chip.
     pub floating: crate::theme::ThemeSpec,
@@ -197,19 +187,6 @@ pub enum DraftMarker {
     LineAbove,
     /// Insert-before: the moved commits land just below this row.
     LineBelow,
-}
-
-/// How a list lays its file rows out.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FileRowLayout {
-    /// `[chevron][icon] name … +N −N [status]`: the source tree.
-    #[default]
-    Classic,
-    /// The changed-files tree: `[chevron or status badge] name … +N −N [pick]`,
-    /// tighter on the left, the counts only for the side that has any, and the
-    /// pick box at the right edge, shown on hover or on every row while
-    /// `picking`.
-    Changes { picking: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +273,6 @@ pub struct FileRowView {
     pub primary: String,
     pub raw_path: String,
     pub status_label: String,
-    pub status_background: Color,
     pub status_text: Color,
     pub additions: usize,
     pub deletions: usize,
@@ -310,11 +286,8 @@ pub struct FileRowView {
     /// [`RevisionRowView::columns`]); the continuation strokes inherit its
     /// packing so the strip doesn't jump at the revision/file boundary.
     pub columns: Rc<[Option<usize>]>,
-    pub additions_width: f32,
-    pub deletions_width: f32,
     pub primary_color: Color,
-    /// Tint of the file/folder icon ahead of the name (dimmer than the
-    /// name for regular rows; follows the row tone for untracked/ignored).
+    /// Tint of a directory's chevron (dimmer than its name).
     pub icon_color: Color,
     /// Tree indentation in px (depth × step), applied left of the badge.
     pub indent: f32,
@@ -333,13 +306,13 @@ pub struct FileRowView {
     /// lane that survives into the continuation. See
     /// [`RevisionRowView::lane_segments`].
     pub lane_segments: Rc<[Option<usize>]>,
-    /// Change-selection checkbox drawn in place of the file/folder icon, or
+    /// Change-selection checkbox drawn at the row's end, or
     /// `None` for no checkbox (see [`RevisionListProps::on_file_check`]).
     pub check: Option<crate::diff_view::CheckState>,
-    /// [`FileRowLayout::Changes`]: what stands in for the counts of a file
-    /// with none ("binary", "mode", "empty").
+    /// What stands in for the counts of a file with none ("binary", "mode",
+    /// "empty").
     pub tag: Option<String>,
-    /// [`FileRowLayout::Changes`]: the name is struck through (a deleted file).
+    /// The name is struck through (a deleted file).
     pub struck: bool,
 }
 
@@ -463,7 +436,8 @@ pub struct RevisionListProps {
     /// Flat row of the working copy, for the pin shown while it's scrolled
     /// away.
     working_copy_flat: Option<usize>,
-    file_layout: FileRowLayout,
+    /// Every file row shows its pick box, not only the hovered one.
+    file_picking: bool,
     /// The colour the header above the list is: see
     /// [`RevisionListProps::top_fade`].
     top_fade: Option<Color>,
@@ -502,23 +476,15 @@ impl RevisionListProps {
             drop_indicator: None,
             multi_selection_count: 0,
             working_copy_flat: None,
-            file_layout: FileRowLayout::Classic,
+            file_picking: false,
             top_fade: None,
         }
     }
 
-    /// Lay the file rows out as `layout`.
-    pub fn file_layout(mut self, layout: FileRowLayout) -> Self {
-        self.file_layout = layout;
+    /// Show every file row's pick box while picks are being made.
+    pub fn file_picking(mut self, picking: bool) -> Self {
+        self.file_picking = picking;
         self
-    }
-
-    /// The indent of one tree level.
-    fn indent_step(&self) -> f32 {
-        match self.file_layout {
-            FileRowLayout::Classic => FILE_TREE_INDENT,
-            FileRowLayout::Changes { .. } => CHANGES_TREE_INDENT,
-        }
     }
 
     /// Where the working copy's row is, so a pin can bring it back when it's
@@ -787,48 +753,12 @@ impl RevisionListProps {
     }
 
     /// Horizontal layout of a file row's content columns:
-    /// [indent][chevron][icon] name … [+N] [-N] [status chip] pad.
-    /// Shared between painting (which ellipsizes the name into `path_w`) and
-    /// the tooltip's "is the name actually truncated?" check, so the two can
-    /// never disagree.
-    fn file_row_columns(
-        &self,
-        row_x: f32,
-        row_width: f32,
-        gutter_total: f32,
-        file: &FileRowView,
-    ) -> FileRowColumns {
-        if let FileRowLayout::Changes { .. } = self.file_layout {
-            return self.changes_row_columns(row_x, row_width, gutter_total, file);
-        }
-        let chip_col = self.style.file_badge_width;
-        let chip_left = row_x + row_width - crate::theme::list::PAD_END - chip_col;
-        let chip_gap = if chip_col > 0.0 { FILE_ROW_GAP } else { 0.0 };
-        let minus_x = chip_left - chip_gap - file.deletions_width;
-        let plus_x = minus_x - FILE_ROW_GAP - file.additions_width;
-        let path_x =
-            row_x + gutter_total + file.indent + FILE_CHEVRON_COL + FILE_ICON_COL + FILE_ROW_GAP;
-        let path_right = if file.chevron.is_some() {
-            row_x + row_width - crate::theme::list::PAD_END
-        } else {
-            plus_x - FILE_ROW_GAP
-        };
-        FileRowColumns {
-            chip_left,
-            minus_x,
-            plus_x,
-            path_x,
-            path_w: (path_right - path_x).max(1.0),
-            mark_x: row_x + gutter_total + file.indent,
-            check_center: None,
-            stats_right: plus_x,
-        }
-    }
-
-    /// [`Self::file_row_columns`] of [`FileRowLayout::Changes`]:
     /// `[mark] name … [stats] [pick]`, the pick box keeping its column whether
-    /// it shows or not so the counts don't move under the cursor.
-    fn changes_row_columns(
+    /// it shows or not so the counts don't move under the cursor. Shared
+    /// between painting (which ellipsizes the name into `path_w`) and the
+    /// tooltip's "is the name actually truncated?" check, so the two can never
+    /// disagree.
+    fn file_row_columns(
         &self,
         row_x: f32,
         row_width: f32,
@@ -837,12 +767,12 @@ impl RevisionListProps {
     ) -> FileRowColumns {
         // No lanes run through this tree: the strip's own padding goes.
         let mark_x = row_x + (gutter_total - GUTTER_PADDING).max(0.0) + file.indent;
-        let path_x = mark_x + CHANGES_MARK_COL + CHANGES_GAP;
+        let path_x = mark_x + FILE_MARK_COL + FILE_MARK_GAP;
         let right = row_x + row_width - crate::theme::list::PAD_END;
         let (check_center, stats_right) = match file.check {
             Some(_) => (
-                Some(right - CHANGES_CHECK_COL / 2.0),
-                right - CHANGES_CHECK_COL - CHANGES_GAP,
+                Some(right - FILE_CHECK_COL / 2.0),
+                right - FILE_CHECK_COL - FILE_MARK_GAP,
             ),
             None => (None, right),
         };
@@ -853,9 +783,6 @@ impl RevisionListProps {
             stats_right
         };
         FileRowColumns {
-            chip_left: stats_right,
-            minus_x: stats_right,
-            plus_x: stats_right,
             path_x,
             path_w: (path_right - path_x).max(1.0),
             mark_x,
@@ -864,7 +791,7 @@ impl RevisionListProps {
         }
     }
 
-    /// [`FileRowLayout::Changes`]: the width of a file row's counts, or of the
+    /// The width of a file row's counts, or of the
     /// tag standing in for them.
     fn changes_stats_width(&self, file: &FileRowView) -> f32 {
         if file.chevron.is_some() {
@@ -873,7 +800,7 @@ impl RevisionListProps {
         let parts = changes_stats(file);
         if parts.is_empty() {
             return file.tag.as_deref().map_or(0.0, |tag| {
-                crate::measure::line_width(tag, CHANGES_TAG_SIZE, self.style.mono_font)
+                crate::measure::line_width(tag, FILE_TAG_SIZE, self.style.mono_font)
             });
         }
         parts
@@ -882,11 +809,11 @@ impl RevisionListProps {
                 crate::measure::line_width(text, CAPTION_TEXT_SIZE, self.style.primary_font)
             })
             .sum::<f32>()
-            + CHANGES_STAT_GAP * (parts.len() - 1) as f32
+            + FILE_STAT_GAP * (parts.len() - 1) as f32
     }
 }
 
-/// [`FileRowLayout::Changes`]: a file's counts, each side only when it counts
+/// A file's counts, each side only when it counts
 /// something, with its colour.
 fn changes_stats(file: &FileRowView) -> Vec<(String, Color)> {
     let mut parts = Vec::with_capacity(2);
@@ -1615,15 +1542,11 @@ impl RevisionList {
                     if file.check.is_none() {
                         return false;
                     }
-                    if let FileRowLayout::Changes { .. } = props.file_layout {
-                        let columns =
-                            props.file_row_columns(bounds.x, bounds.width, gutter_total, &file);
-                        return columns.check_center.is_some_and(|center| {
-                            (cursor.x - center).abs() <= CHANGES_CHECK_COL / 2.0 + 3.0
-                        });
-                    }
-                    let icon_x = bounds.x + gutter_total + file.indent + FILE_CHEVRON_COL;
-                    cursor.x >= icon_x - 2.0 && cursor.x < icon_x + FILE_ICON_COL + 2.0
+                    let columns =
+                        props.file_row_columns(bounds.x, bounds.width, gutter_total, &file);
+                    columns.check_center.is_some_and(|center| {
+                        (cursor.x - center).abs() <= FILE_CHECK_COL / 2.0 + 3.0
+                    })
                 });
                 if let Some(on_check) = on_check {
                     effects.push(call(on_check, display_index));
@@ -1851,7 +1774,7 @@ impl RevisionList {
                 return None;
             }
             let depth_of = |flat: usize| match props.item_at(flat, cx) {
-                Some(Item::File(row)) => Some((row.indent / props.indent_step()).round() as usize),
+                Some(Item::File(row)) => Some((row.indent / FILE_TREE_INDENT).round() as usize),
                 _ => None,
             };
             let depth = depth_of(hovered)?;
@@ -2534,20 +2457,13 @@ impl RevisionList {
         // Deliberately no per-row separator: the indent guides supply the
         // vertical structure, and both line sets together read as a grid.
 
-        let content_x = row.x + gutter_total + file.indent;
-        let row_mid_y = row.y + row.height / 2.0;
-
         // Indent guides: one hairline per ancestor level, aligned under the
         // parent rows' chevron column. The hovered row's sibling run wears a
         // brighter guide at its parent level.
-        let step = props.indent_step();
+        let step = FILE_TREE_INDENT;
         let depth = (file.indent / step).round() as usize;
         let columns = props.file_row_columns(row.x, row.width, gutter_total, file);
-        let guide_x = columns.mark_x - file.indent
-            + match props.file_layout {
-                FileRowLayout::Classic => FILE_CHEVRON_COL / 2.0,
-                FileRowLayout::Changes { .. } => CHANGES_MARK_COL / 2.0,
-            };
+        let guide_x = columns.mark_x - file.indent + FILE_MARK_COL / 2.0;
         for level in 0..depth {
             let x = guide_x + level as f32 * step;
             let color = if emphasized_guide == Some(level) {
@@ -2570,159 +2486,14 @@ impl RevisionList {
             ));
         }
 
-        if let FileRowLayout::Changes { picking } = props.file_layout {
-            self.paint_changes_file(row, file, &columns, hovered || picking, window, cx);
-            graph_view::continuation_row(
-                graph,
-                row.x,
-                row.y,
-                row.height,
-                &file.continuation,
-                &file.columns,
-                &self.lane_geometry(),
-                &style.graph,
-                emphasized_lane,
-            );
-            return;
-        }
-
-        // Left columns: [chevron (dirs)] [file/folder icon] name…
-        if let Some(collapsed) = file.chevron {
-            let glyph = if collapsed {
-                icons::CHEVRON_RIGHT
-            } else {
-                icons::CHEVRON_DOWN
-            };
-            paint_glyph(
-                glyph,
-                content_x + FILE_CHEVRON_COL / 2.0,
-                row_mid_y,
-                CAPTION_TEXT_SIZE,
-                file.primary_color,
-                window,
-                cx,
-            );
-        }
-        let icon_center = content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0;
-        if let Some(check) = file.check {
-            paint_file_check(icon_center, row_mid_y, check, style, window, cx);
-        } else {
-            let icon_glyph = match file.chevron {
-                Some(true) => icons::FOLDER,
-                Some(false) => icons::FOLDER_OPEN,
-                None => icons::FILE,
-            };
-            paint_glyph(
-                icon_glyph,
-                icon_center,
-                row_mid_y,
-                FILE_ICON_SIZE,
-                file.icon_color,
-                window,
-                cx,
-            );
-        }
-
-        // Layout: [indent][chevron][icon] name … [+N] [-N] [status chip] pad.
-        // The status chip is the rightmost column so badges align down the
-        // tree; directory rows have neither stats nor chip, so their name runs
-        // to the right edge. The chip column clears the scrollbar band with the
-        // same right padding the revision rows' bookmark rail uses.
-        let chip_col = style.file_badge_width;
-        let primary = style.primary_font;
-
-        // Cut in the middle, so a name wider than `path_w` keeps both its start
-        // and its extension (and a compacted `a/b/c` chain its leaf) without
-        // bleeding into the +N / -N columns; the full path is on the hover
-        // tooltip. The name's caps are centred on the row; the stats and the
-        // status chip (other sizes and fonts) join it on its baseline.
-        let name_baseline = TextBox::new(
-            primary,
-            FILE_NAME_TEXT_SIZE,
-            FILE_NAME_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
-        )
-        .baseline_for_center(row_mid_y);
-        let stats_center = TextBox::new(
-            primary,
-            CAPTION_TEXT_SIZE,
-            CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
-        )
-        .center_for_baseline(name_baseline);
-        let (name, name_width) =
-            self.name_cuts
-                .cut(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, primary);
-        // Too narrow for even the ellipsis: nothing, rather than a mark over the stats.
-        if name_width <= columns.path_w + 1.0 {
-            paint_centered(
-                &name,
-                columns.path_x,
-                row_mid_y,
-                FILE_NAME_TEXT_SIZE,
-                primary,
-                file.primary_color,
-                window,
-                cx,
-            );
-        }
-
-        // Status chip, right-aligned in the rightmost column (single-letter
-        // labels center within it so mixed labels still line up). An empty
-        // label draws nothing.
-        if file.chevron.is_none() && !file.status_label.is_empty() {
-            let badge = StatusBadge {
-                letter: &file.status_label,
-                ink: file.status_text,
-            };
-            status_badge::paint(
-                &badge,
-                style.mono_font,
-                status_badge::rect(
-                    columns.chip_left + ((chip_col - status_badge::SIZE) / 2.0).max(0.0),
-                    row_mid_y,
-                ),
-                window,
-                cx,
-            );
-        }
-
-        // Directory rows carry no stats; zero-width stat columns (the source
-        // tree) skip them too.
-        if file.chevron.is_none() && file.additions_width > 0.0 {
-            // Right-aligned, so the digits of rows stacked above each other
-            // line up like a table column. The anchor is the right edge.
-            let stat =
-                |text: String, right: f32, color: Color, window: &mut Window, cx: &mut App| {
-                    let line_height = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER;
-                    let shift = TextBox::new(primary, CAPTION_TEXT_SIZE, line_height).trim_shift();
-                    typography::paint_line(
-                        &text,
-                        right,
-                        stats_center + shift - line_height / 2.0,
-                        CAPTION_TEXT_SIZE,
-                        line_height,
-                        primary,
-                        color,
-                        TextAlign::Right,
-                        window,
-                        cx,
-                    );
-                };
-            stat(
-                format!("+{}", file.additions),
-                columns.plus_x + file.additions_width,
-                file.additions_text,
-                window,
-                cx,
-            );
-            stat(
-                format!("\u{2212}{}", file.deletions),
-                columns.minus_x + file.deletions_width,
-                file.deletions_text,
-                window,
-                cx,
-            );
-        }
-
+        self.paint_file_content(
+            row,
+            file,
+            &columns,
+            hovered || props.file_picking,
+            window,
+            cx,
+        );
         graph_view::continuation_row(
             graph,
             row.x,
@@ -2735,13 +2506,11 @@ impl RevisionList {
             emphasized_lane,
         );
     }
-}
 
-impl RevisionList {
-    /// The content of a [`FileRowLayout::Changes`] row: `[chevron or badge]
+    /// The content of a file row: `[chevron or badge]
     /// name … [counts or tag] [pick]`. The name sets the baseline the badge,
     /// the counts and the tag sit on; the chevron and the box centre on the row.
-    fn paint_changes_file(
+    fn paint_file_content(
         &self,
         row: Rectangle,
         file: &FileRowView,
@@ -2772,7 +2541,7 @@ impl RevisionList {
                 } else {
                     icons::CHEVRON_DOWN
                 },
-                columns.mark_x + CHANGES_MARK_COL / 2.0,
+                columns.mark_x + FILE_MARK_COL / 2.0,
                 row_mid_y,
                 CAPTION_TEXT_SIZE,
                 file.icon_color,
@@ -2842,18 +2611,18 @@ impl RevisionList {
                     cx,
                 );
                 right -= crate::measure::line_width(text, CAPTION_TEXT_SIZE, style.primary_font)
-                    + CHANGES_STAT_GAP;
+                    + FILE_STAT_GAP;
             }
             if parts.is_empty()
                 && let Some(tag) = &file.tag
             {
-                let line_height = CHANGES_TAG_SIZE * LINE_HEIGHT_MULTIPLIER;
-                let tag_box = TextBox::new(style.mono_font, CHANGES_TAG_SIZE, line_height);
+                let line_height = FILE_TAG_SIZE * LINE_HEIGHT_MULTIPLIER;
+                let tag_box = TextBox::new(style.mono_font, FILE_TAG_SIZE, line_height);
                 typography::paint_line(
                     tag,
                     columns.stats_right,
                     name_baseline - tag_box.baseline(),
-                    CHANGES_TAG_SIZE,
+                    FILE_TAG_SIZE,
                     line_height,
                     style.mono_font,
                     style.subtle_text,
@@ -2898,7 +2667,6 @@ fn placeholder_style() -> RevisionListStyle {
         accent_foreground: color,
         primary_font: Font::DEFAULT,
         mono_font: Font::MONOSPACE,
-        file_badge_width: 0.0,
         floating: crate::theme::ResolvedTheme::Dark.spec(),
     }
 }
@@ -3354,9 +3122,6 @@ fn paint_file_check(
 }
 
 struct FileRowColumns {
-    chip_left: f32,
-    minus_x: f32,
-    plus_x: f32,
     path_x: f32,
     path_w: f32,
     /// Left edge of the chevron column (the badge's, in the changes layout).

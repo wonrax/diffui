@@ -202,7 +202,7 @@ pub(crate) fn empty_revision_row(theme: ThemeSpec) -> RevisionRowView {
 }
 
 /// One display row of the source tree, lowered to the shared file-row view.
-/// Changed tracked files chip their diff status (`A`/`M`/`C`) and untracked
+/// Changed tracked files badge their diff status (`A`/`M`/`C`) and untracked
 /// files a green `U`, like `jj status`; ignored files and directories render
 /// dimmed.
 fn source_file_row(
@@ -258,9 +258,8 @@ fn source_file_row(
                     )),
                     _ => None,
                 };
-                // A chipped row's name (and icon) carries the chip's color,
-                // so a changed file reads as one colored piece rather than a
-                // plain name with a colored tag hanging off it.
+                // A badged row's name carries the badge's color, so a changed
+                // file reads as one colored piece.
                 let name_color = match (chip, status) {
                     (Some((_, color)), _) => color,
                     (None, SourceEntryStatus::Ignored) => theme.subtle_text,
@@ -277,11 +276,8 @@ fn source_file_row(
                     None,
                     *entry_index,
                     name_color,
-                    if chip.is_some() {
-                        name_color
-                    } else {
-                        theme.subtle_text
-                    },
+                    // No chevron to tint.
+                    theme.subtle_text,
                     chip,
                 )
             }
@@ -290,9 +286,6 @@ fn source_file_row(
         primary,
         raw_path,
         status_label: chip.map(|(label, _)| label.to_owned()).unwrap_or_default(),
-        status_background: chip
-            .map(|(_, color)| chip_background(color))
-            .unwrap_or(crate::theme::TRANSPARENT),
         status_text: chip.map(|(_, color)| color).unwrap_or(theme.text),
         additions: 0,
         deletions: 0,
@@ -300,8 +293,6 @@ fn source_file_row(
         deletions_text: theme.removed_text,
         continuation,
         columns,
-        additions_width: 0.0,
-        deletions_width: 0.0,
         primary_color,
         icon_color,
         indent,
@@ -419,14 +410,6 @@ pub(crate) fn build_source_sidebar(
         )
     });
 
-    // Status chips only exist at the working copy; reserve the badge column
-    // there so names align whether or not a given row carries one.
-    let badge_width = if matches!(browsed_revision(source), RevisionSelection::WorkingCopy) {
-        crate::chip::width("M", None, ui.config.mono_font)
-    } else {
-        0.0
-    };
-
     let empty_continuation: Rc<[Option<GraphEdgeType>]> = Vec::new().into();
     let empty_columns: Rc<[Option<usize>]> = Vec::new().into();
     let empty_labels: Rc<[Vec<String>]> = Vec::new().into();
@@ -448,7 +431,7 @@ pub(crate) fn build_source_sidebar(
     let props = RevisionListProps::new(
         0,
         (row_count > 0).then_some((0, row_count)),
-        crate::sidebar::revision_list_style(theme, ui.config, badge_width),
+        crate::sidebar::revision_list_style(theme, ui.config),
     )
     .files(
         build_file,
