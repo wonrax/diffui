@@ -457,11 +457,11 @@ pub(super) enum SplitSide {
     Right,
 }
 
-/// A strip button: `(row, button)` of a hunk strip, or `(strip, button)` of a file
-/// strip (see [`hunk_actions::HunkActions`]).
+/// A strip button: `(file, hunk, button)` of a hunk strip, or `(strip, button)`
+/// of a file strip (see [`hunk_actions::HunkActions`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActionHit {
-    Hunk(usize, usize),
+    Hunk(usize, usize, usize),
     File(usize, usize),
 }
 
@@ -699,6 +699,8 @@ pub(super) struct View<'a> {
     pub(super) labels: &'a [AnnotationLabel],
     pub(super) matches: &'a [FindMatch],
     pub(super) metrics: LayoutMetrics,
+    /// What the hunk strips' rows are built from; `None` builds none.
+    cx: Option<&'a App>,
 }
 
 impl<'a> View<'a> {
@@ -715,7 +717,10 @@ impl<'a> View<'a> {
             .find
             .as_ref()
             .map_or(&[][..], |find| find.matches.get(cx));
-        Self::new(props, hunks, labels, matches)
+        Self {
+            cx: Some(cx),
+            ..Self::new(props, hunks, labels, matches)
+        }
     }
 
     pub(super) fn new(
@@ -742,6 +747,7 @@ impl<'a> View<'a> {
             labels,
             matches,
             metrics,
+            cx: None,
         }
     }
 
@@ -858,19 +864,19 @@ impl<'a> View<'a> {
     }
 
     /// The hunk-strip buttons of `(file, hunk)` when its header is drawn at
-    /// screen-y `y`: the row's index and where each button sits.
+    /// screen-y `y`: the row and where each button sits.
     pub(super) fn hunk_action_layout(
         &self,
         file: usize,
         hunk: usize,
         y: f32,
         bounds: Rectangle,
-    ) -> Option<(usize, Vec<Placed>)> {
+    ) -> Option<(hunk_actions::Row, Vec<Placed>)> {
         let actions = self.props.hunk_actions.as_ref()?;
         if self.props.plain {
             return None;
         }
-        let row = actions.row(file, hunk)?;
+        let row = (actions.rows)(file, hunk, self.cx?)?;
         let header = &self.hunks.get(file)?.get(hunk)?.header;
         let strip = Rectangle {
             x: bounds.x,
@@ -885,16 +891,14 @@ impl<'a> View<'a> {
             + self.metrics.prefix_width
             + TEXT_X_PADDING
             + self.text_width(header);
-        Some((
-            row,
-            hunk_actions::place(
-                &actions.rows[row],
-                &actions.style,
-                strip,
-                HEADER_HORIZONTAL_PADDING,
-                min_x,
-            ),
-        ))
+        let placed = hunk_actions::place(
+            &row,
+            &actions.style,
+            strip,
+            HEADER_HORIZONTAL_PADDING,
+            min_x,
+        );
+        Some((row, placed))
     }
 
     /// The hunk- or file-strip button under `point`, against the layout `index`
@@ -940,11 +944,12 @@ impl<'a> View<'a> {
         }
         let (file, hunk) = index.hunk_ids[slot];
         let y = bounds.y + (top - vertical_offset);
-        let (row, placed) = self.hunk_action_layout(file as usize, hunk as usize, y, bounds)?;
+        let (file, hunk) = (file as usize, hunk as usize);
+        let (_, placed) = self.hunk_action_layout(file, hunk, y, bounds)?;
         placed
             .iter()
             .position(|button| button.rect.contains(point))
-            .map(|button| ActionHit::Hunk(row, button))
+            .map(|button| ActionHit::Hunk(file, hunk, button))
     }
 
     /// The button of `file`'s note drawn with its band's top at screen-y `top`: a

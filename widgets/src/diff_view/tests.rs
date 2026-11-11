@@ -247,7 +247,7 @@ fn conflict_strip(file: usize) -> HunkActions {
         color: BLACK,
     };
     HunkActions {
-        rows: Vec::new(),
+        rows: Rc::new(|_, _, _| None),
         style: Style {
             size: 12.0,
             fill: WHITE,

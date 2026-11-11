@@ -2655,13 +2655,13 @@ impl View<'_> {
                     bounds,
                 );
                 if let Some(actions) = &props.hunk_actions
-                    && let Some((row, placed)) =
+                    && let Some((row_spec, placed)) =
                         self.hunk_action_layout(file_index, hunk_index, y, bounds)
-                    && (!actions.rows[row].hover
+                    && (!row_spec.hover
                         || picked
                         || state.hovered_hunk == Some((file_index, hunk_index)))
                 {
-                    let row_spec = &actions.rows[row];
+                    let row_spec = &row_spec;
                     let strip = Rectangle {
                         x: bounds.x,
                         y,
@@ -2676,7 +2676,8 @@ impl View<'_> {
                             spec,
                             at,
                             &actions.style,
-                            state.hovered_hunk_action == Some(ActionHit::Hunk(row, button)),
+                            state.hovered_hunk_action
+                                == Some(ActionHit::Hunk(file_index, hunk_index, button)),
                             bounds,
                         );
                     }

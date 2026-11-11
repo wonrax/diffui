@@ -771,11 +771,20 @@ impl State {
         if let Some(hit) = hit
             && let Some(actions) = &props.hunk_actions
         {
-            let (callback, value) = match hit {
-                ActionHit::Hunk(row, button) => (actions.on_press.clone(), (row, button)),
-                ActionHit::File(strip, button) => (actions.on_file_press.clone(), (strip, button)),
-            };
-            out.push(Box::new(move |window, cx| callback(&value, window, cx)));
+            match hit {
+                ActionHit::Hunk(file, hunk, button) => {
+                    let callback = actions.on_press.clone();
+                    out.push(Box::new(move |window, cx| {
+                        callback(&(file, hunk, button), window, cx)
+                    }));
+                }
+                ActionHit::File(strip, button) => {
+                    let callback = actions.on_file_press.clone();
+                    out.push(Box::new(move |window, cx| {
+                        callback(&(strip, button), window, cx)
+                    }));
+                }
+            }
             return;
         }
         if let Some(hit) = check

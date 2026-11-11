@@ -318,6 +318,32 @@ fn find_states() {
     h.shot(LANE, "find-regex-invalid");
 }
 
+/// A hunk header's buttons are built when asked for, only for a hunk that
+/// can be picked, and a press on one reaches that hunk.
+#[test]
+fn a_hunk_button_reaches_its_hunk() {
+    let (mut h, repo) = open_sized(SIZE);
+    select(&mut h, &repo, "working-copy");
+    let actions = h
+        .act(|ui, cx| crate::changes::hunk_actions(ui, ui.resolved_theme().spec(), cx))
+        .expect("the working copy's hunks can be picked");
+    let files = h.read(|ui| ui.active().session.document.files.len());
+    let file = h
+        .with_window(|_, cx| (0..files).find(|&file| (actions.rows)(file, 0, cx).is_some()))
+        .expect("the working copy has a pickable hunk");
+    let label = |h: &mut Harness| {
+        h.with_window(|_, cx| {
+            let row = (actions.rows)(file, 0, cx).expect("the hunk has buttons");
+            row.buttons[0].runs[0].text.clone()
+        })
+    };
+    assert_eq!(label(&mut h), "Pick hunk");
+    assert!(h.with_window(|_, cx| (actions.rows)(file, usize::MAX, cx).is_none()));
+    h.with_window(|window, cx| (actions.on_press)(&(file, 0, 0), window, cx));
+    h.settle();
+    assert_eq!(label(&mut h), "Picked");
+}
+
 #[test]
 fn picks_and_lines() {
     let (mut h, repo) = open_sized(SIZE);

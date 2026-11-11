@@ -899,61 +899,63 @@ fn write_hunk(out: &mut String, hunk: &DiffHunkView, picked: Option<&[LineRef]>)
 
 /// The pick actions riding each pickable hunk's header, shown while the
 /// cursor is on the hunk or while it's picked: pick it, restore it, copy it.
+/// A header's buttons are built when it's on screen.
 pub(crate) fn hunk_actions(
     ui: &Diffui,
     theme: ThemeSpec,
     cx: &mut Cx,
 ) -> Option<crate::hunk_actions::HunkActions> {
     use crate::hunk_actions::{Button, HunkActions, Row, Run, Style, Tone};
-    let tab = ui.active();
-    if !editable(tab) {
+    if !editable(ui.active()) {
         return None;
     }
-    let revision = &tab.session.selected_revision;
     let font = ui.config.ui_font;
-    let mut rows = Vec::new();
-    for (index, file) in tab.session.document.files.iter().enumerate() {
-        if !hunk_pickable(file, crate::conflicts::is_conflicted(tab, &file.path)) {
-            continue;
+    let app = cx.entity();
+    let rows = move |file: usize, hunk: usize, cx: &gpui_kit::App| {
+        let tab = app.read(cx).active();
+        let document = tab.session.document.files.get(file)?;
+        if hunk >= document.hunks.len()
+            || !hunk_pickable(
+                document,
+                crate::conflicts::is_conflicted(tab, &document.path),
+            )
+        {
+            return None;
         }
-        for hunk in 0..file.hunks.len() {
-            let state = tab.changes.hunk_state(revision, file, hunk);
-            let button = |text: &str, tone: Tone| Button {
-                runs: vec![Run {
-                    text: text.to_owned(),
-                    font,
-                    color: match tone {
-                        Tone::On => theme.panel_background,
-                        _ => theme.muted_text,
-                    },
-                }],
-                tone,
-            };
-            let pick = match state {
-                CheckState::Off => button("Pick hunk", Tone::Ghost),
-                CheckState::On => button("Picked", Tone::On),
-                CheckState::Partial => button("Picked lines", Tone::On),
-            };
-            rows.push(Row {
-                file: index,
-                hunk,
-                focused: false,
-                lead: None,
-                buttons: vec![
-                    pick,
-                    button("Restore hunk", Tone::Ghost),
-                    button("Copy", Tone::Ghost),
-                ],
-                hover: true,
-            });
-        }
-    }
-    if rows.is_empty() {
-        return None;
-    }
-    let targets: Vec<(usize, usize)> = rows.iter().map(|row| (row.file, row.hunk)).collect();
+        let button = |text: &str, tone: Tone| Button {
+            runs: vec![Run {
+                text: text.to_owned(),
+                font,
+                color: match tone {
+                    Tone::On => theme.panel_background,
+                    _ => theme.muted_text,
+                },
+            }],
+            tone,
+        };
+        let pick = match tab
+            .changes
+            .hunk_state(&tab.session.selected_revision, document, hunk)
+        {
+            CheckState::Off => button("Pick hunk", Tone::Ghost),
+            CheckState::On => button("Picked", Tone::On),
+            CheckState::Partial => button("Picked lines", Tone::On),
+        };
+        Some(Row {
+            file,
+            hunk,
+            focused: false,
+            lead: None,
+            buttons: vec![
+                pick,
+                button("Restore hunk", Tone::Ghost),
+                button("Copy", Tone::Ghost),
+            ],
+            hover: true,
+        })
+    };
     Some(HunkActions {
-        rows,
+        rows: std::rc::Rc::new(rows),
         style: Style {
             size: text_size::CAPTION,
             fill: theme.panel_background,
@@ -966,10 +968,7 @@ pub(crate) fn hunk_actions(
         },
         on_press: std::rc::Rc::new(Diffui::listen(
             cx,
-            move |this, &(row, button): &(usize, usize), _, cx| {
-                let Some(&(file, hunk)) = targets.get(row) else {
-                    return;
-                };
+            move |this, &(file, hunk, button): &(usize, usize, usize), _, cx| {
                 let msg = match button {
                     0 => ChangesMsg::ToggleHunk(file, hunk),
                     1 => ChangesMsg::RestoreHunk(file, hunk),

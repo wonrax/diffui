@@ -1061,9 +1061,22 @@ pub(crate) fn hunk_actions(
         });
         targets.push((path.to_owned(), at.region, at.regions, picks(conflict)));
     }
+    // A handful of regions: built here, looked up by their hunk.
+    let rows = std::rc::Rc::new(rows);
+    let row_of = {
+        let rows = rows.clone();
+        move |file: usize, hunk: usize| {
+            rows.iter()
+                .position(|row: &Row| (row.file, row.hunk) == (file, hunk))
+        }
+    };
     let raised = crate::theme::raised_button_style(theme);
+    let build_row = {
+        let (rows, row_of) = (rows.clone(), row_of.clone());
+        move |file: usize, hunk: usize, _: &gpui_kit::App| Some(rows[row_of(file, hunk)?].clone())
+    };
     Some(crate::hunk_actions::HunkActions {
-        rows,
+        rows: std::rc::Rc::new(build_row),
         style: crate::hunk_actions::Style {
             size: crate::theme::text_size::BODY,
             fill: raised.rest.unwrap_or(theme.panel_background),
@@ -1076,7 +1089,10 @@ pub(crate) fn hunk_actions(
         },
         on_press: std::rc::Rc::new(Diffui::listen(
             cx,
-            move |this, &(row, button): &(usize, usize), _, cx| {
+            move |this, &(file, hunk, button): &(usize, usize, usize), _, cx| {
+                let Some(row) = row_of(file, hunk) else {
+                    return;
+                };
                 let (path, region, regions, picks) = &targets[row];
                 let action = resolve(
                     path,

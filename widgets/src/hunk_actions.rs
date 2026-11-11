@@ -103,16 +103,19 @@ pub struct Style {
     pub radius: f32,
 }
 
-/// Where a press on a strip button goes: `(row or strip, button)`.
+/// Where a press on a file strip's button goes: `(strip, button)`.
 pub type OnPress = Rc<dyn Fn(&(usize, usize), &mut Window, &mut App)>;
+/// The buttons on hunk `(file, hunk)`'s header, if it has any. Built when the
+/// header is laid out, painted or hit, so only headers on screen pay for them.
+pub type BuildRow = Rc<dyn Fn(usize, usize, &App) -> Option<Row>>;
+/// Where a press on a hunk header's button goes: `(file, hunk, button)`.
+pub type OnHunkPress = Rc<dyn Fn(&(usize, usize, usize), &mut Window, &mut App)>;
 
 /// Hunk-strip buttons for a diff view, and where their presses go.
 pub struct HunkActions {
-    /// Sorted by `(file, hunk)`.
-    pub rows: Vec<Row>,
+    pub rows: BuildRow,
     pub style: Style,
-    /// `(row, button)` of a press.
-    pub on_press: OnPress,
+    pub on_press: OnHunkPress,
     /// Sorted by `file`.
     pub files: Vec<FileStrip>,
     /// `(strip, button)` of a press on a file strip, its tools counted before its
@@ -123,13 +126,6 @@ pub struct HunkActions {
 }
 
 impl HunkActions {
-    /// The row for `(file, hunk)`, by index.
-    pub fn row(&self, file: usize, hunk: usize) -> Option<usize> {
-        self.rows
-            .binary_search_by(|row| (row.file, row.hunk).cmp(&(file, hunk)))
-            .ok()
-    }
-
     /// The strip under `file`'s header, by index.
     pub fn file_strip(&self, file: usize) -> Option<usize> {
         self.files
@@ -141,43 +137,50 @@ impl HunkActions {
     /// reaching the producer that made its row. Two producers never put a row on
     /// the same hunk or a strip under the same file. `self`'s style wins.
     pub fn merge(self, other: HunkActions) -> HunkActions {
-        fn interleave<T>(
-            a: Vec<T>,
-            b: Vec<T>,
-            key: impl Fn(&T) -> (usize, usize),
-        ) -> (Vec<T>, Vec<(bool, usize)>) {
-            let mut tagged: Vec<(T, bool, usize)> = a
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| (item, false, index))
-                .chain(
-                    b.into_iter()
-                        .enumerate()
-                        .map(|(index, item)| (item, true, index)),
-                )
-                .collect();
-            tagged.sort_by_key(|(item, ..)| key(item));
-            tagged
-                .into_iter()
-                .map(|(item, second, index)| (item, (second, index)))
-                .unzip()
-        }
-        fn route(first: OnPress, second: OnPress, map: Vec<(bool, usize)>) -> OnPress {
-            Rc::new(move |&(at, button), window, cx| {
-                if let Some(&(other, index)) = map.get(at) {
-                    let press = if other { &second } else { &first };
-                    press(&(index, button), window, cx);
-                }
-            })
-        }
-        let (rows, row_map) = interleave(self.rows, other.rows, |row| (row.file, row.hunk));
-        let (files, file_map) = interleave(self.files, other.files, |strip| (strip.file, 0));
+        let (first_rows, second_rows) = (self.rows, other.rows);
+        let rows: BuildRow = {
+            let (first, second) = (first_rows.clone(), second_rows.clone());
+            Rc::new(move |file, hunk, cx| first(file, hunk, cx).or_else(|| second(file, hunk, cx)))
+        };
+        let (first_press, second_press) = (self.on_press, other.on_press);
+        let on_press: OnHunkPress = Rc::new(move |&(file, hunk, button), window, cx| {
+            if first_rows(file, hunk, cx).is_some() {
+                first_press(&(file, hunk, button), window, cx);
+            } else if second_rows(file, hunk, cx).is_some() {
+                second_press(&(file, hunk, button), window, cx);
+            }
+        });
+        let mut tagged: Vec<(FileStrip, bool, usize)> = self
+            .files
+            .into_iter()
+            .enumerate()
+            .map(|(index, strip)| (strip, false, index))
+            .chain(
+                other
+                    .files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, strip)| (strip, true, index)),
+            )
+            .collect();
+        tagged.sort_by_key(|(strip, ..)| strip.file);
+        let (files, map): (Vec<FileStrip>, Vec<(bool, usize)>) = tagged
+            .into_iter()
+            .map(|(strip, second, index)| (strip, (second, index)))
+            .unzip();
+        let (first_file, second_file) = (self.on_file_press, other.on_file_press);
+        let on_file_press: OnPress = Rc::new(move |&(at, button), window, cx| {
+            if let Some(&(other, index)) = map.get(at) {
+                let press = if other { &second_file } else { &first_file };
+                press(&(index, button), window, cx);
+            }
+        });
         HunkActions {
             rows,
             style: self.style,
-            on_press: route(self.on_press, other.on_press, row_map),
+            on_press,
             files,
-            on_file_press: route(self.on_file_press, other.on_file_press, file_map),
+            on_file_press,
             reveal: self.reveal.or(other.reveal),
         }
     }
