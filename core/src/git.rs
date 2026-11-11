@@ -606,13 +606,14 @@ pub async fn read_git_file_pair(
         RevisionSelection::WorkingCopy => {
             // The new side is the working tree itself; the old side is what
             // the diff compared against (`git diff HEAD`).
-            let new = tokio::fs::read(repository.root.join(path))
-                .await
-                .ok()
-                .and_then(|bytes| {
-                    (bytes.len() <= MAX_SOURCE_BYTES)
-                        .then(|| String::from_utf8_lossy(&bytes).into_owned())
-                });
+            let new = crate::source_browse::read_disk_capped(
+                &repository.root.join(path),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             let old = git_show_file(&repository.root, &format!("HEAD:{old_path}"))
                 .await
                 .and_then(cap);
@@ -736,16 +737,7 @@ pub async fn read_git_source_file(
 ) -> Result<crate::source_browse::SourceFileData> {
     match revision {
         RevisionSelection::WorkingCopy => {
-            if Path::new(path)
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                bail!("invalid path {path}");
-            }
-            let bytes = tokio::fs::read(repository.root.join(path))
-                .await
-                .with_context(|| format!("failed to read {path}"))?;
-            Ok(crate::source_browse::classify_disk_bytes(bytes))
+            crate::source_browse::read_working_copy_file(&repository.root, path).await
         }
         RevisionSelection::Commit(id) => {
             let bytes = run_command_bytes(

@@ -272,17 +272,7 @@ pub(crate) async fn read_jj_source_file(
     path: &str,
 ) -> Result<SourceFileData> {
     if matches!(revision, RevisionSelection::WorkingCopy) {
-        // Paths come from our own tree listing, but reject traversal anyway —
-        // the read must stay inside the workspace.
-        if Path::new(&path)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            bail!("invalid path {path}");
-        }
-        let bytes = std::fs::read(repository.root.join(path))
-            .with_context(|| format!("failed to read {path}"))?;
-        return Ok(crate::source_browse::classify_disk_bytes(bytes));
+        return crate::source_browse::read_working_copy_file(&repository.root, path).await;
     }
 
     let commit = resolve_browse_commit(repo, workspace_name, revision).await?;
