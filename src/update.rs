@@ -1450,7 +1450,7 @@ impl Diffui {
         file_index: usize,
         spans: Vec<(usize, usize, Vec<SyntaxSpan>)>,
     ) {
-        let Some((tab, target)) = self.document_target_mut(document_id) else {
+        let Some((_, target)) = self.document_target_mut(document_id) else {
             // The document was replaced; this result highlighted a
             // dead snapshot.
             return;
@@ -1470,12 +1470,13 @@ impl Diffui {
                 }
             }
         }
-        // Repaint (re-shape) the rows now carrying spans; the layout
-        // is untouched, so the height index survives — that's the
-        // whole point of the paint/layout version split. A backgrounded
-        // tab repaints when it's next activated.
-        if applied && self.is_active(tab) {
-            self.document_version = self.document_version.wrapping_add(1);
+        // Re-shape this file's rows, now carrying spans. The text and layout
+        // are untouched, so every other cache survives.
+        if applied {
+            if target.paint_stamps.len() <= file_index {
+                target.paint_stamps.resize(file_index + 1, 0);
+            }
+            target.paint_stamps[file_index] = target.paint_stamps[file_index].wrapping_add(1);
         }
         self.spawn_highlights(document_id);
     }

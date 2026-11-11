@@ -320,11 +320,14 @@ impl Harness {
     }
 
     /// What changes when work lands: a cheap stand-in for "did anything happen".
-    fn fingerprint(&mut self) -> (u64, usize, usize, bool, bool) {
+    fn fingerprint(&mut self) -> (u64, u32, usize, usize, bool, bool) {
         self.read(|ui| {
             let tab = ui.active();
             (
                 ui.document_version,
+                tab.paint_stamps
+                    .iter()
+                    .fold(0u32, |sum, stamp| sum.wrapping_add(*stamp)),
                 tab.session.commits.len(),
                 ui.modes.len(),
                 tab.session.loading_since.is_some() || tab.session.diff_in_flight(),

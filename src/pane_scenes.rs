@@ -155,11 +155,15 @@ fn highlighting_redraws_the_diff_alone() {
         ui.spawn_highlights(document_id);
     });
     let before = renders(&mut h);
+    let version = h.read(|ui| ui.document_version);
     h.wait_until("the highlighting", highlighted);
     h.settle();
     h.frames();
     let delta = renders(&mut h) - before;
     assert!(delta.main > 0, "the diff redrew: {delta:?}");
+    // A merge re-shapes its own file's rows; the document's caches stay.
+    assert_eq!(h.read(|ui| ui.document_version), version);
+    assert!(h.read(|ui| ui.active().paint_stamps.iter().any(|stamp| *stamp > 0)));
     assert_eq!(
         (delta.tab_bar, delta.left, delta.files),
         (0, 0, 0),

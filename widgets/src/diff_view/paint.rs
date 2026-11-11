@@ -462,14 +462,15 @@ struct HighlightGeometry {
     row_height: f32,
 }
 
-/// Shaped code per `(file, hunk, line, wrap width)`: reused across frames while
-/// scrolling, and evicted once it's a screenful or two out of date.
+/// Shaped code per `(file, hunk, line, wrap width, paint stamp)`: reused across
+/// frames while scrolling, and evicted once it's a screenful or two out of date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct CodeKey {
     file_index: u32,
     hunk_index: u32,
     line_index: u32,
     wrap_width_bits: u32,
+    paint_stamp: u32,
 }
 
 const CODE_CACHE_CAP: usize = 1_024;
@@ -505,13 +506,18 @@ impl View<'_> {
         cache: &RefCell<CodeCache>,
     ) -> Rc<[ShapedLine]> {
         cache.borrow_mut().clear();
-        let key = CodeKey {
-            file_index: 0,
-            hunk_index: 0,
-            line_index: 0,
-            wrap_width_bits: 0,
-        };
+        let key = self.code_key(0, 0, 0, 0.0);
         self.code_text(plan, line, geometry, key, cache)
+    }
+
+    fn code_key(&self, file: usize, hunk: usize, line: usize, wrap_width: f32) -> CodeKey {
+        CodeKey {
+            file_index: file as u32,
+            hunk_index: hunk as u32,
+            line_index: line as u32,
+            wrap_width_bits: wrap_width.to_bits(),
+            paint_stamp: self.props.paint_stamps.get(file).copied().unwrap_or(0),
+        }
     }
 
     /// Text in the code font on one row's line box, unwrapped. The row's own code
@@ -1116,12 +1122,7 @@ impl View<'_> {
             &line.content,
             wrap_width,
         );
-        let key = CodeKey {
-            file_index: row.file_index as u32,
-            hunk_index: row.hunk_index as u32,
-            line_index: row.line_index as u32,
-            wrap_width_bits: wrap_width.to_bits(),
-        };
+        let key = self.code_key(row.file_index, row.hunk_index, row.line_index, wrap_width);
         let lines = self.code_text(plan, line, &geometry, key, code);
         plan.ops.push(Op::Code {
             lines,
@@ -1215,12 +1216,7 @@ impl View<'_> {
                 &line.content,
                 wrap_width,
             );
-            let key = CodeKey {
-                file_index: row.file_index as u32,
-                hunk_index: row.hunk_index as u32,
-                line_index: line_index as u32,
-                wrap_width_bits: wrap_width.to_bits(),
-            };
+            let key = self.code_key(row.file_index, row.hunk_index, line_index, wrap_width);
             let lines = self.code_text(plan, line, &geometry, key, code);
             plan.ops.push(Op::Code {
                 lines,

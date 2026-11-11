@@ -473,12 +473,17 @@ pub struct DiffProps {
     /// tab's saved scroll on activation.
     restore_offset: f32,
     restore_token: u64,
-    /// Monotonic version of the diff content's *paint*, bumped by the app on every
-    /// document swap and on background-highlight merges. The per-line caches are
-    /// keyed by `(file, hunk, line)`, which point at *different* text after a reload,
-    /// a working-copy edit, or a tab switch. `revision_key` alone can't catch those:
-    /// it's a constant `"working-copy"` for any `@`.
+    /// Monotonic version of the diff content, bumped by the app on every document
+    /// swap. The per-line caches are keyed by `(file, hunk, line)`, which point at
+    /// *different* text after a reload, a working-copy edit, or a tab switch.
+    /// `revision_key` alone can't catch those: it's a constant `"working-copy"` for
+    /// any `@`.
     content_version: u64,
+    /// Per file, a stamp the app bumps when the file's colours change under the same
+    /// text (highlight spans merging in). Part of the shaped-text key, so a merge
+    /// re-shapes that file's rows and leaves every other cache alone. Missing
+    /// entries read as zero.
+    paint_stamps: Vec<u32>,
     /// Whether long lines wrap into extra visual lines (the default) or clip at the
     /// pane edge, leaving every row exactly one line tall.
     wrap: bool,
@@ -555,6 +560,7 @@ impl DiffProps {
             restore_offset: 0.0,
             restore_token: 0,
             content_version: 0,
+            paint_stamps: Vec::new(),
             wrap: true,
             side_by_side: false,
             layout_version: 0,
@@ -726,6 +732,11 @@ impl DiffProps {
 
     pub fn content_version(mut self, version: u64) -> Self {
         self.content_version = version;
+        self
+    }
+
+    pub fn paint_stamps(mut self, stamps: Vec<u32>) -> Self {
+        self.paint_stamps = stamps;
         self
     }
 

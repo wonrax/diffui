@@ -697,6 +697,13 @@ pub(crate) struct TabState {
     /// were folded in (see `diff_panel::folded_files`).
     pub(crate) folded_files: (String, HashSet<String>),
     pub(crate) selected_file: usize,
+    /// Per file of the shown document, bumped each time highlight spans merge
+    /// into it: the diff view's [`DiffProps::paint_stamps`], so a merge
+    /// re-shapes that file's rows and keeps every other cache. Never reset: a
+    /// new document bumps `document_version`, which drops the caches anyway.
+    ///
+    /// [`DiffProps::paint_stamps`]: diffui_widgets::diff_view::DiffProps::paint_stamps
+    pub(crate) paint_stamps: Vec<u32>,
     /// Bumped whenever the user picks a revision through a path that doesn't go
     /// through the revision list (currently: the palette). The sidebar's
     /// `RevisionList` watches this and scrolls the matching row into view on
@@ -795,6 +802,7 @@ impl TabState {
             collapsed_dirs: HashSet::new(),
             folded_files: (String::new(), HashSet::new()),
             selected_file: 0,
+            paint_stamps: Vec::new(),
             revision_reveal_token: 0,
             candidate_reveal_token: 0,
             pending_revision_reveal: false,

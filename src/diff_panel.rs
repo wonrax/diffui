@@ -899,6 +899,7 @@ fn diff_props(
     }))
     .restore_scroll(tab.diff_scroll_offset, ui.scroll_restore_token)
     .content_version(ui.document_version)
+    .paint_stamps(tab.paint_stamps.clone())
     .layout_version(session.document_id)
     .wrap(ui.diff_wrap)
     .side_by_side(split_in_effect(ui))
