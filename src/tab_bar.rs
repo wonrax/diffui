@@ -2141,7 +2141,8 @@ fn recent_repo_row(
             // say more than its middle.
             Aligned::text(
                 typography::line(
-                    middle_cut(&parent, where_width, text_size::CAPTION, mono),
+                    crate::ellipsis::cut_middle(&parent, where_width, text_size::CAPTION, mono)
+                        .into_owned(),
                     mono,
                     text_size::CAPTION,
                     theme.subtle_text,
@@ -2208,34 +2209,6 @@ fn recent_repo_row(
     )
     .group(group)
     .on_click(Diffui::on_action(Action::OpenRepo(recent.root.clone()), cx))
-}
-
-/// `text` cut out of its middle to fit `width` on one line. GPUI can end a line
-/// with an ellipsis or start one, not put it in between.
-fn middle_cut(text: &str, width: f32, size: f32, font: Font) -> String {
-    if measure::line_width(text, size, font) <= width {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let cut = |keep: usize| -> String {
-        let tail = keep / 2;
-        let head = keep - tail;
-        chars[..head]
-            .iter()
-            .chain(std::iter::once(&'\u{2026}'))
-            .chain(&chars[chars.len() - tail..])
-            .collect()
-    };
-    let (mut fits, mut over) = (0, chars.len());
-    while over - fits > 1 {
-        let keep = (fits + over) / 2;
-        if measure::line_width(&cut(keep), size, font) <= width {
-            fits = keep;
-        } else {
-            over = keep;
-        }
-    }
-    cut(fits)
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ use super::{
     SyntaxKind, media,
 };
 use crate::chip::{self, Chip};
+use crate::ellipsis;
 use crate::geometry::{Point, Rectangle};
 use crate::hunk_actions::{self, FilePlaced, Placed, Run};
 use crate::icons;
@@ -1634,7 +1635,7 @@ impl View<'_> {
         );
         let author_x = x + label.id.chars().count() as f32 * cell + cell;
         let author_end = end - age_width - cell;
-        let author = truncate_end(&label.author, size, style.font, author_end - author_x);
+        let author = ellipsis::cut_end(&label.author, author_end - author_x, size, style.font);
         paint(plan, &author, style.font, author_x, colors(style.author));
     }
 
@@ -1987,19 +1988,20 @@ impl View<'_> {
         };
         let split = file.title.rfind('/').map_or(0, |at| at + 1);
         let (dir, name) = file.title.split_at(split);
-        let name_width = measure::line_width(name, size, bold);
+        let name_width = ellipsis::text_width(name, size, bold);
         let gone = file.status == super::DiffFileStatus::Deleted;
         let name_color = if gone {
             palette.text_muted
         } else {
             palette.text
         };
+        // A path keeps the directories nearest its file.
         let (dir, name) = if name_width >= available {
-            (String::new(), truncate_end(name, size, bold, available))
+            ("".into(), ellipsis::cut_end(name, available, size, bold))
         } else {
             (
-                truncate_start(dir, size, regular, available - name_width),
-                name.to_owned(),
+                ellipsis::cut_start(dir, available - name_width, size, regular),
+                name.into(),
             )
         };
         let dir_width = plan.line(
@@ -2821,50 +2823,6 @@ fn split_hunk_header(header: &str) -> Option<(&str, &str)> {
     let rest = header.strip_prefix("@@")?;
     let end = rest.find("@@")?;
     Some((rest[..end].trim(), rest[end + 2..].trim()))
-}
-
-/// `text` with its start cut to an ellipsis to fit `max_width`: a path keeps the
-/// directories nearest its file.
-fn truncate_start(text: &str, size: f32, font: Font, max_width: f32) -> String {
-    if measure::line_width(text, size, font) <= max_width {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    for start in 1..chars.len() {
-        let candidate: String = std::iter::once('\u{2026}')
-            .chain(chars[start..].iter().copied())
-            .collect();
-        if measure::line_width(&candidate, size, font) <= max_width {
-            return candidate;
-        }
-    }
-    String::new()
-}
-
-/// `text` cut with an ellipsis to fit `max_width`.
-fn truncate_end(text: &str, size: f32, font: Font, max_width: f32) -> String {
-    if measure::line_width(text, size, font) <= max_width {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let cut = |count: usize| -> String {
-        chars[..count]
-            .iter()
-            .copied()
-            .chain(std::iter::once('\u{2026}'))
-            .collect()
-    };
-    // The longest prefix that still fits, found by halving.
-    let (mut low, mut high) = (0, chars.len());
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if measure::line_width(&cut(mid), size, font) <= max_width {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    cut(low)
 }
 
 /// A placed button: fill, border and label.

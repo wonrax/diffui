@@ -216,6 +216,45 @@ pub fn cut_end<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'
     }
 }
 
+/// Plain `content` cut at its start so an ellipsis and it fit `width`, keeping
+/// its end (a path's nearest directories); borrowed back when it fits.
+pub fn cut_start<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    start_cut(
+        content,
+        width,
+        |part| text_width(part, size, font),
+        text_width(ELLIPSIS, size, font),
+    )
+}
+
+fn start_cut<'a>(
+    content: &'a str,
+    width: f32,
+    measure: impl Fn(&str) -> f32,
+    ellipsis: f32,
+) -> Cow<'a, str> {
+    if measure(content) <= width + TOLERANCE {
+        return Cow::Borrowed(content);
+    }
+    let room = width + TOLERANCE - ellipsis;
+    let starts: Vec<usize> = content
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain([content.len()])
+        .collect();
+    // The earliest start, on a char boundary, whose rest fits the room.
+    let (mut low, mut high) = (0, starts.len() - 1);
+    while low < high {
+        let mid = (low + high) / 2;
+        if measure(&content[starts[mid]..]) <= room {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Cow::Owned(format!("{ELLIPSIS}{}", content[starts[low]..].trim_start()))
+}
+
 /// Plain `content` cut in the middle so it and an ellipsis fit `width`, keeping
 /// both its start and its end (a file's extension, a compacted chain's leaf).
 pub fn cut_middle<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
@@ -428,6 +467,18 @@ mod tests {
         // One line is as wide as the folded text, and a narrow room cuts it.
         assert!(line.fits(10_000.0));
         assert!(!line.fits(20.0));
+    }
+
+    #[test]
+    fn a_start_cut_keeps_the_end() {
+        let count = |text: &str| text.chars().count() as f32;
+        assert_eq!(start_cut("src/", 4.0, count, 1.0), "src/");
+        assert_eq!(start_cut("abc/def/ghi/", 6.0, count, 1.0), "…/ghi/");
+        assert_eq!(start_cut("abc/def/ghi/", 7.0, count, 1.0), "…f/ghi/");
+        // No room for anything but the ellipsis.
+        assert_eq!(start_cut("abcdefghij", 0.5, count, 1.0), "…");
+        // Multi-byte chars stay whole.
+        assert_eq!(start_cut("ééééé", 3.0, count, 1.0), "…éé");
     }
 
     #[test]
