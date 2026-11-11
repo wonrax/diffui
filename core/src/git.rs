@@ -10,11 +10,12 @@ use jj_lib::graph::GraphEdge;
 use tokio::process::Command;
 
 use crate::FetchTarget;
-use crate::diff_parse::parse_unified_diff;
+use crate::diff_parse::{DiffStreamParser, parse_unified_diff};
 use crate::graph::assign_lanes;
+use crate::jj::large_diff::{self, DiffLimits, RowBudget};
 use crate::model::{
-    CommitSummary, DiffDocument, ParentBrief, RevisionDetails, RevisionSelection, SignatureInfo,
-    StreamRow,
+    CommitSummary, DiffDocument, DiffFile, DiffHunkView, ParentBrief, RevisionDetails,
+    RevisionSelection, SignatureInfo, StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus};
@@ -31,9 +32,13 @@ pub const GIT_WORKING_COPY_ID: &str = "wc";
 /// the bottom of; the cut-off rows show their parents as stubs.
 pub const DEFAULT_LOG_LIMIT: usize = 10_000;
 
+/// `revision`'s diff, within the jj backend's size caps (see
+/// [`large_diff`]): a file past them keeps its counts but no rows, unless it
+/// is one of the `expand`ed paths.
 pub async fn load_git_diff(
     repository: &Repository,
     revision: &RevisionSelection,
+    expand: &[String],
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let base = match revision {
         RevisionSelection::WorkingCopy => working_copy_base(&repository.root).await?,
@@ -41,9 +46,68 @@ pub async fn load_git_diff(
     };
     let args = git_backend_command(repository, revision, &base);
     let output = run_command(&repository.root, "git", args).await?;
-    let document = parse_unified_diff(&output);
+    let document = parse_capped(&output, DiffLimits::default(), expand);
     let details = load_git_revision_details(repository, revision).await.ok();
     Ok((document, details))
+}
+
+/// One file of `revision`'s diff in full, for a file [`load_git_diff`]
+/// collapsed. `None` when the diff no longer has it.
+pub async fn load_git_file_diff(
+    repository: &Repository,
+    revision: &RevisionSelection,
+    path: &str,
+) -> Result<Option<DiffFile>> {
+    let base = match revision {
+        RevisionSelection::WorkingCopy => working_copy_base(&repository.root).await?,
+        RevisionSelection::Commit(_) => String::new(),
+    };
+    let scoped = Repository {
+        scope: PathBuf::from(format!(":(literal){path}")),
+        ..repository.clone()
+    };
+    let args = git_backend_command(&scoped, revision, &base);
+    let output = run_command(&repository.root, "git", args).await?;
+    Ok(parse_unified_diff(&output)
+        .files
+        .into_iter()
+        .find(|file| file.path == path))
+}
+
+/// [`parse_unified_diff`], collapsing each file past `limits` as it completes
+/// so its rows never pile up.
+fn parse_capped(output: &str, limits: DiffLimits, expand: &[String]) -> DiffDocument {
+    let mut budget = RowBudget::new(limits);
+    let mut files = Vec::new();
+    let mut keep = |mut file: DiffFile| {
+        let changed = file.additions + file.deletions;
+        if changed > 0
+            && !expand.contains(&file.path)
+            && let Err(reason) = budget.admit(changed)
+        {
+            file.hunks = vec![DiffHunkView {
+                header: large_diff::collapsed_header(reason, changed),
+                lines: Vec::new(),
+            }];
+            file.collapsed = Some(reason);
+        }
+        files.push(file);
+    };
+    let mut parser = DiffStreamParser::default();
+    for line in output.lines() {
+        if let Some(file) = parser.push_line(line) {
+            keep(file);
+        }
+    }
+    if let Some(file) = parser.finish() {
+        keep(file);
+    }
+    DiffDocument {
+        total_additions: files.iter().map(|file| file.additions).sum(),
+        total_deletions: files.iter().map(|file| file.deletions).sum(),
+        files,
+        range: None,
+    }
 }
 
 pub async fn load_git_commits(

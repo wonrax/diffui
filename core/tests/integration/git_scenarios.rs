@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use diffui_core::git::{
-    list_git_source_tree, load_git_commits, load_git_diff, load_git_repository_snapshot,
+    list_git_source_tree, load_git_commits, load_git_diff, load_git_file_diff,
+    load_git_repository_snapshot,
 };
-use diffui_core::{DiffFileStatus, DiffLineKind, Repository, RevisionSelection, Vcs};
+use diffui_core::{DiffCollapse, DiffFileStatus, DiffLineKind, Repository, RevisionSelection, Vcs};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -166,7 +167,7 @@ fn worktree_heads_are_labeled_in_the_shared_graph() {
     assert_eq!(rows[0].summary.parent_ids, vec![base.clone()]);
     let scoped = diffui_core::prepare_repository(&linked.join("file.txt")).unwrap();
     assert_eq!(scoped.scope, PathBuf::from("file.txt"));
-    let (diff, _) = block_on(load_git_diff(&scoped, &RevisionSelection::WorkingCopy)).unwrap();
+    let (diff, _) = block_on(load_git_diff(&scoped, &RevisionSelection::WorkingCopy, &[])).unwrap();
     assert!(
         diff.files.is_empty(),
         "main's dirty files must not leak into the linked checkout"
@@ -390,6 +391,7 @@ fn latin1_content_still_diffs() {
     let (document, _) = block_on(load_git_diff(
         &repository(&root),
         &RevisionSelection::WorkingCopy,
+        &[],
     ))
     .expect("diff a latin-1 file");
 
@@ -427,8 +429,12 @@ fn non_utf8_filename_does_not_take_the_listing_down() {
     std::fs::write(root.join(name), b"two\n").expect("write scratch file");
 
     let repository = repository(&root);
-    let (document, _) = block_on(load_git_diff(&repository, &RevisionSelection::WorkingCopy))
-        .expect("diff a latin-1 filename");
+    let (document, _) = block_on(load_git_diff(
+        &repository,
+        &RevisionSelection::WorkingCopy,
+        &[],
+    ))
+    .expect("diff a latin-1 filename");
     assert_eq!(document.files.len(), 1);
     assert!(
         document.files[0].path.starts_with("caf") && document.files[0].path.ends_with(".txt"),
@@ -468,6 +474,7 @@ fn hostile_diff_config_does_not_reach_the_parser() {
     let (document, _) = block_on(load_git_diff(
         &repository(&root),
         &RevisionSelection::WorkingCopy,
+        &[],
     ))
     .expect("diff under a hostile config");
 
@@ -491,6 +498,7 @@ fn hostile_diff_config_does_not_reach_the_parser() {
     let (document, _) = block_on(load_git_diff(
         &repository(&root),
         &RevisionSelection::Commit(head(&root)),
+        &[],
     ))
     .expect("show a mode-only commit under a hostile config");
 
@@ -532,6 +540,7 @@ fn merge_commit_diffs_against_its_first_parent() {
     let (document, _) = block_on(load_git_diff(
         &repository(&root),
         &RevisionSelection::Commit(head(&root)),
+        &[],
     ))
     .expect("diff a merge commit");
 
@@ -568,12 +577,77 @@ fn binary_file_carries_the_binary_hunk() {
     let (document, _) = block_on(load_git_diff(
         &repository(&root),
         &RevisionSelection::WorkingCopy,
+        &[],
     ))
     .expect("diff a binary file");
 
     assert_eq!(document.files.len(), 1);
     assert_eq!(document.files[0].hunks.len(), 1);
     assert_eq!(document.files[0].hunks[0].header, "binary files differ");
+}
+
+/// A file past the jj path's row cap comes back collapsed with its counts,
+/// stays whole when it's one the user expanded, and expands on its own.
+#[test]
+fn a_large_file_collapses_and_expands_in_full() {
+    if !git_present() {
+        eprintln!("skipping: git is not on PATH");
+        return;
+    }
+    let root = scratch_repo("large-file");
+    write(&root, "small.txt", b"one\n");
+    commit(&root, "add a small file");
+    let big: String = (0..4_000).map(|n| format!("line {n}\n")).collect();
+    write(&root, "big.txt", big.as_bytes());
+    git(&root, &["add", "big.txt"]);
+    write(&root, "small.txt", b"two\n");
+    let repository = repository(&root);
+
+    let (document, _) = block_on(load_git_diff(
+        &repository,
+        &RevisionSelection::WorkingCopy,
+        &[],
+    ))
+    .expect("diff a large file");
+    let file = |document: &diffui_core::DiffDocument, path: &str| {
+        document
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path} is in the diff"))
+    };
+    let big_file = file(&document, "big.txt");
+    assert_eq!(big_file.collapsed, Some(DiffCollapse::LargeFile));
+    assert_eq!(big_file.additions, 4_000);
+    assert!(big_file.hunks.iter().all(|hunk| hunk.lines.is_empty()));
+    assert!(file(&document, "small.txt").collapsed.is_none());
+    assert_eq!(document.total_additions, 4_001);
+
+    let (document, _) = block_on(load_git_diff(
+        &repository,
+        &RevisionSelection::WorkingCopy,
+        &["big.txt".to_owned()],
+    ))
+    .expect("diff with the file expanded");
+    assert!(file(&document, "big.txt").collapsed.is_none());
+
+    let expanded = block_on(load_git_file_diff(
+        &repository,
+        &RevisionSelection::WorkingCopy,
+        "big.txt",
+    ))
+    .expect("expand the file")
+    .expect("the file is in the diff");
+    assert!(expanded.collapsed.is_none());
+    assert_eq!(
+        expanded
+            .hunks
+            .iter()
+            .map(|hunk| hunk.lines.len())
+            .sum::<usize>(),
+        4_000
+    );
 }
 
 /// A repository with no commits: `git log HEAD` and `git diff HEAD` both exit
@@ -599,8 +673,12 @@ fn an_empty_repository_loads() {
     assert!(rows[0].summary.is_working_copy);
     assert!(rows[0].summary.parent_ids.is_empty(), "@ is a root here");
 
-    let (document, details) = block_on(load_git_diff(&repository, &RevisionSelection::WorkingCopy))
-        .expect("diff the working copy against the empty tree");
+    let (document, details) = block_on(load_git_diff(
+        &repository,
+        &RevisionSelection::WorkingCopy,
+        &[],
+    ))
+    .expect("diff the working copy against the empty tree");
     assert!(details.is_none());
     assert_eq!(document.files.len(), 1);
     assert_eq!(document.files[0].path, "first.txt");

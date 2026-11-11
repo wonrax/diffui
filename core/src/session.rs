@@ -484,10 +484,7 @@ impl Session {
             .files
             .iter()
             .any(|file| file.path == path && file.collapsed.is_some());
-        if !self.capabilities.compare
-            || !collapsed
-            || self.expand_jobs.iter().any(|(_, pending)| pending == path)
-        {
+        if !collapsed || self.expand_jobs.iter().any(|(_, pending)| pending == path) {
             return Vec::new();
         }
         let job = self.next_job();

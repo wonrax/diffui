@@ -121,17 +121,35 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
                 error: RepoError::Unsupported,
             }]
         }
-        Command::LoadDiff { job, revision, .. } => {
-            match crate::git::load_git_diff(repository, &revision).await {
-                Ok((document, details)) => vec![Payload::DiffLoaded {
-                    job,
-                    revision,
-                    document,
-                    details,
-                }],
-                Err(error) => failed(job, error),
-            }
+        Command::LoadDiff {
+            job,
+            revision,
+            expand,
+            ..
+        } => match crate::git::load_git_diff(repository, &revision, &expand).await {
+            Ok((document, details)) => vec![Payload::DiffLoaded {
+                job,
+                revision,
+                document,
+                details,
+            }],
+            Err(error) => failed(job, error),
+        },
+        Command::ExpandFile { job, base, .. } if base.is_compare() => {
+            vec![Payload::Failed {
+                job,
+                error: RepoError::Unsupported,
+            }]
         }
+        Command::ExpandFile {
+            job,
+            revision,
+            path,
+            ..
+        } => match crate::git::load_git_file_diff(repository, &revision, &path).await {
+            Ok(file) => vec![Payload::FileExpanded { job, path, file }],
+            Err(error) => failed(job, error),
+        },
         Command::Snapshot { job, origin } => {
             match crate::git::load_git_repository_snapshot(&repository.root).await {
                 Ok(snapshot) => vec![Payload::SnapshotDone {
@@ -209,7 +227,6 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         | Command::PrepareMergeTool { job, .. }
         | Command::ConflictText { job, .. }
         | Command::History { job, .. }
-        | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }
         | Command::ResolveDiff { job, .. }
         | Command::RunCli { job, .. } => vec![Payload::Failed {
