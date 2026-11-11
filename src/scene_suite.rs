@@ -414,6 +414,29 @@ fn jj(repo: &Path, args: &[&str]) {
     assert!(status.success(), "jj {args:?}");
 }
 
+/// The Refresh scenes show what they say: edits and staleness as the
+/// session has them.
+fn disk_shows(c: &mut Ctx, edits: bool, stale: bool) {
+    let disk = c.h.read(|ui| ui.active().session.disk().clone());
+    assert_eq!(
+        (disk.edits, disk.stale.is_some()),
+        (edits, stale),
+        "{disk:?}"
+    );
+}
+
+/// A new file on disk that `@` doesn't hold until something snapshots it.
+fn edit_on_disk(repo: &Path) {
+    std::fs::write(repo.join("NOTES.md"), "Draft notes\n").unwrap();
+}
+
+/// `@` moved to another tree without updating the files on disk, as another
+/// workspace or a `--ignore-working-copy` command leaves it: the checkout is
+/// stale.
+fn stale_checkout(repo: &Path) {
+    jj(repo, &["--ignore-working-copy", "new", "@-"]);
+}
+
 /// Drops jj from the copy, leaving the colocated git repository. `.jj` holds the
 /// manifest, which steps still read, so that moves aside first.
 fn plain_git(repo: &Path) {
@@ -561,6 +584,20 @@ fn all() -> Vec<Scene> {
     }).raw());
     t.add(s("toolbar-source-view", "Toolbar in the Source view: view switcher plus the browsed revision's id and description instead of the repo actions.", "Press the Source segment of the view switcher.", |c| { c.cmd("view.source"); }));
     t.add(s("toolbar-plain-git", "A plain git repository: no jj-only actions (no Undo, no Push), revset placeholder and git graph.", "Open a repository that has .git and no .jj.", |_c| {}).prepare(plain_git));
+    t.add(s("toolbar-refresh-edits", "Manual refresh with an edit on disk: an accent dot on Refresh's glyph; the diff of @ doesn't show the edit yet.", "Set refresh = \"manual\", edit a file, focus the window.", |c| disk_shows(c, true, false)).config("refresh = \"manual\"\n").prepare(edit_on_disk));
+    t.add(s("toolbar-refresh-stale", "Manual refresh on a stale checkout: Refresh's glyph in the warning ink, the stale toast once.", "Set refresh = \"manual\", move @ with --ignore-working-copy, open the repository.", |c| disk_shows(c, false, true)).config("refresh = \"manual\"\n").prepare(stale_checkout));
+    t.add(
+        s(
+            "toolbar-refresh-stale-dark",
+            "toolbar-refresh-stale in dark.",
+            "As toolbar-refresh-stale, theme Dark.",
+            |c| disk_shows(c, false, true),
+        )
+        .config("refresh = \"manual\"\n")
+        .prepare(stale_checkout)
+        .dark(),
+    );
+    t.add(s("toolbar-refresh-stale-edits", "Manual refresh on a stale checkout with an edit on disk: the warning glyph and the accent dot together.", "As toolbar-refresh-stale, with a file edited too.", |c| disk_shows(c, true, true)).config("refresh = \"manual\"\n").prepare(|repo| { stale_checkout(repo); edit_on_disk(repo); }));
     t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |_c| {}).cold());
 
     t.group("Revision list");

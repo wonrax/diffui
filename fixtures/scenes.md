@@ -131,6 +131,30 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: A plain git repository: no jj-only actions (no Undo, no Push), revset placeholder and git graph.
 - Steps: Open a repository that has .git and no .jj.
 
+### `toolbar-refresh-edits`
+
+- Window: 1440x900, light
+- State: Manual refresh with an edit on disk: an accent dot on Refresh's glyph; the diff of @ doesn't show the edit yet.
+- Steps: Set refresh = "manual", edit a file, focus the window.
+
+### `toolbar-refresh-stale`
+
+- Window: 1440x900, light
+- State: Manual refresh on a stale checkout: Refresh's glyph in the warning ink, the stale toast once.
+- Steps: Set refresh = "manual", move @ with --ignore-working-copy, open the repository.
+
+### `toolbar-refresh-stale-dark`
+
+- Window: 1440x900, dark
+- State: toolbar-refresh-stale in dark.
+- Steps: As toolbar-refresh-stale, theme Dark.
+
+### `toolbar-refresh-stale-edits`
+
+- Window: 1440x900, light
+- State: Manual refresh on a stale checkout with an edit on disk: the warning glyph and the accent dot together.
+- Steps: As toolbar-refresh-stale, with a file edited too.
+
 ### `load-cold`
 
 - Window: 1440x900, light

@@ -49,8 +49,8 @@ const GROUP_GAP: f32 = theme::space::XXS;
 
 /// The push target chip: between its glyph, name and count, and before it.
 const PUSH_CHIP_GAP: f32 = 4.0;
-/// Between Push's glyph and its label, as in every labelled button.
-const PUSH_ICON_GAP: f32 = 6.0;
+/// Between a glyph and its label, as in every labelled button.
+const ICON_GAP: f32 = 6.0;
 /// The widest a bookmark name in the push chip gets before it ellipsises.
 const PUSH_TARGET_MAX_WIDTH: f32 = 200.0;
 
@@ -152,14 +152,7 @@ pub(crate) fn build_toolbar(
         actions = actions.child(browsed_revision_label(ui, look, is_jj));
     } else {
         actions = actions
-            .child(toolbar_button(
-                "toolbar-refresh",
-                icons::REFRESH,
-                "Refresh",
-                Action::Refresh,
-                look,
-                cx,
-            ))
+            .child(refresh_button(ui, look, cx))
             .child(fetch_split_button(look, window, cx));
         // Plain `jj git push` (tracked bookmarks that moved), behind a
         // confirmation listing what goes out.
@@ -385,6 +378,73 @@ fn toolbar_button(
         .on_click(Diffui::on_action(action, cx))
 }
 
+/// The edits dot on Refresh's glyph.
+const EDITS_DOT: f32 = 6.0;
+
+/// Refresh, flagging what it would bring in from the disk (jj only): a dot
+/// on the glyph for edits `@` doesn't hold yet, the glyph in the warning ink
+/// for a stale checkout. Clean, it is a plain toolbar button.
+fn refresh_button(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, font, .. } = look;
+    let disk = ui.active().session.disk();
+    let stale = disk.stale.as_deref();
+    if !disk.edits && stale.is_none() {
+        return toolbar_button(
+            "toolbar-refresh",
+            icons::REFRESH,
+            "Refresh",
+            Action::Refresh,
+            look,
+            cx,
+        )
+        .into_any_element();
+    }
+    let tip = match stale {
+        // Refresh would run into the same wall; jj's message names the way out.
+        Some(message) if disk.stuck => message.to_owned(),
+        Some(_) if disk.edits => {
+            "The working copy is stale and the disk has edits. Refresh snapshots them and updates it"
+                .to_owned()
+        }
+        Some(_) => "The working copy is stale. Refresh updates it".to_owned(),
+        None => "Edits on disk aren't in @ yet. Refresh to snapshot them".to_owned(),
+    };
+    let ink = match stale {
+        Some(_) => ui::Tone::Warn.ink(theme),
+        None => theme.muted_text,
+    };
+    let glyph = div()
+        .relative()
+        .flex_none()
+        .child(icons::icon(icons::REFRESH, CONTROL.icon_size(), ink))
+        .when(disk.edits, |glyph| {
+            glyph.child(
+                div()
+                    .absolute()
+                    .top(px(-1.0))
+                    .right(px(-2.0))
+                    .size(px(EDITS_DOT))
+                    .rounded(px(EDITS_DOT / 2.0))
+                    .bg(theme.accent),
+            )
+        });
+    look.bare_button("toolbar-refresh")
+        .step(CONTROL)
+        .flex_none()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(ICON_GAP))
+                .child(glyph)
+                .child(ui::label(None, "Refresh", CONTROL, font)),
+        )
+        .tip(tip)
+        .on_click(Diffui::on_action(Action::Refresh, cx))
+        .into_any_element()
+}
+
 /// A toolbar toggle: an icon-only button with a persistent accent tint while
 /// active so the on state reads at a glance. The label lives in a hover tooltip
 /// instead of beside the glyph: these are view options, not actions, so they stay
@@ -536,7 +596,7 @@ fn push_button(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
             icons::icon(icons::UPLOAD, ui::ICON_SIZE, theme.muted_text),
             size,
         ),
-        Aligned::gap(PUSH_ICON_GAP),
+        Aligned::gap(ICON_GAP),
         Aligned::text(typography::line("Push", font, size, theme.text), font, size),
     ];
     let target = match candidates.as_slice() {
