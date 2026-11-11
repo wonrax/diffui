@@ -915,7 +915,8 @@ pub(crate) mod scenes {
 
     /// What `jj log` says of `revset` in `repo`.
     fn jj(repo: &std::path::Path, revset: &str, template: &str) -> String {
-        let program = std::env::var("JJ").unwrap_or_else(|_| "/tmp/diffui-fix/uikit/jj".into());
+        // `$JJ`, as the dev shell sets for the fixture, else `jj` on PATH.
+        let program = std::env::var_os("JJ").unwrap_or_else(|| "jj".into());
         let output = std::process::Command::new(program)
             .args(["--ignore-working-copy", "--no-pager", "log", "--no-graph"])
             .args(["-r", revset, "-T", template])
