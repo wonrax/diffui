@@ -319,11 +319,7 @@ pub(crate) mod reason {
 /// Whether the row a command names is still in the loaded graph. A menu built
 /// before a reload can otherwise act on a commit the reload hid.
 fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
-    let commits = &ui.active().session.commits;
-    match selection {
-        RevisionSelection::WorkingCopy => commits.working_copy().is_some(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex).is_some(),
-    }
+    ui.active().session.commits.find(selection).is_some()
 }
 
 /// A mutation is offered when the backend supports one (jj only) and every
@@ -610,10 +606,7 @@ fn result_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowVi
                 .revision()
                 .cloned()
                 .unwrap_or_else(|| ui.active().session.selected_revision.clone());
-            match selection {
-                RevisionSelection::WorkingCopy => commits.working_copy(),
-                RevisionSelection::Commit(hex) => commits.find_by_commit_id(&hex),
-            }
+            commits.find(&selection)
         }
     }
 }

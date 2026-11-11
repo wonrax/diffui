@@ -266,7 +266,7 @@ impl Diffui {
                 self.enter_history_view(cx)
             }
             HistoryAction::ShowEvolog(revision) => {
-                let label = self.revision_short_label(&revision);
+                let label = self.active().revision_short_label(&revision);
                 let history = &mut self.active_mut().history;
                 history.kind = HistoryKind::Evolog {
                     revision: revision.clone(),

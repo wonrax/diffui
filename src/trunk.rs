@@ -34,11 +34,7 @@ pub(crate) fn blocker_for(ui: &Diffui, targets: &[RevisionSelection]) -> Option<
         return Some("trunk() doesn't resolve to a bookmark");
     }
     for target in targets {
-        let row = match target {
-            RevisionSelection::WorkingCopy => session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex),
-        };
-        let Some(row) = row else {
+        let Some(row) = session.commits.find(target) else {
             return Some("Revision isn't in the log");
         };
         if row.is_immutable() {
@@ -112,15 +108,15 @@ impl Diffui {
                 Vec::new()
             }
         };
-        if conflicts.is_empty() || self.active_tab_id() != Some(tab) {
-            return self.start_mutation_op(op);
+        if conflicts.is_empty() || !self.is_active(tab) {
+            return self.start_mutation_on(tab, op, false);
         }
         let MutationOp::Rebase { sources, .. } = &op else {
             return;
         };
         let title = if let [source] = sources.as_slice() {
             Prose::from("Rebase ")
-                .then(self.revision_prose(source))
+                .then(self.active().revision_prose(source))
                 .text(" onto trunk?")
         } else {
             Prose::from(format!(
@@ -264,6 +260,30 @@ mod tests {
             assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
             assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
             assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
+        });
+    }
+
+    /// A forecast that lands after a tab switch starts its rebase on the tab
+    /// that asked for it, not on the one now on screen.
+    #[test]
+    fn a_late_forecast_rebases_its_own_tab() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = ui(Some("t"), cx);
+            let asked = ui.active_tab_id().unwrap();
+            let other = push_tab(&mut ui, "/tmp/other");
+            ui.tab_mut(other).unwrap().session.capabilities.mutate = true;
+            let job = JobId::next();
+            let op = rebase_op(
+                vec![RevisionSelection::Commit("f".repeat(8))],
+                "t".repeat(8),
+            );
+            ui.tab_mut(asked).unwrap().jobs.trunk_rebase = Some((job, op));
+            ui.active = 1;
+
+            ui.finish_trunk_preview(asked, job, Err("no forecast".to_owned()));
+
+            assert!(ui.tab(asked).unwrap().jobs.mutation.is_some());
+            assert!(ui.tab(other).unwrap().jobs.mutation.is_none());
         });
     }
 }

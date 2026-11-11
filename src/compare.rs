@@ -111,12 +111,7 @@ pub(crate) fn comparing(ui: &Diffui) -> bool {
 
 /// `k1x2m3n4 · first line of the description`, or `@` for the working copy.
 fn revision_label(ui: &Diffui, revision: &RevisionSelection) -> (String, String) {
-    let commits = &ui.active().session.commits;
-    let row = match revision {
-        RevisionSelection::WorkingCopy => commits.working_copy(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
-    };
-    let Some(row) = row else {
+    let Some(row) = ui.active().session.commits.find(revision) else {
         let id = match revision {
             RevisionSelection::WorkingCopy => "@".to_owned(),
             RevisionSelection::Commit(hex) => hex.chars().take(8).collect(),

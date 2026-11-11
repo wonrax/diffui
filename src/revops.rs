@@ -12,7 +12,7 @@ use crate::Cx;
 use std::time::Duration;
 
 use crate::modes::{ModeKind, TabMode};
-use crate::{Diffui, PreviewRequest};
+use crate::{Diffui, PreviewRequest, TabState};
 use crate::{DraftPreviewState, DraftUi, mutations};
 use diffui_core::{DraftKind, PlacementKind, RevisionSelection};
 
@@ -234,7 +234,7 @@ pub(crate) fn description_save_op(
 /// Whether a mutation consumes the sidebar's marked rows: a batch op run on
 /// more than one revision, or on exactly the marked set (a one-row batch
 /// from a `selection.*` command).
-pub(crate) fn consumes_marks(ui: &Diffui, op: &mutations::MutationOp) -> bool {
+pub(crate) fn consumes_marks(tab: &TabState, op: &mutations::MutationOp) -> bool {
     use mutations::MutationOp;
     let targets = match op {
         MutationOp::Abandon { targets }
@@ -247,7 +247,7 @@ pub(crate) fn consumes_marks(ui: &Diffui, op: &mutations::MutationOp) -> bool {
         _ => return false,
     };
     targets.len() > 1 || {
-        let marked = marked_selections(ui);
+        let marked = marked_selections(tab);
         !marked.is_empty() && marked == *targets
     }
 }
@@ -260,11 +260,10 @@ use crate::commands::{Availability, CommandArg, can_mutate, require, target_revi
 /// The sidebar's marked rows still in the loaded graph, in mark order, with
 /// the working-copy row addressed as [`RevisionSelection::WorkingCopy`] so a
 /// mutation never acts on a pre-snapshot `@`.
-pub(crate) fn marked_selections(ui: &Diffui) -> Vec<RevisionSelection> {
-    let commits = &ui.active().session.commits;
+pub(crate) fn marked_selections(tab: &TabState) -> Vec<RevisionSelection> {
+    let commits = &tab.session.commits;
     let working_copy = commits.working_copy().map(|row| row.commit_id().to_owned());
-    ui.active()
-        .revision_multi_selection
+    tab.revision_multi_selection
         .iter()
         .filter(|id| commits.find_by_commit_id(id).is_some())
         .map(|id| diffui_core::canonical_selection(id, working_copy.as_deref()))
@@ -276,7 +275,7 @@ pub(crate) fn marked_selections(ui: &Diffui) -> Vec<RevisionSelection> {
 pub(crate) fn batch(ui: &Diffui, arg: &CommandArg) -> Vec<RevisionSelection> {
     match arg {
         CommandArg::Revisions(targets) => targets.clone(),
-        _ => marked_selections(ui),
+        _ => marked_selections(ui.active()),
     }
 }
 
@@ -294,7 +293,7 @@ pub(crate) fn drag_sources(ui: &Diffui, index: usize) -> Vec<RevisionSelection> 
     let Some(source_id) = ui.draft_source_for(&source).map(|source| source.commit_id) else {
         return vec![source];
     };
-    let marked = marked_selections(ui);
+    let marked = marked_selections(ui.active());
     if marked.len() > 1
         && marked.iter().any(|selection| {
             ui.draft_source_for(selection)
@@ -334,11 +333,7 @@ pub(crate) fn batch_draft(ui: &Diffui, arg: &CommandArg, kind: DraftKind) -> Opt
 
 /// The loaded row a command's target names.
 fn target_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowView<'a>> {
-    let commits = &ui.active().session.commits;
-    match target_revision(ui, arg)? {
-        RevisionSelection::WorkingCopy => commits.working_copy(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(&hex),
-    }
+    ui.active().session.commits.find(&target_revision(ui, arg)?)
 }
 
 /// "Commit…" is offered for the working copy only — `jj commit` has no `-r`.
@@ -640,7 +635,7 @@ mod tests {
             ui.active_mut().revision_multi_selection =
                 vec!["w".repeat(8), "gone".to_owned(), "b".repeat(8)];
             assert_eq!(
-                marked_selections(&ui),
+                marked_selections(ui.active()),
                 vec![
                     RevisionSelection::WorkingCopy,
                     RevisionSelection::Commit("b".repeat(8)),

@@ -17,18 +17,17 @@ use diffui_core::cli::highlight::{self, Mark};
 use diffui_core::plan::{self, Phrase};
 use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
-use crate::Diffui;
 use crate::ellipsis;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
+use crate::{Diffui, TabState};
 
 /// Size of the line's glyphs.
 const GLYPH: f32 = 12.0;
 
 /// The jj command `op` is equivalent to, as a user would type it, named
-/// from the active tab's graph. `None` outside a jj repository.
-pub(crate) fn op_command(ui: &Diffui, op: &MutationOp, allow_immutable: bool) -> Option<String> {
-    let tab = ui.active();
+/// from `tab`'s graph. `None` outside a jj repository.
+pub(crate) fn op_command(tab: &TabState, op: &MutationOp, allow_immutable: bool) -> Option<String> {
     if tab.repository.as_ref().map(|repository| repository.vcs) != Some(Vcs::Jj) {
         return None;
     }
@@ -51,7 +50,7 @@ pub(crate) fn draft_command(
     op: Option<&MutationOp>,
 ) -> Option<String> {
     match op {
-        Some(op) => op_command(ui, op, false),
+        Some(op) => op_command(ui.active(), op, false),
         None => ui
             .active()
             .repository

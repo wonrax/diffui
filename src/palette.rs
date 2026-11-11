@@ -1962,11 +1962,7 @@ fn command_icon(id: CommandId) -> &'static str {
 fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId, indices: &[u32]) -> Aligned {
     let selection = &ui.active().session.selected_revision;
     let commits = &ui.active().session.commits;
-    let row = match selection {
-        RevisionSelection::WorkingCopy => commits.working_copy(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
-    };
-    let (target, summary) = match row {
+    let (target, summary) = match commits.find(selection) {
         Some(row) => {
             let prefix = revision_prefix(Some(&row), &ChangeId(row.change_id().to_owned()));
             let summary = if row.has_description() {
@@ -1976,7 +1972,7 @@ fn verb_label(ui: &Diffui, theme: ThemeSpec, id: CommandId, indices: &[u32]) -> 
             };
             (prefix, summary)
         }
-        None => (ui.revision_short_label(selection), String::new()),
+        None => (ui.active().revision_short_label(selection), String::new()),
     };
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;

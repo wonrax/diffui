@@ -609,11 +609,7 @@ fn selection_of(tab: &TabState) -> DiffSelection {
 
 /// Short display id of the selected revision ("k1x2…" / "@").
 fn revision_label(tab: &TabState, revision: &RevisionSelection) -> String {
-    let row = match revision {
-        RevisionSelection::WorkingCopy => tab.session.commits.working_copy(),
-        RevisionSelection::Commit(hex) => tab.session.commits.find_by_commit_id(hex),
-    };
-    match row {
+    match tab.session.commits.find(revision) {
         Some(row) => row.change_id().chars().take(8).collect(),
         None => match revision {
             RevisionSelection::WorkingCopy => "@".to_owned(),

@@ -669,11 +669,11 @@ impl Diffui {
         if loaded || asked || tab.session.diff_in_flight() {
             return;
         }
-        let row = match &revision {
-            RevisionSelection::WorkingCopy => tab.session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => tab.session.commits.find_by_commit_id(hex),
-        };
-        let conflicted = row.is_some_and(|row| row.has_conflict())
+        let conflicted = tab
+            .session
+            .commits
+            .find(&revision)
+            .is_some_and(|row| row.has_conflict())
             || tab
                 .session
                 .document

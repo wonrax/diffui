@@ -694,12 +694,8 @@ fn separator(theme: ThemeSpec) -> impl IntoElement {
 fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl IntoElement {
     let mono = ui.config.mono_font;
     let revision = crate::source_panel::browsed_revision(&ui.active().source);
-    let (commit, working_copy) = match &revision {
-        RevisionSelection::WorkingCopy => (ui.active().session.commits.working_copy(), true),
-        RevisionSelection::Commit(hex) => {
-            (ui.active().session.commits.find_by_commit_id(hex), false)
-        }
-    };
+    let commit = ui.active().session.commits.find(&revision);
+    let working_copy = revision == RevisionSelection::WorkingCopy;
 
     // The chip, the mono id and the sans description share one baseline.
     let mut label: Vec<Aligned> = Vec::new();

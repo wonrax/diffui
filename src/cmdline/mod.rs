@@ -1085,7 +1085,9 @@ impl Diffui {
                 ..
             }
         );
-        self.start_mutation(op, allow_backwards)
+        if let Some(tab) = self.active_tab_id() {
+            self.start_mutation_on(tab, op, allow_backwards);
+        }
     }
 
     /// Land a typed rebase / squash / placed new or duplicate / parallelize

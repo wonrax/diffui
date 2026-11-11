@@ -98,7 +98,7 @@ impl Diffui {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
-            return self.batch_menu_tree(crate::revops::marked_selections(self));
+            return self.batch_menu_tree(crate::revops::marked_selections(self.active()));
         }
 
         let on = || CommandArg::Revision(selection.clone());
@@ -160,13 +160,7 @@ impl Diffui {
 
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
-            let row = match selection {
-                RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => {
-                    self.active().session.commits.find_by_commit_id(hex)
-                }
-            };
-            row.map(|row| {
+            self.active().session.commits.find(selection).map(|row| {
                 (
                     row.change_id().to_owned(),
                     row.commit_id().to_owned(),
@@ -457,21 +451,30 @@ impl Diffui {
         }
     }
 
-    /// Wrap `op` in an activity and send it to the repository actor. Every
-    /// mutation entry point — context menu, target-mode confirm, drag & drop —
-    /// funnels through here so labels and guards can't drift apart.
+    /// [`Self::start_mutation_on`] the active tab: what a user's gesture
+    /// starts.
     pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) {
-        self.start_mutation(op, false)
+        if let Some(tab) = self.active_tab_id() {
+            self.start_mutation_on(tab, op, false);
+        }
     }
 
-    /// [`Self::start_mutation_op`], where `allow_backwards` is a typed
-    /// `--allow-backwards`: a bookmark move then runs without asking first.
-    pub(crate) fn start_mutation(&mut self, op: mutations::MutationOp, allow_backwards: bool) {
+    /// Wrap `op` in an activity and send it to `tab_id`'s repository actor.
+    /// Every mutation entry point — context menu, target-mode confirm, drag &
+    /// drop — funnels through here so labels and guards can't drift apart.
+    /// `allow_backwards` is a typed `--allow-backwards`: a bookmark move then
+    /// runs without asking first.
+    pub(crate) fn start_mutation_on(
+        &mut self,
+        tab_id: TabId,
+        op: mutations::MutationOp,
+        allow_backwards: bool,
+    ) {
         use mutations::MutationOp;
-        let Some(tab_id) = self.active_tab_id() else {
+        let Some(tab) = self.tab(tab_id) else {
             return;
         };
-        if !self.active().session.capabilities.mutate {
+        if !tab.session.capabilities.mutate {
             return;
         }
         // Surface the mutation as an activity (push captures its remote output).
@@ -568,8 +571,10 @@ impl Diffui {
         );
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
-        if crate::revops::consumes_marks(self, &op) {
-            self.active_mut().revision_multi_selection.clear();
+        if crate::revops::consumes_marks(tab, &op)
+            && let Some(tab) = self.tab_mut(tab_id)
+        {
+            tab.revision_multi_selection.clear();
         }
         let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
         let pending = PendingMutation {
@@ -616,7 +621,7 @@ impl Diffui {
         let (title, label, body) = match targets.as_slice() {
             [target] => (
                 Prose::from("Abandon ")
-                    .then(self.revision_prose(target))
+                    .then(self.active().revision_prose(target))
                     .text("?"),
                 "Abandon".to_owned(),
                 "Its changes are dropped and its descendants move onto its parent. Undo \

@@ -31,11 +31,10 @@ pub(crate) fn selection_outside_view(ui: &Diffui) -> bool {
     if tab.repository.is_none() || !matches!(tab.session.status, LoadStatus::Loaded) {
         return false;
     }
-    let commits = &tab.session.commits;
-    match &tab.session.selected_revision {
-        RevisionSelection::WorkingCopy => commits.working_copy().is_none(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex).is_none(),
-    }
+    tab.session
+        .commits
+        .find(&tab.session.selected_revision)
+        .is_none()
 }
 
 /// The revision list's stand-in while it has no rows: a load in flight, or a
@@ -215,7 +214,7 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
     }
     let label = match &ui.active().session.selected_revision {
         RevisionSelection::WorkingCopy => Prose::from("The working copy ").rev("@"),
-        selection => ui.revision_prose(selection),
+        selection => ui.active().revision_prose(selection),
     };
     let sentence = label.text(" isn't in the current revset.").view(
         ui.config.ui_font,

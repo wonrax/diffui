@@ -561,6 +561,14 @@ impl CommitStore {
         self.working_copy_row.map(|index| self.row(index))
     }
 
+    /// The row `selection` names, if it's in the loaded graph.
+    pub fn find(&self, selection: &RevisionSelection) -> Option<RowView<'_>> {
+        match selection {
+            RevisionSelection::WorkingCopy => self.working_copy(),
+            RevisionSelection::Commit(hex) => self.find_by_commit_id(hex),
+        }
+    }
+
     /// Row index of the working-copy (`@`) commit, if it's in the loaded graph.
     /// Used to refresh @'s "empty" chip from a working-copy snapshot without
     /// re-walking the graph.

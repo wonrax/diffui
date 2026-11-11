@@ -18,7 +18,7 @@ use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec};
-use crate::{ConfirmDialog, Diffui, PendingMutation, activity};
+use crate::{ConfirmDialog, Diffui, PendingMutation, TabState, activity};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
 
@@ -387,7 +387,10 @@ impl Diffui {
     /// has. The CLI doesn't refuse it outright, so this is a warning, not a
     /// guard (an undescribed `@` is refused by the push checks regardless).
     pub(crate) fn run_mutation_checking_wc_push(&mut self, pending: PendingMutation) {
-        if !self.publishes_working_copy(&pending.op) {
+        let publishes = self
+            .tab(pending.tab_id)
+            .is_some_and(|tab| tab.publishes_working_copy(&pending.op));
+        if !publishes {
             return self.run_mutation(pending);
         }
         if let Some(log) = self.activity_log_for(pending.tab_id) {
@@ -409,44 +412,6 @@ impl Diffui {
             },
             pending,
         }));
-    }
-
-    /// Whether `op` would put the working-copy commit on a remote.
-    pub(crate) fn publishes_working_copy(&self, op: &MutationOp) -> bool {
-        let session = &self.active().session;
-        let Some(wc) = session
-            .bookmarks
-            .working_copy_commit
-            .as_deref()
-            .or_else(|| session.commits.working_copy().map(|row| row.commit_id()))
-        else {
-            return false;
-        };
-        let is_wc = |selection: &RevisionSelection| match selection {
-            RevisionSelection::WorkingCopy => true,
-            RevisionSelection::Commit(hex) => hex == wc,
-        };
-        let bookmark_at_wc = |name: &str| {
-            session
-                .bookmarks
-                .entry(name)
-                .is_some_and(|entry| entry.local_targets.iter().any(|t| t == wc))
-        };
-        match op {
-            MutationOp::MoveBookmark {
-                to,
-                push_remote: Some(_),
-                ..
-            } => is_wc(to),
-            MutationOp::PushBookmark { name, .. } => bookmark_at_wc(name),
-            MutationOp::Push(request) => request.targets.iter().any(|target| match target {
-                PushTarget::Bookmark(name) => bookmark_at_wc(name),
-                PushTarget::SetBookmark { to, .. } => is_wc(to),
-                PushTarget::Change(revision) => is_wc(revision),
-                PushTarget::DeleteBookmark(_) | PushTarget::Tracked => false,
-            }),
-            _ => false,
-        }
     }
 
     // ── Revision context menu ───────────────────────────────────────────
@@ -587,6 +552,46 @@ impl Diffui {
     }
 }
 
+impl TabState {
+    /// Whether `op` would put the working-copy commit on a remote.
+    pub(crate) fn publishes_working_copy(&self, op: &MutationOp) -> bool {
+        let session = &self.session;
+        let Some(wc) = session
+            .bookmarks
+            .working_copy_commit
+            .as_deref()
+            .or_else(|| session.commits.working_copy().map(|row| row.commit_id()))
+        else {
+            return false;
+        };
+        let is_wc = |selection: &RevisionSelection| match selection {
+            RevisionSelection::WorkingCopy => true,
+            RevisionSelection::Commit(hex) => hex == wc,
+        };
+        let bookmark_at_wc = |name: &str| {
+            session
+                .bookmarks
+                .entry(name)
+                .is_some_and(|entry| entry.local_targets.iter().any(|t| t == wc))
+        };
+        match op {
+            MutationOp::MoveBookmark {
+                to,
+                push_remote: Some(_),
+                ..
+            } => is_wc(to),
+            MutationOp::PushBookmark { name, .. } => bookmark_at_wc(name),
+            MutationOp::Push(request) => request.targets.iter().any(|target| match target {
+                PushTarget::Bookmark(name) => bookmark_at_wc(name),
+                PushTarget::SetBookmark { to, .. } => is_wc(to),
+                PushTarget::Change(revision) => is_wc(revision),
+                PushTarget::DeleteBookmark(_) | PushTarget::Tracked => false,
+            }),
+            _ => false,
+        }
+    }
+}
+
 /// Why pushing `@` is usually a mistake.
 pub(crate) fn working_copy_push_warning() -> Prose {
     Prose::new()
@@ -694,7 +699,7 @@ pub(crate) fn build_name_prompt(
     let verdict = ui.prompt_verdict(prompt);
     let (title, verb) = match &prompt.kind {
         PromptKind::Create { at } => (
-            Prose::from("New bookmark at ").then(ui.revision_prose(at)),
+            Prose::from("New bookmark at ").then(ui.active().revision_prose(at)),
             "Create",
         ),
         PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
@@ -940,21 +945,30 @@ mod tests {
                 allow: PushAllow::default(),
                 confirm: false,
             });
-            assert!(ui.publishes_working_copy(&wc_push));
-            assert!(!ui.publishes_working_copy(&MutationOp::PushBookmark {
-                name: "main".to_owned(),
-                remote: "origin".to_owned(),
-            }));
-            assert!(ui.publishes_working_copy(&MutationOp::MoveBookmark {
-                name: "main".to_owned(),
-                to: RevisionSelection::Commit(WC.to_owned()),
-                push_remote: Some("origin".to_owned()),
-            }));
-            assert!(!ui.publishes_working_copy(&MutationOp::MoveBookmark {
-                name: "main".to_owned(),
-                to: RevisionSelection::WorkingCopy,
-                push_remote: None,
-            }));
+            assert!(ui.active().publishes_working_copy(&wc_push));
+            assert!(
+                !ui.active()
+                    .publishes_working_copy(&MutationOp::PushBookmark {
+                        name: "main".to_owned(),
+                        remote: "origin".to_owned(),
+                    })
+            );
+            assert!(
+                ui.active()
+                    .publishes_working_copy(&MutationOp::MoveBookmark {
+                        name: "main".to_owned(),
+                        to: RevisionSelection::Commit(WC.to_owned()),
+                        push_remote: Some("origin".to_owned()),
+                    })
+            );
+            assert!(
+                !ui.active()
+                    .publishes_working_copy(&MutationOp::MoveBookmark {
+                        name: "main".to_owned(),
+                        to: RevisionSelection::WorkingCopy,
+                        push_remote: None,
+                    })
+            );
 
             let held = pending(&mut ui, tab, wc_push);
             ui.run_mutation_checking_wc_push(held);

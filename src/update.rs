@@ -2943,13 +2943,15 @@ impl Diffui {
         if !backwards {
             return self.run_mutation_checking_wc_push(pending);
         }
-        let target = self.revision_prose(to);
+        let Some(state) = self.tab(tab) else {
+            return;
+        };
+        let target = state.revision_prose(to);
         // A conflicted bookmark also lands here (it has no single commit to be
         // "a descendant of"), but there the move *is* the fix — the dialog
         // explains the resolution rather than warning about a backwards move
         // that isn't the story.
-        let conflicted_sides = self
-            .active()
+        let conflicted_sides = state
             .session
             .bookmarks
             .bookmarks
@@ -2993,7 +2995,7 @@ impl Diffui {
             (None, Some(_)) => "Move & resolve".to_owned(),
             (None, None) => "Move anyway".to_owned(),
         };
-        if self.publishes_working_copy(&pending.op) {
+        if state.publishes_working_copy(&pending.op) {
             body = body
                 .text(" ")
                 .then(crate::bookmarks::working_copy_push_warning());
@@ -3849,11 +3851,7 @@ impl Diffui {
         &self,
         selection: &RevisionSelection,
     ) -> Option<diffui_core::DraftSource> {
-        let commits = &self.active().session.commits;
-        let row = match selection {
-            RevisionSelection::WorkingCopy => commits.working_copy(),
-            RevisionSelection::Commit(id) => commits.find_by_commit_id(id),
-        }?;
+        let row = self.active().session.commits.find(selection)?;
         Some(diffui_core::DraftSource {
             selection: selection.clone(),
             commit_id: row.commit_id().to_owned(),
@@ -4112,12 +4110,13 @@ impl Diffui {
     pub(crate) fn run_mutation(&mut self, pending: PendingMutation) {
         // Every mutation's row shows its jj command, with
         // `--ignore-immutable` once the confirmation turned the guards off.
-        let command = crate::plan::op_command(self, &pending.op, pending.allow_immutable);
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_command(pending.activity_id, command);
-        }
+        let Some(state) = self.tab_mut(pending.tab_id) else {
+            return;
+        };
+        let command = crate::plan::op_command(state, &pending.op, pending.allow_immutable);
+        state.activities.set_command(pending.activity_id, command);
         if !pending.allow_immutable {
-            let immutable = self.immutable_op_targets(&pending.op);
+            let immutable = state.immutable_op_targets(&pending.op);
             if !immutable.is_empty() {
                 return self.confirm_immutable(pending, &immutable, false);
             }
@@ -4161,41 +4160,6 @@ impl Diffui {
         // that started them.
         state.jobs.mutation = Some((job, pending));
         self.run_effects(tab, effects)
-    }
-
-    /// The short display labels of `op`'s rewrite targets that the loaded graph
-    /// marks immutable.
-    ///
-    /// The target set comes from [`diffui_core::rewritten_targets`], the same
-    /// list the actor's guard reads, so the dialog can't name a different set
-    /// from the one that will actually be refused. Only rows the UI directly
-    /// addresses are caught here — computed sets (a rebase's descendants, an
-    /// insert-after target's other children, a parent-squash's destination)
-    /// stay the backend guard's job, whose typed rejection re-raises the same
-    /// dialog after the fact.
-    fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
-        let session = &self.active().session;
-        let targets = diffui_core::rewritten_targets(
-            op,
-            &session.selected_revision,
-            session.root_commit_id.as_deref(),
-        );
-        let mut labels: Vec<String> = Vec::new();
-        for selection in &targets {
-            let row = match selection {
-                RevisionSelection::WorkingCopy => session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex.as_str()),
-            };
-            if let Some(row) = row
-                && row.is_immutable()
-            {
-                let label = self.revision_short_label(selection);
-                if !labels.contains(&label) {
-                    labels.push(label);
-                }
-            }
-        }
-        labels
     }
 
     /// Park `pending` behind the immutable-rewrite confirmation dialog, its
@@ -4275,44 +4239,6 @@ impl Diffui {
             look: Default::default(),
             pending,
         }));
-    }
-
-    /// [`Self::revision_short_label`] as an id in prose, or plain words when
-    /// the revision isn't in the graph.
-    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
-        let label = self.revision_short_label(selection);
-        let in_graph = match selection {
-            RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => self.active().session.commits.find_by_commit_id(hex),
-        };
-        match (in_graph, selection) {
-            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
-            _ => Prose::new().rev(label),
-        }
-    }
-
-    /// Short display name for a revision, matching the sidebar: unique
-    /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
-    /// copies, falling back to a commit-id prefix for rows not in the graph.
-    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
-        let commits = &self.active().session.commits;
-        let row = match selection {
-            RevisionSelection::WorkingCopy => commits.working_copy(),
-            RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
-        };
-        match (row, selection) {
-            (Some(row), _) => {
-                let len = row.shortest_change_id_len().unwrap_or(8).max(8);
-                let mut id: String = row.change_id().chars().take(len).collect();
-                if let Some(offset) = row.change_offset() {
-                    id.push('/');
-                    id.push_str(&offset.to_string());
-                }
-                id
-            }
-            (None, RevisionSelection::WorkingCopy) => "the working copy".to_owned(),
-            (None, RevisionSelection::Commit(hex)) => hex.chars().take(12).collect(),
-        }
     }
 
     /// The activity log for `tab_id`, or `None` if the tab has since closed.
@@ -4505,6 +4431,68 @@ pub(crate) fn push_undo_body(summary: &str) -> Prose {
          remote. The remote keeps the pushed commits, so pushing these bookmarks again fails \
          until you fetch, which can leave them conflicted."
     ))
+}
+
+impl TabState {
+    /// The short display labels of `op`'s rewrite targets that the loaded graph
+    /// marks immutable.
+    ///
+    /// The target set comes from [`diffui_core::rewritten_targets`], the same
+    /// list the actor's guard reads, so the dialog can't name a different set
+    /// from the one that will actually be refused. Only rows the UI directly
+    /// addresses are caught here — computed sets (a rebase's descendants, an
+    /// insert-after target's other children, a parent-squash's destination)
+    /// stay the backend guard's job, whose typed rejection re-raises the same
+    /// dialog after the fact.
+    pub(crate) fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
+        let session = &self.session;
+        let targets = diffui_core::rewritten_targets(
+            op,
+            &session.selected_revision,
+            session.root_commit_id.as_deref(),
+        );
+        let mut labels: Vec<String> = Vec::new();
+        for selection in &targets {
+            if let Some(row) = session.commits.find(selection)
+                && row.is_immutable()
+            {
+                let label = self.revision_short_label(selection);
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
+    /// [`Self::revision_short_label`] as an id in prose, or plain words when
+    /// the revision isn't in the graph.
+    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
+        let label = self.revision_short_label(selection);
+        match (self.session.commits.find(selection), selection) {
+            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
+            _ => Prose::new().rev(label),
+        }
+    }
+
+    /// Short display name for a revision, matching the sidebar: unique
+    /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
+    /// copies, falling back to a commit-id prefix for rows not in the graph.
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+        match (self.session.commits.find(selection), selection) {
+            (Some(row), _) => {
+                let len = row.shortest_change_id_len().unwrap_or(8).max(8);
+                let mut id: String = row.change_id().chars().take(len).collect();
+                if let Some(offset) = row.change_offset() {
+                    id.push('/');
+                    id.push_str(&offset.to_string());
+                }
+                id
+            }
+            (None, RevisionSelection::WorkingCopy) => "the working copy".to_owned(),
+            (None, RevisionSelection::Commit(hex)) => hex.chars().take(12).collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4768,13 +4756,13 @@ mod tests {
                 push_remote: None,
             };
 
-            ui.start_mutation(op(), false);
+            ui.start_mutation_on(tab, op(), false);
             let state = ui.tab_mut(tab).unwrap();
             assert!(state.jobs.bookmark_check.is_some());
             assert!(state.jobs.mutation.is_none());
             state.jobs.bookmark_check = None;
 
-            ui.start_mutation(op(), true);
+            ui.start_mutation_on(tab, op(), true);
             let state = ui.tab_mut(tab).unwrap();
             assert!(state.jobs.bookmark_check.is_none());
             assert!(state.jobs.mutation.is_some(), "the move runs straight away");

@@ -22,9 +22,19 @@ impl Diffui {
         }
     }
 
-    /// The state owned by `tab`, or `None` once that tab has closed — the
-    /// single lookup every routed async completion goes through, so a result
-    /// that outlives its tab is dropped instead of landing on a stranger.
+    /// The state owned by `tab`, or `None` once that tab has closed. Work
+    /// addressed to a tab reads it through this, never through
+    /// [`Self::active`], so a result that outlives its tab or lands after a
+    /// switch can't act on a stranger.
+    pub(crate) fn tab(&self, tab: TabId) -> Option<&TabState> {
+        self.tabs
+            .iter()
+            .find(|candidate| candidate.id == tab)
+            .map(|candidate| &candidate.state)
+    }
+
+    /// [`Self::tab`], mutably: the lookup every routed async completion goes
+    /// through.
     pub(crate) fn tab_mut(&mut self, tab: TabId) -> Option<&mut TabState> {
         self.tabs
             .iter_mut()
