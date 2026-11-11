@@ -21,7 +21,11 @@ use crate::Diffui;
 /// One side's decode, by blob id.
 #[derive(Debug, Clone)]
 enum Entry {
-    Pending,
+    /// Queued or decoding. The decoder holds a weak handle to `_wanted` and
+    /// skips the job once the entry is dropped.
+    Pending {
+        _wanted: Arc<()>,
+    },
     Ready(Arc<RenderImage>),
     Failed,
 }
@@ -71,7 +75,7 @@ impl MediaCache {
         match self.entries.get(&side.id) {
             Some(Entry::Ready(handle)) => MediaImage::Ready(handle.clone()),
             Some(Entry::Failed) => MediaImage::Unavailable,
-            Some(Entry::Pending) | None => MediaImage::Loading,
+            Some(Entry::Pending { .. }) | None => MediaImage::Loading,
         }
     }
 }
@@ -167,13 +171,21 @@ impl Diffui {
         if self.media.scanned == Some(key) {
             return;
         }
-        let mut jobs: Vec<(String, BlobKind, Arc<[u8]>)> = Vec::new();
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut tokens: Vec<Arc<()>> = Vec::new();
         let shown = std::iter::once(&tab.session.document).chain(history.map(|(doc, _)| doc));
         for (kind, side) in shown.flat_map(previewable_sides) {
             let known = self.media.entries.contains_key(&side.id)
-                || jobs.iter().any(|(id, ..)| id == &side.id);
+                || jobs.iter().any(|job| job.id == side.id);
             if let (false, Some(bytes)) = (known, &side.bytes) {
-                jobs.push((side.id.clone(), kind, Arc::clone(bytes)));
+                let token = Arc::new(());
+                jobs.push(Job {
+                    id: side.id.clone(),
+                    kind,
+                    bytes: Arc::clone(bytes),
+                    wanted: Arc::downgrade(&token),
+                });
+                tokens.push(token);
             }
         }
         self.media.scanned = Some(key);
@@ -202,8 +214,10 @@ impl Diffui {
         if jobs.is_empty() {
             return;
         }
-        for (id, ..) in &jobs {
-            self.media.entries.insert(id.clone(), Entry::Pending);
+        for (job, token) in jobs.iter().zip(tokens) {
+            self.media
+                .entries
+                .insert(job.id.clone(), Entry::Pending { _wanted: token });
         }
         decode(jobs, cx)
     }
@@ -223,25 +237,43 @@ impl Diffui {
 }
 
 /// The decoded pixels as what GPUI paints. It takes BGRA.
-fn render_image(image: diffui_core::media::DecodedImage) -> Arc<RenderImage> {
+fn render_image(image: diffui_core::media::DecodedImage) -> Result<Arc<RenderImage>, String> {
     let mut bytes = image.rgba;
     for pixel in bytes.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(image.width, image.height, bytes)
-        .expect("a decode's buffer matches its size");
-    Arc::new(RenderImage::new([image::Frame::new(buffer)]))
+        .ok_or_else(|| "the decoded buffer doesn't match its size".to_owned())?;
+    Ok(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
+}
+
+/// One side to decode, while its entry still wants it.
+struct Job {
+    id: String,
+    kind: BlobKind,
+    bytes: Arc<[u8]>,
+    wanted: std::sync::Weak<()>,
 }
 
 /// Decode `jobs` one after another on a thread of their own, reporting each
-/// as it lands so the first previews paint while the rest decode.
-fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>, cx: &mut Cx) {
+/// as it lands so the first previews paint while the rest decode. A job whose
+/// entry was dropped meanwhile (the user moved on) is skipped.
+fn decode(jobs: Vec<Job>, cx: &mut Cx) {
     let (sender, mut receiver) = futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("diffui-media".to_owned())
         .spawn(move || {
-            for (id, kind, bytes) in jobs {
-                let result = diffui_core::media::decode(kind, &bytes).map(render_image);
+            for Job {
+                id,
+                kind,
+                bytes,
+                wanted,
+            } in jobs
+            {
+                if wanted.strong_count() == 0 {
+                    continue;
+                }
+                let result = diffui_core::media::decode(kind, &bytes).and_then(render_image);
                 if sender.unbounded_send(Decoded { id, result }).is_err() {
                     break;
                 }
