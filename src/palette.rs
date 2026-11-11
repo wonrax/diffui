@@ -21,7 +21,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, Div, ElementId, MouseButton, MouseMoveEvent, ScrollHandle, Window, div, point, px,
 };
-use nucleo_matcher::{Config, Matcher, Utf32String};
+use nucleo_matcher::{Config, Matcher, Utf32Str, Utf32String};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -651,6 +651,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
     let needle_utf32 = Utf32String::from(needle);
 
     let root = matches!(column.source, ColumnSource::Root);
+    let search_commits = root && mode == Mode::Revisions && search_revisions;
     let mut candidates: Vec<Candidate> = Vec::new();
     match &column.source {
         ColumnSource::Root => {
@@ -661,8 +662,12 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             push_command_candidates(&mut candidates, ui, PaletteScope::Root, &CommandArg::None);
             push_bookmark_candidates(&mut candidates, ui);
             push_file_candidates(&mut candidates, ui);
-            if mode == Mode::Revisions && search_revisions {
-                push_revision_candidates(&mut candidates, ui);
+            if search_commits {
+                candidates.push(Candidate {
+                    item: ResultRef::WorkingCopy,
+                    haystack: "working copy @".to_owned(),
+                    disabled: None,
+                });
             }
         }
         ColumnSource::Actions(target) => {
@@ -672,13 +677,17 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
 
     let mut counts = ScopeCounts::default();
     let mut matches: Vec<(PaletteMatch, String)> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let score = if needle.is_empty() {
+    // One buffer for every haystack's code points, rather than one per row.
+    let mut chars = Vec::new();
+    let mut score_of = |haystack: &str| {
+        if needle.is_empty() {
             Some(0u16)
         } else {
-            let hay_utf32 = Utf32String::from(candidate.haystack.as_str());
-            matcher.fuzzy_match(hay_utf32.slice(..), needle_utf32.slice(..))
-        };
+            matcher.fuzzy_match(Utf32Str::new(haystack, &mut chars), needle_utf32.slice(..))
+        }
+    };
+    for candidate in candidates {
+        let score = score_of(&candidate.haystack);
         let Some(raw_score) = score else { continue };
         match &candidate.item {
             ResultRef::Command(_) => counts.commands += 1,
@@ -718,6 +727,39 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             candidate.haystack,
         ));
     }
+    if search_commits {
+        // Every commit is scored through one reused haystack, and only the
+        // ones that can still make the list are made rows.
+        let commits = &ui.active().session.commits;
+        let mut hits: Vec<(u32, usize)> = Vec::new();
+        let mut haystack = String::new();
+        for (index, commit) in commits.iter().enumerate() {
+            commit_haystack(&commit, &mut haystack);
+            if let Some(score) = score_of(&haystack) {
+                // The commit category's tie-break is 3, as in the loop above.
+                let total = score as u32 * 100 + ui.recents.revision_bonus(commit.change_id()) + 3;
+                hits.push((total, index));
+            }
+        }
+        hits.sort_by_key(|&(total, index)| (std::cmp::Reverse(total), index));
+        hits.truncate(MAX_RESULT_ROWS);
+        hits.sort_by_key(|&(_, index)| index);
+        for (score, index) in hits {
+            let commit = commits.row(index);
+            let item = ResultRef::Commit {
+                change: ChangeId(commit.change_id().to_owned()),
+                commit: commit.commit_id().to_owned(),
+            };
+            let entry = PaletteMatch {
+                item,
+                score,
+                disabled: None,
+                indices: Vec::new(),
+            };
+            // A commit row's label isn't its haystack, so no positions to find.
+            matches.push((entry, String::new()));
+        }
+    }
 
     // What can run first, then what can't, each by score.
     matches.sort_by_key(|(entry, _)| (entry.disabled.is_some(), std::cmp::Reverse(entry.score)));
@@ -729,9 +771,8 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             if !label_leads_haystack(&entry.item) {
                 continue;
             }
-            let hay_utf32 = Utf32String::from(haystack.as_str());
             let _ = matcher.fuzzy_indices(
-                hay_utf32.slice(..),
+                Utf32Str::new(haystack, &mut chars),
                 needle_utf32.slice(..),
                 &mut entry.indices,
             );
@@ -847,37 +888,22 @@ struct Candidate {
     disabled: Option<commands::Reason>,
 }
 
-fn push_revision_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
-    out.push(Candidate {
-        item: ResultRef::WorkingCopy,
-        haystack: "working copy @".to_owned(),
-        disabled: None,
-    });
-    for commit in ui.active().session.commits.iter() {
-        let mut haystack = String::with_capacity(
-            commit.change_id().len() + commit.description().len() + commit.author().len() + 32,
-        );
-        haystack.push_str(commit.change_id());
-        haystack.push(' ');
-        haystack.push_str(commit.commit_id());
-        haystack.push(' ');
-        if commit.has_description() {
-            haystack.push_str(commit.description());
-            haystack.push(' ');
-        }
-        haystack.push_str(commit.author());
-        for bookmark in commit.bookmarks() {
-            haystack.push(' ');
-            haystack.push_str(bookmark);
-        }
-        out.push(Candidate {
-            item: ResultRef::Commit {
-                change: ChangeId(commit.change_id().to_owned()),
-                commit: commit.commit_id().to_owned(),
-            },
-            haystack,
-            disabled: None,
-        });
+/// What a commit is searched by: its ids, description, author and
+/// bookmarks, written into `out`.
+fn commit_haystack(commit: &diffui_core::RowView<'_>, out: &mut String) {
+    out.clear();
+    out.push_str(commit.change_id());
+    out.push(' ');
+    out.push_str(commit.commit_id());
+    out.push(' ');
+    if commit.has_description() {
+        out.push_str(commit.description());
+        out.push(' ');
+    }
+    out.push_str(commit.author());
+    for bookmark in commit.bookmarks() {
+        out.push(' ');
+        out.push_str(bookmark);
     }
 }
 
@@ -2023,6 +2049,58 @@ pub(crate) fn filling(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `:` search scores every commit and lists the ones that match, best
+    /// first.
+    #[test]
+    fn commit_search_lists_the_matching_commits() {
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = crate::tabs::tests::app();
+            crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
+            let mut builder = diffui_core::CommitStoreBuilder::with_capacity(3);
+            for (id, description) in [
+                ("k", "fix the parser"),
+                ("l", "docs"),
+                ("m", "parser tests"),
+            ] {
+                builder.push(diffui_core::CommitSummary {
+                    change_id: id.repeat(8),
+                    commit_id: id.repeat(12),
+                    shortest_change_id_len: None,
+                    description: description.to_owned(),
+                    author: String::new(),
+                    author_timestamp: None,
+                    has_description: true,
+                    is_empty: None,
+                    has_conflict: false,
+                    is_divergent: false,
+                    is_hidden: false,
+                    change_offset: None,
+                    is_working_copy: false,
+                    is_immutable: false,
+                    on_trunk: false,
+                    bookmarks: Vec::new(),
+                    parent_ids: Vec::new(),
+                });
+            }
+            ui.active_mut().session.commits = builder.finish();
+            let mut column = PaletteState::open(&ui).stack.remove(0);
+            column.query = ":parser".to_owned();
+
+            recompute_matches(&mut column, &ui, true);
+
+            let changes: Vec<&str> = column
+                .matches
+                .iter()
+                .filter_map(|entry| match &entry.item {
+                    ResultRef::Commit { change, .. } => Some(change.0.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(changes.len(), 2, "{changes:?}");
+            assert!(!changes.contains(&"llllllll"));
+        });
+    }
 
     /// The pre-registry names in a recents file written by an older build all
     /// resolve, so an upgrade doesn't quietly empty the palette's MRU.
