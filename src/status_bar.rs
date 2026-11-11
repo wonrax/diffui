@@ -20,8 +20,8 @@ pub const HEIGHT: f32 = 26.0;
 /// What the bar takes from the window's height: the bar and its hairline.
 pub const TOTAL_HEIGHT: f32 = HEIGHT + theme::HAIRLINE;
 
-const TEXT_SIZE: f32 = 11.5;
-const ICON_SIZE: f32 = 13.0;
+const TEXT_SIZE: f32 = theme::text_size::CAPTION;
+const ICON_SIZE: f32 = theme::icon::SM;
 /// Between two items.
 const ITEM_GAP: f32 = 16.0;
 
@@ -121,7 +121,7 @@ pub(crate) fn build_status_bar(
         .w_full()
         .h(px(TOTAL_HEIGHT))
         .flex_none()
-        .bg(theme.background)
+        .bg(theme::chrome_fill(theme))
         .child(crate::root::horizontal_divider(theme))
         .child(
             div()

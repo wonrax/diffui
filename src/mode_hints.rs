@@ -35,8 +35,8 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         return Some((
             Context::ConflictEdit,
             vec![
-                hint(&["conflict.edit.save"], "save"),
-                hint(&["conflict.edit.cancel"], "cancel"),
+                hint(&["conflict.edit.save"], "Save"),
+                hint(&["conflict.edit.cancel"], "Cancel"),
             ],
         ));
     }
@@ -44,27 +44,27 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         let kind = draft.draft.kind;
         let mut hints = vec![hint(
             &["draft.candidate.next", "draft.candidate.previous"],
-            "pick",
+            "Pick",
         )];
         if kind.uses_placement() {
             hints.extend([
-                hint(&["draft.place.onto"], "onto"),
-                hint(&["draft.place.after"], "after"),
-                hint(&["draft.place.before"], "before"),
+                hint(&["draft.place.onto"], "Onto"),
+                hint(&["draft.place.after"], "After"),
+                hint(&["draft.place.before"], "Before"),
             ]);
         }
         let toggle = match kind {
             DraftKind::New => None,
-            DraftKind::Merge => Some("add parent"),
-            DraftKind::Parallelize => Some("add revision"),
-            _ => Some("add source"),
+            DraftKind::Merge => Some("Add parent"),
+            DraftKind::Parallelize => Some("Add revision"),
+            _ => Some("Add source"),
         };
         if let Some(toggle) = toggle {
             hints.push(hint(&["draft.toggle-source"], toggle));
         }
         hints.extend([
-            hint(&["draft.confirm"], "apply"),
-            hint(&["draft.cancel"], "cancel"),
+            hint(&["draft.confirm"], "Apply"),
+            hint(&["draft.cancel"], "Cancel"),
         ]);
         return Some((Context::Draft, hints));
     }
@@ -74,10 +74,10 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             vec![
                 hint(&[], "Click or drag lines"),
                 hint(&[], "\u{21e7}-click a range"),
-                hint(&["lines.next", "lines.previous"], "move"),
-                hint(&["lines.extend-next", "lines.extend-previous"], "extend"),
-                hint(&["lines.toggle-line"], "pick"),
-                hint(&["lines.exit"], "done"),
+                hint(&["lines.next", "lines.previous"], "Move"),
+                hint(&["lines.extend-next", "lines.extend-previous"], "Extend"),
+                hint(&["lines.toggle-line"], "Pick"),
+                hint(&["lines.exit"], "Done"),
             ],
         ));
     }
@@ -87,26 +87,26 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         let leave = match mode {
             RangeMode::Since => {
                 hints.push(hint(&[], "Click a revision to move the end"));
-                "stop diffing since trunk"
+                "Stop diffing since trunk"
             }
-            RangeMode::Span(_) => "clear the marks",
-            RangeMode::Fixed => "leave the range",
+            RangeMode::Span(_) => "Clear the marks",
+            RangeMode::Fixed => "Leave the range",
         };
-        hints.push(hint(&["range.edit"], "edit revset"));
+        hints.push(hint(&["range.edit"], "Edit revset"));
         hints.push(hint(&["compare.exit"], leave));
         hints.push(hint(&["selection.clear"], leave));
         return Some((Context::Base, hints));
     }
     if crate::compare::comparing(ui) {
         let mut hints = vec![
-            hint(&["compare.swap"], "swap sides"),
-            hint(&["compare.interdiff"], "interdiff"),
-            hint(&["compare.exit"], "stop comparing"),
+            hint(&["compare.swap"], "Swap sides"),
+            hint(&["compare.interdiff"], "Interdiff"),
+            hint(&["compare.exit"], "Stop comparing"),
         ];
         // Esc leaves a comparison once no rows are marked (it clears the
         // marks first).
         if tab.revision_multi_selection.is_empty() {
-            hints.push(hint(&["selection.clear"], "stop comparing"));
+            hints.push(hint(&["selection.clear"], "Stop comparing"));
         }
         return Some((Context::Base, hints));
     }
@@ -117,11 +117,11 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             vec![
                 hint(
                     &["conflict.region.next", "conflict.region.previous"],
-                    "region",
+                    "Region",
                 ),
-                hint(&["conflict.region.take-side-1"], "take side 1"),
-                hint(&["conflict.region.take-side-2"], "take side 2"),
-                hint(&["conflict.region.take-base"], "take base"),
+                hint(&["conflict.region.take-side-1"], "Take side 1"),
+                hint(&["conflict.region.take-side-2"], "Take side 2"),
+                hint(&["conflict.region.take-base"], "Take base"),
             ],
         ));
     }
@@ -195,7 +195,9 @@ pub(crate) fn strip(
             .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
             .py(px(theme::space::SM))
             .bg(theme.file_header)
-            .border_1()
+            // Docked on the pane's bottom: the status bar's rule is under it
+            // and the pane dividers beside it.
+            .border_t_1()
             .border_color(theme.border)
             .child(typography::baseline_row(line, 0.0))
             .into_any_element(),

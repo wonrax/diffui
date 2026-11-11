@@ -67,7 +67,10 @@ pub(super) const CHECK_SIZE: f32 = 14.0;
 /// pieces, the side of its icon buttons, and the gaps around its counts.
 pub(super) const FILE_HEADER_MIN_HEIGHT: f32 = 38.0;
 const FILE_HEADER_PAD_LEFT: f32 = 8.0;
-const FILE_HEADER_PAD_RIGHT: f32 = 14.0;
+/// The file controls' glyphs end on the pane's trailing edge,
+/// [`HEADER_HORIZONTAL_PADDING`] in, as the commit bar's do.
+const FILE_HEADER_PAD_RIGHT: f32 =
+    HEADER_HORIZONTAL_PADDING - (FILE_CONTROL_SIZE - super::paint::BROWSE_ICON_SIZE) / 2.0;
 const FILE_HEADER_GAP: f32 = 8.0;
 const FILE_CONTROL_SIZE: f32 = 22.0;
 const FILE_HEADER_META_GAP: f32 = 10.0;

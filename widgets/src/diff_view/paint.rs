@@ -50,7 +50,7 @@ const EMPHASIS_CORNER_RADIUS: f32 = 3.0;
 /// Width of the accent bar a picked line wears at its gutter's left edge.
 const PICK_BAR_WIDTH: f32 = 3.0;
 // Glyph size of the browse button's icon within its square.
-const BROWSE_ICON_SIZE: f32 = 13.0;
+pub(super) const BROWSE_ICON_SIZE: f32 = 13.0;
 const HEADER_BUTTON_ICON_SIZE: f32 = 12.0;
 const HEADER_EDIT_ICON_SIZE: f32 = 13.0;
 const HEADER_EDIT_LABEL_SIZE: f32 = crate::theme::text_size::BODY;

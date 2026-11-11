@@ -798,7 +798,8 @@ pub(crate) fn toast_layer(
         .id("toasts")
         .absolute()
         .right(px(theme::space::LG))
-        .bottom(px(theme::space::LG))
+        // Clear of the status bar, as the picks action bar is.
+        .bottom(px(crate::status_bar::TOTAL_HEIGHT + theme::space::LG))
         .w(px(380.0))
         .flex()
         .flex_col()
