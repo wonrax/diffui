@@ -696,21 +696,24 @@ impl Diffui {
         self.send(tab_id, diffui_core::Command::ConflictInfo { job, revision })
     }
 
-    /// Route a repository event answering one of our jobs. `None` when the
-    /// event isn't ours.
+    /// Route a repository event answering one of our jobs, or hand it back
+    /// when it isn't ours.
     pub(crate) fn take_conflict_job(
         &mut self,
         tab: TabId,
-        event: &diffui_core::Event,
+        event: diffui_core::Event,
         cx: &mut Cx,
-    ) -> Option<()> {
+    ) -> Option<diffui_core::Event> {
         use diffui_core::Payload;
-        let job = event.job()?;
+        let owned = event.job().is_some_and(|job| {
+            self.tab(tab)
+                .is_some_and(|state| state.changes.conflicts.owns(job))
+        });
+        let (true, Some(job)) = (owned, event.job()) else {
+            return Some(event);
+        };
         let conflicts = &mut self.tab_mut(tab)?.changes.conflicts;
-        if !conflicts.owns(job) {
-            return None;
-        }
-        let _: () = match &event.payload {
+        match event.payload {
             Payload::ConflictInfoLoaded { files, .. } => {
                 if let Some((_, revision, document_id)) = conflicts.job.take() {
                     if std::mem::take(&mut conflicts.reveal_on_load) {
@@ -724,7 +727,7 @@ impl Diffui {
                     conflicts.loaded = Some(LoadedConflicts {
                         revision,
                         document_id,
-                        files: files.clone(),
+                        files,
                     });
                 }
             }
@@ -735,7 +738,7 @@ impl Diffui {
                     .map(|(_, path)| path)
                     .unwrap_or_else(|| invocation.path.clone());
                 conflicts.tool_running = Some(path.clone());
-                let invocation = Box::new(invocation.clone());
+                let invocation = Box::new(invocation);
                 let (activity, _) = self.begin_activity(
                     tab,
                     Prose::from("Resolving ")
@@ -769,15 +772,13 @@ impl Diffui {
             Payload::ConflictTextLoaded {
                 text, marker_len, ..
             } => {
-                let Some((_, revision, path)) = conflicts.text_job.take() else {
-                    return Some(());
-                };
+                let (_, revision, path) = conflicts.text_job.take()?;
                 conflicts.editor = Some(MarkerEditor {
                     revision,
                     path,
                     original: text.clone(),
-                    content: (text).to_owned(),
-                    marker_len: *marker_len,
+                    content: text,
+                    marker_len,
                     saving: None,
                 });
                 crate::input::focus(MARKER_EDITOR_ID, cx)
@@ -797,8 +798,8 @@ impl Diffui {
                 conflicts.tool_job.take_if(|(id, _)| *id == job);
                 conflicts.text_job.take_if(|(id, ..)| *id == job);
             }
-        };
-        Some(())
+        }
+        None
     }
 }
 

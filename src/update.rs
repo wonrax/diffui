@@ -311,12 +311,12 @@ impl Diffui {
         let Some(tab) = self.route_event(&event) else {
             return;
         };
-        if self.take_conflict_job(tab, &event, cx).is_some() {
+        let Some(event) = self.take_conflict_job(tab, event, cx) else {
             return;
-        }
-        if self.history_event(tab, &event, cx).is_some() {
+        };
+        let Some(event) = self.history_event(tab, event, cx) else {
             return;
-        }
+        };
         // A mutation is both the frontend's and the projection's — it owns an
         // activity row *and* a slot — so its event comes back for the second.
         let Some(event) = self.take_own_job(tab, event, cx) else {

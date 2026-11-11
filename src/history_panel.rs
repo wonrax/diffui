@@ -589,24 +589,25 @@ impl Diffui {
     pub(crate) fn history_event(
         &mut self,
         tab: TabId,
-        event: &diffui_core::Event,
+        event: diffui_core::Event,
         cx: &mut Cx,
-    ) -> Option<()> {
+    ) -> Option<diffui_core::Event> {
         use diffui_core::Payload;
-        let job = event.job()?;
-        let state = self.tab_mut(tab)?;
-        if !state.history.owns(job) {
-            return None;
-        }
-        let history = &mut state.history;
+        let owned = event
+            .job()
+            .is_some_and(|job| self.tab(tab).is_some_and(|state| state.history.owns(job)));
+        let (true, Some(job)) = (owned, event.job()) else {
+            return Some(event);
+        };
+        let history = &mut self.tab_mut(tab)?.history;
         let mut follow_up: Option<HistoryAction> = None;
-        match &event.payload {
+        match event.payload {
             Payload::OpLogBatch { entries, .. } if history.ops_job == Some(job) => {
                 if std::mem::take(&mut history.ops_stale) {
                     history.ops.clear();
                 }
                 let first = history.ops.is_empty();
-                history.ops.extend(entries.iter().cloned());
+                history.ops.extend(entries);
                 // Land on the current operation the first time the log
                 // shows, so the pane never opens empty.
                 let keep = history
@@ -626,7 +627,7 @@ impl Diffui {
                     if std::mem::take(&mut history.ops_stale) {
                         history.ops.clear();
                     }
-                    history.ops_truncated = *truncated;
+                    history.ops_truncated = truncated;
                 }
                 HistoryResponse::Operation(changes) => {
                     history.op_job = None;
@@ -637,17 +638,17 @@ impl Diffui {
                         .iter()
                         .position(|change| !change.rebased)
                         .or((!changes.commits.is_empty()).then_some(0));
-                    history.op_changes = Some(changes.clone());
+                    history.op_changes = Some(changes);
                     if history.kind == HistoryKind::OpLog {
                         follow_up = first.map(HistoryAction::SelectChange);
                     }
                 }
                 HistoryResponse::Evolog(entries) => {
                     history.evolog_job = None;
-                    history.evolog = entries.clone();
                     if !entries.is_empty() {
                         follow_up = Some(HistoryAction::SelectVersion(0));
                     }
+                    history.evolog = entries;
                 }
                 HistoryResponse::Diff {
                     target,
@@ -655,8 +656,6 @@ impl Diffui {
                     details,
                 } => {
                     history.diff_job = None;
-                    let target = target.clone();
-                    let (document, details) = (document.clone(), details.clone());
                     let doc_id = self.allocate_document_id();
                     self.document_version = self.document_version.wrapping_add(1);
                     self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
@@ -672,11 +671,9 @@ impl Diffui {
                 }
                 HistoryResponse::Annotation(annotation) => {
                     history.annotation_job = None;
-                    let labels = annotation_labels(annotation);
-                    self.tab_mut(tab)?.history.annotation = Some(AnnotationView {
-                        annotation: annotation.clone(),
-                        labels,
-                    });
+                    let labels = annotation_labels(&annotation);
+                    self.tab_mut(tab)?.history.annotation =
+                        Some(AnnotationView { annotation, labels });
                     self.document_version = self.document_version.wrapping_add(1);
                 }
             },
@@ -693,11 +690,12 @@ impl Diffui {
             Payload::Cancelled { .. } => clear_job(history, job),
             _ => {}
         }
-        let _: () = match follow_up {
-            Some(action) if self.is_active(tab) => self.perform_history(action, cx),
-            _ => {}
-        };
-        Some(())
+        if let Some(action) = follow_up
+            && self.is_active(tab)
+        {
+            self.perform_history(action, cx);
+        }
+        None
     }
 
     /// Bring the active tab's history views in line with what is on screen:
