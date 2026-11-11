@@ -201,8 +201,7 @@ impl Actor {
         let Some(slot) = self.workspace.as_ref() else {
             return;
         };
-        let root = slot.workspace.workspace_root().to_owned();
-        match jj::read_op_head_with(&slot.settings, &root).await {
+        match jj::read_op_heads(slot.workspace.repo_loader()).await {
             Ok(fingerprint) => {
                 if self.op_head.as_deref() != Some(fingerprint.as_str()) {
                     self.op_head = Some(fingerprint.clone());
@@ -256,6 +255,15 @@ impl Actor {
             .expect("the workspace was just opened"))
     }
 
+    /// [`Self::slot`], about to take the working-copy lock: the repo we hold
+    /// goes along, so the lock reuses it instead of loading the one at head.
+    fn slot_for_lock(&mut self, repository: &Repository) -> Result<&mut WorkspaceSlot> {
+        let head = self.repo.clone();
+        let slot = self.slot(repository)?;
+        slot.snapshot.head.set(head);
+        Ok(slot)
+    }
+
     /// Re-read the jj config when one of its files changed since the
     /// workspace was opened, so an edited identity, signing setup or
     /// `immutable_heads()` applies without reopening the tab. jj-lib bakes the
@@ -275,21 +283,21 @@ impl Actor {
             return;
         }
         tracing::info!("jj config changed on disk; reloading the workspace settings");
-        self.workspace = None;
-        self.repo = None;
-        self.op_head = None;
+        self.forget_loaded_state();
     }
 
     /// The repo at head, reloading only when the operation head has moved.
-    /// The op-heads read is a bare readdir, so paying it before every read is
-    /// far cheaper than re-reading the commit index would be.
+    /// Reading the op heads is a readdir through the workspace's loader, so
+    /// paying it before every read is far cheaper than re-reading the commit
+    /// index would be.
+    ///
+    /// A head that moved since we last looked is an operation someone else
+    /// wrote, so it is announced here as the watcher would have: the watcher's
+    /// own signal arrives later and finds the head already seen.
     async fn repo_at_head(&mut self, repository: &Repository) -> Result<Arc<ReadonlyRepo>> {
-        let root = repository.root.clone();
-        let settings = self.slot(repository)?.settings.clone();
-        // A bare readdir of `.jj/repo/op_heads/heads` — cheap enough to pay
-        // before every read, and far cheaper than re-reading the commit index
-        // would be.
-        let fingerprint = jj::read_op_head_with(&settings, &root).await.ok();
+        let fingerprint = jj::read_op_heads(self.slot(repository)?.workspace.repo_loader())
+            .await
+            .ok();
         if let Some(repo) = self.repo.clone()
             && fingerprint.is_some()
             && fingerprint == self.op_head
@@ -309,8 +317,15 @@ impl Actor {
                 .await
                 .context("failed to load the jj repo")?,
         };
-        self.op_head = Some(repo.op_id().hex());
+        let previous = self.op_head.replace(repo.op_id().hex());
         self.repo = Some(repo.clone());
+        if let Some(previous) = previous
+            && Some(&previous) != self.op_head.as_ref()
+        {
+            self.emit(Payload::OpHeadChanged {
+                fingerprint: repo.op_id().hex(),
+            });
+        }
         Ok(repo)
     }
 
@@ -323,22 +338,21 @@ impl Actor {
 
     /// Take note of an operation we just wrote.
     ///
-    /// The cached repo is a generation behind, so it goes; the op head is read
-    /// afresh so the watcher's next signal dedups against *our* write. Leaving
-    /// it stale made every mutation and fetch look like an external operation,
-    /// which cost a second lock-and-snapshot that could only report "already
-    /// up to date".
+    /// The op head is read afresh so the watcher's next signal dedups against
+    /// *our* write. Leaving it stale made every mutation and fetch look like
+    /// an external operation, which cost a second lock-and-snapshot that could
+    /// only report "already up to date". The cached repo stays only when the
+    /// head didn't move (the work committed nothing).
     async fn adopt_written_op(&mut self, repository: &Repository) {
-        self.repo = None;
         let Ok(slot) = self.slot(repository) else {
+            self.repo = None;
             self.op_head = None;
             return;
         };
-        let (settings, root) = (
-            slot.settings.clone(),
-            slot.workspace.workspace_root().to_owned(),
-        );
-        self.op_head = jj::read_op_head_with(&settings, &root).await.ok();
+        self.op_head = jj::read_op_heads(slot.workspace.repo_loader()).await.ok();
+        if self.repo.as_ref().map(|repo| repo.op_id().hex()) != self.op_head {
+            self.repo = None;
+        }
     }
 
     /// After a CLI run: it may have written operations (or edited the jj
@@ -407,7 +421,7 @@ impl Actor {
                 if origin == crate::session::RefreshOrigin::Focus {
                     self.reload_settings_if_changed(repository);
                 }
-                let slot = self.slot(repository)?;
+                let slot = self.slot_for_lock(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
                         workspace,
@@ -817,8 +831,8 @@ impl Actor {
         seen_wc: Option<&str>,
     ) -> Result<()> {
         self.reload_settings_if_changed(repository);
-        let progress = LoadProgress::default();
-        let slot = self.slot(repository)?;
+        let (progress, _relay) = self.relay_progress(job);
+        let slot = self.slot_for_lock(repository)?;
         let (outcome, recovered_stale) = {
             let WorkspaceSlot {
                 workspace,

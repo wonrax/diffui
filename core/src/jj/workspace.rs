@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -181,10 +181,15 @@ pub(crate) async fn lock_working_copy<'a>(
         .await
         .context("failed to lock jj working copy")?;
 
-    let base_repo = repo_loader
-        .load_at_head()
-        .await
-        .context("failed to load jj repo")?;
+    // The actor usually holds the repo at head already; reading the commit
+    // index again for it is the costly part of a lock on a big repository.
+    let base_repo = match context.head.take() {
+        Some(repo) if read_op_heads(repo_loader).await.ok() == Some(repo.op_id().hex()) => repo,
+        _ => repo_loader
+            .load_at_head()
+            .await
+            .context("failed to load jj repo")?,
+    };
     let Some(wc_commit_id) = base_repo.view().get_wc_commit_id(workspace_name).cloned() else {
         return Err(StaleWorkingCopy(
             "This workspace was forgotten in another workspace (`jj workspace forget`), so it has \
@@ -894,6 +899,10 @@ pub(crate) struct SnapshotContext {
     /// `snapshot.auto-update-stale`: recover a stale checkout instead of
     /// refusing it.
     auto_update_stale: bool,
+    /// The repo the caller holds, offered to the next [`lock_working_copy`],
+    /// which uses it instead of loading one when it is still at head. Taken by
+    /// that lock either way, so it never keeps an old repo alive.
+    pub(crate) head: Cell<Option<Arc<ReadonlyRepo>>>,
 }
 
 impl SnapshotContext {
@@ -905,6 +914,7 @@ impl SnapshotContext {
             auto_update_stale: settings
                 .get_bool("snapshot.auto-update-stale")
                 .context("invalid snapshot.auto-update-stale")?,
+            head: Cell::new(None),
         })
     }
 
@@ -1143,9 +1153,8 @@ async fn absorb_snapshot(
 }
 
 /// Read the current jj operation-head id(s) *without* loading the working copy,
-/// taking a lock, or walking commits. `get_op_heads` is a bare readdir of
-/// `.jj/repo/op_heads/heads`, so the actor can run it before every read to
-/// decide whether its cached repo is still at head.
+/// taking a lock, or walking commits: `get_op_heads` is a readdir of
+/// `.jj/repo/op_heads/heads`.
 ///
 /// Heads are sorted and joined so the string is stable across readdir order and
 /// still changes when a divergent head set does. The single-head common case
@@ -1153,16 +1162,19 @@ async fn absorb_snapshot(
 /// (`op_id().hex()`), so the two compare directly.
 pub async fn read_jj_op_head(repository: Repository) -> Result<String> {
     let settings = jj_settings(&repository.root)?;
-    read_op_head_with(&settings, &repository.root).await
-}
-
-pub(crate) async fn read_op_head_with(settings: &UserSettings, root: &Path) -> Result<String> {
     // Resolve through the `.jj/repo` pointer file so a secondary workspace
     // (whose op store lives in the primary repo) reads the right heads.
-    let repo_dir = crate::repository::resolve_jj_repo_dir(root)?;
+    let repo_dir = crate::repository::resolve_jj_repo_dir(&repository.root)?;
     let loader =
-        RepoLoader::init_from_file_system(settings, &repo_dir, &default_backend_factories())
+        RepoLoader::init_from_file_system(&settings, &repo_dir, &default_backend_factories())
             .context("failed to init jj repo loader for op-head read")?;
+    read_op_heads(&loader).await
+}
+
+/// [`read_jj_op_head`] through a loader already open. Building one opens the
+/// git repo and reads its config, which is most of the cost, so the actor
+/// reads through its workspace's loader before every command.
+pub(crate) async fn read_op_heads(loader: &RepoLoader) -> Result<String> {
     let mut heads: Vec<String> = loader
         .op_heads_store()
         .get_op_heads()
