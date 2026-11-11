@@ -219,10 +219,45 @@ impl Actor {
         self.workspace = None;
         self.repo = None;
         self.op_head = None;
+        self.sides = None;
     }
 
     fn emit(&self, payload: Payload) {
         let _ = self.events.send(Event::new(self.id.clone(), payload));
+    }
+
+    /// A progress handle for `job`'s git transfer (a fetch, a push), relayed
+    /// as `Progress` events while the returned guard lives. git runs inside a
+    /// blocking jj-lib call that holds this thread until it returns, so the
+    /// relay polls from a thread of its own.
+    fn relay_progress(&self, job: JobId) -> (LoadProgress, ProgressRelay) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let progress = LoadProgress::default();
+        let stop = CancelFlag::default();
+        let (events, id) = (self.events.clone(), self.id.clone());
+        let (reporter, stopped) = (progress.clone(), stop.clone());
+        let spawned = std::thread::Builder::new()
+            .name("diffui-progress".to_owned())
+            .spawn(move || {
+                let mut last = (0, 0);
+                while !stopped.is_cancelled() {
+                    std::thread::sleep(POLL);
+                    let (loaded, total) = reporter.snapshot();
+                    // Nothing to show until git reports a total.
+                    if total > 0 && (loaded, total) != last {
+                        last = (loaded, total);
+                        let _ = events.send(Event::new(
+                            id.clone(),
+                            Payload::Progress { job, loaded, total },
+                        ));
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "failed to spawn the progress relay");
+        }
+        (progress, ProgressRelay(stop))
     }
 
     /// Open (once) the workspace `repository` names.

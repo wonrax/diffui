@@ -562,6 +562,25 @@ impl Diffui {
                 }
                 self.tab_mut(tab)?.jobs.clear(job);
             }
+            Payload::Progress { loaded, total, .. } => {
+                let jobs = &self.tab_mut(tab)?.jobs;
+                let activity = jobs
+                    .fetch
+                    .as_ref()
+                    .filter(|(id, ..)| *id == job)
+                    .map(|(_, activity, _)| *activity)
+                    .or_else(|| {
+                        jobs.mutation
+                            .as_ref()
+                            .filter(|(id, _)| *id == job)
+                            .map(|(_, pending)| pending.activity_id)
+                    });
+                if let Some(activity) = activity
+                    && let Some(log) = self.activity_log_for(tab)
+                {
+                    log.set_progress(activity, *loaded, *total);
+                }
+            }
             // A job this tab owns can't produce anything else.
             _ => {}
         };

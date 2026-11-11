@@ -439,8 +439,8 @@ const NO_TIMESTAMP: i64 = i64::MIN;
 #[derive(Debug, Clone, Default)]
 struct IdOrder {
     /// Row count the lanes were built at; any other length means they're stale.
-    /// Only `push` changes it, and the one id that changes in place
-    /// ([`CommitStore::set_commit_id`]) clears it.
+    /// Only `push` changes it; the one id that changes in place
+    /// ([`CommitStore::set_commit_id`]) moves its row within the lane.
     built_at: Option<usize>,
     by_change_id: Vec<u32>,
     by_commit_id: Vec<u32>,
@@ -622,13 +622,37 @@ impl CommitStore {
     /// without touching anything else in the graph, so patching the one row is
     /// all a re-walk would have changed. The old text stays in the arena (a few
     /// dozen bytes per save, gone at the next reload).
+    ///
+    /// The commit-id lane of [`IdOrder`] is patched in place rather than
+    /// dropped: this runs on every watcher snapshot, and a dropped order costs
+    /// the next lookup a sort of both lanes over the whole store.
     pub fn set_commit_id(&mut self, index: usize, commit_id: &str) {
         if index >= self.len() || self.row(index).commit_id() == commit_id {
             return;
         }
+        let mut order = std::mem::take(self.id_order.get_mut());
+        let built = order.built_at == Some(self.len());
+        if built {
+            let old = self.row(index).commit_id();
+            let start = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < old);
+            if let Some(offset) = order.by_commit_id[start..]
+                .iter()
+                .position(|&row| row as usize == index)
+            {
+                order.by_commit_id.remove(start + offset);
+            }
+        }
         let span = self.intern_text(commit_id);
         self.spans[index].commit_id = span;
-        self.id_order.get_mut().built_at = None;
+        if built {
+            let at = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < commit_id);
+            order.by_commit_id.insert(at, index as u32);
+        }
+        *self.id_order.get_mut() = order;
     }
 
     /// Set a row's empty status, used to fill in the merge/root commits left
@@ -1426,6 +1450,38 @@ mod tests {
         assert!(store.find_by_change_id("bc").is_none());
         assert!(store.find_by_commit_id("a0x").is_none());
         assert!(CommitStore::default().find_by_change_id("ac").is_none());
+    }
+
+    #[test]
+    fn a_rewritten_commit_id_moves_within_the_built_order() {
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        for (change_id, commit_id) in [("zc", "z0"), ("ac", "a0"), ("mc", "m0")] {
+            store.push(ids(change_id, commit_id), &mut interner);
+        }
+        store.id_order.get_mut().last_push = None;
+        assert!(store.find_by_commit_id("a0").is_some());
+
+        // A watcher snapshot gives `@` (row 1) a new id, sorting last now.
+        store.set_commit_id(1, "zz");
+        assert_eq!(
+            store.id_order.borrow().built_at,
+            Some(3),
+            "the order survives the patch"
+        );
+        assert!(store.find_by_commit_id("a0").is_none());
+        assert_eq!(
+            store.find_by_commit_id("zz").map(|row| row.change_id()),
+            Some("ac")
+        );
+        assert_eq!(
+            store.find_by_commit_id("m0").map(|row| row.change_id()),
+            Some("mc")
+        );
+        assert_eq!(
+            store.find_by_change_id("ac").map(|row| row.commit_id()),
+            Some("zz")
+        );
     }
 
     #[test]

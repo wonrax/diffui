@@ -372,6 +372,14 @@ impl ActivityLog {
             .filter(|a| a.started.elapsed() >= ACTIVITY_DISPLAY_DELAY)
     }
 
+    /// Report how far a running op has got, for its determinate bar.
+    pub fn set_progress(&mut self, id: ActivityId, loaded: usize, total: usize) {
+        if let Some(activity) = self.get_mut(id) {
+            activity.progress.set_total(total);
+            activity.progress.set_loaded(loaded);
+        }
+    }
+
     fn get_mut(&mut self, id: ActivityId) -> Option<&mut Activity> {
         self.activities.iter_mut().find(|a| a.id == id)
     }

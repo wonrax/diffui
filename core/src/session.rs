@@ -925,9 +925,12 @@ impl Session {
             Payload::MutationDone { job, outcome } => self.on_mutation(job, outcome),
             Payload::FileExpanded { job, path, file } => self.on_file_expanded(job, path, file),
             Payload::EmptyStatus { job, updates } => self.on_empty_status(job, updates),
-            Payload::Progress { loaded, total, .. } => {
-                self.commit_progress.set_total(total);
-                self.commit_progress.set_loaded(loaded);
+            // A fetch's or a push's progress is the frontend's to show.
+            Payload::Progress { job, loaded, total } => {
+                if self.graph_job.as_ref().is_some_and(|load| load.id == job) {
+                    self.commit_progress.set_total(total);
+                    self.commit_progress.set_loaded(loaded);
+                }
                 Vec::new()
             }
             Payload::WorkingCopyChanged => self.snapshot(RefreshOrigin::Watcher),
