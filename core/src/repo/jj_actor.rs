@@ -30,6 +30,7 @@ use crate::jj;
 use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::MutationOp;
 use crate::repository::Repository;
+use crate::session::RefreshMode;
 use crate::watcher::WatchBatch;
 
 /// Rows per streamed batch. Small enough that the first screenful paints
@@ -90,6 +91,7 @@ pub(super) fn spawn(
                         sides: None,
                         jobs,
                         stale_notice: None,
+                        refresh_mode: None,
                     }
                     .run(work_rx)
                     .await;
@@ -118,6 +120,9 @@ struct Actor {
     /// The stale-checkout notice last reported, so a refresh on every save
     /// doesn't raise it again until it changes or the checkout is updated.
     stale_notice: Option<String>,
+    /// The app's refresh mode, once it has said ([`Command::SetRefreshMode`]).
+    /// Until then a stale checkout is handled by jj's setting alone.
+    refresh_mode: Option<RefreshMode>,
 }
 
 /// Stops [`Actor::relay_progress`]'s thread when dropped.
@@ -148,6 +153,10 @@ impl Actor {
                     repository,
                     command,
                 } => {
+                    if let Command::SetRefreshMode { mode } = command.as_ref() {
+                        self.refresh_mode = Some(*mode);
+                        continue;
+                    }
                     // Cancels never reach here; `route_commands` applies them.
                     let Some(job) = command.job() else { continue };
                     // Let the reader run before the job starts. A caller that
@@ -288,6 +297,13 @@ impl Actor {
             .workspace
             .as_mut()
             .expect("the workspace was just opened"))
+    }
+
+    /// Whether a stale checkout is updated rather than refused: jj's
+    /// `snapshot.auto-update-stale`, or the app's automatic refresh mode.
+    fn update_stale(&mut self, repository: &Repository) -> Result<bool> {
+        let auto = self.refresh_mode == Some(RefreshMode::Auto);
+        Ok(auto || self.slot(repository)?.snapshot.auto_update_stale)
     }
 
     /// [`Self::slot`], about to take the working-copy lock: the repo we hold
@@ -457,12 +473,13 @@ impl Actor {
                 self.emit(Payload::FileExpanded { job, path, file });
                 Ok(())
             }
-            Command::Snapshot { job, origin } => {
+            Command::Snapshot { job, origin, disk } => {
                 // A watcher tick is a file save; only a refresh (or the tail
                 // of a mutation, or focus regain) is worth the config check.
                 if origin == crate::session::RefreshOrigin::Focus {
                     self.reload_settings_if_changed(repository);
                 }
+                let update_stale = self.update_stale(repository)?;
                 let slot = self.slot_for_lock(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
@@ -470,25 +487,26 @@ impl Actor {
                         snapshot,
                         ..
                     } = slot;
-                    jj::snapshot_working_copy(workspace, snapshot).await?
+                    jj::snapshot_working_copy(workspace, snapshot, disk, update_stale).await?
                 };
                 self.adopt(outcome.repo.clone());
                 if outcome.recovered_stale {
                     self.emit(Payload::StaleWorkingCopyRecovered);
                 }
-                if outcome.stale != self.stale_notice {
-                    if let Some(message) = &outcome.stale {
+                if outcome.disk.stale != self.stale_notice {
+                    if let Some(message) = &outcome.disk.stale {
                         self.emit(Payload::StaleWorkingCopy {
                             message: message.clone(),
                         });
                     }
-                    self.stale_notice = outcome.stale;
+                    self.stale_notice = outcome.disk.stale.clone();
                 }
                 self.emit(Payload::SnapshotDone {
                     job,
                     origin,
                     snapshot: outcome.snapshot,
                     warnings: outcome.warnings,
+                    disk: outcome.disk,
                 });
                 Ok(())
             }
@@ -521,17 +539,29 @@ impl Actor {
             Command::Fetch { job, target } => {
                 self.reload_settings_if_changed(repository);
                 let (progress, _relay) = self.relay_progress(job);
+                let update_stale = self.update_stale(repository)?;
                 let slot = self.slot_for_lock(repository)?;
-                let (outcome, written) = {
+                let (outcome, recovered_stale, written) = {
                     let WorkspaceSlot {
                         workspace,
                         settings,
                         snapshot,
                         ..
                     } = slot;
-                    jj::fetch_jj(workspace, settings, snapshot, &target, &progress).await?
+                    jj::fetch_jj(
+                        workspace,
+                        settings,
+                        snapshot,
+                        update_stale,
+                        &target,
+                        &progress,
+                    )
+                    .await?
                 };
                 self.adopt_written_op(repository, Some(written)).await;
+                if recovered_stale {
+                    self.emit(Payload::StaleWorkingCopyRecovered);
+                }
                 self.emit(Payload::FetchDone { job, outcome });
                 Ok(())
             }
@@ -724,7 +754,7 @@ impl Actor {
                 self.notice_cli_writes(repository).await;
                 Ok(())
             }
-            Command::Cancel { .. } => Ok(()),
+            Command::Cancel { .. } | Command::SetRefreshMode { .. } => Ok(()),
         }
     }
 
@@ -874,6 +904,7 @@ impl Actor {
     ) -> Result<()> {
         self.reload_settings_if_changed(repository);
         let (progress, _relay) = self.relay_progress(job);
+        let update_stale = self.update_stale(repository)?;
         let slot = self.slot_for_lock(repository)?;
         let (outcome, recovered_stale, written) = {
             let WorkspaceSlot {
@@ -886,6 +917,7 @@ impl Actor {
                 workspace,
                 settings,
                 snapshot,
+                update_stale,
                 repository,
                 op,
                 &progress,
@@ -1088,6 +1120,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ResolveDiff { .. } => "resolve_diff",
         Command::RunCli { .. } => "run_cli",
         Command::Cancel { .. } => "cancel",
+        Command::SetRefreshMode { .. } => "set_refresh_mode",
     }
 }
 
@@ -1114,7 +1147,7 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
         };
     }
     if let Some(stale) = error.downcast_ref::<jj::workspace::StaleWorkingCopy>() {
-        return RepoError::StaleWorkspace(stale.0.clone());
+        return RepoError::StaleWorkspace(stale.message.clone());
     }
     if let Some(undo) = error.downcast_ref::<jj::undo::UndoesPush>() {
         return RepoError::UndoesPush {

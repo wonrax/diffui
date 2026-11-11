@@ -97,8 +97,10 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// would leave the old files in place, and the next snapshot would record them
 /// into the moved-to commit.
 ///
-/// The flag beside the outcome says the checkout was stale and had to be
-/// recovered first, which the caller tells the user about.
+/// A stale checkout is recovered first when `update_stale` says so (jj's
+/// `snapshot.auto-update-stale`, or diffui's refresh mode), and refused
+/// otherwise. The flag beside the outcome says it was, which the caller tells
+/// the user about.
 ///
 /// `seen_op` is the operation the sender's rows reflect, which tells a stale
 /// row from a hidden commit picked on purpose (see [`follow_rewritten`]).
@@ -107,6 +109,7 @@ pub(crate) async fn apply_mutation(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repository: &Repository,
     op: &MutationOp,
     progress: &LoadProgress,
@@ -119,6 +122,7 @@ pub(crate) async fn apply_mutation(
             workspace,
             settings,
             context,
+            update_stale,
             &repository.root,
             op,
             progress,
@@ -137,6 +141,7 @@ pub(crate) async fn apply_mutation(
             workspace,
             settings,
             context,
+            update_stale,
             repository,
             op,
             progress,
@@ -182,6 +187,7 @@ async fn apply_view_only(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
@@ -230,7 +236,14 @@ async fn apply_view_only(
                     drop(tx);
                     signed = Some(
                         sign_before_push(
-                            workspace, settings, context, repo_root, op, seen_op, seen_wc,
+                            workspace,
+                            settings,
+                            context,
+                            update_stale,
+                            repo_root,
+                            op,
+                            seen_op,
+                            seen_wc,
                         )
                         .await?,
                     );
@@ -404,10 +417,12 @@ async fn stage_view_only(
 /// planned again inside the transaction to pick the commits (the repo may have
 /// moved since the lock-free plan); its bookmark changes are then rolled back,
 /// since they belong to the push, which runs afterwards without the lock.
+#[allow(clippy::too_many_arguments)]
 async fn sign_before_push(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repo_root: &Path,
     op: &MutationOp,
     seen_op: Option<&str>,
@@ -418,11 +433,18 @@ async fn sign_before_push(
     // A stale checkout is recovered instead of locked; the retry signs against
     // the recovered `@`, as `apply_mutation` does.
     for _ in 0..2 {
-        let mut locked =
-            match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
-                LockOutcome::Locked(locked) => locked,
-                LockOutcome::Recovered { .. } => continue,
-            };
+        let mut locked = match lock_working_copy(
+            workspace,
+            &repo_loader,
+            &workspace_name,
+            context,
+            update_stale,
+        )
+        .await?
+        {
+            LockOutcome::Locked(locked) => locked,
+            LockOutcome::Recovered { .. } => continue,
+        };
         let result = sign_locked(
             &mut locked,
             settings,
@@ -556,6 +578,7 @@ async fn apply_mutation_attempt(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repository: &Repository,
     op: &MutationOp,
     progress: &LoadProgress,
@@ -566,11 +589,18 @@ async fn apply_mutation_attempt(
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
 
-    let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
-            LockOutcome::Locked(locked) => locked,
-            LockOutcome::Recovered { .. } => return Ok(None),
-        };
+    let mut locked = match lock_working_copy(
+        workspace,
+        &repo_loader,
+        &workspace_name,
+        context,
+        update_stale,
+    )
+    .await?
+    {
+        LockOutcome::Locked(locked) => locked,
+        LockOutcome::Recovered { .. } => return Ok(None),
+    };
 
     let result = mutate_locked(
         &mut locked,

@@ -34,8 +34,8 @@ pub use cancel::CancelFlag;
 use cancel::{CancelRegistry, JobTicket};
 pub use jj_actor::{canonical_selection, rewritten_targets};
 pub use protocol::{
-    Capabilities, Command, Event, GraphTail, JobId, OpenSpec, Payload, PreviewRequest, RepoError,
-    RepoId,
+    Capabilities, Command, DiskState, DiskSync, Event, GraphTail, JobId, OpenSpec, Payload,
+    PreviewRequest, RepoError, RepoId,
 };
 
 use crate::repository::{Repository, Vcs};

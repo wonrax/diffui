@@ -129,6 +129,7 @@ async fn load_jj_repository_snapshot(repository: Repository) -> anyhow::Result<R
     let events = run_one(&repository.root, |job| Command::Snapshot {
         job,
         origin: diffui_core::RefreshOrigin::Focus,
+        disk: diffui_core::DiskSync::Fold,
     })
     .await;
     match events.into_iter().next_back() {

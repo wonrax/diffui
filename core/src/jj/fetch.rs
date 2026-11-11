@@ -62,39 +62,53 @@ use crate::repository::{FetchOutcome, FetchTarget};
 /// jj-lib's [`GitFetch`] spawns `git fetch`, so authentication reuses the
 /// user's git credential setup, plus diffui's credential prompt.
 ///
+/// A stale checkout is updated first when `update_stale` says so (the flag
+/// beside the outcome reports it), as [`apply_mutation`] does.
+///
 /// Also returns the repo at the operation the fetch left at head, for the
 /// caller to keep instead of loading it again.
+///
+/// [`apply_mutation`]: super::mutate::apply_mutation
 pub(crate) async fn fetch_jj(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     target: &FetchTarget,
     progress: &LoadProgress,
-) -> Result<(FetchOutcome, Arc<ReadonlyRepo>)> {
+) -> Result<(FetchOutcome, bool, Arc<ReadonlyRepo>)> {
     let workspace_name = workspace.workspace_name().to_owned();
     let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, context).await? {
+    // A recovered checkout already finished its own lock at the merged
+    // operation, so the fetch takes a new one over the updated `@`.
+    for attempt in 0..2 {
+        let mut locked = match lock_working_copy(
+            workspace,
+            &repo_loader,
+            &workspace_name,
+            context,
+            update_stale,
+        )
+        .await?
+        {
             LockOutcome::Locked(locked) => locked,
-            // A recovered checkout already finished its own lock at the merged
-            // operation; the caller refreshes and the user can fetch again.
-            LockOutcome::Recovered { .. } => {
-                bail!("the working copy was stale and has been recovered; try the fetch again")
+            LockOutcome::Recovered { .. } => continue,
+        };
+        let place = Place {
+            settings,
+            workspace_name: &workspace_name,
+            workspace_root: &workspace_root,
+        };
+        return match fetch_locked(&mut locked, &place, target, progress).await {
+            Ok((outcome, repo)) => Ok((outcome, attempt > 0, repo)),
+            Err(error) => {
+                locked.abandon();
+                Err(error)
             }
         };
-    let place = Place {
-        settings,
-        workspace_name: &workspace_name,
-        workspace_root: &workspace_root,
-    };
-    match fetch_locked(&mut locked, &place, target, progress).await {
-        Ok(outcome) => Ok(outcome),
-        Err(error) => {
-            locked.abandon();
-            Err(error)
-        }
     }
+    bail!("jj working copy kept going stale while fetching")
 }
 
 /// `cmd_git_fetch`, with the lock held. Split out so [`fetch_jj`] has exactly

@@ -5,9 +5,10 @@
 
 use crate::harness;
 
-use diffui_core::repo::{Command, JobId, Payload};
+use diffui_core::repo::{Command, DiskState, DiskSync, JobId, Payload};
 use diffui_core::{
-    Effect, Event, MutationOp, RefreshOrigin, RepoError, RepoId, RevisionSelection, Session,
+    Effect, Event, MutationOp, RefreshMode, RefreshOrigin, RepoError, RepoId, RevisionSelection,
+    Session,
 };
 use harness::{TestRepo, commit_file, commit_ids, scratch_repo, write};
 
@@ -1237,4 +1238,156 @@ fn a_read_that_adopts_an_external_operation_announces_it() {
         "{:?}",
         repo.parked()
     );
+}
+
+/// One snapshot of the kind `disk` names, answered with what it left between
+/// the disk and `@`.
+fn snapshot_as(
+    repo: &mut TestRepo,
+    disk: DiskSync,
+) -> (diffui_core::RepositorySnapshot, DiskState) {
+    let events = repo.run(|job| Command::Snapshot {
+        job,
+        origin: RefreshOrigin::Focus,
+        disk,
+    });
+    match events.into_iter().next_back() {
+        Some(Payload::SnapshotDone { snapshot, disk, .. }) => (snapshot, disk),
+        other => panic!("expected SnapshotDone, got {other:?}"),
+    }
+}
+
+/// The first workspace's checkout left behind: another workspace's snapshot
+/// rebased the merge `@` sits on, so `side.txt` is in `@` but not on disk.
+fn stale_checkout(test: &str) -> (std::path::PathBuf, TestRepo) {
+    let root = scratch_repo(test);
+    let mut main = TestRepo::open(&root);
+    main.snapshot();
+    commit_file(&mut main, "shared.txt", "base\n", "base");
+    let side = harness::add_workspace(&root, "side");
+    let mut other = TestRepo::open(&side);
+    let heads: Vec<RevisionSelection> = commit_ids(&root)
+        .into_iter()
+        .take(2)
+        .map(RevisionSelection::Commit)
+        .collect();
+    main.mutate(MutationOp::Merge { parents: heads })
+        .expect("merge the two workspaces' heads");
+    write(&side, "side.txt", "side-work\n");
+    other.snapshot();
+    (root, main)
+}
+
+/// A check looks without writing: no operation, and the edit it saw is still
+/// unsnapshotted the next time, because its lock was abandoned rather than
+/// finished over the edited files.
+#[test]
+fn a_check_writes_nothing_and_keeps_reporting_the_edit() {
+    let root = scratch_repo("check-reports-edits");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    let (_, clean) = snapshot_as(&mut repo, DiskSync::Check);
+    assert_eq!(clean, DiskState::default());
+
+    write(&root, "edit.txt", "unsaved\n");
+    let ops = harness::operation_log(&root).len();
+    for _ in 0..2 {
+        let (_, disk) = snapshot_as(&mut repo, DiskSync::Check);
+        assert!(disk.edits, "the edit is reported, every time");
+        assert_eq!(disk.stale, None);
+    }
+    assert_eq!(
+        harness::operation_log(&root).len(),
+        ops,
+        "a check writes no op"
+    );
+    assert!(repo.diff(RevisionSelection::WorkingCopy).files.is_empty());
+
+    let (_, folded) = snapshot_as(&mut repo, DiskSync::Fold);
+    assert!(!folded.edits);
+    assert_eq!(harness::operation_log(&root).len(), ops + 1);
+    let files = repo.diff(RevisionSelection::WorkingCopy).files;
+    assert!(
+        files.iter().any(|file| file.path == "edit.txt"),
+        "{files:?}"
+    );
+}
+
+/// A check on a stale checkout says so, with jj's message, and touches
+/// neither the files nor the op log.
+#[test]
+fn a_check_on_a_stale_checkout_reports_it_and_leaves_the_files() {
+    let (root, mut main) = stale_checkout("check-stale");
+    write(&root, "local.txt", "unsaved\n");
+    let ops = harness::operation_log(&root).len();
+
+    let (_, disk) = snapshot_as(&mut main, DiskSync::Check);
+    let message = disk.stale.expect("the checkout is reported stale");
+    assert!(message.contains("jj workspace update-stale"), "{message}");
+    assert!(disk.edits, "the edit made before is reported too");
+    assert!(!disk.stuck, "a Refresh can update this one");
+    assert_eq!(harness::operation_log(&root).len(), ops);
+    assert!(!root.join("side.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).ok(),
+        Some("unsaved\n".to_owned())
+    );
+}
+
+/// The Refresh button updates a stale checkout whatever the policy, and the
+/// edit on disk is snapshotted first rather than lost.
+#[test]
+fn a_sync_updates_a_stale_checkout_and_snapshots_the_edits_first() {
+    let (root, mut main) = stale_checkout("sync-stale");
+    write(&root, "local.txt", "unsaved\n");
+
+    let (_, disk) = snapshot_as(&mut main, DiskSync::Sync);
+    assert_eq!(disk, DiskState::default(), "nothing is left pending");
+    assert!(
+        main.parked()
+            .iter()
+            .any(|event| matches!(event.payload, Payload::StaleWorkingCopyRecovered))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("side.txt")).ok(),
+        Some("side-work\n".to_owned()),
+        "the checkout now holds the other workspace's work"
+    );
+    // As `jj workspace update-stale`: the disk was snapshotted at the
+    // operation it was synced at, so the edit lives on in a (divergent)
+    // commit next to the rebased `@` that is now checked out.
+    let kept = commit_ids(&root)
+        .iter()
+        .any(|id| harness::file_at_or_absent(&root, id, "local.txt") == "unsaved\n");
+    assert!(kept, "the edit was snapshotted before the update");
+}
+
+/// The app's mode decides what a mutation does with a stale checkout when jj
+/// leaves it to the default: automatic updates it and goes ahead, manual
+/// refuses as jj-cli does.
+#[test]
+fn the_refresh_mode_decides_whether_a_mutation_updates_a_stale_checkout() {
+    let (root, mut main) = stale_checkout("mode-decides-stale");
+    let describe = || MutationOp::Describe {
+        target: RevisionSelection::WorkingCopy,
+        description: "described merge".to_owned(),
+    };
+
+    main.handle.send(Command::SetRefreshMode {
+        mode: RefreshMode::Manual,
+    });
+    match main.mutate(describe()) {
+        Err(RepoError::StaleWorkspace(message)) => {
+            assert!(message.contains("jj workspace update-stale"), "{message}")
+        }
+        other => panic!("expected the stale refusal, got {other:?}"),
+    }
+    assert!(!root.join("side.txt").exists());
+
+    main.handle.send(Command::SetRefreshMode {
+        mode: RefreshMode::Auto,
+    });
+    main.mutate(describe())
+        .expect("the mutation updates the checkout and applies");
+    assert!(root.join("side.txt").exists());
 }

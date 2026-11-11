@@ -137,7 +137,9 @@ async fn run(
             job,
             error: RepoError::Unsupported,
         }),
-        Command::Cancel { .. } => unreachable!("cancels are handled before dispatch"),
+        Command::Cancel { .. } | Command::SetRefreshMode { .. } => {
+            unreachable!("jobless commands are handled before dispatch")
+        }
     }
 }
 

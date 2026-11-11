@@ -150,13 +150,15 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
             Ok(file) => vec![Payload::FileExpanded { job, path, file }],
             Err(error) => failed(job, error),
         },
-        Command::Snapshot { job, origin } => {
+        // No snapshot exists in git: every `DiskSync` reads the worktree.
+        Command::Snapshot { job, origin, .. } => {
             match crate::git::load_git_repository_snapshot(&repository.root).await {
                 Ok(snapshot) => vec![Payload::SnapshotDone {
                     job,
                     origin,
                     snapshot,
                     warnings: Vec::new(),
+                    disk: Default::default(),
                 }],
                 Err(error) => failed(job, error),
             }
@@ -233,6 +235,8 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
             job,
             error: RepoError::Unsupported,
         }],
-        Command::Cancel { .. } => unreachable!("cancels are handled before dispatch"),
+        Command::Cancel { .. } | Command::SetRefreshMode { .. } => {
+            unreachable!("jobless commands are handled before dispatch")
+        }
     }
 }

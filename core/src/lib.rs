@@ -50,8 +50,8 @@ pub use push::{
     RejectedCommit,
 };
 pub use repo::{
-    Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
-    RepoId, canonical_selection, rewritten_targets,
+    Capabilities, Command, DiskState, DiskSync, Event, JobId, OpenSpec, Payload, PreviewRequest,
+    RepoError, RepoHandle, RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{
     FetchOutcome, FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository,

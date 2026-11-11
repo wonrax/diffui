@@ -23,7 +23,7 @@ use crate::preview_graph::PostOpGraph;
 use crate::repository::{FetchOutcome, FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::revset::{RevsetError, RevsetMatch, RevsetQuery, RevsetSymbols};
-use crate::session::RefreshOrigin;
+use crate::session::{RefreshMode, RefreshOrigin};
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
 /// Identity of an open repository: the workspace root for a local repository,
@@ -196,11 +196,13 @@ pub enum Command {
         /// already expanded, kept expanded across a reload.
         expand: Vec<String>,
     },
-    /// Fold the on-disk tree into `@`. `origin` rides along untouched so the
-    /// projection knows how much to reload when the fingerprint moves.
+    /// Bring `@` up to date with the disk, as `disk` says. `origin` rides
+    /// along untouched so the projection knows how much to reload when the
+    /// fingerprint moves.
     Snapshot {
         job: JobId,
         origin: RefreshOrigin,
+        disk: DiskSync,
     },
     Mutate {
         job: JobId,
@@ -325,6 +327,13 @@ pub enum Command {
         job: JobId,
         invocation: CliInvocation,
     },
+    /// How the app keeps up with the disk. Jobless and answered by nothing:
+    /// it only sets whether a stale checkout is updated without being asked
+    /// (see [`DiskSync::Fold`]). Ignored by backends without a working copy
+    /// to update.
+    SetRefreshMode {
+        mode: RefreshMode,
+    },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
     /// inflight slot is always cleared by exactly one terminal event.
@@ -335,7 +344,7 @@ pub enum Command {
 
 impl Command {
     /// The job this command runs under, or `None` for `Cancel` (which names
-    /// someone else's job).
+    /// someone else's job) and `SetRefreshMode` (which is no work at all).
     pub fn job(&self) -> Option<JobId> {
         match self {
             Self::LoadGraph { job, .. }
@@ -358,9 +367,40 @@ impl Command {
             | Self::ResolveRevset { job, .. }
             | Self::ResolveDiff { job, .. }
             | Self::RunCli { job, .. } => Some(*job),
-            Self::Cancel { .. } => None,
+            Self::Cancel { .. } | Self::SetRefreshMode { .. } => None,
         }
     }
+}
+
+/// What a [`Command::Snapshot`] does with the disk. Only jj has a snapshot to
+/// take; git and pull requests read every variant as a plain refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskSync {
+    /// Look without writing: whether the disk has edits `@` doesn't hold and
+    /// whether the checkout is stale. No snapshot, no stale update.
+    Check,
+    /// Fold the disk into `@`. A stale checkout is updated when jj's
+    /// `snapshot.auto-update-stale` is set or the app's mode is
+    /// [`RefreshMode::Auto`], and left alone otherwise.
+    Fold,
+    /// Fold the disk into `@` and update a stale checkout whatever the mode:
+    /// the user pressed Refresh.
+    Sync,
+}
+
+/// How the disk stands against `@`, as the last snapshot found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskState {
+    /// The disk has edits `@` doesn't hold yet. Only a [`DiskSync::Check`]
+    /// leaves any behind.
+    pub edits: bool,
+    /// The checkout is stale and was left alone: jj's message, naming the
+    /// command that updates it.
+    pub stale: Option<String>,
+    /// The stale checkout is one a [`DiskSync::Sync`] can't update either:
+    /// the operation it was synced at is gone, or the workspace was
+    /// forgotten. Only the command in `stale` gets out of it.
+    pub stuck: bool,
 }
 
 /// The tail of a graph walk: what only the completed walk knows.
@@ -436,6 +476,9 @@ pub enum Payload {
         /// The skipped-large-file warning, when the snapshot hit one. Surfaced
         /// once here because the snapshot prologue is single now.
         warnings: Vec<String>,
+        /// What the snapshot left between the disk and `@`; the default for
+        /// backends without a snapshot.
+        disk: DiskState,
     },
     MutationDone {
         job: JobId,
@@ -523,8 +566,9 @@ pub enum Payload {
     /// `jj workspace update-stale`. Edits on disk were snapshotted first.
     /// Unsolicited: it rides alongside the snapshot or mutation that hit it.
     StaleWorkingCopyRecovered,
-    /// The jj checkout is stale and `snapshot.auto-update-stale` is off, so
-    /// the files on disk were left alone and the graph shows the repo at head.
+    /// The jj checkout is stale and was left alone (the update-stale policy
+    /// is off, or the operation it was synced at is gone), so the graph shows
+    /// the repo at head.
     /// Sent once per distinct state, not on every refresh.
     StaleWorkingCopy {
         message: String,

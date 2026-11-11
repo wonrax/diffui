@@ -4801,6 +4801,7 @@ mod tests {
                                 ..Default::default()
                             },
                             warnings: Vec::new(),
+                            disk: Default::default(),
                         },
                     ),
                     cx,

@@ -26,7 +26,8 @@ use crate::model::{
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repo::{
-    Capabilities, Command, Event, JobId, Payload, PreviewRequest, RepoError, RepoId,
+    Capabilities, Command, DiskState, DiskSync, Event, JobId, Payload, PreviewRequest, RepoError,
+    RepoId,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
 use crate::revset::{
@@ -293,6 +294,13 @@ pub struct Session {
     /// `Focus` subsumes `Watcher`) so it runs once the current work finishes
     /// rather than racing it (a second wc snapshot thrashes jj's lock).
     pub pending_refresh: Option<RefreshOrigin>,
+    /// The held refresh is the Refresh button's ([`Self::sync_disk`]), so it
+    /// must not run as a plain snapshot.
+    pending_sync: bool,
+    /// How background refreshes treat the disk. See [`Self::set_refresh_mode`].
+    refresh_mode: RefreshMode,
+    /// The disk against `@`, as the last snapshot left it.
+    disk: DiskState,
 
     // ── inflight slots ──────────────────────────────────────────────────
     graph_job: Option<GraphJob>,
@@ -814,20 +822,61 @@ impl Session {
                     .is_none_or(|range| range.includes_working_copy)
     }
 
-    /// Fold the working copy into `@`. Coalesces instead of racing when
-    /// something is already in flight: a second snapshot thrashes jj's lock,
-    /// and the in-flight work's terminal event drains what was held.
+    /// A background refresh: fold the working copy into `@` in
+    /// [`RefreshMode::Auto`], only look at it in [`RefreshMode::Manual`].
+    /// Coalesces instead of racing when something is already in flight: a
+    /// second snapshot thrashes jj's lock, and the in-flight work's terminal
+    /// event drains what was held.
     pub fn snapshot(&mut self, origin: RefreshOrigin) -> Vec<Effect> {
+        let disk = match self.refresh_mode {
+            RefreshMode::Auto => DiskSync::Fold,
+            RefreshMode::Manual => DiskSync::Check,
+        };
+        self.request_snapshot(origin, disk)
+    }
+
+    /// The Refresh button: fold the disk into `@` and update a stale checkout
+    /// whatever the mode, with a full reload. Held behind work in flight like
+    /// [`Self::snapshot`], and never downgraded to a plain snapshot there.
+    pub fn sync_disk(&mut self) -> Vec<Effect> {
+        self.request_snapshot(RefreshOrigin::Focus, DiskSync::Sync)
+    }
+
+    fn request_snapshot(&mut self, origin: RefreshOrigin, disk: DiskSync) -> Vec<Effect> {
         if !self.capabilities.graph {
             return Vec::new();
         }
         if self.busy() {
             self.pending_refresh = Some(coalesce_refresh(self.pending_refresh, origin));
+            self.pending_sync |= disk == DiskSync::Sync;
             return Vec::new();
         }
         let job = self.next_job();
         self.snapshot_job = Some((job, origin));
-        vec![Effect::Send(Command::Snapshot { job, origin })]
+        vec![Effect::Send(Command::Snapshot { job, origin, disk })]
+    }
+
+    pub fn refresh_mode(&self) -> RefreshMode {
+        self.refresh_mode
+    }
+
+    /// Whether the disk has edits `@` doesn't hold and whether the checkout
+    /// is stale, as the last snapshot found them.
+    pub fn disk(&self) -> &DiskState {
+        &self.disk
+    }
+
+    /// Switch how background refreshes treat the disk. The actor is told
+    /// either way (it decides whether a mutation or a fetch may update a
+    /// stale checkout), and switching to `Auto` catches up on whatever
+    /// `Manual` left pending.
+    pub fn set_refresh_mode(&mut self, mode: RefreshMode) -> Vec<Effect> {
+        self.refresh_mode = mode;
+        let mut effects = vec![Effect::Send(Command::SetRefreshMode { mode })];
+        if mode == RefreshMode::Auto && (self.disk.edits || self.disk.stale.is_some()) {
+            effects.extend(self.snapshot(RefreshOrigin::Focus));
+        }
+        effects
     }
 
     /// Run `op`. The actor serializes mutations on its own thread, so there is
@@ -930,7 +979,8 @@ impl Session {
                 origin,
                 snapshot,
                 warnings,
-            } => self.on_snapshot(job, origin, snapshot, warnings),
+                disk,
+            } => self.on_snapshot(job, origin, snapshot, warnings, disk),
             Payload::MutationDone { job, outcome } => self.on_mutation(job, outcome),
             Payload::FileExpanded { job, path, file } => self.on_file_expanded(job, path, file),
             Payload::EmptyStatus { job, updates } => self.on_empty_status(job, updates),
@@ -1159,11 +1209,13 @@ impl Session {
         origin: RefreshOrigin,
         snapshot: RepositorySnapshot,
         warnings: Vec<String>,
+        disk: DiskState,
     ) -> Vec<Effect> {
         if self.snapshot_job.as_ref().map(|(id, _)| *id) != Some(job) {
             return Vec::new();
         }
         self.snapshot_job = None;
+        self.disk = disk;
         let mut effects: Vec<Effect> = warnings
             .into_iter()
             .map(|note| Effect::Activity(Activity::Note(note)))
@@ -1414,7 +1466,9 @@ impl Session {
         if self.busy() {
             return Vec::new();
         }
+        let sync = std::mem::take(&mut self.pending_sync);
         match self.pending_refresh.take() {
+            Some(origin) if sync => self.request_snapshot(origin, DiskSync::Sync),
             Some(origin) => self.snapshot(origin),
             None => Vec::new(),
         }
@@ -1951,6 +2005,7 @@ mod tests {
                 origin: RefreshOrigin::Focus,
                 snapshot: at_b,
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         assert!(
@@ -2019,6 +2074,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         assert!(
@@ -2079,6 +2135,118 @@ mod tests {
         assert_eq!(
             coalesce_refresh(Some(RefreshOrigin::Focus), RefreshOrigin::Watcher),
             RefreshOrigin::Focus
+        );
+    }
+
+    // ── refresh mode ────────────────────────────────────────────────────
+
+    fn jj_session() -> Session {
+        let mut session = Session::unloaded("all()".to_owned());
+        session.capabilities = Capabilities {
+            graph: true,
+            mutate: true,
+            ..Capabilities::default()
+        };
+        // What every snapshot below lands at, so none of them reloads and
+        // leaves the session busy.
+        session.repository_snapshot = Some(RepositorySnapshot::default());
+        session
+    }
+
+    /// The snapshot `effects` sends: its job and what it does with the disk.
+    fn sent_snapshot(effects: &[Effect]) -> Option<(JobId, DiskSync)> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::Snapshot { job, disk, .. }) => Some((*job, *disk)),
+            _ => None,
+        })
+    }
+
+    fn land_snapshot(session: &mut Session, job: JobId, disk: DiskState) -> Vec<Effect> {
+        session.apply(Event::new(
+            test_repo(),
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Focus,
+                snapshot: RepositorySnapshot::default(),
+                warnings: Vec::new(),
+                disk,
+            },
+        ))
+    }
+
+    #[test]
+    fn the_mode_picks_what_a_background_snapshot_does() {
+        let mut session = jj_session();
+        let (job, disk) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        assert_eq!(disk, DiskSync::Fold);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        session.set_refresh_mode(RefreshMode::Manual);
+        let (job, disk) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        assert_eq!(disk, DiskSync::Check);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        let (_, disk) = sent_snapshot(&session.sync_disk()).unwrap();
+        assert_eq!(disk, DiskSync::Sync, "Refresh syncs in either mode");
+    }
+
+    #[test]
+    fn a_refresh_held_behind_work_is_not_lost_or_downgraded() {
+        let mut session = jj_session();
+        session.set_refresh_mode(RefreshMode::Manual);
+        let (busy, _) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+
+        assert!(session.sync_disk().is_empty(), "held while a snapshot runs");
+        assert!(session.snapshot(RefreshOrigin::Watcher).is_empty());
+        let edits = DiskState {
+            edits: true,
+            ..DiskState::default()
+        };
+        let effects = land_snapshot(&mut session, busy, edits.clone());
+        assert_eq!(session.disk(), &edits);
+        let (job, disk) = sent_snapshot(&effects).expect("the held refresh runs");
+        assert_eq!(disk, DiskSync::Sync, "a watcher tick doesn't downgrade it");
+
+        let effects = land_snapshot(&mut session, job, DiskState::default());
+        assert_eq!(session.disk(), &DiskState::default());
+        assert!(sent_snapshot(&effects).is_none(), "and runs only once");
+    }
+
+    #[test]
+    fn switching_to_auto_catches_up_on_what_manual_left() {
+        let mut session = jj_session();
+        let effects = session.set_refresh_mode(RefreshMode::Manual);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Command::SetRefreshMode {
+                mode: RefreshMode::Manual
+            })]
+        ));
+        let (job, _) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        land_snapshot(
+            &mut session,
+            job,
+            DiskState {
+                stale: Some("stale".to_owned()),
+                ..DiskState::default()
+            },
+        );
+
+        let effects = session.set_refresh_mode(RefreshMode::Auto);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Send(Command::SetRefreshMode {
+                mode: RefreshMode::Auto
+            }))
+        ));
+        let (job, disk) = sent_snapshot(&effects).expect("the pending state is folded");
+        assert_eq!(disk, DiskSync::Fold);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        let effects = session.set_refresh_mode(RefreshMode::Auto);
+        assert!(
+            sent_snapshot(&effects).is_none(),
+            "nothing pending, no snapshot"
         );
     }
 
@@ -2217,6 +2385,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         let (_, revision, base) = sent_diff(&effects).expect("the comparison reloads");
@@ -2305,6 +2474,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ))
     }
