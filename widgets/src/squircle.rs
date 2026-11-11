@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use gpui_kit::{
     App, BorderStyle, Bounds, Canvas, ElementId, Hitbox, HitboxBehavior, MouseButton,
-    MouseDownEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Styled, Window, canvas, point,
-    px,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Styled, Window,
+    canvas, point, px,
 };
 
 use crate::theme::Color;
@@ -393,9 +393,11 @@ pub fn hover_background(fill: Fill, border: f32) -> Canvas<Hitbox> {
     canvas(
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
         move |bounds, hitbox, window, _| {
-            if hitbox.is_hovered(window) {
+            let hovered = hitbox.is_hovered(window);
+            if hovered {
                 paint(bounds, fill, window);
             }
+            repaint_on_hover_change(hitbox, hovered, window);
         },
     )
     .absolute()
@@ -403,6 +405,17 @@ pub fn hover_background(fill: Fill, border: f32) -> Canvas<Hitbox> {
     .left(px(-border))
     .right(px(-border))
     .bottom(px(-border))
+}
+
+/// Repaints the view when the pointer crosses `hitbox`, painted as `hovered`.
+/// GPUI does this for an element with a hover style; a canvas has none.
+fn repaint_on_hover_change(hitbox: Hitbox, hovered: bool, window: &mut Window) {
+    let view = window.current_view();
+    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+        if phase.capture() && hitbox.is_hovered(window) != hovered {
+            cx.notify(view);
+        }
+    });
 }
 
 /// The fills of a control that answers the pointer.
@@ -435,6 +448,7 @@ pub fn interactive_background(
                 (false, _) => states.rest,
             };
             paint(bounds, fill, window);
+            repaint_on_hover_change(hitbox.clone(), hovered, window);
 
             let down = pressed.clone();
             let target = hitbox.clone();
