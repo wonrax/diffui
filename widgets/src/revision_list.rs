@@ -17,6 +17,8 @@
 //! computed by the caller and passed in per row, so this module stays decoupled
 //! from the rest of the app's theming logic.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -1128,7 +1130,54 @@ pub struct RevisionList {
     /// strings to lay itself out, and they are the same strings every frame:
     /// see [`WidthMemo`].
     widths: WidthMemo,
+    /// File names cut to their column, kept across frames: see [`NameCuts`].
+    name_cuts: NameCuts,
     _escape: Subscription,
+}
+
+/// File names cut in the middle to fit their column, one entry per name. A cut
+/// measures a couple of new strings for each char it keeps, which would flood
+/// the shared width memo as names scroll in; the column's width only changes on
+/// a resize, so the latest cut per name is the one asked for again.
+#[derive(Default)]
+struct NameCuts(RefCell<HashMap<String, NameCut>>);
+
+struct NameCut {
+    /// `(width, size, font)` the cut was made for.
+    key: (u32, u32, Font),
+    text: Rc<str>,
+    /// The cut's own width.
+    width: f32,
+}
+
+impl NameCuts {
+    /// Names kept before the memo is cleared: a screenful or two.
+    const CAPACITY: usize = 1024;
+
+    /// `name` cut in the middle to fit `width`, and how wide the cut is.
+    fn cut(&self, name: &str, width: f32, size: f32, font: Font) -> (Rc<str>, f32) {
+        let key = (width.to_bits(), size.to_bits(), font);
+        if let Some(cut) = self.0.borrow().get(name)
+            && cut.key == key
+        {
+            return (Rc::clone(&cut.text), cut.width);
+        }
+        let text: Rc<str> = ellipsis::cut_middle(name, width, size, font).into();
+        let drawn = crate::measure::line_width(&text, size, font);
+        let mut cuts = self.0.borrow_mut();
+        if cuts.len() >= Self::CAPACITY {
+            cuts.clear();
+        }
+        cuts.insert(
+            name.to_owned(),
+            NameCut {
+                key,
+                text: Rc::clone(&text),
+                width: drawn,
+            },
+        );
+        (text, drawn)
+    }
 }
 
 /// The list named `id`, drawing `props`. See [`RevisionListProps`].
@@ -1180,6 +1229,7 @@ impl RevisionList {
             pending_click: None,
             target_hover: None,
             widths: WidthMemo::default(),
+            name_cuts: NameCuts::default(),
             _escape: escape,
         }
     }
@@ -2656,10 +2706,11 @@ impl RevisionList {
             CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
         )
         .center_for_baseline(name_baseline);
-        let name =
-            ellipsis::cut_middle(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, primary);
+        let (name, name_width) =
+            self.name_cuts
+                .cut(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, primary);
         // Too narrow for even the ellipsis: nothing, rather than a mark over the stats.
-        if crate::measure::line_width(&name, FILE_NAME_TEXT_SIZE, primary) <= columns.path_w + 1.0 {
+        if name_width <= columns.path_w + 1.0 {
             paint_centered(
                 &name,
                 columns.path_x,
@@ -2799,8 +2850,9 @@ impl RevisionList {
             );
         }
 
-        let name = ellipsis::cut_middle(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, font);
-        let name_width = crate::measure::line_width(&name, FILE_NAME_TEXT_SIZE, font);
+        let (name, name_width) =
+            self.name_cuts
+                .cut(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, font);
         if name_width <= columns.path_w + 1.0 {
             paint_centered(
                 &name,
