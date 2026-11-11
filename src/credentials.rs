@@ -249,7 +249,7 @@ pub(crate) fn build_overlay(
             if let Some(detail) = &prompt.detail {
                 card = card.child(fingerprint(detail, mono, theme));
             }
-            Some("Yes")
+            Some("Trust")
         }
         PromptKind::Confirm => {
             card = card.lede(&Prose::from(prompt.text.clone()), mono);
@@ -277,7 +277,8 @@ pub(crate) fn build_overlay(
         )
     };
     let (decline, decline_label) = match prompt.kind {
-        PromptKind::YesNo | PromptKind::Confirm => (raised("No", cx), "No"),
+        PromptKind::YesNo => (raised("Don't trust", cx), "Don't trust"),
+        PromptKind::Confirm => (raised("No", cx), "No"),
         PromptKind::Notice => (raised("Dismiss", cx), "Dismiss"),
         PromptKind::Secret | PromptKind::Text => (
             ui::cancel_button("credential-decline", ui::Size::Standard, font, theme, cx),

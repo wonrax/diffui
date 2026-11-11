@@ -381,7 +381,7 @@ pub(crate) fn build_overlay(
                 "cli-output-done",
                 None,
                 "Close",
-                ui::Variant::Primary,
+                ui::Variant::Raised,
                 ui::Size::Standard,
                 font,
                 theme,
