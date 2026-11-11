@@ -295,6 +295,10 @@ impl Diffui {
                 state.handle = Some(handle.with_scope(scope));
                 state.session.repo = Some(event.repo.clone());
                 state.session.capabilities = capabilities;
+                // Before anything loads: the mode picks what a snapshot does,
+                // and the actor goes by jj's setting alone until told.
+                let effects = state.session.set_refresh_mode(self.config.refresh);
+                self.run_effects(id, effects);
                 // Only the tab on screen loads now; the rest load when they are
                 // first activated, as they always have. Their actors are up
                 // either way, so the switch is instant.
@@ -1018,9 +1022,11 @@ impl Diffui {
                     return;
                 }
                 // A manual refresh is a full reload: the user may have run an
-                // external jj op since the last load. An up-to-date refresh
-                // that finds nothing changed is silent.
-                self.start_repository_snapshot(tab, RefreshOrigin::Focus)
+                // external jj op since the last load. It also folds the disk
+                // and updates a stale checkout in either refresh mode. An
+                // up-to-date refresh that finds nothing changed is silent.
+                let effects = self.active_mut().session.sync_disk();
+                self.run_effects(tab, effects)
             }
             Action::Fetch(target) => self.start_fetch(target),
             Action::Undo => self.start_undo(),
@@ -1086,7 +1092,7 @@ impl Diffui {
                 self.selected_theme = theme;
                 self.apply_theme(cx);
             }
-            Action::SetRefreshMode(mode) => self.config.refresh = mode,
+            Action::SetRefreshMode(mode) => self.set_refresh_mode(mode),
             Action::SetMainView(mode) => self.set_main_view(mode, cx),
 
             // ── Tabs ────────────────────────────────────────────────────
@@ -3628,6 +3634,17 @@ impl Diffui {
         };
         {
             self.run_effects(tab, effects);
+        }
+    }
+
+    /// Switch every open tab to refresh `mode`. A tab whose actor isn't up
+    /// yet gets it again when it is.
+    pub(crate) fn set_refresh_mode(&mut self, mode: diffui_core::RefreshMode) {
+        self.config.refresh = mode;
+        for index in 0..self.tabs.len() {
+            let id = self.tabs[index].id;
+            let effects = self.tabs[index].state.session.set_refresh_mode(mode);
+            self.run_effects(id, effects);
         }
     }
 
