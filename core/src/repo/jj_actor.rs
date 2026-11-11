@@ -18,13 +18,13 @@ use jj_lib::{
     workspace::Workspace,
 };
 use tokio::sync::mpsc;
-use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
+use super::cancel::JobTicket;
 use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
-use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands};
+use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands, run_job};
 use crate::history::{HistoryRequest, HistoryResponse};
 use crate::jj;
 use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
@@ -151,35 +151,30 @@ impl Actor {
                     // cancel together, and a short job can otherwise finish
                     // without ever yielding — the two futures share a thread.
                     tokio::task::yield_now().await;
-                    let cancel = self.begin(job);
                     let span = tracing::info_span!(
                         "repo_command",
                         repo = %self.id,
                         job = job.0,
                         command = command_name(&command),
                     );
-                    let work = async {
+                    let (events, id) = (self.events.clone(), self.id.clone());
+                    let emit = |payload| {
+                        let _ = events.send(Event::new(id.clone(), payload));
+                    };
+                    let jobs = self.jobs.clone();
+                    let actor = &mut *self;
+                    let panicked = run_job(&jobs, job, span, emit, move |ticket| async move {
                         #[cfg(feature = "fault-injection")]
                         super::fault::trip(&repository.root);
-                        self.dispatch(&repository, *command, &cancel).await
-                    };
-                    let error = match catch_panic(work).instrument(span.clone()).await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => {
-                            let error = classify(error);
-                            span.in_scope(|| tracing::warn!(%error, "command failed"));
-                            Some(error)
-                        }
-                        Err(message) => {
-                            span.in_scope(|| tracing::error!("command panicked: {message}"));
-                            self.forget_loaded_state();
-                            Some(RepoError::Crashed(message))
-                        }
-                    };
-                    if let Some(error) = error {
-                        self.emit(Payload::Failed { job, error });
+                        actor
+                            .dispatch(&repository, *command, ticket)
+                            .await
+                            .map_err(classify)
+                    })
+                    .await;
+                    if panicked {
+                        self.forget_loaded_state();
                     }
-                    self.finish(job);
                 }
             }
             if self.events.is_closed() {
@@ -361,8 +356,9 @@ impl Actor {
         &mut self,
         repository: &Repository,
         command: Command,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
+        let cancel = &ticket.flag().clone();
         match command {
             Command::LoadGraph { job, revset } => {
                 self.load_graph(repository, job, revset, cancel).await
@@ -462,13 +458,13 @@ impl Actor {
                 graph,
                 seen_op,
             } => {
-                self.preview(repository, job, draft, graph, seen_op, cancel)
+                self.preview(repository, job, draft, graph, seen_op, ticket)
                     .await
             }
             Command::Fetch { job, target } => {
                 self.reload_settings_if_changed(repository);
-                let progress = LoadProgress::default();
-                let slot = self.slot(repository)?;
+                let (progress, _relay) = self.relay_progress(job);
+                let slot = self.slot_for_lock(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
                         workspace,
@@ -637,7 +633,7 @@ impl Actor {
                 Ok(())
             }
             Command::History { job, request } => {
-                self.history(repository, job, request, cancel).await
+                self.history(repository, job, request, ticket).await
             }
             Command::ResolveRevset { job, query } => {
                 let repo = self.repo_at_head(repository).await?;
@@ -847,12 +843,12 @@ impl Actor {
         draft: PreviewRequest,
         graph: Option<String>,
         seen_op: Option<String>,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
         let operation = self.repo_at_head(repository).await?.op_id().hex();
         let settings = self.slot(repository)?.settings.clone();
         let repository = repository.clone();
-        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        let (events, id) = (self.events.clone(), self.id.clone());
         std::thread::Builder::new()
             .name("diffui-preview".to_owned())
             .spawn(move || {
@@ -867,12 +863,12 @@ impl Actor {
                         &draft,
                         graph.as_deref(),
                         seen_op.as_deref(),
-                        &cancel,
+                        ticket.flag(),
                     )),
                     Err(error) => Err(error.into()),
                 };
                 let payload = match result {
-                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    _ if ticket.flag().is_cancelled() => Payload::Cancelled { job },
                     Ok((simulation, graph)) => Payload::PreviewDone {
                         job,
                         simulation,
@@ -902,12 +898,12 @@ impl Actor {
         job: JobId,
         revision: crate::model::RevisionSelection,
         path: String,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
         let settings = self.slot(repository)?.settings.clone();
         let root = repository.root.clone();
         let operation = repo.op_id().hex();
-        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        let (events, id) = (self.events.clone(), self.id.clone());
         std::thread::Builder::new()
             .name("diffui-annotate".to_owned())
             .spawn(move || {
@@ -921,7 +917,7 @@ impl Actor {
                     Err(error) => Err(error.into()),
                 };
                 let payload = match result {
-                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    _ if ticket.flag().is_cancelled() => Payload::Cancelled { job },
                     Ok(annotation) => Payload::History {
                         job,
                         response: HistoryResponse::Annotation(annotation),
@@ -944,8 +940,9 @@ impl Actor {
         repository: &Repository,
         job: JobId,
         request: HistoryRequest,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
+        let cancel = ticket.flag();
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
         let response = match request {
@@ -982,7 +979,7 @@ impl Actor {
                 }
             }
             HistoryRequest::Annotate { revision, path } => {
-                self.annotate_detached(repository, &repo, job, revision, path, cancel)?;
+                self.annotate_detached(repository, &repo, job, revision, path, ticket)?;
                 return Ok(());
             }
         };

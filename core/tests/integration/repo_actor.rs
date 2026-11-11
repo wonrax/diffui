@@ -1142,3 +1142,99 @@ fn bookmarks_stay_out_of_a_backing_git_repo_that_is_not_colocated() {
     let packed = std::fs::read_to_string(git_dir.join("packed-refs")).unwrap_or_default();
     assert!(!packed.contains("refs/heads/feature"), "{packed}");
 }
+
+/// A diff superseded while it waited its turn never runs: the cancel that
+/// arrived first answers it. Holding an arrow key used to queue one full diff
+/// per row passed.
+#[test]
+fn a_job_cancelled_before_its_turn_never_runs() {
+    let root = scratch_repo("cancelled-before-its-turn");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    let base = commit_ids(&root)[1].clone();
+    harness::new_chain(&root, &base, 300);
+    repo.snapshot();
+
+    // The walk keeps the actor busy while the diff and its cancel queue up.
+    let walk = repo.send(|job| Command::LoadGraph {
+        job,
+        revset: "all()".to_owned(),
+    });
+    let diff = repo.send(|job| Command::LoadDiff {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: diffui_core::DiffBase::Parents,
+        expand: Vec::new(),
+    });
+    repo.handle.send(Command::Cancel { job: diff });
+
+    assert!(matches!(
+        repo.drain(walk).last(),
+        Some(Payload::GraphLoaded { .. })
+    ));
+    assert!(
+        matches!(repo.drain(diff).as_slice(), [Payload::Cancelled { .. }]),
+        "the cancelled diff answers Cancelled and nothing else"
+    );
+}
+
+/// A preview runs on a thread of its own, and the actor moves on as soon as it
+/// has started it. A cancel sent after that still has to reach the thread.
+#[test]
+fn a_detached_preview_still_hears_a_late_cancel() {
+    use diffui_core::{Destination, PreviewRequest, RebaseSourceMode};
+
+    let root = scratch_repo("detached-late-cancel");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    let base = commit_ids(&root)[1].clone();
+    let target = harness::new_commit(&root, std::slice::from_ref(&base), "target");
+    let chain = harness::new_chain(&root, &base, 390);
+    let preview = repo.send(|job| Command::Preview {
+        job,
+        draft: PreviewRequest::Rebase {
+            mode: RebaseSourceMode::WithDescendants,
+            sources: vec![RevisionSelection::Commit(chain[0].clone())],
+            destination: Destination::Onto(RevisionSelection::Commit(target.clone())),
+        },
+        graph: Some("all()".to_owned()),
+        seen_op: None,
+    });
+    // Answered only once the actor has handed the preview to its thread.
+    repo.diff(RevisionSelection::Commit(target));
+    repo.handle.send(Command::Cancel { job: preview });
+
+    assert!(
+        matches!(repo.drain(preview).last(), Some(Payload::Cancelled { .. })),
+        "the late cancel reached the preview's thread"
+    );
+}
+
+/// A read that finds an operation someone else wrote reloads onto it, and says
+/// so: the watcher's own signal arrives later, finds the head already seen,
+/// and stays quiet, so this is the only announcement the rows get.
+#[test]
+fn a_read_that_adopts_an_external_operation_announces_it() {
+    let root = scratch_repo("read-adopts-external-op");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    repo.snapshot();
+    let head = commit_ids(&root)[1].clone();
+
+    harness::describe(&root, harness::OpBase::Head, &head, "written elsewhere");
+    let job = repo.send(|job| Command::RevisionDetails {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+    });
+    repo.drain(job);
+
+    let external = harness::operation_log(&root)[0].1.clone();
+    assert!(
+        repo.parked().iter().any(|event| matches!(
+            &event.payload,
+            Payload::OpHeadChanged { fingerprint } if *fingerprint == external
+        )),
+        "{:?}",
+        repo.parked()
+    );
+}

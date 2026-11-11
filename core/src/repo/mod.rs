@@ -31,7 +31,7 @@ use futures::Stream;
 use tokio::sync::mpsc;
 
 pub use cancel::CancelFlag;
-use cancel::CancelRegistry;
+use cancel::{CancelRegistry, JobTicket};
 pub use jj_actor::{canonical_selection, rewritten_targets};
 pub use protocol::{
     Capabilities, Command, Event, GraphTail, JobId, OpenSpec, Payload, PreviewRequest, RepoError,
@@ -101,6 +101,53 @@ pub(crate) async fn catch_panic<F: Future>(work: F) -> Result<F::Output, String>
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_owned())
         })
+}
+
+/// Run one command's job, the part every actor shares: register its cancel
+/// flag, answer `Cancelled` without starting when a cancel got there first,
+/// and turn an error or a panic into `Failed`. `work` gets the job's ticket;
+/// dropping it ends the job, so work that detaches onto a thread of its own
+/// moves the ticket there and sends its own terminal event.
+///
+/// Returns whether `work` panicked, so an actor holding loaded state can drop
+/// what the panic may have left half-updated.
+pub(crate) async fn run_job<Fut>(
+    jobs: &Jobs,
+    job: JobId,
+    span: tracing::Span,
+    emit: impl Fn(Payload),
+    work: impl FnOnce(JobTicket) -> Fut,
+) -> bool
+where
+    Fut: Future<Output = Result<(), RepoError>>,
+{
+    use tracing::Instrument as _;
+    let ticket = JobTicket::begin(jobs, job);
+    // A caller that supersedes its own work sends the cancel right behind the
+    // replacement, so on a busy actor most superseded jobs are cancelled before
+    // their turn. Running them anyway queued one full diff per row an arrow
+    // key passed.
+    if ticket.flag().is_cancelled() {
+        drop(ticket);
+        emit(Payload::Cancelled { job });
+        return false;
+    }
+    match catch_panic(work(ticket)).instrument(span.clone()).await {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
+            span.in_scope(|| tracing::warn!(%error, "command failed"));
+            emit(Payload::Failed { job, error });
+            false
+        }
+        Err(message) => {
+            span.in_scope(|| tracing::error!("command panicked: {message}"));
+            emit(Payload::Failed {
+                job,
+                error: RepoError::Crashed(message),
+            });
+            true
+        }
+    }
 }
 
 /// Test-only fault injection: make the next command an actor runs for a

@@ -6,11 +6,10 @@
 //! as `Batch`-shaped work, and the commit list arrives as graph rows.
 
 use tokio::sync::mpsc;
-use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
-use super::{Envelope, Jobs, catch_panic, route_commands};
+use super::{Envelope, Jobs, route_commands, run_job};
 use crate::github::{self, PrSpec};
 use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
 
@@ -38,25 +37,16 @@ pub(super) fn spawn(
                 Envelope::Watch(_) => {}
                 Envelope::Run { command, .. } => {
                     let Some(job) = command.job() else { continue };
-                    let cancel = match jobs.lock() {
-                        Ok(mut jobs) => jobs.begin(job),
-                        Err(_) => CancelFlag::default(),
-                    };
                     let span = tracing::info_span!("pr_command", repo = %id, job = job.0);
-                    let work = run(&id, &spec, *command, &cancel, &events);
-                    if let Err(message) = catch_panic(work).instrument(span.clone()).await {
-                        span.in_scope(|| tracing::error!("command panicked: {message}"));
-                        let _ = events.send(Event::new(
-                            id.clone(),
-                            Payload::Failed {
-                                job,
-                                error: RepoError::Crashed(message),
-                            },
-                        ));
-                    }
-                    if let Ok(mut jobs) = jobs.lock() {
-                        jobs.finish(job);
-                    }
+                    let emit = |payload| {
+                        let _ = events.send(Event::new(id.clone(), payload));
+                    };
+                    let (id, spec, events, info) = (&id, &spec, &events, &mut info);
+                    run_job(&jobs, job, span, emit, |ticket| async move {
+                        run(id, spec, info, *command, ticket.flag(), events).await;
+                        Ok(())
+                    })
+                    .await;
                 }
             }
             if events.is_closed() {
