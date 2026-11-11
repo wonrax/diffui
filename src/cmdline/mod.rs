@@ -188,7 +188,6 @@ pub(crate) struct CommandLine {
     slots: Vec<RevsetSlot>,
     pub(crate) completions: Vec<Completion>,
     pub(crate) selected: usize,
-    pub(crate) scroll_y: f32,
     /// ↑/↓ moved through the list since the last edit, so Enter picks the
     /// highlighted candidate instead of running the line.
     pub(crate) navigated: bool,
@@ -217,7 +216,6 @@ impl CommandLine {
             slots: Vec::new(),
             completions: Vec::new(),
             selected: 0,
-            scroll_y: 0.0,
             navigated: false,
             settled: false,
             insisted: false,
@@ -530,7 +528,6 @@ impl Diffui {
         group_completions(&mut completions);
         command.completions = completions;
         command.selected = 0;
-        command.scroll_y = 0.0;
     }
 
     /// The palette's query changed. Returns the settle timer for a command
@@ -795,22 +792,6 @@ impl Diffui {
         let len = command.completions.len() as i32;
         command.selected = (command.selected as i32 + delta).rem_euclid(len) as usize;
         command.navigated = true;
-        let (top, bottom) = palette::row_span(
-            command
-                .completions
-                .iter()
-                .map(|completion| crate::cmdline_view::completion_group(completion.kind)),
-            command.selected,
-        );
-        let viewport = palette::command_results_viewport();
-        let y = if top < command.scroll_y {
-            top
-        } else if bottom > command.scroll_y + viewport {
-            bottom - viewport
-        } else {
-            return Some(());
-        };
-        command.scroll_y = y.max(0.0);
         Some(())
     }
 

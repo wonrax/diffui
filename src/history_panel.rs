@@ -1766,27 +1766,9 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     let list = &history.op_list;
     let spans: Rc<[Range<usize>]> = op_row_spans(&history.ops).into();
     list.sync(op_log_keys(history, &spans));
-    let state = list.state.clone();
     let app = cx.entity();
     let now = now_millis();
-    // The panes repaint when the list leaves or reaches its top, for the
-    // header's fade; scrolling otherwise only moves the list.
-    let scrolled = list.scrolled.clone();
-    let app_id = app.entity_id();
-    state.set_scroll_handler({
-        let scrolled = scrolled.clone();
-        move |event, _, cx| note_scrolled(&scrolled, event.is_scrolled, app_id, cx)
-    });
-    let wheel = op_log_wheel(&state, &list.wheel, &scrolled, app_id);
-    let fade = crate::field::scroll_fade(
-        if state.logical_scroll_top() == gpui_kit::ListOffset::default() {
-            0.0
-        } else {
-            1.0
-        },
-        ui.resolved_theme().spec().panel_background,
-    );
-    let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
+    let rows = move |index: usize, window: &mut Window, cx: &mut gpui_kit::App| {
         diffui_widgets::frame_log::time("oplog.row", || {
             app.update(cx, |ui, cx| {
                 let theme = ui.resolved_theme().spec();
@@ -1812,16 +1794,8 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
                     .into_any_element()
             })
         })
-    })
-    .size_full();
-    div()
-        .relative()
-        .size_full()
-        .child(wheel)
-        .child(rows)
-        .children(fade)
-        .vertical_scrollbar(&state)
-        .into_any_element()
+    };
+    list.view(ui.resolved_theme().spec().panel_background, rows, cx)
 }
 
 /// The evolog, building only the rows on screen, as [`op_log_list`] does.
@@ -1837,10 +1811,8 @@ fn evolog_list(ui: &Diffui, now: i64, cx: &mut Cx) -> AnyElement {
         keys.push(EvologKey::Loading);
     }
     list.sync(keys);
-    let state = list.state.clone();
     let app = cx.entity();
-    let wheel = op_log_wheel(&state, &list.wheel, &list.scrolled, app.entity_id());
-    let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
+    let rows = move |index: usize, window: &mut Window, cx: &mut gpui_kit::App| {
         app.update(cx, |ui, cx| {
             let theme = ui.resolved_theme().spec();
             let row = match ui.active().history.evolog.get(index) {
@@ -1857,15 +1829,8 @@ fn evolog_list(ui: &Diffui, now: i64, cx: &mut Cx) -> AnyElement {
                 .child(row)
                 .into_any_element()
         })
-    })
-    .size_full();
-    div()
-        .relative()
-        .size_full()
-        .child(wheel)
-        .child(rows)
-        .vertical_scrollbar(&state)
-        .into_any_element()
+    };
+    list.view(ui.resolved_theme().spec().panel_background, rows, cx)
 }
 
 /// What decides an evolog row's height: which version it is.
@@ -1985,6 +1950,37 @@ enum OpLogKey {
     },
     Loading,
     LoadOlder,
+}
+
+impl<K> RowList<K> {
+    /// The list on screen: `row` builds row `index`, under the resampled wheel,
+    /// the bar, and a fade once it's off its top. The panes repaint when it
+    /// leaves or reaches its top, for the fade; scrolling otherwise only moves
+    /// the list.
+    fn view(
+        &self,
+        ground: Color,
+        row: impl Fn(usize, &mut Window, &mut gpui_kit::App) -> AnyElement + 'static,
+        cx: &mut Cx,
+    ) -> AnyElement {
+        let state = self.state.clone();
+        let app_id = cx.entity().entity_id();
+        state.set_scroll_handler({
+            let scrolled = self.scrolled.clone();
+            move |event, _, cx| note_scrolled(&scrolled, event.is_scrolled, app_id, cx)
+        });
+        let wheel = op_log_wheel(&state, &self.wheel, &self.scrolled, app_id);
+        let fade = (state.logical_scroll_top() != gpui_kit::ListOffset::default())
+            .then(|| ui::top_fade(ground));
+        div()
+            .relative()
+            .size_full()
+            .child(wheel)
+            .child(gpui_kit::list(state.clone(), row).size_full())
+            .children(fade)
+            .vertical_scrollbar(&state)
+            .into_any_element()
+    }
 }
 
 impl<K: PartialEq> RowList<K> {

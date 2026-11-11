@@ -1239,19 +1239,7 @@ pub fn scroll_list(
                 .overflow_y_scroll()
                 .child(list.inset.apply(div().w_full().flex_none().child(rows))),
         )
-        .children(list.fade.filter(|_| scrolled).map(|ground| {
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(theme::list::TOP_FADE))
-                .bg(gpui_kit::linear_gradient(
-                    180.0,
-                    gpui_kit::linear_color_stop(ground, 0.0),
-                    gpui_kit::linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
-                ))
-        }))
+        .children(list.fade.filter(|_| scrolled).map(top_fade))
         // The bar fills the box it's mounted on: one inset from the ends.
         .child(
             div()
@@ -1262,6 +1250,24 @@ pub fn scroll_list(
                 .bottom(px(list.bar_inset))
                 .vertical_scrollbar(handle),
         )
+}
+
+/// The fade a list's header casts over it once it has scrolled off its top:
+/// `ground` into nothing, so rows slide under the header instead of being cut
+/// by it, and the cut says there's more above. Hung over the list's box
+/// (which is `relative`); it takes no presses.
+pub fn top_fade(ground: Color) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(theme::list::TOP_FADE))
+        .bg(gpui_kit::linear_gradient(
+            180.0,
+            gpui_kit::linear_color_stop(ground, 0.0),
+            gpui_kit::linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
+        ))
 }
 
 /// Scrolls `handle` just enough to show row `selected`, whose top and bottom
@@ -1299,6 +1305,18 @@ pub fn reveal_on_change(
         return;
     };
     handle.set_offset(point(px(0.0), px(-to.max(0.0))));
+}
+
+/// How tall the view on `handle` is: its own bounds once laid out, the
+/// window's height before then (a list building only the rows in view builds
+/// a window's worth on its first frame).
+pub fn scroll_viewport(handle: &ScrollHandle, window: &Window) -> f32 {
+    let height = f32::from(handle.bounds().size.height);
+    if height > 0.0 {
+        height
+    } else {
+        f32::from(window.viewport_size().height)
+    }
 }
 
 /// The scroll handle of list `id`, kept while the list is on screen.

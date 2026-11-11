@@ -665,8 +665,14 @@ fn palette_keys() {
         h.press("down");
     }
     h.settle();
-    assert!(h.read(|ui| ui.palette().unwrap().top().unwrap().scroll_y) > 0.0);
     h.shot(LANE, "palette-scrolled");
+    // The list scrolled with it: the row under the list's top is past the
+    // first screenful.
+    let top = crate::toolbar::modal_top() + crate::palette::list_top() + 20.0;
+    h.hover_point(at(1440.0 / 2.0, top));
+    h.settle();
+    let row = selected(&mut h);
+    assert!(row > 15, "the list stayed at its top: {row}");
     // The keys didn't reach what's behind.
     assert_eq!(
         h.read(|ui| ui.palette().unwrap().top().unwrap().query.clone()),

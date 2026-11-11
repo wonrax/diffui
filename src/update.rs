@@ -1700,9 +1700,6 @@ impl Diffui {
             && column.dirty
         {
             column.selected = 0;
-            // Re-running the matcher invalidates row positions; jump
-            // the scroll back to the top so the first row is visible.
-            column.scroll_y = 0.0;
             column.dirty = false;
             palette::recompute_matches(column, self, false);
         }
@@ -1955,9 +1952,8 @@ impl Diffui {
             return;
         }
         let len = column.matches.len() as i32;
+        // The view scrolls the highlight into sight.
         column.selected = (column.selected as i32 + delta).rem_euclid(len) as usize;
-        // The view scrolls to `column.scroll_y`.
-        column.ensure_selected_visible();
     }
 
     /// Open the find bar, closing the overlays that share its keyboard.
@@ -3447,7 +3443,6 @@ impl Diffui {
                 column.searched = true;
                 column.dirty = false;
                 column.selected = 0;
-                column.scroll_y = 0.0;
                 // Back to the top for the new results. The pending debounced
                 // recompute finds the column clean and leaves them be.
                 column.query_version = column.query_version.wrapping_add(1);
@@ -3485,7 +3480,6 @@ impl Diffui {
         if let Some(column) = state.top_mut() {
             column.dirty = false;
             column.selected = 0;
-            column.scroll_y = 0.0;
             // The debounced recompute still in flight finds the column clean
             // and leaves what we just settled alone.
             column.query_version = column.query_version.wrapping_add(1);

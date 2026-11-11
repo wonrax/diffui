@@ -19,7 +19,7 @@ use crate::theme::{Color, Font, Weight, text_size};
 use crate::{Action, Cx, icons, input, ui};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, Div, ElementId, MouseButton, MouseMoveEvent, ScrollHandle, Window, div, point, px,
+    AnyElement, Div, ElementId, MouseButton, MouseMoveEvent, ScrollHandle, Window, div, px,
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str, Utf32String};
 use std::collections::VecDeque;
@@ -42,21 +42,6 @@ pub fn results_scrollable_id(depth: usize) -> String {
     format!("palette-results-{depth}")
 }
 
-/// Approximate viewport height of a column's result list. Used to decide
-/// when keyboard navigation has pushed the highlighted row out of view.
-/// Doesn't need to be exact — the worst case of a too-small estimate is
-/// an extra scroll-to that doesn't move the offset, which is invisible to
-/// the user. Computed as: column height − input band − rule − scope tabs −
-/// rule − results-pane padding (top + bottom) − rule − footer.
-pub(crate) const RESULTS_VIEWPORT_HEIGHT: f32 = COLUMN_HEIGHT
-    - INPUT_BAND
-    - 1.0
-    - SCOPES_HEIGHT
-    - 1.0
-    - 2.0 * RESULTS_INSET
-    - 1.0
-    - FOOTER_HEIGHT;
-
 /// Where a root column's results list starts below the card's top edge.
 #[cfg(test)]
 pub(crate) fn list_top() -> f32 {
@@ -72,7 +57,6 @@ const COLUMN_HORIZONTAL_GAP: f32 = 16.0;
 /// Height of the input band at the card's top.
 pub(crate) const INPUT_BAND: f32 = 52.0;
 pub(crate) const ROW_HEIGHT: f32 = theme::list::height::RESULT;
-pub(crate) use crate::overlay_kit::FOOTER_HEIGHT;
 /// Inset of the results list inside the card. A result row pads its content
 /// by [`ROW_PAD_X`], so row glyphs, the input's glyph and the group headings
 /// all start on the one [`CONTENT_X`] edge.
@@ -183,12 +167,9 @@ pub struct PaletteColumn {
     pub source: ColumnSource,
     pub matches: Vec<PaletteMatch>,
     pub selected: usize,
-    /// Y offset the view moves this column's results to. Updated whenever a
-    /// keyboard move pushes the selected row out of the visible window; the
-    /// wheel moves the list without touching it.
-    pub scroll_y: f32,
     /// Bumped on every query edit and every recompute: the results list
-    /// scrolls back to the top when it moves.
+    /// reveals its highlighted row afresh when it moves, so a new query starts
+    /// at the top.
     pub query_version: u64,
     /// True while a query edit is awaiting its debounced recompute — drives
     /// the palette's "searching…" hint.
@@ -495,38 +476,6 @@ pub fn revision_mode_needle(query: &str) -> Option<&str> {
     }
 }
 
-impl PaletteColumn {
-    /// Adjust `scroll_y` so the highlighted row is inside the visible
-    /// window. Returns `true` when the offset actually changed. Mirrors the
-    /// "keep cursor visible" math every
-    /// editor uses: only scroll when the selection has left the window,
-    /// snap just enough to bring it back.
-    pub fn ensure_selected_visible(&mut self) -> bool {
-        if self.matches.is_empty() {
-            return false;
-        }
-        let (row_top, row_bottom) = row_span(
-            self.matches.iter().map(|entry| group_of(&entry.item)),
-            self.selected,
-        );
-        let viewport = RESULTS_VIEWPORT_HEIGHT;
-        let new_y = if row_top < self.scroll_y {
-            row_top
-        } else if row_bottom > self.scroll_y + viewport {
-            row_bottom - viewport
-        } else {
-            self.scroll_y
-        };
-        let new_y = new_y.max(0.0);
-        if (new_y - self.scroll_y).abs() > f32::EPSILON {
-            self.scroll_y = new_y;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 impl PaletteState {
     pub fn open(ui: &Diffui) -> Self {
         let mut column = PaletteColumn {
@@ -534,7 +483,6 @@ impl PaletteState {
             source: ColumnSource::Root,
             matches: Vec::new(),
             selected: 0,
-            scroll_y: 0.0,
             query_version: 0,
             dirty: false,
             searched: false,
@@ -579,7 +527,6 @@ impl PaletteState {
             source: ColumnSource::Actions(target),
             matches: Vec::new(),
             selected: 0,
-            scroll_y: 0.0,
             query_version: 0,
             dirty: false,
             searched: false,
@@ -981,12 +928,6 @@ fn push_action_candidates(out: &mut Vec<Candidate>, ui: &Diffui, target: &Result
         ResultRef::Command(_) => return,
     };
     push_command_candidates(out, ui, scope, &CommandArg::Result(target.clone()));
-}
-
-/// The command line's results viewport: the plain one less the argument
-/// strip under the input and the preview over the list.
-pub(crate) fn command_results_viewport() -> f32 {
-    RESULTS_VIEWPORT_HEIGHT - crate::cmdline_view::ARGS_HEIGHT - crate::cmdline_view::PREVIEW_BLOCK
 }
 
 fn is_revision_verb(id: CommandId) -> bool {
@@ -1492,29 +1433,6 @@ impl Diffui {
     }
 }
 
-/// A list's handle, moved to `target` whenever `target` moves. Between those,
-/// the wheel owns the offset.
-pub(crate) fn list_scroll(
-    id: impl Into<ElementId>,
-    target: f32,
-    epoch: u64,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> ScrollHandle {
-    struct Applied(ScrollHandle, f32, u64);
-    let entry = window.use_keyed_state(id, cx, |_, _| Applied(ScrollHandle::default(), 0.0, 0));
-    let handle = entry.read(cx).0.clone();
-    let applied = entry.read(cx);
-    if (applied.1 - target).abs() > f32::EPSILON || applied.2 != epoch {
-        handle.set_offset(point(px(0.0), px(-target)));
-        entry.update(cx, |entry, _| {
-            entry.1 = target;
-            entry.2 = epoch;
-        });
-    }
-    handle
-}
-
 fn build_results(
     ui: &Diffui,
     theme: ThemeSpec,
@@ -1551,19 +1469,30 @@ fn build_results(
     // The bar floats over the rows' right inset like the graph's does; the rows'
     // text padding keeps every label and hint clear of it.
     let id = results_scrollable_id(depth);
-    let handle = list_scroll(
-        ElementId::Name(format!("{id}-scroll").into()),
-        column.scroll_y,
-        // The wheel moves the list without touching `scroll_y`, so a target of 0
-        // can be no change at all: every new query goes back to it regardless.
-        column.query_version,
+    let handle = ui::scroll_handle(ElementId::Name(format!("{id}-scroll").into()), window, cx)
+        .read(cx)
+        .clone();
+    // A new query reveals its highlight afresh, which takes the list back to
+    // its top; between queries, only a highlight that moves scrolls it.
+    ui::reveal_on_change(
+        ElementId::Name(format!("{id}-revealed-{}", column.query_version).into()),
+        &handle,
+        Some(column.selected),
+        |row| {
+            let (top, bottom) = row_span(
+                column.matches.iter().map(|entry| group_of(&entry.item)),
+                row,
+            );
+            (top, bottom + 2.0 * RESULTS_INSET)
+        },
         window,
         cx,
     );
+    let viewport = ui::scroll_viewport(&handle, window);
     let items = visible_results(
         column.matches.iter().map(|row| Some(group_of(&row.item))),
         &handle,
-        RESULTS_VIEWPORT_HEIGHT,
+        viewport,
         ROW_HEIGHT,
         |heading| group_heading(heading, font, theme).into_any_element(),
         |index| {
@@ -1595,13 +1524,23 @@ fn build_results(
                 .into_any_element()
         },
     );
-    let list = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .p(px(RESULTS_INSET))
-        .children(items);
-    ui::scrollable_with(ElementId::Name(id.into()), &handle, list).into_any_element()
+    let list = div().w_full().flex().flex_col().children(items);
+    results_list(ElementId::Name(id.into()), &handle, list)
+}
+
+/// A results list scrolling in what's left of its column, the rows inset
+/// from it inside the scroll view so the bar keeps to the column's edge.
+pub(crate) fn results_list(id: ElementId, handle: &ScrollHandle, rows: Div) -> AnyElement {
+    ui::scroll_list(
+        id,
+        handle,
+        ui::ScrollList {
+            inset: [RESULTS_INSET, RESULTS_INSET].into(),
+            ..Default::default()
+        },
+        rows,
+    )
+    .into_any_element()
 }
 
 /// A results list's group headings and rows, in order, built only near the
@@ -2074,6 +2013,7 @@ pub(crate) fn filling(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::point;
 
     /// `:` search scores every commit and lists the ones that match, best
     /// first.
@@ -2141,7 +2081,7 @@ mod tests {
             visible_results(
                 groups.iter().copied(),
                 handle,
-                RESULTS_VIEWPORT_HEIGHT,
+                400.0,
                 ROW_HEIGHT,
                 |group| {
                     headings.borrow_mut().push(group);

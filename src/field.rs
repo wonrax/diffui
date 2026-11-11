@@ -10,8 +10,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Bounds, Div, MouseButton, Pixels, Window, canvas, div, px};
 
 use crate::root::PaneSet;
+use crate::theme::Font;
 use crate::theme::{self, ThemeSpec};
-use crate::theme::{Color, Font};
 use crate::{Cx, Diffui, icons, input};
 use crate::{HoverTarget, ToolbarMenu};
 
@@ -208,27 +208,6 @@ pub(crate) fn panel_strip() -> Div {
         .pr(px(trail))
         .pt(px(crate::revision_list::ROW_CARD_INSET_Y))
         .pb(px(PANEL_TOGGLE_INSET))
-}
-
-/// The fade a panel's header casts over its list once the list has scrolled
-/// off its top: the pane's colour into nothing, so rows slide under the
-/// header instead of being cut by it, and the cut says there's more above.
-/// `None` at the top. Hung over the list's box (which is `relative`); it takes
-/// no presses.
-pub(crate) fn scroll_fade(offset: f64, ground: Color) -> Option<Div> {
-    (offset > 0.0).then(|| {
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(theme::list::TOP_FADE))
-            .bg(gpui_kit::linear_gradient(
-                180.0,
-                gpui_kit::linear_color_stop(ground, 0.0),
-                gpui_kit::linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
-            ))
-    })
 }
 
 /// A [`filter_field`] alone in a panel header (the source browser's file

@@ -401,15 +401,35 @@ pub(crate) fn results(
         palette::empty_results(ui, theme, label.to_owned()).into_any_element()
     } else {
         let font = ui.config.ui_font;
-        let handle =
-            palette::list_scroll("command-results-scroll", command.scroll_y, 0, window, cx);
+        let id = "command-results";
+        let handle = ui::scroll_handle("command-results-scroll", window, cx)
+            .read(cx)
+            .clone();
+        ui::reveal_on_change(
+            "command-results-revealed",
+            &handle,
+            Some(command.selected),
+            |row| {
+                let (top, bottom) = palette::row_span(
+                    command
+                        .completions
+                        .iter()
+                        .map(|completion| completion_group(completion.kind)),
+                    row,
+                );
+                (top, bottom + 2.0 * RESULTS_INSET)
+            },
+            window,
+            cx,
+        );
+        let viewport = ui::scroll_viewport(&handle, window);
         let items = palette::visible_results(
             command
                 .completions
                 .iter()
                 .map(|completion| Some(completion_group(completion.kind))),
             &handle,
-            palette::RESULTS_VIEWPORT_HEIGHT,
+            viewport,
             palette::ROW_HEIGHT,
             |heading| palette::group_heading(heading, font, theme).into_any_element(),
             |index| {
@@ -440,13 +460,8 @@ pub(crate) fn results(
                     .into_any_element()
             },
         );
-        let list = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .p(px(RESULTS_INSET))
-            .children(items);
-        ui::scrollable_with("command-results", &handle, list).into_any_element()
+        let list = div().w_full().flex().flex_col().children(items);
+        palette::results_list(id.into(), &handle, list)
     };
     div()
         .size_full()
@@ -472,10 +487,6 @@ pub(crate) fn completion_group(kind: CompletionKind) -> &'static str {
         CompletionKind::History => "Recent",
     }
 }
-
-/// How much of the list's height the preview takes, card and inset, for the
-/// keyboard's scroll math.
-pub(crate) const PREVIEW_BLOCK: f32 = 66.0;
 
 /// The command Enter would run, in full: the line as typed with the
 /// highlighted candidate ghosted in where it would go, what kind of command it
