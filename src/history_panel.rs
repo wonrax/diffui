@@ -19,6 +19,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Div, ElementId, SharedString, Stateful, Window, div, px};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -176,7 +177,9 @@ pub(crate) struct HistoryState {
     /// or it pulls the view back to the file it was given.
     diff_file: usize,
     /// The op log's rows as the list last measured them, and its scroll.
-    op_list: OpLogList,
+    op_list: RowList<OpLogKey>,
+    /// The same for the evolog.
+    evolog_list: RowList<EvologKey>,
     /// The last failure of a list or detail read, shown in place of it.
     error: Option<String>,
     pub(crate) file_filter: Option<FileFilter>,
@@ -1061,9 +1064,19 @@ fn description_change(history: &HistoryState) -> Option<(&str, &str)> {
     (old.summary != new.summary).then(|| (name(old), name(new)))
 }
 
+#[cfg(test)]
 fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
-    let mut rows = Vec::new();
-    let ops = &history.ops;
+    op_row_spans(&history.ops)
+        .into_iter()
+        .filter_map(|span| OpRow::of(history, span))
+        .collect()
+}
+
+/// The op log's rows as spans of `history.ops`: one operation, or a folded run
+/// of two or more snapshots. Plain indices, so a list build works them out once
+/// and every row it builds reads its own.
+fn op_row_spans(ops: &[OperationEntry]) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
     let mut index = 0;
     while index < ops.len() {
         let op = &ops[index];
@@ -1073,25 +1086,34 @@ fn op_rows<'a>(history: &'a HistoryState) -> Vec<OpRow<'a>> {
                 !candidate.is_snapshot || candidate.is_current && candidate.id != op.id
             })
             .map_or(ops.len(), |offset| index + offset);
-        let run = run_end - index;
         // A lone snapshot reads fine on its own; two or more fold.
-        if op.is_snapshot && !op.is_current && run >= 2 {
-            rows.push(OpRow::Run {
-                first: op,
-                count: run,
-                oldest: &ops[run_end - 1],
-                children: history
-                    .expanded_runs
-                    .contains(&op.id)
-                    .then(|| &ops[index..run_end]),
-            });
-            index = run_end;
+        let end = if op.is_snapshot && !op.is_current && run_end - index >= 2 {
+            run_end
         } else {
-            rows.push(OpRow::Op(op));
-            index += 1;
-        }
+            index + 1
+        };
+        spans.push(index..end);
+        index = end;
     }
-    rows
+    spans
+}
+
+impl<'a> OpRow<'a> {
+    /// The row over `span` of [`op_row_spans`], or `None` once the log has
+    /// changed under it.
+    fn of(history: &'a HistoryState, span: Range<usize>) -> Option<Self> {
+        let ops = history.ops.get(span)?;
+        Some(match ops {
+            [] => return None,
+            [op] => OpRow::Op(op),
+            [first, .., oldest] => OpRow::Run {
+                first,
+                count: ops.len(),
+                oldest,
+                children: history.expanded_runs.contains(&first.id).then_some(ops),
+            },
+        })
+    }
 }
 
 /// The source info bar's history controls: the blame toggle and the browsed
@@ -1727,7 +1749,7 @@ fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
 pub(crate) fn build_history_sidebar(
     ui: &Diffui,
     theme: ThemeSpec,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
     let history = &ui.active().history;
@@ -1816,24 +1838,7 @@ pub(crate) fn build_history_sidebar(
                     0.0,
                 )))
                 .child(reload);
-            let mut rows = list_column()
-                .gap(px(2.0 * ROW_CARD_INSET_Y))
-                .pt(px(ROW_CARD_INSET_Y))
-                .pb(px(ROW_CARD_INSET_Y));
-            for (index, entry) in history.evolog.iter().enumerate() {
-                rows = rows.child(version_row(ui, theme, index, entry, now, window, cx));
-            }
-            if history.evolog_job.is_some() {
-                rows = rows.child(note(
-                    "Reading the change's history\u{2026}",
-                    theme.subtle_text,
-                    ui,
-                ));
-            }
-            (
-                header,
-                ui::scrollable("history-evolog", rows).into_any_element(),
-            )
+            (header, evolog_list(ui, now, cx))
         }
     };
 
@@ -1861,10 +1866,12 @@ fn list_column() -> Div {
 /// The op log, building only the rows on screen. A page holds hundreds of
 /// operations, and a scroll tick rebuilds the pane holding the list: with every
 /// row built that cost about 15ms a tick, over a 120 Hz frame. Each row is
-/// still measured once when it arrives (see [`OpLogList`]), for the scrollbar.
+/// still measured once when it arrives (see [`RowList`]), for the scrollbar.
 fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
-    let list = &ui.active().history.op_list;
-    list.sync(op_log_keys(ui));
+    let history = &ui.active().history;
+    let list = &history.op_list;
+    let spans: Rc<[Range<usize>]> = op_row_spans(&history.ops).into();
+    list.sync(op_log_keys(history, &spans));
     let state = list.state.clone();
     let app = cx.entity();
     let now = now_millis();
@@ -1890,9 +1897,12 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
             app.update(cx, |ui, cx| {
                 let theme = ui.resolved_theme().spec();
                 let history = &ui.active().history;
-                let row = match op_rows(history).get(index) {
+                let row = match spans
+                    .get(index)
+                    .and_then(|span| OpRow::of(history, span.clone()))
+                {
                     Some(OpRow::Op(op)) => op_row(ui, theme, op, now, window, cx),
-                    Some(&OpRow::Run {
+                    Some(OpRow::Run {
                         first,
                         count,
                         oldest,
@@ -1918,6 +1928,57 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
         .children(fade)
         .vertical_scrollbar(&state)
         .into_any_element()
+}
+
+/// The evolog, building only the rows on screen, as [`op_log_list`] does.
+fn evolog_list(ui: &Diffui, now: i64, cx: &mut Cx) -> AnyElement {
+    let history = &ui.active().history;
+    let list = &history.evolog_list;
+    let mut keys: Vec<EvologKey> = history
+        .evolog
+        .iter()
+        .map(|entry| EvologKey::Version(entry.commit.commit_id.clone()))
+        .collect();
+    if history.evolog_job.is_some() {
+        keys.push(EvologKey::Loading);
+    }
+    list.sync(keys);
+    let state = list.state.clone();
+    let app = cx.entity();
+    let wheel = op_log_wheel(&state, &list.wheel, &list.scrolled, app.entity_id());
+    let rows = gpui_kit::list(state.clone(), move |index, window, cx| {
+        app.update(cx, |ui, cx| {
+            let theme = ui.resolved_theme().spec();
+            let row = match ui.active().history.evolog.get(index) {
+                Some(entry) => version_row(ui, theme, index, entry, now, window, cx),
+                None => note(
+                    "Reading the change's history\u{2026}",
+                    theme.subtle_text,
+                    ui,
+                )
+                .into_any_element(),
+            };
+            list_column()
+                .py(px(ROW_CARD_INSET_Y))
+                .child(row)
+                .into_any_element()
+        })
+    })
+    .size_full();
+    div()
+        .relative()
+        .size_full()
+        .child(wheel)
+        .child(rows)
+        .vertical_scrollbar(&state)
+        .into_any_element()
+}
+
+/// What decides an evolog row's height: which version it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvologKey {
+    Version(String),
+    Loading,
 }
 
 /// Records whether the op log is off its top, notifying the app when that
@@ -1992,17 +2053,18 @@ fn op_log_wheel(
 /// again on each scroll tick, so this stays near one row.
 const OP_LOG_OVERDRAW: f32 = 48.0;
 
-/// The op log's list, and what each of its rows showed when it was measured.
+/// A history list (the op log, an evolog), and what each of its rows showed
+/// when it was measured.
 #[derive(Debug)]
-struct OpLogList {
+struct RowList<K> {
     state: gpui_kit::ListState,
-    keys: std::cell::RefCell<Vec<OpLogKey>>,
+    keys: std::cell::RefCell<Vec<K>>,
     wheel: Rc<RefCell<Resampler>>,
     /// Off its top, as the panes last drew it: see [`note_scrolled`].
     scrolled: Rc<Cell<bool>>,
 }
 
-impl Default for OpLogList {
+impl<K> Default for RowList<K> {
     fn default() -> Self {
         Self {
             // Every row measured once, so the scrollbar is right from the start
@@ -2031,7 +2093,7 @@ enum OpLogKey {
     LoadOlder,
 }
 
-impl OpLogList {
+impl<K: PartialEq> RowList<K> {
     /// Tells the list which rows changed. Only those are measured again, so an
     /// opened run or a new operation keeps the scroll position.
     ///
@@ -2039,7 +2101,7 @@ impl OpLogList {
     /// At the top, that would carry the view down past every newer operation:
     /// the log's first batch lands above the "Reading" row the list started on.
     /// A log read at its top stays there.
-    fn sync(&self, keys: Vec<OpLogKey>) {
+    fn sync(&self, keys: Vec<K>) {
         let mut old = self.keys.borrow_mut();
         if keys == *old {
             return;
@@ -2072,10 +2134,10 @@ impl OpLogList {
     }
 }
 
-fn op_log_keys(ui: &Diffui) -> Vec<OpLogKey> {
-    let history = &ui.active().history;
-    let mut keys: Vec<OpLogKey> = op_rows(history)
+fn op_log_keys(history: &HistoryState, spans: &[Range<usize>]) -> Vec<OpLogKey> {
+    let mut keys: Vec<OpLogKey> = spans
         .iter()
+        .filter_map(|span| OpRow::of(history, span.clone()))
         .map(|row| match row {
             OpRow::Op(op) => OpLogKey::Op(op.id.clone()),
             OpRow::Run {
@@ -2085,7 +2147,7 @@ fn op_log_keys(ui: &Diffui) -> Vec<OpLogKey> {
                 ..
             } => OpLogKey::Run {
                 first: first.id.clone(),
-                count: *count,
+                count,
                 open: children.is_some(),
             },
         })
@@ -2516,6 +2578,7 @@ fn operation_changes(
     window: &mut Window,
     cx: &mut Cx,
 ) -> Div {
+    let scroll = ui::scroll_handle("op-changes-scroll", window, cx);
     let mut list = div()
         .w_full()
         .flex()
@@ -2535,23 +2598,47 @@ fn operation_changes(
             count.push_str(", more not listed");
         }
         list = list.child(section_title("Changed revisions", count, ui, theme));
+        // Up to 200 rows, about eight in view: build those near the view, and
+        // hold the rest's place with spacers. Rows are one height, and the table
+        // starts less than a box's height down, so a box's height either side
+        // of the scroll covers what shows.
         let last = changes.commits.len() - 1;
-        let rows = changes
+        let pitch = CHANGE_ROW_HEIGHT + 1.0;
+        let top = -f32::from(scroll.read(cx).offset().y);
+        let first_built = ((top - OP_CHANGES_MAX_HEIGHT) / pitch).floor().max(0.0) as usize;
+        let built_end =
+            (((top + 2.0 * OP_CHANGES_MAX_HEIGHT) / pitch).ceil() as usize).min(last + 1);
+        let spacer = |rows: usize| {
+            div()
+                .w_full()
+                .flex_none()
+                .h(px(rows as f32 * pitch - 1.0))
+                .into_any_element()
+        };
+        let mut rows = Vec::new();
+        if first_built > 0 {
+            rows.push(spacer(first_built));
+        }
+        for (index, change) in changes
             .commits
             .iter()
             .enumerate()
-            .map(|(index, change)| {
-                change_row(
-                    ui,
-                    theme,
-                    index,
-                    change,
-                    (index == 0, index == last),
-                    window,
-                    cx,
-                )
-            })
-            .collect();
+            .take(built_end)
+            .skip(first_built)
+        {
+            rows.push(change_row(
+                ui,
+                theme,
+                index,
+                change,
+                (index == 0, index == last),
+                window,
+                cx,
+            ));
+        }
+        if built_end <= last {
+            rows.push(spacer(last + 1 - built_end));
+        }
         list = list.child(table(rows, theme));
     }
     if !changes.refs.is_empty() {
@@ -2580,7 +2667,7 @@ fn operation_changes(
         .w_full()
         .flex_none()
         .max_h(px(OP_CHANGES_MAX_HEIGHT))
-        .child(ui::scrollable("op-changes", list))
+        .child(ui::scrollable_with("op-changes", scroll.read(cx), list))
 }
 
 fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Option<Div> {
@@ -2946,7 +3033,7 @@ mod tests {
     fn the_op_log_stays_at_its_top_as_batches_land() {
         use gpui_kit::{ListOffset, px};
         let key = |id: &str| OpLogKey::Op(id.to_owned());
-        let list = OpLogList::default();
+        let list = RowList::default();
         list.sync(vec![OpLogKey::Loading]);
         // Where layout anchors a list shorter than its viewport.
         list.state.scroll_to(ListOffset::default());
