@@ -1133,6 +1133,59 @@ fn rebase_between_refuses_a_loop() {
     );
 }
 
+/// Rebase onto trunk resolves `trunk()` when it runs: a fetch that moved
+/// trunk after the graph was walked is what the branch lands on.
+#[test]
+fn rebase_onto_trunk_follows_trunk_as_it_is_now() {
+    let root = scratch_repo("rebase-onto-moved-trunk");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let feature = new_leaf(&root, std::slice::from_ref(&base), "feature");
+    let rebase = || {
+        block_on(run_mutation(
+            repository(&root),
+            MutationOp::Rebase {
+                mode: RebaseSourceMode::Branch,
+                sources: vec![RevisionSelection::Commit(feature.clone())],
+                destination: Destination::Trunk,
+            },
+            LoadProgress::default(),
+            false,
+        ))
+    };
+    let error = rebase().expect_err("no trunk bookmark yet");
+    assert!(
+        error
+            .to_string()
+            .contains("trunk() doesn't resolve to a bookmark"),
+        "{error}"
+    );
+
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'trunk()' = 'present(main)'\n",
+    )
+    .expect("write repo config");
+    let old_trunk = new_leaf(&root, std::slice::from_ref(&base), "old trunk");
+    harness::set_bookmark(&root, OpBase::Head, "main", &old_trunk);
+    let (_, _, _, bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        "all()".to_owned(),
+        LoadProgress::default(),
+    ))
+    .expect("load commits");
+    assert_eq!(bookmarks.trunk.as_deref(), Some(old_trunk.as_str()));
+
+    let new_trunk = new_leaf(&root, std::slice::from_ref(&old_trunk), "new trunk");
+    harness::set_bookmark(&root, OpBase::Head, "main", &new_trunk);
+    rebase().expect("rebase onto trunk");
+    assert_eq!(
+        commit_id(&root, "description(exact:\"feature\\n\")-"),
+        new_trunk
+    );
+}
+
 /// `jj bookmark delete` of a name that isn't there changes nothing.
 #[test]
 fn deleting_a_missing_bookmark_is_refused() {

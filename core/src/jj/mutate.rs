@@ -705,7 +705,8 @@ async fn mutate_locked(
         .change_id()
         .clone();
     let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op)
-        .seeing_working_copy(seen_wc);
+        .seeing_working_copy(seen_wc)
+        .resolving_trunk(&place);
 
     // Captured side output: remote sideband for push, skipped/absorbed notes
     // for absorb; empty for the other mutations.
@@ -1511,6 +1512,10 @@ pub(super) async fn resolve_rebase_location(
             let child = resolve_mutation_target(repo, context, child).await?;
             (vec![parent.id().clone()], vec![child.id().clone()], parent)
         }
+        Destination::Trunk => {
+            let anchor = context.trunk(repo).await?;
+            (vec![anchor.id().clone()], Vec::new(), anchor)
+        }
     };
     // jj-cli's `ensure_no_commit_loop`: `-A x -B y` with `y` an ancestor of
     // `x` would make the moved commits both, which jj-lib can't rewrite.
@@ -1687,7 +1692,7 @@ pub(super) fn rebase_stats_message(
     destination: &Destination,
 ) -> String {
     let place = match destination {
-        Destination::Onto(_) => "onto",
+        Destination::Onto(_) | Destination::Trunk => "onto",
         Destination::After(_) => "after",
         Destination::Before(_) => "before",
         Destination::Between { .. } => "between",

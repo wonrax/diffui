@@ -1190,7 +1190,7 @@ pub fn rewritten_targets(
                 Destination::Between { child, .. } => push(child),
                 // `Onto` rewrites only the sources; `After` rewrites the
                 // target's children, which nobody can enumerate up front.
-                Destination::Onto(_) | Destination::After(_) => {}
+                Destination::Onto(_) | Destination::After(_) | Destination::Trunk => {}
             }
         }
         MutationOp::Squash { from, into } => {
@@ -1205,7 +1205,7 @@ pub fn rewritten_targets(
             // The insertion's far side gains the new commit as a parent.
             Destination::Before(target) => push(target),
             Destination::Between { child, .. } => push(child),
-            Destination::Onto(_) | Destination::After(_) => {}
+            Destination::Onto(_) | Destination::After(_) | Destination::Trunk => {}
         },
         MutationOp::Parallelize { targets: picked }
         | MutationOp::Metaedit {

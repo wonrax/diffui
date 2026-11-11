@@ -148,7 +148,7 @@ async fn insertion_point(
 
 fn placement_word(destination: &Destination) -> &'static str {
     match destination {
-        Destination::Onto(_) => "on",
+        Destination::Onto(_) | Destination::Trunk => "on",
         Destination::After(_) => "after",
         Destination::Before(_) => "before",
         Destination::Between { .. } => "between",

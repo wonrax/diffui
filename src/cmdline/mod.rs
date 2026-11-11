@@ -1109,7 +1109,7 @@ impl Diffui {
         };
         let armed = match destination {
             None => None,
-            Some(Destination::Between { .. }) => return None,
+            Some(Destination::Between { .. } | Destination::Trunk) => return None,
             Some(
                 Destination::Onto(target)
                 | Destination::After(target)

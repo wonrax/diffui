@@ -1,8 +1,9 @@
 use std::cell::{Cell, OnceCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt as _;
 use jj_cli::{cli_util::short_operation_hash, ui::Ui};
 use jj_lib::{
     backend::CommitId,
@@ -15,7 +16,7 @@ use jj_lib::{
     merged_tree::MergedTree,
     object_id::ObjectId,
     op_store::{OpStoreError, OperationId},
-    ref_name::WorkspaceName,
+    ref_name::{WorkspaceName, WorkspaceNameBuf},
     repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader},
     revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension},
     rewrite::RebaseOptions,
@@ -748,6 +749,9 @@ pub(crate) struct TargetContext {
     seen: Option<SeenOp>,
     /// The change `@` was on when the sender picked its targets.
     seen_wc: Option<String>,
+    /// The workspace root and name `trunk()` is parsed with: its aliases
+    /// and its `@`.
+    trunk_scope: Option<(PathBuf, WorkspaceNameBuf)>,
 }
 
 /// A command addressed `@`, and `@` is on another change than the one the
@@ -786,7 +790,46 @@ impl TargetContext {
             wc_id,
             seen,
             seen_wc: None,
+            trunk_scope: None,
         }
+    }
+
+    /// Let [`Self::trunk`] resolve `trunk()` in this workspace.
+    pub(crate) fn resolving_trunk(mut self, place: &Place<'_>) -> Self {
+        self.trunk_scope = Some((
+            place.workspace_root.to_path_buf(),
+            place.workspace_name.to_owned(),
+        ));
+        self
+    }
+
+    /// `trunk()` as jj resolves it in `repo` now. The builtin alias falls
+    /// back to `root()` when no trunk bookmark exists, which is no trunk
+    /// anyone means, so that is refused, as the graph's trunk flag does.
+    pub(crate) async fn trunk(&self, repo: &dyn Repo) -> Result<Commit> {
+        let Some((root, name)) = &self.trunk_scope else {
+            bail!("trunk() can't be resolved here");
+        };
+        let id = parse_user_revset(root, repo.base_repo().settings(), name, "trunk() ~ root()")?
+            .resolve_user_expression(
+                repo,
+                &SymbolResolver::new(repo, &[] as &[Box<dyn SymbolResolverExtension>]),
+            )
+            .context("failed to resolve trunk()")?
+            .evaluate(repo)
+            .context("failed to evaluate trunk()")?
+            .stream()
+            .next()
+            .await
+            .transpose()
+            .context("failed to evaluate trunk()")?;
+        let Some(id) = id else {
+            bail!("trunk() doesn't resolve to a bookmark");
+        };
+        repo.store()
+            .get_commit_async(&id)
+            .await
+            .with_context(|| format!("failed to load jj commit {}", id.hex()))
     }
 
     /// `seen_wc` is the change id (jj's reverse hex) of `@` as the sender saw

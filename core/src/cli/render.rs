@@ -173,6 +173,7 @@ impl Renderer<'_> {
             Destination::Between { parent, child } => {
                 vec!["-A".into(), self.rev(parent), "-B".into(), self.rev(child)]
             }
+            Destination::Trunk => vec!["-o".into(), "trunk()".into()],
         }
     }
 

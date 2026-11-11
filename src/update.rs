@@ -2439,6 +2439,11 @@ impl Diffui {
         let Some(request) = draft.preview_request.take().map(|request| *request) else {
             return;
         };
+        // Drafts are anchored on a revision; only rebase onto trunk isn't,
+        // and it never runs as a draft.
+        let Some(anchor) = request.destination.anchor().cloned() else {
+            return;
+        };
         let draft = match request.kind {
             mutations::DraftKind::Rebase { mode } => diffui_core::PreviewRequest::Rebase {
                 mode,
@@ -2449,14 +2454,13 @@ impl Diffui {
                 // The merge's second parent is the destination's anchor
                 // (gap drops resolve to the parent side, like the
                 // confirm path).
-                let anchor = request.destination.anchor().clone();
                 diffui_core::PreviewRequest::Merge {
                     parents: request.sources.into_iter().chain([anchor]).collect(),
                 }
             }
             // Gap drops squash into the gap's parent side, the anchor.
             mutations::DraftKind::Squash => diffui_core::PreviewRequest::Squash {
-                into: request.destination.anchor().clone(),
+                into: anchor,
                 sources: request.sources,
                 selection: request.selection.map(|selection| *selection),
             },
@@ -4047,7 +4051,8 @@ impl Diffui {
         let anchor_blocked = selected_merge_target.is_none()
             && destination
                 .as_ref()
-                .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
+                .and_then(mutations::Destination::anchor)
+                .is_some_and(|anchor| self.draft_blocks_target(anchor));
         let Some(ui) = self.active_mut().op_draft_mut() else {
             return;
         };

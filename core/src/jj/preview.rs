@@ -21,7 +21,7 @@ use jj_lib::{
 
 use super::mutate::*;
 use super::walk::{describe_resolution_error, parse_user_revset, ref_labels};
-use super::workspace::TargetContext;
+use super::workspace::{Place, TargetContext};
 use crate::model::{CommitSummary, RevisionSelection};
 use crate::mutations::{
     Destination, DraftSimulation, InsertPreview, MergePreview, MutationOp, RebasePreview,
@@ -78,7 +78,12 @@ pub(crate) async fn preview(
         .get_wc_commit_id(scope.workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    let context = TargetContext::new(scope.repo.loader(), wc_commit_id, scope.seen_op);
+    let context = TargetContext::new(scope.repo.loader(), wc_commit_id, scope.seen_op)
+        .resolving_trunk(&Place {
+            settings: scope.settings,
+            workspace_name: scope.workspace_name,
+            workspace_root: &scope.repository.root,
+        });
     let mut tx = scope.repo.start_transaction();
     let simulated = match request {
         PreviewRequest::Rebase {

@@ -47,12 +47,13 @@ pub(crate) fn blocker_for(ui: &Diffui, targets: &[RevisionSelection]) -> Option<
 }
 
 /// The op the command runs: the whole branches the `sources` sit on, onto
-/// trunk.
-fn rebase_op(sources: Vec<RevisionSelection>, trunk: String) -> MutationOp {
+/// `trunk()` as it resolves when the op runs (a fetch may have moved it
+/// since the graph was walked).
+fn rebase_op(sources: Vec<RevisionSelection>) -> MutationOp {
     MutationOp::Rebase {
         mode: RebaseSourceMode::Branch,
         sources,
-        destination: Destination::Onto(RevisionSelection::Commit(trunk)),
+        destination: Destination::Trunk,
     }
 }
 
@@ -62,10 +63,10 @@ impl Diffui {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
-        let Some(trunk) = self.active().session.bookmarks.trunk.clone() else {
+        if self.active().session.bookmarks.trunk.is_none() {
             return;
-        };
-        let op = rebase_op(sources.clone(), trunk.clone());
+        }
+        let op = rebase_op(sources.clone());
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
@@ -73,7 +74,7 @@ impl Diffui {
         let (job, preview) = state.session.preview(PreviewRequest::Rebase {
             mode: RebaseSourceMode::Branch,
             sources,
-            destination: Destination::Onto(RevisionSelection::Commit(trunk)),
+            destination: Destination::Trunk,
         });
         if let Some(previous) = state.jobs.issue(job, Pending::TrunkRebase(op)) {
             effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
@@ -220,16 +221,13 @@ mod tests {
             mode,
             sources,
             destination,
-        } = rebase_op(vec![source.clone()], "t".repeat(8))
+        } = rebase_op(vec![source.clone()])
         else {
             panic!("a rebase");
         };
         assert_eq!(mode, RebaseSourceMode::Branch);
         assert_eq!(sources, vec![source]);
-        assert_eq!(
-            destination,
-            Destination::Onto(RevisionSelection::Commit("t".repeat(8)))
-        );
+        assert_eq!(destination, Destination::Trunk);
     }
 
     #[test]
@@ -256,10 +254,7 @@ mod tests {
             let asked = ui.active_tab_id().unwrap();
             let other = push_tab(&mut ui, "/tmp/other");
             ui.tab_mut(other).unwrap().session.capabilities.mutate = true;
-            let op = rebase_op(
-                vec![RevisionSelection::Commit("f".repeat(8))],
-                "t".repeat(8),
-            );
+            let op = rebase_op(vec![RevisionSelection::Commit("f".repeat(8))]);
             ui.active = 1;
 
             ui.finish_trunk_preview(asked, op, Err("no forecast".to_owned()));

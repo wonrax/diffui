@@ -46,15 +46,20 @@ pub enum Destination {
         parent: RevisionSelection,
         child: RevisionSelection,
     },
+    /// New children of `trunk()` as it resolves when the op runs
+    /// (`jj rebase -o 'trunk()'`), not as the last graph walk saw it.
+    Trunk,
 }
 
 impl Destination {
     /// The revision the destination is anchored on — what target-mode
-    /// highlights and preview summaries name.
-    pub fn anchor(&self) -> &RevisionSelection {
+    /// highlights and preview summaries name. `None` for [`Self::Trunk`],
+    /// which only names a revision once it runs.
+    pub fn anchor(&self) -> Option<&RevisionSelection> {
         match self {
-            Self::Onto(target) | Self::After(target) | Self::Before(target) => target,
-            Self::Between { parent, .. } => parent,
+            Self::Onto(target) | Self::After(target) | Self::Before(target) => Some(target),
+            Self::Between { parent, .. } => Some(parent),
+            Self::Trunk => None,
         }
     }
 }
