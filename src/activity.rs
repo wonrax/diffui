@@ -27,6 +27,7 @@ use crate::Diffui;
 use crate::geometry::Rectangle;
 use crate::prose::Prose;
 use crate::theme::ThemeSpec;
+use crate::ui::Look;
 use diffui_core::LoadProgress;
 
 /// Frames for the running spinner. Braille-dot frames read as a smooth orbit
@@ -470,6 +471,7 @@ pub(crate) fn activity_indicator(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let mono = ui.config.mono_font;
     let font = ui.config.ui_font;
     let activities = &ui.active().activities;
@@ -505,7 +507,7 @@ pub(crate) fn activity_indicator(
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(px(text_size::BODY))
-                    .child(active.label.view(font, mono, theme.muted_text, theme)),
+                    .child(active.label.view(look, theme.muted_text)),
                 font,
                 text_size::BODY,
             )
@@ -568,24 +570,18 @@ pub(crate) fn activity_indicator(
         )
     };
 
-    ui::button(
-        "activity-indicator",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        theme,
-        cx,
-    )
-    .when(ui.activity_popover_open(), |button| {
-        button.resting(theme::press_wash(theme), None)
-    })
-    .child(body)
-    .child(
-        gpui_kit::canvas(|bounds, _, _| INDICATOR.set(bounds.into()), |_, _, _, _| {})
-            .absolute()
-            .size_full(),
-    )
-    .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
-    .into_any_element()
+    look.bare_button("activity-indicator")
+        .when(ui.activity_popover_open(), |button| {
+            button.resting(theme::press_wash(theme), None)
+        })
+        .child(body)
+        .child(
+            gpui_kit::canvas(|bounds, _, _| INDICATOR.set(bounds.into()), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .on_click(Diffui::on_action(Action::ToggleActivityPopover, cx))
+        .into_any_element()
 }
 
 thread_local! {
@@ -661,6 +657,7 @@ pub(crate) fn activity_popover(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if !ui.activity_popover_open() {
         return div().into_any_element();
     }
@@ -730,9 +727,8 @@ pub(crate) fn activity_popover(
                 )),
         );
     }
-    let heading = |label: &'static str| {
-        crate::overlay_kit::group_heading(label, font, theme).px(px(ROW_PAD_X))
-    };
+    let heading =
+        |label: &'static str| crate::overlay_kit::group_heading(label, look).px(px(ROW_PAD_X));
     if !live.is_empty() {
         // In the order they run.
         list = list.child(heading("In progress"));
@@ -820,6 +816,7 @@ pub(crate) fn toast_layer(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if ui.toasts.is_empty() {
         return div().into_any_element();
     }
@@ -857,17 +854,18 @@ pub(crate) fn toast_layer(
                         .w_full()
                         .text_size(px(text_size::BODY))
                         .child(toast.title.view(
-                            title_font,
-                            ui.config.mono_font,
+                            Look {
+                                font: title_font,
+                                ..look
+                            },
                             theme.removed_text,
-                            theme,
                         )),
                     title_font,
                     text_size::BODY,
                 )
                 .fill(),
                 Aligned::glyph(
-                    ui::close_button(("toast-close", id as usize), theme.muted_text, theme, cx)
+                    look.close_button(("toast-close", id as usize), theme.muted_text)
                         .on_click(Diffui::listen(cx, move |this, _, _, _| {
                             this.on_toast_dismiss(id);
                         })),
@@ -879,12 +877,7 @@ pub(crate) fn toast_layer(
         let detail = div()
             .w_full()
             .text_size(px(text_size::BODY))
-            .child(toast.detail.view(
-                ui.config.ui_font,
-                ui.config.mono_font,
-                theme.muted_text,
-                theme,
-            ));
+            .child(toast.detail.view(look, theme.muted_text));
         cards = cards.child(
             theme::surface(div(), theme::Elevation::Popover, theme)
                 .w_full()
@@ -915,6 +908,7 @@ fn row_button(
     on_press: Action,
     cx: &mut Cx,
 ) -> Div {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
     let ink = theme.muted_text;
     let size = ui::Size::Small;
@@ -932,7 +926,9 @@ fn row_button(
         size.text_size(),
     ));
     press_stays(
-        ui::button((id.0, id.1 as usize), variant, size, theme, cx)
+        look.bare_button((id.0, id.1 as usize))
+            .variant(variant)
+            .step(size)
             .child(typography::baseline_row(line, 0.0))
             .on_click(Diffui::on_action(on_press, cx)),
     )
@@ -992,6 +988,7 @@ fn activity_row(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let group: gpui_kit::SharedString = format!("activity-row-{}", activity.id.0).into();
     let error = matches!(activity.status, ActivityStatus::Error);
     let header = activity_header(ui, theme, activity, ROW_WIDTH, &group, window, cx);
@@ -1069,7 +1066,7 @@ fn activity_row(
         actions = actions.child(
             div()
                 .id(("activity-link-tip", index))
-                .tip(url.clone(), ui.config.ui_font, theme)
+                .tip(url.clone(), look)
                 .child(row_button(
                     ui,
                     theme,
@@ -1122,6 +1119,7 @@ fn activity_header(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let mono = ui.config.mono_font;
     let ui_font = ui.config.ui_font;
     let (loaded, total, determinate) = activity.progress_snapshot();
@@ -1233,17 +1231,16 @@ fn activity_header(
     } else {
         theme.text
     };
-    let title = activity
-        .label
-        .line(ui_font, mono, title_color, theme, text_size::BODY);
+    let title = activity.label.line(look, title_color, text_size::BODY);
     let result_color = if error {
         theme.removed_text
     } else {
         theme.muted_text
     };
-    let result = activity.result.as_deref().map(|result| {
-        crate::prose::Prose::from(result).line(ui_font, mono, result_color, theme, text_size::BODY)
-    });
+    let result = activity
+        .result
+        .as_deref()
+        .map(|result| crate::prose::Prose::from(result).line(look, result_color, text_size::BODY));
     let cut_short = !title.fits(text_width - trailing_width)
         || activity.command.as_deref().is_some_and(|command| {
             !crate::plan::command_fits(ui, theme, command, text_size::CAPTION, text_width)
@@ -1390,30 +1387,20 @@ fn mono_glyph(glyph: &'static str, mono: Font, color: Color) -> AnyElement {
 
 /// "Clear finished": drops what's done, keeps what runs or waits.
 fn clear_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let enabled = ui.active().activities.activities.iter().any(|a| {
         matches!(
             a.status,
             ActivityStatus::Done | ActivityStatus::Cancelled | ActivityStatus::Error
         )
     });
-    ui::text_button(
-        "activity-clear",
-        None,
-        "Clear finished",
-        ui::Variant::Ghost,
-        ui::Size::Small,
-        ui.config.ui_font,
-        theme,
-        cx,
-    )
-    .disabled(!enabled)
-    .on_click(Diffui::on_action(Action::ClearActivities, cx))
-    .tip(
-        "Remove finished entries. Running and queued work stays.",
-        ui.config.ui_font,
-        theme,
-    )
-    .into_any_element()
+    look.button("activity-clear", "Clear finished")
+        .ghost()
+        .small()
+        .disabled(!enabled)
+        .on_click(Diffui::on_action(Action::ClearActivities, cx))
+        .tip("Remove finished entries. Running and queued work stays.")
+        .into_any_element()
 }
 
 const POPOVER_WIDTH: f32 = 470.0;

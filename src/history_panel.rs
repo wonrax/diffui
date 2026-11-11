@@ -43,6 +43,7 @@ use crate::theme::{
     Color, Font, ThemeSpec, Weight, diff_palette, emphasis_font, list, radius, space, text_size,
 };
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Action, ConfirmDialog, Diffui, MainView, TabId, icons, meta_line, ui};
 
 /// Operations read per page of the op log.
@@ -1121,56 +1122,39 @@ pub(crate) fn source_bar_actions(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let on = annotate_on(ui);
-    let blame = ui::text_button(
-        "source-blame",
-        Some((
+    let blame = look
+        .button("source-blame", "Blame")
+        .ghost()
+        .compact()
+        .icon(
             icons::SCROLL_TEXT,
             if on { theme.accent } else { theme.muted_text },
-        )),
-        "Blame",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-        cx,
-    )
-    .when(on, |button| {
-        button.resting(crate::theme::press_wash(theme), None)
-    })
-    .on_click(Diffui::on_action(
-        Action::History(HistoryAction::ToggleAnnotate),
-        cx,
-    ));
-    let history = ui::text_button(
-        "source-file-history",
-        Some((icons::FILE_CLOCK, theme.muted_text)),
-        "History",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::on_action(
-        Action::History(HistoryAction::CurrentFileHistory),
-        cx,
-    ));
+        )
+        .when(on, |button| {
+            button.resting(crate::theme::press_wash(theme), None)
+        })
+        .on_click(Diffui::on_action(
+            Action::History(HistoryAction::ToggleAnnotate),
+            cx,
+        ));
+    let history = look
+        .button("source-file-history", "History")
+        .ghost()
+        .compact()
+        .icon(icons::FILE_CLOCK, theme.muted_text)
+        .on_click(Diffui::on_action(
+            Action::History(HistoryAction::CurrentFileHistory),
+            cx,
+        ));
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::XS))
-        .child(blame.tip(
-            "Show which change last touched each line",
-            ui.config.ui_font,
-            theme,
-        ))
-        .child(history.tip(
-            "Show the revisions that touched this file",
-            ui.config.ui_font,
-            theme,
-        ))
+        .child(blame.tip("Show which change last touched each line"))
+        .child(history.tip("Show the revisions that touched this file"))
         .into_any_element()
 }
 
@@ -1182,31 +1166,29 @@ pub(crate) fn file_filter_banner(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     if !file_filter_active(ui) {
         return None;
     }
     let filter = ui.active().history.file_filter.as_ref()?;
     let title = Prose::from("History of ")
         .path(&filter.path)
-        .line(
-            ui.config.ui_font,
-            ui.config.mono_font,
-            theme.text,
-            theme,
-            text_size::BODY,
-        )
+        .line(look, theme.text, text_size::BODY)
         .view();
-    let close = ui::close_button("file-filter-close", theme.muted_text, theme, cx).on_click(
-        Diffui::on_action(Action::History(HistoryAction::ClearFileFilter), cx),
-    );
+    let close = look
+        .close_button("file-filter-close", theme.muted_text)
+        .on_click(Diffui::on_action(
+            Action::History(HistoryAction::ClearFileFilter),
+            cx,
+        ));
     Some(
         crate::field::panel_strip()
             .child(
                 ui::Banner::new(ui::Tone::Accent)
                     .icon(icons::FILE_CLOCK)
                     .child(title)
-                    .end(close.tip("Show the whole graph again", ui.config.ui_font, theme))
-                    .build(ui.config.ui_font, theme),
+                    .end(close.tip("Show the whole graph again"))
+                    .build(look),
             )
             .into_any_element(),
     )
@@ -1326,6 +1308,7 @@ fn op_row(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if op.is_snapshot {
         return snapshot_row(ui, theme, op, now, window, cx);
     }
@@ -1350,10 +1333,11 @@ fn op_row(
         Some(args) => meta.push(fill_on_line(
             crate::plan::command_prose(args)
                 .line(
-                    ui.config.mono_font,
-                    ui.config.mono_font,
+                    Look {
+                        font: look.mono,
+                        ..look
+                    },
                     theme.subtle_text,
-                    theme,
                     CAPTION_TEXT_SIZE,
                 )
                 .view(),
@@ -1663,21 +1647,16 @@ pub(crate) fn build_history_sidebar(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let history = &ui.active().history;
     let now = now_millis();
-    let reload = ui::icon_button(
-        "history-reload",
-        icons::REFRESH,
-        theme.muted_text,
-        ui::Size::Compact,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::on_action(
-        Action::History(HistoryAction::Reload),
-        cx,
-    ))
-    .tip("Reload", ui.config.ui_font, theme);
+    let reload = look
+        .icon_button("history-reload", icons::REFRESH, theme.muted_text)
+        .on_click(Diffui::on_action(
+            Action::History(HistoryAction::Reload),
+            cx,
+        ))
+        .tip("Reload");
     let (header, list): (Div, AnyElement) = match &history.kind {
         HistoryKind::OpLog => {
             let header = div()
@@ -1692,31 +1671,20 @@ pub(crate) fn build_history_sidebar(
                     theme.subtle_text,
                 ))
                 .child(div().flex_1().child(typography::baseline_row(
-                    [ui::panel_title(
-                        "Operations",
-                        None,
-                        ui.config.ui_font,
-                        theme,
-                    )],
+                    [ui::panel_title("Operations", None, look)],
                     0.0,
                 )))
                 .child(reload);
             (header, op_log_list(ui, cx))
         }
         HistoryKind::Evolog { label, .. } => {
-            let back = ui::icon_button(
-                "history-back",
-                icons::ARROW_LEFT,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(
-                Action::History(HistoryAction::ShowOpLog),
-                cx,
-            ))
-            .tip("Back to the operation log", ui.config.ui_font, theme);
+            let back = look
+                .icon_button("history-back", icons::ARROW_LEFT, theme.muted_text)
+                .on_click(Diffui::on_action(
+                    Action::History(HistoryAction::ShowOpLog),
+                    cx,
+                ))
+                .tip("Back to the operation log");
             let header = div()
                 .w_full()
                 .flex()
@@ -1726,7 +1694,7 @@ pub(crate) fn build_history_sidebar(
                 .child(back)
                 .child(div().flex_1().min_w_0().child(typography::baseline_row(
                     [
-                        ui::panel_title("Evolution of", None, ui.config.ui_font, theme),
+                        ui::panel_title("Evolution of", None, look),
                         mono_on_line(label.clone(), theme.accent, ui),
                     ],
                     space::XS,
@@ -2052,6 +2020,7 @@ fn op_log_keys(history: &HistoryState, spans: &[Range<usize>]) -> Vec<OpLogKey> 
 
 /// Below the last operation: that more is on its way, or a button for it.
 fn op_log_footer(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let history = &ui.active().history;
     if history.ops_job.is_some() {
         return note("Reading the operation log\u{2026}", theme.subtle_text, ui).into_any_element();
@@ -2065,20 +2034,13 @@ fn op_log_footer(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
         .justify_center()
         .p(px(space::SM))
         .child(
-            ui::text_button(
-                "history-load-older",
-                None,
-                "Load older operations",
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                ui.config.ui_font,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(
-                Action::History(HistoryAction::LoadMoreOperations),
-                cx,
-            )),
+            look.button("history-load-older", "Load older operations")
+                .ghost()
+                .compact()
+                .on_click(Diffui::on_action(
+                    Action::History(HistoryAction::LoadMoreOperations),
+                    cx,
+                )),
         )
         .into_any_element()
 }
@@ -2127,6 +2089,7 @@ fn change_row(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let selected = ui.active().history.selected_change == Some(index);
     let (glyph, color, verb) = match change.kind {
         CommitChangeKind::Created => ("+", theme.added_text, "created"),
@@ -2141,24 +2104,19 @@ fn change_row(
         div()
             .id(SharedString::from(format!("change-open-tip-{index}")))
             .flex_none()
-            .tip("Show in the diff view", ui.config.ui_font, theme)
+            .tip("Show in the diff view", look)
             // The row is a button too: this one mustn't also select it.
             .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation()
             })
             .child(
-                ui::icon_button(
-                    id,
-                    icons::FILE_DIFF,
-                    theme.muted_text,
-                    ui::Size::Compact,
-                    theme,
-                    cx,
-                )
-                .on_click(Diffui::on_action(
-                    Action::History(HistoryAction::OpenRevision(change.commit.commit_id.clone())),
-                    cx,
-                )),
+                look.icon_button(id, icons::FILE_DIFF, theme.muted_text)
+                    .on_click(Diffui::on_action(
+                        Action::History(HistoryAction::OpenRevision(
+                            change.commit.commit_id.clone(),
+                        )),
+                        cx,
+                    )),
             )
             .into_any_element()
     } else {
@@ -2271,17 +2229,13 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
 
 /// A section's label with its count: "Changed revisions 1".
 fn section_title(label: &str, count: String, ui: &Diffui, theme: ThemeSpec) -> Div {
+    let look = ui.look(theme);
     div()
         .flex_none()
         .pt(px(space::LG))
         .pb(px(space::MD))
         .child(typography::baseline_row(
-            [ui::section_label(
-                label.to_owned(),
-                Some(count),
-                ui.config.ui_font,
-                theme,
-            )],
+            [ui::section_label(label.to_owned(), Some(count), look)],
             0.0,
         ))
 }
@@ -2313,6 +2267,7 @@ fn operation_header(
     window: &mut Window,
     cx: &mut Cx,
 ) -> Div {
+    let look = ui.look(theme);
     let mut badges = Vec::new();
     if op.is_current {
         badges.push(meta_line::Badge {
@@ -2355,17 +2310,11 @@ fn operation_header(
                          label: &'static str,
                          action: Option<HistoryAction>,
                          cx: &mut Cx| {
-        let mut button = ui::text_button(
-            id,
-            Some((glyph, theme.muted_text)),
-            label,
-            ui::Variant::Raised,
-            ui::Size::Compact,
-            ui.config.ui_font,
-            theme,
-            cx,
-        )
-        .disabled(action.is_none());
+        let mut button = look
+            .button(id, label)
+            .compact()
+            .icon(glyph, theme.muted_text)
+            .disabled(action.is_none());
         if let Some(action) = action {
             button = button.on_click(Diffui::on_action(Action::History(action), cx));
         }
@@ -2419,8 +2368,8 @@ fn operation_header(
                     title_font,
                     DETAIL_TITLE_SIZE,
                 )))
-                .child(restore.tip("Put every revision and bookmark back to how this operation left them (jj op restore)", ui.config.ui_font, theme))
-                .child(revert.tip("Undo just this operation, keeping later work (jj op revert)", ui.config.ui_font, theme)),
+                .child(restore.tip("Put every revision and bookmark back to how this operation left them (jj op restore)"))
+                .child(revert.tip("Undo just this operation, keeping later work (jj op revert)")),
         )
         .child(meta);
     if let Some(args) = &op.args {
@@ -2555,6 +2504,7 @@ fn operation_changes(
 }
 
 fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Option<Div> {
+    let look = ui.look(theme);
     let history = &ui.active().history;
     let entry = history.evolog.get(history.selected_version?)?;
     let has_previous = !entry.predecessor_ids.is_empty();
@@ -2605,27 +2555,20 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
                 ),
                 segment(icons::FILE_DIFF, "Full diff", EvologDiff::Parents, true),
             ],
-            ui.config.ui_font,
-            theme,
+            look,
             window,
             cx,
         ));
     if entry.commit.visible {
         actions = actions.child(div().flex_1()).child(
-            ui::text_button(
-                "evolog-open",
-                Some((icons::FILE_DIFF, theme.muted_text)),
-                "Show in diff view",
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                ui.config.ui_font,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(
-                Action::History(HistoryAction::OpenRevision(entry.commit.commit_id.clone())),
-                cx,
-            )),
+            look.button("evolog-open", "Show in diff view")
+                .ghost()
+                .compact()
+                .icon(icons::FILE_DIFF, theme.muted_text)
+                .on_click(Diffui::on_action(
+                    Action::History(HistoryAction::OpenRevision(entry.commit.commit_id.clone())),
+                    cx,
+                )),
         );
     }
     let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);

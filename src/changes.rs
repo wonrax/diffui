@@ -1554,6 +1554,7 @@ pub(crate) fn action_bar(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     use gpui_kit::base::TestSupportExt as _;
     let tab = ui.active();
     let empty = || div().into_any_element();
@@ -1653,7 +1654,7 @@ pub(crate) fn action_bar(
                 ))
             })
             .child(content)
-            .tip(tip, font, theme);
+            .tip(tip, look);
         element = if show_label {
             element.px(px(9.0))
         } else {
@@ -1769,7 +1770,7 @@ pub(crate) fn action_bar(
         )
         .into_iter()
         .map(|key| {
-            ui::keycap(key, font, theme)
+            ui::keycap(key, look)
                 .colors(faded, theme::TRANSPARENT, Color { a: 0.6, ..ink })
                 .view()
         });
@@ -1789,7 +1790,7 @@ pub(crate) fn action_bar(
                 0.0,
             ))
             .cursor_pointer()
-            .tip("Clear picks", font, theme)
+            .tip("Clear picks", look)
             .on_click(Diffui::on_action(Action::Changes(ChangesMsg::Clear), cx))
             .child(typography::centered(
                 typography::line("Clear", font, text_size::BODY, ink),
@@ -1835,10 +1836,11 @@ pub(crate) fn split_modal(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(prompt) = split_prompt_shown(ui) else {
         return div().into_any_element();
     };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let mono = ui.config.mono_font;
     let label = revision_label(ui.active(), &prompt.revision);
     let size = ui.config.code_type.size;
     let width = SPLIT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD;
@@ -1863,12 +1865,11 @@ pub(crate) fn split_modal(
             .flex()
             .flex_col()
             .gap(px(theme::space::SM))
-            .child(div().text_size(px(text_size::BODY)).child(caption.view(
-                font,
-                mono,
-                theme.muted_text,
-                theme,
-            )))
+            .child(
+                div()
+                    .text_size(px(text_size::BODY))
+                    .child(caption.view(look, theme.muted_text)),
+            )
             .child({
                 let (editor, focused) = crate::input::multi_line_with_focus(spec, mono, window, cx);
                 crate::field::field_well(focused, theme)
@@ -1896,44 +1897,39 @@ pub(crate) fn split_modal(
         window,
         cx,
     );
-    let cancel = ui::cancel_button("split-cancel", ui::Size::Standard, font, theme, cx).on_click(
-        Diffui::on_action(Action::Changes(ChangesMsg::SplitCancel), cx),
-    );
-    let split = ui::text_button(
-        "split-confirm",
-        None,
-        "Split",
-        ui::Variant::Primary,
-        ui::Size::Standard,
-        font,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::on_action(
-        Action::Changes(ChangesMsg::SplitConfirm),
-        cx,
-    ));
+    let cancel = look
+        .cancel_button("split-cancel")
+        .on_click(Diffui::on_action(
+            Action::Changes(ChangesMsg::SplitCancel),
+            cx,
+        ));
+    let split = look
+        .button("split-confirm", "Split")
+        .primary()
+        .on_click(Diffui::on_action(
+            Action::Changes(ChangesMsg::SplitConfirm),
+            cx,
+        ));
 
-    let card =
-        crate::overlay_kit::Dialog::new(&Prose::from("Split ").rev(label), font, mono, theme)
-            .width(SPLIT_WIDTH)
-            .lede(&prompt.summary, mono)
-            .child(first)
-            .child(second)
-            .bound_hint(
-                ui,
-                crate::commands::Context::Split,
-                &["split.confirm"],
-                "Split",
-            )
-            .bound_hint(
-                ui,
-                crate::commands::Context::Split,
-                &["split.cancel"],
-                "Cancel",
-            )
-            .buttons([cancel.into_any_element(), split.into_any_element()])
-            .build();
+    let card = crate::overlay_kit::Dialog::new(&Prose::from("Split ").rev(label), look)
+        .width(SPLIT_WIDTH)
+        .lede(&prompt.summary)
+        .child(first)
+        .child(second)
+        .bound_hint(
+            ui,
+            crate::commands::Context::Split,
+            &["split.confirm"],
+            "Split",
+        )
+        .bound_hint(
+            ui,
+            crate::commands::Context::Split,
+            &["split.cancel"],
+            "Cancel",
+        )
+        .buttons([cancel.into_any_element(), split.into_any_element()])
+        .build();
     ui::input_modal("split-modal", card, crate::toolbar::modal_top()).into_any_element()
 }
 

@@ -16,6 +16,7 @@ use gpui_kit::{AnyElement, Window, div, px};
 use crate::action::Action;
 use crate::theme::{ThemeSpec, Weight, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Cx, Diffui, ellipsis, icons, ui};
 
 #[derive(Debug, Clone)]
@@ -156,14 +157,13 @@ impl Diffui {
 pub(crate) fn banner_strip(
     sides: gpui_kit::Div,
     controls: gpui_kit::Div,
-    font: crate::theme::Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> AnyElement {
     ui::Banner::new(ui::Tone::Accent)
         .shape(ui::BannerShape::Strip)
         .child(sides.overflow_hidden().flex().flex_col().gap(px(3.0)))
         .end(controls.flex().flex_row().items_center().gap(px(4.0)))
-        .build(font, theme)
+        .build(look)
         .into_any_element()
 }
 
@@ -175,6 +175,7 @@ pub(crate) fn build_compare_banner(
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     if let Some(banner) = crate::range::banner(ui, theme, window, cx) {
         return Some(banner);
     }
@@ -243,47 +244,32 @@ pub(crate) fn build_compare_banner(
 
     let controls = div()
         .child(
-            ui::icon_button(
-                "compare-swap",
-                icons::ARROW_LEFT_RIGHT,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(Action::Compare(CompareAction::Swap), cx))
-            .tip("Swap the two sides", font, theme),
+            look.icon_button("compare-swap", icons::ARROW_LEFT_RIGHT, theme.muted_text)
+                .on_click(Diffui::on_action(Action::Compare(CompareAction::Swap), cx))
+                .tip("Swap the two sides"),
         )
         .child(
-            ui::text_button(
+            look.button(
                 "compare-mode",
-                None,
                 if interdiff { "Tree diff" } else { "Interdiff" },
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                font,
-                theme,
-                cx,
             )
+            .ghost()
+            .compact()
             .on_click(Diffui::on_action(
                 Action::Compare(CompareAction::SetInterdiff(!interdiff)),
                 cx,
             ))
-            .tip(
-                if interdiff {
-                    "Diff the two trees (jj diff --from)"
-                } else {
-                    "Diff the two versions of the change itself (jj interdiff)"
-                },
-                font,
-                theme,
-            ),
+            .tip(if interdiff {
+                "Diff the two trees (jj diff --from)"
+            } else {
+                "Diff the two versions of the change itself (jj interdiff)"
+            }),
         )
         .child(
-            ui::close_button("compare-exit", theme.muted_text, theme, cx)
+            look.close_button("compare-exit", theme.muted_text)
                 .on_click(Diffui::on_action(Action::Compare(CompareAction::Exit), cx))
-                .tip("Stop comparing", font, theme),
+                .tip("Stop comparing"),
         );
 
-    Some(banner_strip(sides, controls, font, theme))
+    Some(banner_strip(sides, controls, look))
 }

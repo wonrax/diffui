@@ -325,6 +325,7 @@ fn build_file_navigator_surface(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let files = &ui.active().session.document.files;
     if files.is_empty() {
         return div().into_any_element();
@@ -336,8 +337,7 @@ fn build_file_navigator_surface(
             [ui::panel_title(
                 "Changed files",
                 Some(files.len().to_string()),
-                ui.config.ui_font,
-                theme,
+                look,
             )],
             0.0,
         )
@@ -582,6 +582,7 @@ fn build_diff_panel_body(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let tab = ui.active();
     let session = &tab.session;
     let range = crate::range::shown_range(ui);
@@ -650,20 +651,12 @@ fn build_diff_panel_body(
             .gap(px(ui::BUTTON_GAP));
         if tab.repository.is_some() {
             actions = actions.child(
-                ui::text_button(
-                    "empty-browse-source",
-                    Some((icons::CODE, theme.muted_text)),
-                    "Browse source",
-                    ui::Variant::Raised,
-                    ui::Size::Standard,
-                    ui.config.ui_font,
-                    theme,
-                    cx,
-                )
-                .on_click(Diffui::on_action(
-                    Action::SetMainView(crate::MainView::Source),
-                    cx,
-                )),
+                look.button("empty-browse-source", "Browse source")
+                    .icon(icons::CODE, theme.muted_text)
+                    .on_click(Diffui::on_action(
+                        Action::SetMainView(crate::MainView::Source),
+                        cx,
+                    )),
             );
         }
         // Offered only while there is no description, and not while the editor above is
@@ -676,20 +669,11 @@ fn build_diff_panel_body(
                 .is_some_and(|details| details.description.trim().is_empty());
         if describable {
             actions = actions.child(
-                ui::text_button(
-                    "empty-add-description",
-                    None,
-                    "Add description",
-                    ui::Variant::Raised,
-                    ui::Size::Standard,
-                    ui.config.ui_font,
-                    theme,
-                    cx,
-                )
-                .on_click(Diffui::on_action(
-                    Action::EditDescription { target: None },
-                    cx,
-                )),
+                look.button("empty-add-description", "Add description")
+                    .on_click(Diffui::on_action(
+                        Action::EditDescription { target: None },
+                        cx,
+                    )),
             );
         }
         let empty = centered_fill().p(px(crate::theme::space::XXL)).child(
@@ -936,6 +920,7 @@ fn build_description_editor(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(editor) = ui
         .active()
         .description_editor()
@@ -973,15 +958,11 @@ fn build_description_editor(
                 .h_full(),
         );
 
-    let cancel = ui::cancel_button(
-        "description-cancel",
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-        cx,
-    )
-    .disabled(saving)
-    .on_click(Diffui::on_action(Action::CancelDescription, cx));
+    let cancel = look
+        .cancel_button("description-cancel")
+        .compact()
+        .disabled(saving)
+        .on_click(Diffui::on_action(Action::CancelDescription, cx));
 
     // A commit may keep the description as it stands.
     let save_enabled = !saving && (editor.is_dirty() || editor.commit);
@@ -991,16 +972,12 @@ fn build_description_editor(
         (false, true) => "Commit",
         (false, false) => "Save",
     };
-    let save = ui::primary_button(
-        "description-save",
-        save_label,
-        save_enabled,
-        ui::Size::Compact,
-        ui.config.ui_font,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::on_action(Action::SaveDescription, cx));
+    let save = look
+        .button("description-save", save_label)
+        .primary()
+        .compact()
+        .disabled(!save_enabled)
+        .on_click(Diffui::on_action(Action::SaveDescription, cx));
 
     let font = ui.config.ui_font;
     let bound = |command: crate::commands::CommandId, label: &'static str| {
@@ -1009,7 +986,7 @@ fn build_description_editor(
             crate::commands::Context::Description,
             &[command],
             label,
-            theme,
+            look,
         )
         .map(IntoElement::into_any_element)
     };

@@ -569,6 +569,7 @@ fn op_target_row(
 /// The target-mode strip: what's being moved, the placement toggle
 /// (rebase only), the live preview line, and the key hints.
 fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     use diffui_core::{DraftKind, PlacementKind};
     let Some(draft_ui) = ui.active().op_draft() else {
         return div().into_any_element();
@@ -711,15 +712,8 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
                 .child(typography::baseline_row(operation, 0.0)),
         )
         .child(
-            ui::icon_button(
-                "op-bar-cancel",
-                icons::CLOSE,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(Action::DraftCancel, cx)),
+            look.icon_button("op-bar-cancel", icons::CLOSE, theme.muted_text)
+                .on_click(Diffui::on_action(Action::DraftCancel, cx)),
         );
     let headline = div()
         .flex()
@@ -1031,18 +1025,13 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
     } else {
         theme.subtle_text
     };
-    let apply_font = emphasis_font(ui_font, Weight::MEDIUM);
-    let mut apply = ui::primary_button(
-        "op-bar-apply",
-        "Apply",
-        can_apply,
-        ui::Size::Compact,
-        apply_font,
-        theme,
-        cx,
-    )
-    .gap(px(6.0))
-    .child(icons::icon(icons::ENTER, 12.0, apply_color));
+    let mut apply = look
+        .button("op-bar-apply", "Apply")
+        .primary()
+        .compact()
+        .disabled(!can_apply)
+        .gap(px(6.0))
+        .child(icons::icon(icons::ENTER, 12.0, apply_color));
     if can_apply {
         apply = apply.on_click(Diffui::on_action(Action::DraftConfirm, cx));
     }
@@ -1089,7 +1078,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
             div()
                 .w_full()
                 .text_size(px(text_size::BODY))
-                .child(sentence.view(ui_font, mono_font, theme.text, theme))
+                .child(sentence.view(look, theme.text))
         }))
         .children(command.map(|command| {
             div()

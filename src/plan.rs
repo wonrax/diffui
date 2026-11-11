@@ -7,7 +7,7 @@
 
 use crate::typography::{self, Aligned};
 use crate::ui::Tip as _;
-use crate::{Action, Cx, icons, ui};
+use crate::{Action, Cx, icons};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 use std::cell::RefCell;
@@ -20,6 +20,7 @@ use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 use crate::ellipsis;
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, text_size};
+use crate::ui::Look;
 use crate::{Diffui, TabState};
 
 /// Size of the line's glyphs.
@@ -142,8 +143,15 @@ fn command_text(
     command: &str,
     size: f32,
 ) -> ellipsis::Line<'static> {
-    let mono = ui.config.mono_font;
-    command_prose(command).line(mono, mono, theme.muted_text, theme, size)
+    let look = ui.look(theme);
+    command_prose(command).line(
+        Look {
+            font: look.mono,
+            ..look
+        },
+        theme.muted_text,
+        size,
+    )
 }
 
 /// Whether the command fits `width` on one line, glyph and copy button
@@ -198,7 +206,8 @@ fn laid_out(
     theme: ThemeSpec,
     cx: &mut Cx,
 ) -> AnyElement {
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let look = ui.look(theme);
+    let mono = ui.config.mono_font;
     // Commands repeat across a list: the text says which one this is.
     let id = {
         use std::hash::{Hash as _, Hasher as _};
@@ -208,23 +217,17 @@ fn laid_out(
     };
     let copy = div()
         .id(("copy-command-tip", id))
-        .tip("Copy command", ui_font, theme)
+        .tip("Copy command", look)
         // Above a row that opens on press, a press here is the button's alone.
         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
             cx.stop_propagation()
         })
         .child(
-            ui::button(
-                ("copy-command", id),
-                ui::Variant::Ghost,
-                ui::Size::Compact,
-                theme,
-                cx,
-            )
-            .size(px(GLYPH + 4.0))
-            .p(px(0.0))
-            .child(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
-            .on_click(Diffui::on_action(Action::Copy(command.to_owned()), cx)),
+            look.bare_button(("copy-command", id))
+                .size(px(GLYPH + 4.0))
+                .p(px(0.0))
+                .child(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
+                .on_click(Diffui::on_action(Action::Copy(command.to_owned()), cx)),
         );
     typography::baseline_row(
         [

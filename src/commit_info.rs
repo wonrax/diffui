@@ -357,6 +357,7 @@ fn signature_field(label: &str, signature: &SignatureInfo, theme: ThemeSpec) -> 
 /// change is, and what can be done to it. With a panel hidden, the
 /// ids and the file count open it over the diff (see [`crate::root`]).
 pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let session = &ui.active().session;
     let font = ui.config.ui_font;
     let has_files = !session.document.files.is_empty();
@@ -396,31 +397,24 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
     let mut actions = Vec::new();
     if session.capabilities.mutate {
         actions.push(
-            ui::text_button(
-                "commit-edit",
-                Some((icons::PENCIL, theme.muted_text)),
-                "Describe",
-                ui::Variant::Raised,
-                ui::Size::Compact,
-                font,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(
-                Action::EditDescription { target: None },
-                cx,
-            ))
-            .tip(
-                crate::toolbar::with_shortcut(ui, "Edit description", "revision.edit-description"),
-                font,
-                theme,
-            )
-            .into_any_element(),
+            look.button("commit-edit", "Describe")
+                .compact()
+                .icon(icons::PENCIL, theme.muted_text)
+                .on_click(Diffui::on_action(
+                    Action::EditDescription { target: None },
+                    cx,
+                ))
+                .tip(crate::toolbar::with_shortcut(
+                    ui,
+                    "Edit description",
+                    "revision.edit-description",
+                ))
+                .into_any_element(),
         );
     }
     let folded = ui.commit_details_collapsed;
     actions.push(
-        ui::icon_button(
+        look.icon_button(
             "commit-fold",
             if folded {
                 icons::UNFOLD_VERTICAL
@@ -428,20 +422,13 @@ pub(crate) fn view(ui: &Diffui, theme: ThemeSpec, _window: &mut Window, cx: &mut
                 icons::FOLD_VERTICAL
             },
             theme.muted_text,
-            ui::Size::Compact,
-            theme,
-            cx,
         )
         .on_click(Diffui::on_action(Action::ToggleCommitDetails, cx))
-        .tip(
-            if folded {
-                "Show the description and details"
-            } else {
-                "Show just the title"
-            },
-            font,
-            theme,
-        )
+        .tip(if folded {
+            "Show the description and details"
+        } else {
+            "Show just the title"
+        })
         .into_any_element(),
     );
     if let Some(more) = more_button(ui, theme, cx) {
@@ -505,12 +492,12 @@ fn panel_trigger(
     theme: ThemeSpec,
     cx: &mut Cx,
 ) -> Aligned {
+    let look = ui.look(theme);
     let group = typography::group(content, space::MD);
     let Some(panel) = panel else {
         return group;
     };
     let open = ui.panel_peek.is_some_and(|peek| peek.panel == panel);
-    let font = ui.config.ui_font;
     let mut content = vec![group];
     content.push(Aligned::glyph(
         icons::icon(icons::CHEVRON_DOWN, 11.0, theme.muted_text),
@@ -535,7 +522,7 @@ fn panel_trigger(
             .cursor_pointer()
             .when(open, |trigger| trigger.bg(theme::press_wash(theme)))
             .hover(move |trigger| trigger.bg(theme::hover_wash(theme)))
-            .tip(tooltip, font, theme)
+            .tip(tooltip, look)
             .on_click(on_click)
             .child(tracker)
             .child(line)
@@ -698,6 +685,7 @@ fn diff_stats(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Vec<Aligned> {
 /// ⋯: the revision's context menu, the one its row in the list opens. jj
 /// only, as that menu is.
 fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let tab = ui.active();
     if tab.repository.as_ref().map(|r| r.vcs) != Some(crate::repository::Vcs::Jj) {
         return None;
@@ -721,16 +709,9 @@ fn more_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement>
             .relative()
             .child(tracker)
             .child(
-                ui::icon_button(
-                    "commit-more",
-                    icons::ELLIPSIS,
-                    theme.muted_text,
-                    ui::Size::Compact,
-                    theme,
-                    cx,
-                )
-                .on_click(open)
-                .tip("More revision actions", ui.config.ui_font, theme),
+                look.icon_button("commit-more", icons::ELLIPSIS, theme.muted_text)
+                    .on_click(open)
+                    .tip("More revision actions"),
             )
             .into_any_element(),
     )

@@ -20,6 +20,7 @@ use crate::cmdline::{COMMAND_INPUT_ID, CommandLine, PREFIX, PlanState};
 use crate::icons;
 use crate::palette::{CONTENT_X, GLYPH_GAP, INPUT_BAND, RESULTS_INSET};
 use crate::theme::ThemeSpec;
+use crate::ui::Look;
 
 /// The strip under the input: the revset arguments, or the error.
 pub(crate) const ARGS_HEIGHT: f32 = 30.0;
@@ -196,7 +197,6 @@ pub(crate) fn input(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     // The field holds what follows the `jj ` the chip stands for; offsets into
     // the line move by its length.
@@ -256,8 +256,7 @@ pub(crate) fn input(
                 crate::commands::Context::Palette,
                 &["palette.back"],
             ),
-            font,
-            theme,
+            ui.look(theme),
         ))
         .into_any_element()
 }
@@ -295,6 +294,7 @@ pub(crate) fn args_strip(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let plan = ui.plan(command);
@@ -309,10 +309,8 @@ pub(crate) fn args_strip(
         let line = typography::baseline_row(
             [sentence(
                 &crate::prose::Prose::from_backticks(&reason),
-                font,
-                mono,
                 theme.removed_text,
-                theme,
+                look,
             )],
             0.0,
         );
@@ -321,7 +319,7 @@ pub(crate) fn args_strip(
                 .shape(ui::BannerShape::Strip)
                 .icon(icons::ALERT_TRIANGLE)
                 .child(line)
-                .build(font, theme)
+                .build(look)
                 .into_any_element(),
         );
     }
@@ -396,6 +394,7 @@ pub(crate) fn results(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let preview = preview(ui, theme, line, command);
     let list = if command.completions.is_empty() {
         let label = if line.trim_end() != "jj" {
@@ -407,7 +406,6 @@ pub(crate) fn results(
         };
         palette::empty_results(ui, theme, label.to_owned()).into_any_element()
     } else {
-        let font = ui.config.ui_font;
         let id = "command-results";
         let handle = ui::scroll_handle("command-results-scroll", window, cx)
             .read(cx)
@@ -438,7 +436,7 @@ pub(crate) fn results(
             &handle,
             viewport,
             palette::ROW_HEIGHT,
-            |heading| palette::group_heading(heading, font, theme).into_any_element(),
+            |heading| palette::group_heading(heading, look).into_any_element(),
             |index| {
                 let completion = &command.completions[index];
                 let selected = index == command.selected;
@@ -500,6 +498,7 @@ pub(crate) fn completion_group(kind: CompletionKind) -> &'static str {
 /// is, and what it will do in words. Nothing on a bare `jj ` with nothing to
 /// offer.
 fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let completion = command.completions.get(command.selected);
     if line.trim_end() == "jj" && completion.is_none() {
         return None;
@@ -571,7 +570,7 @@ fn preview(ui: &Diffui, theme: ThemeSpec, line: &str, command: &CommandLine) -> 
         .child(typography::baseline_row(head, 0.0));
     if !ghosted && !plan.words.is_empty() {
         card = card.child(typography::baseline_row(
-            [sentence(&plan.words, font, mono, theme.muted_text, theme)],
+            [sentence(&plan.words, theme.muted_text, look)],
             0.0,
         ));
     }
@@ -607,6 +606,7 @@ fn candidate_row(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let mono = ui.config.mono_font;
     let font = ui.config.ui_font;
     let (glyph, _) = completion_glyph(completion.kind, theme);
@@ -658,8 +658,7 @@ fn candidate_row(
                     crate::commands::Context::Palette,
                     &["palette.actions"],
                 ),
-                font,
-                theme,
+                look,
             ))
         })
         .into_any_element()
@@ -673,7 +672,7 @@ pub(crate) fn footer(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    let font = ui.config.ui_font;
+    let look = ui.look(theme);
     let plan = ui.plan(command);
     let enter = match &plan.state {
         PlanState::Pending => "Resolving\u{2026}",
@@ -685,8 +684,7 @@ pub(crate) fn footer(
         Some(CommandKind::OpensUi) => "Opens the editor",
         Some(CommandKind::Passthrough) | None => "Output opens in the CLI panel",
     };
-    let hint =
-        |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, font, theme);
+    let hint = |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, look);
     crate::overlay_kit::footer(
         crate::overlay_kit::Density::Strip,
         crate::overlay_kit::MODAL_FOOT,
@@ -697,7 +695,7 @@ pub(crate) fn footer(
         crate::commands::Context::Palette,
         &["palette.actions"],
         "Complete",
-        theme,
+        look,
     ))
     .child(hint(&[crate::keymap::key_label("enter")], enter))
     .children(crate::overlay_kit::bound_hint(
@@ -705,22 +703,16 @@ pub(crate) fn footer(
         crate::commands::Context::Palette,
         &["palette.leave-command-line"],
         "Back to commands",
-        theme,
+        look,
     ))
-    .child(crate::overlay_kit::footer_note(lands, font, theme).ml_auto())
+    .child(crate::overlay_kit::footer_note(lands, look).ml_auto())
     .into_any_element()
 }
 
 /// A one-line sentence that shares the row's baseline with its badge or
 /// glyph, clipped at the row's end.
-fn sentence(
-    words: &crate::prose::Prose,
-    font: Font,
-    mono: Font,
-    color: Color,
-    theme: ThemeSpec,
-) -> Aligned {
-    typography::group(words.runs(font, mono, color, theme, text_size::BODY), 0.0)
+fn sentence(words: &crate::prose::Prose, color: Color, look: Look) -> Aligned {
+    typography::group(words.runs(look, color, text_size::BODY), 0.0)
         .map(|line| {
             div()
                 .w_full()

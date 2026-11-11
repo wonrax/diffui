@@ -1691,8 +1691,8 @@ impl RevisionList {
             )
         };
 
-        let (card, at) =
-            crate::ui::placed_tooltip(text, target, style.primary_font, style.floating, window);
+        let look = crate::ui::Look::new(style.floating, style.primary_font, style.mono_font);
+        let (card, at) = crate::ui::placed_tooltip(text, target, look, window);
         Some((card.into_any_element(), at))
     }
 

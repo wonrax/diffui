@@ -149,6 +149,7 @@ pub(crate) fn strip(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let (context, hints) = active_hints(ui)?;
     let font = ui.config.ui_font;
     let mut line: Vec<Aligned> = Vec::new();
@@ -169,7 +170,7 @@ pub(crate) fn strip(
         let gesture = keys.is_empty();
         any_key |= !gesture;
         if !gesture {
-            line.push(crate::ui::chord_aligned(keys, ui.config.ui_font, theme));
+            line.push(crate::ui::chord_aligned(keys, look));
         }
         if !gesture {
             line.push(Aligned::gap(theme::space::SM));

@@ -4418,6 +4418,11 @@ impl Diffui {
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
         self.selected_theme.active(self.system_theme)
     }
+
+    /// What a pane draws in under `theme`: the configured UI and mono fonts.
+    pub(crate) fn look(&self, theme: crate::theme::ThemeSpec) -> crate::ui::Look {
+        crate::ui::Look::new(theme, self.config.ui_font, self.config.mono_font)
+    }
 }
 
 /// What undoing the push named `summary` does, for its confirm dialog.

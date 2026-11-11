@@ -17,6 +17,7 @@ use crate::theme::{
     text_size,
 };
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, FetchTarget, MainView, ToolbarMenu, activity, icons, sidebar, ui};
 
 /// Every control in the bar is one [`ui::Size::Compact`] step tall.
@@ -120,6 +121,7 @@ pub(crate) fn build_toolbar(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if ui.tabs.is_empty() {
         return div().into_any_element();
     }
@@ -135,7 +137,7 @@ pub(crate) fn build_toolbar(
         .items_center()
         .gap(px(GROUP_GAP))
         .flex_none()
-        .child(panel_toggles(ui, theme, font, cx))
+        .child(panel_toggles(ui, theme, cx))
         .child(separator(theme));
     // Diff ↔ Source view switcher, so the "what am I looking at" control leads
     // the bar after the panels. Repo tabs only: a PR has no tree to browse.
@@ -143,7 +145,7 @@ pub(crate) fn build_toolbar(
     let in_source = is_repo && ui.active().main_view == MainView::Source;
     if is_repo {
         actions = actions
-            .child(view_switcher(ui, theme, font, window, cx))
+            .child(view_switcher(ui, theme, window, cx))
             .child(separator(theme));
     }
     if in_source {
@@ -157,11 +159,10 @@ pub(crate) fn build_toolbar(
                 icons::REFRESH,
                 "Refresh",
                 Action::Refresh,
-                theme,
-                font,
+                look,
                 cx,
             ))
-            .child(fetch_split_button(theme, font, window, cx));
+            .child(fetch_split_button(look, window, cx));
         // Plain `jj git push` (tracked bookmarks that moved), behind a
         // confirmation listing what goes out.
         if is_jj
@@ -180,8 +181,7 @@ pub(crate) fn build_toolbar(
                     with_shortcut(ui, "Undo the last operation", "repo.undo"),
                     false,
                     Some(Action::Undo),
-                    theme,
-                    font,
+                    look,
                     cx,
                 ))
                 .child(toggle_button(
@@ -190,8 +190,7 @@ pub(crate) fn build_toolbar(
                     with_shortcut(ui, "Redo the last undone operation", "repo.redo"),
                     false,
                     Some(Action::Redo),
-                    theme,
-                    font,
+                    look,
                     cx,
                 ));
         }
@@ -214,13 +213,12 @@ pub(crate) fn build_toolbar(
             Action::Changes(crate::changes::ChangesMsg::Lines(
                 crate::changes::LineMsg::Toggle,
             )),
-            theme,
-            font,
+            look,
             cx,
         ));
     }
     if crate::media::shows_svg_preview(ui) {
-        toggles = toggles.child(svg_switcher(ui, theme, font, window, cx));
+        toggles = toggles.child(svg_switcher(ui, theme, window, cx));
     }
     toggles = toggles.child(toolbar_toggle_button(
         "toolbar-wrap",
@@ -228,8 +226,7 @@ pub(crate) fn build_toolbar(
         "Wrap lines".into(),
         ui.diff_wrap,
         Action::ToggleWrap,
-        theme,
-        font,
+        look,
         cx,
     ));
     // Side-by-side only applies to the diff; the source view is one column by
@@ -248,8 +245,7 @@ pub(crate) fn build_toolbar(
             split_label.into(),
             ui.diff_split,
             Action::ToggleSplit,
-            theme,
-            font,
+            look,
             cx,
         ));
     }
@@ -298,13 +294,8 @@ pub(crate) fn build_toolbar(
 /// The Diff ↔ Source view switcher, a [`segmented`] control. Deliberately *not*
 /// the bordered-button-group look of the fetch split button: this switches what
 /// the window shows, so it reads as tabs, not as an action.
-fn view_switcher(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    font: Font,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn view_switcher(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let segment = |icon: &'static str, label: &'static str, view: MainView| Segment {
         icon: Some(icon),
         label,
@@ -318,18 +309,13 @@ fn view_switcher(
     if crate::history_panel::available(ui) {
         segments.push(segment(icons::HISTORY, "History", MainView::History));
     }
-    segmented(segments, font, theme, window, cx)
+    segmented(segments, look, window, cx)
 }
 
 /// How the diff shows SVG files: rendered, or as their markup's text diff. Only on
 /// screen while the diff holds an SVG it can render.
-fn svg_switcher(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    font: Font,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn svg_switcher(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let segment = |icon: &'static str, label: &'static str, source: bool| Segment {
         icon: Some(icon),
         label,
@@ -341,8 +327,7 @@ fn svg_switcher(
             segment(icons::IMAGE, "Rendered", false),
             segment(icons::CODE_XML, "Markup", true),
         ],
-        font,
-        theme,
+        look,
         window,
         cx,
     )
@@ -352,11 +337,11 @@ fn svg_switcher(
 /// [`ui::segmented`] at the bar's control height.
 pub(crate) fn segmented(
     segments: Vec<Segment>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let mut well = ui::segmented(theme);
     for segment in segments {
         let Segment {
@@ -375,9 +360,7 @@ pub(crate) fn segmented(
                 enabled: on_press.is_some(),
             },
             ui::Segmented::Compact,
-            font,
-            theme,
-            cx,
+            look,
         );
         if let Some(action) = on_press {
             tab = tab.on_click(Diffui::on_action(action, cx));
@@ -394,22 +377,16 @@ fn toolbar_button(
     icon: &'static str,
     label: &'static str,
     action: Action,
-    theme: ThemeSpec,
-    font: Font,
+    look: Look,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    ui::text_button(
-        id,
-        Some((icon, theme.muted_text)),
-        label,
-        ui::Variant::Ghost,
-        CONTROL,
-        font,
-        theme,
-        cx,
-    )
-    .flex_none()
-    .on_click(Diffui::on_action(action, cx))
+    let Look { theme, .. } = look;
+    look.button(id, label)
+        .ghost()
+        .step(CONTROL)
+        .icon(icon, theme.muted_text)
+        .flex_none()
+        .on_click(Diffui::on_action(action, cx))
 }
 
 /// A toolbar toggle: an icon-only button with a persistent accent tint while
@@ -423,11 +400,10 @@ fn toolbar_toggle_button(
     label: SharedString,
     active: bool,
     action: Action,
-    theme: ThemeSpec,
-    font: Font,
+    look: Look,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    toggle_button(id, icon, label, active, Some(action), theme, font, cx)
+    toggle_button(id, icon, label, active, Some(action), look, cx)
 }
 
 /// [`toolbar_toggle_button`], inert (greyed, no press) without an action.
@@ -438,16 +414,16 @@ fn toggle_button(
     label: SharedString,
     active: bool,
     action: Option<Action>,
-    theme: ThemeSpec,
-    font: Font,
+    look: Look,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let icon_color = if active {
         theme.accent
     } else {
         theme.muted_text
     };
-    let mut button = ui::icon_button(id, icon, icon_color, CONTROL, theme, cx);
+    let mut button = look.icon_button(id, icon, icon_color).step(CONTROL);
     if active {
         button = button.resting(theme::press_wash(theme), None);
     }
@@ -455,7 +431,7 @@ fn toggle_button(
         Some(action) => button.on_click(Diffui::on_action(action, cx)),
         None => button.disabled(true),
     };
-    button.tip(label, font, theme).into_any_element()
+    button.tip(label).into_any_element()
 }
 
 /// `label`, with the first key bound to `command` in parentheses.
@@ -469,7 +445,8 @@ pub(crate) fn with_shortcut(ui: &Diffui, label: &str, command: &'static str) -> 
 /// The two panel toggles that lead the bar: the revision list and the changed
 /// files beside the diff. Only the Diff view hides its panels; the others keep
 /// theirs, so there the toggles sit inert.
-fn panel_toggles(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> impl IntoElement {
+fn panel_toggles(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
+    let look = ui.look(theme);
     let tab = ui.active();
     let in_diff = tab.main_view == MainView::Diff;
     let toggle = |id: &'static str,
@@ -494,8 +471,7 @@ fn panel_toggles(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> impl
             label,
             shown && in_diff,
             in_diff.then_some(action),
-            theme,
-            font,
+            look,
             cx,
         )
     };
@@ -529,6 +505,7 @@ fn panel_toggles(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> impl
 /// would send and how far it is ahead of the remote, or how many go. Plain
 /// "Push" when nothing would.
 fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let session = &ui.active().session;
     let bookmarks = &session.bookmarks;
     let remote = bookmarks.default_push_remote();
@@ -571,7 +548,12 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
     ];
     let target = match candidates.as_slice() {
         [] => None,
-        [one] if one.tag => Some((icons::TAG, one.name.clone(), Some(one.ahead), theme.lanes[0])),
+        [one] if one.tag => Some((
+            icons::TAG,
+            one.name.clone(),
+            Some(one.ahead),
+            theme.lanes[0],
+        )),
         [one] => {
             let lane = session
                 .commits
@@ -617,7 +599,9 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
         ));
     }
 
-    let button = ui::button("toolbar-push", ui::Variant::Ghost, CONTROL, theme, cx)
+    let button = look
+        .bare_button("toolbar-push")
+        .step(CONTROL)
         .flex_none()
         .child(typography::baseline_row(line, 0.0))
         .on_click(Diffui::on_action(
@@ -625,7 +609,7 @@ fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyEle
             cx,
         ));
     button
-        .tip(with_shortcut(ui, &tip, "repo.push"), font, theme)
+        .tip(with_shortcut(ui, &tip, "repo.push"))
         .into_any_element()
 }
 
@@ -714,23 +698,14 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl In
 /// remote-branch menu, joined by a short hairline: the seam is what marks the two
 /// ghost halves as one group. They highlight **independently** on hover so the
 /// seam also reads as "two actions".
-fn fetch_split_button(
-    theme: ThemeSpec,
-    font: Font,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> impl IntoElement {
-    let main = ui::text_button(
-        "toolbar-fetch",
-        Some((icons::FETCH, theme.muted_text)),
-        "Fetch",
-        ui::Variant::Ghost,
-        CONTROL,
-        font,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::on_action(Action::Fetch(FetchTarget::Default), cx));
+fn fetch_split_button(look: Look, window: &mut Window, cx: &mut Cx) -> impl IntoElement {
+    let Look { theme, .. } = look;
+    let main = look
+        .button("toolbar-fetch", "Fetch")
+        .ghost()
+        .step(CONTROL)
+        .icon(icons::FETCH, theme.muted_text)
+        .on_click(Diffui::on_action(Action::Fetch(FetchTarget::Default), cx));
 
     // The whole split button's rect, so the dropdown anchors edge-to-edge below it.
     let (anchor, tracker) = crate::menu::anchor_tracker();

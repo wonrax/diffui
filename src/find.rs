@@ -15,7 +15,8 @@ use regex::{Regex, RegexBuilder};
 use std::time::Duration;
 
 use crate::diff_view::FindMatch;
-use crate::theme::{self, Font, ThemeSpec, Weight, text_size};
+use crate::theme::{self, ThemeSpec, Weight, text_size};
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, icons};
 use diffui_core::DiffFile;
 
@@ -214,6 +215,7 @@ pub(crate) fn build_overlay(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(state) = ui.active().find() else {
         return div().into_any_element();
     };
@@ -253,27 +255,19 @@ pub(crate) fn build_overlay(
             cx,
         ));
 
-    let case_button = toggle_button(
-        "find-case",
-        "Aa",
-        state.case_sensitive,
-        theme,
-        ui.config.ui_font,
-        cx,
-    )
-    .on_click(Diffui::listen(
-        cx,
-        |this, _: &gpui_kit::ClickEvent, _, _| {
+    let case_button = toggle_button("find-case", "Aa", state.case_sensitive, look).on_click(
+        Diffui::listen(cx, |this, _: &gpui_kit::ClickEvent, _, _| {
             this.find_on_toggle_case();
-        },
-    ));
+        }),
+    );
     let regex_button = toggle_button(
         "find-regex",
         ".*",
         state.regex,
-        theme,
-        ui.config.mono_font,
-        cx,
+        Look {
+            font: look.mono,
+            ..look
+        },
     )
     .on_click(Diffui::listen(
         cx,
@@ -283,7 +277,8 @@ pub(crate) fn build_overlay(
     ));
 
     let nav = |id: &'static str, glyph, action, cx: &mut Cx| {
-        crate::ui::icon_button(id, glyph, theme.muted_text, CONTROL, theme, cx)
+        look.icon_button(id, glyph, theme.muted_text)
+            .step(CONTROL)
             .on_click(Diffui::on_action(action, cx))
     };
     let prev_button = nav("find-prev", icons::CHEVRON_UP, Action::FindPrevious, cx);
@@ -373,19 +368,11 @@ pub(crate) fn build_overlay(
 
 /// A match-option toggle: the toolbar toggles' look, quiet at rest, an accent wash and
 /// accent label while on.
-fn toggle_button(
-    id: &'static str,
-    label: &'static str,
-    on: bool,
-    theme: ThemeSpec,
-    font: Font,
-    cx: &mut Cx,
-) -> crate::ui::Button {
+fn toggle_button(id: &'static str, label: &'static str, on: bool, look: Look) -> crate::ui::Button {
+    let Look { theme, font, .. } = look;
     let side = px(CONTROL.height());
     let font = theme::emphasis_font(font, Weight::MEDIUM);
-    let mut button = crate::ui::button(id, crate::ui::Variant::Ghost, CONTROL, theme, cx)
-        .size(side)
-        .p(px(0.0));
+    let mut button = look.bare_button(id).step(CONTROL).size(side).p(px(0.0));
     if on {
         button = button.resting(theme::chip_background(theme.accent), None);
     }

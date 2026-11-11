@@ -22,9 +22,7 @@ use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
 use crate::theme::{self, ThemeSpec, text_size};
-use crate::{
-    Action, Diffui, PendingMutation, TabId, TabState, activity, icons, input, typography, ui,
-};
+use crate::{Action, Diffui, PendingMutation, TabId, TabState, activity, icons, input, typography};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConflictMsg {
@@ -1146,6 +1144,7 @@ pub(crate) fn marker_editor(
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     const GAP: f32 = 8.0;
     let editor = editor_shown(ui)?;
     let saving = editor.saving.is_some();
@@ -1165,7 +1164,7 @@ pub(crate) fn marker_editor(
                     Prose::new()
                         .text("Editing ")
                         .path(editor.path.as_str())
-                        .view(font, mono, theme.text, theme),
+                        .view(look, theme.text),
                 ),
             font,
             text_size::BODY,
@@ -1209,6 +1208,7 @@ pub(crate) fn marker_editor(
 
 /// How many conflicts the edit still holds, Cancel and Save.
 fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
     let saving = editor.saving.is_some();
     let hint = match markers_left(&editor.content, editor.marker_len) {
@@ -1216,23 +1216,24 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
         1 => "1 conflict left: saving keeps it conflicted".to_owned(),
         n => format!("{n} conflicts left: saving keeps them conflicted"),
     };
-    let cancel = ui::cancel_button("marker-cancel", ui::Size::Compact, font, theme, cx)
+    let cancel = look
+        .cancel_button("marker-cancel")
+        .compact()
         .disabled(saving)
         .on_click(Diffui::listen(cx, |this, _, _, cx| {
             this.on_conflict(ConflictMsg::EditorCancel, cx);
         }));
-    let save = ui::primary_button(
-        "marker-save",
-        if saving { "Saving\u{2026}" } else { "Save" },
-        !saving,
-        ui::Size::Compact,
-        font,
-        theme,
-        cx,
-    )
-    .on_click(Diffui::listen(cx, |this, _, _, cx| {
-        this.on_conflict(ConflictMsg::EditorSave, cx);
-    }));
+    let save = look
+        .button(
+            "marker-save",
+            if saving { "Saving\u{2026}" } else { "Save" },
+        )
+        .primary()
+        .compact()
+        .disabled(!(!saving))
+        .on_click(Diffui::listen(cx, |this, _, _, cx| {
+            this.on_conflict(ConflictMsg::EditorSave, cx);
+        }));
     crate::overlay_kit::footer_with_buttons(
         crate::overlay_kit::Density::Well,
         crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
@@ -1247,7 +1248,7 @@ fn editor_footer(ui: &Diffui, theme: ThemeSpec, editor: &MarkerEditor, cx: &mut 
                 crate::commands::Context::ConflictEdit,
                 &[id],
                 label,
-                theme,
+                look,
             )
         })
         .map(IntoElement::into_any_element)

@@ -45,6 +45,7 @@ pub(crate) fn build_status_bar(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if ui.tabs.is_empty() {
         return div().into_any_element();
     }
@@ -96,7 +97,7 @@ pub(crate) fn build_status_bar(
                 bookmark.map(move |bookmark| {
                     div()
                         .id("status-bookmark")
-                        .tip(upstream, font, theme)
+                        .tip(upstream, look)
                         .child(bookmark)
                         .into_any_element()
                 })

@@ -281,12 +281,13 @@ fn hover(
     ui: &Diffui,
     theme: ThemeSpec,
 ) -> AnyElement {
+    let look = ui.look(theme);
     match detail.filter(|detail| !detail.is_empty()) {
         Some(detail) => div()
             .id(ElementId::Name(id.into()))
             .flex()
             .min_w_0()
-            .tip(detail, ui.config.ui_font, theme)
+            .tip(detail, look)
             .child(content)
             .into_any_element(),
         None => content,

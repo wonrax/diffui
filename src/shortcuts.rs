@@ -182,6 +182,7 @@ pub(crate) fn build_overlay(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     if ui.mode(ModeKind::Shortcuts).is_none() {
         return div().into_any_element();
     }
@@ -258,7 +259,6 @@ pub(crate) fn build_overlay(
         .collect();
     let left = left.child(section(ui, theme, "Mouse", gestures));
 
-    let font = ui.config.ui_font;
     let columns = div()
         .flex()
         .flex_row()
@@ -272,34 +272,29 @@ pub(crate) fn build_overlay(
 
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
         .clamp(240.0, CARD_MAX_HEIGHT);
-    let card = crate::overlay_kit::Dialog::new(
-        &crate::prose::Prose::from("Keyboard shortcuts"),
-        font,
-        ui.config.mono_font,
-        theme,
-    )
-    .width(CARD_WIDTH)
-    .height(height)
-    .lede(
-        &crate::prose::Prose::from("Rebind any of them under ")
-            .code("[keys]")
-            .text(" in ")
-            .path("config.toml")
-            .text("."),
-        ui.config.mono_font,
-    )
-    .child(
-        div()
-            .size_full()
-            .child(ui::scrollable("shortcuts-list", columns)),
-    )
-    .bound_hint(
-        ui,
-        crate::commands::Context::Shortcuts,
-        &["shortcuts.close"],
-        "Close",
-    )
-    .build();
+    let card =
+        crate::overlay_kit::Dialog::new(&crate::prose::Prose::from("Keyboard shortcuts"), look)
+            .width(CARD_WIDTH)
+            .height(height)
+            .lede(
+                &crate::prose::Prose::from("Rebind any of them under ")
+                    .code("[keys]")
+                    .text(" in ")
+                    .path("config.toml")
+                    .text("."),
+            )
+            .child(
+                div()
+                    .size_full()
+                    .child(ui::scrollable("shortcuts-list", columns)),
+            )
+            .bound_hint(
+                ui,
+                crate::commands::Context::Shortcuts,
+                &["shortcuts.close"],
+                "Close",
+            )
+            .build();
     let dismiss = Diffui::on_action::<()>(Action::CloseShortcuts, cx);
     ui::modal(
         "shortcuts-sheet",
@@ -316,6 +311,7 @@ fn section(
     title: &'static str,
     rows: Vec<AnyElement>,
 ) -> impl IntoElement {
+    let look = ui.look(theme);
     div()
         .flex()
         .flex_col()
@@ -324,7 +320,7 @@ fn section(
             div()
                 .pb(px(theme::space::XS))
                 .child(typography::baseline_row(
-                    [ui::section_label(title, None, ui.config.ui_font, theme)],
+                    [ui::section_label(title, None, look)],
                     0.0,
                 )),
         )
@@ -340,6 +336,7 @@ fn binding_row(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
     // The label and the mono keycaps share a baseline (see `crate::typography`). A
     // command that can't run right now greys out and says why after its label.
@@ -380,7 +377,7 @@ fn binding_row(
         } else {
             crate::overlay_kit::chord_keys(&chord)
         };
-        line.push(ui::chord_aligned(caps, ui.config.ui_font, theme));
+        line.push(ui::chord_aligned(caps, look));
     }
     div()
         .flex()
@@ -400,6 +397,7 @@ pub(crate) fn welcome_hints(
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
     let chord = |id: CommandId| {
         ui.keymap
@@ -409,7 +407,7 @@ pub(crate) fn welcome_hints(
     let tip = |key: Option<String>, what: &'static str| {
         let mut line = Vec::new();
         if let Some(key) = key {
-            line.push(ui::keycap(key, ui.config.ui_font, theme).aligned());
+            line.push(ui::keycap(key, look).aligned());
         }
         line.push(Aligned::text(
             typography::line(what, font, text_size::BODY, theme.subtle_text),
@@ -428,20 +426,15 @@ pub(crate) fn welcome_hints(
         .child(tip(chord("palette.toggle"), "Command palette"))
         .child(tip(chord("help.shortcuts"), "All shortcuts"))
         .child(tip(chord("repo.open-dialog"), "Open another"));
-    let all = ui::button(
-        "welcome-shortcuts",
-        ui::Variant::Ghost,
-        ui::Size::Compact,
-        theme,
-        cx,
-    )
-    .child(typography::line(
-        "Keyboard shortcuts",
-        font,
-        text_size::BODY,
-        theme.muted_text,
-    ))
-    .on_click(Diffui::on_action(Action::ToggleShortcuts, cx));
+    let all = look
+        .bare_button("welcome-shortcuts")
+        .child(typography::line(
+            "Keyboard shortcuts",
+            font,
+            text_size::BODY,
+            theme.muted_text,
+        ))
+        .on_click(Diffui::on_action(Action::ToggleShortcuts, cx));
     div()
         .flex()
         .flex_col()

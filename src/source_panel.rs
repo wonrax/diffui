@@ -360,6 +360,7 @@ pub(crate) fn build_source_sidebar(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let source = &ui.active().source;
     let mut body = div()
         .flex()
@@ -385,7 +386,7 @@ pub(crate) fn build_source_sidebar(
                             .text_color(theme.text)
                             .child(format!("Couldn't list files: {error}")),
                     )
-                    .build(ui.config.ui_font, theme),
+                    .build(look),
             ),
         );
     }

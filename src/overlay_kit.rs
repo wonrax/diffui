@@ -9,6 +9,7 @@ use crate::icons;
 use crate::prose::Prose;
 use crate::theme::{self, Color, Font, ThemeSpec, Weight, radius, text_size};
 use crate::typography;
+use crate::ui::{self, Look};
 
 /// Lucide glyphs the overlays use that the shared catalog doesn't carry, from
 /// the same pinned font (see `widgets/build.rs`).
@@ -84,19 +85,15 @@ pub(crate) fn chord_keys(display: &str) -> Vec<String> {
 }
 
 /// A footer hint: the keys, then what they do.
-pub(crate) fn key_hint(
-    keys: &[&str],
-    label: impl Into<SharedString>,
-    font: Font,
-    theme: ThemeSpec,
-) -> Div {
+pub(crate) fn key_hint(keys: &[&str], label: impl Into<SharedString>, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     div()
         .flex()
         .flex_row()
         .flex_none()
         .items_center()
         .gap(px(theme::space::SM))
-        .child(crate::ui::chord(keys.iter().copied(), font, theme))
+        .child(ui::chord(keys.iter().copied(), look))
         .child(typography::centered(
             typography::line(label, font, text_size::CAPTION, theme.subtle_text),
             font,
@@ -112,14 +109,14 @@ pub(crate) fn bound_hint(
     context: crate::commands::Context,
     commands: &[crate::commands::CommandId],
     label: impl Into<SharedString>,
-    theme: ThemeSpec,
+    look: Look,
 ) -> Option<Div> {
     let keys = bound_keys(ui, context, commands);
     if keys.is_empty() {
         return None;
     }
     let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-    Some(key_hint(&keys, label, ui.config.ui_font, theme))
+    Some(key_hint(&keys, label, look))
 }
 
 /// The keys of `commands` in `context`: each command's first live chord, one
@@ -137,7 +134,8 @@ pub(crate) fn bound_keys(
 }
 
 /// Quiet text in a footer, without keys (the far end's note).
-pub(crate) fn footer_note(text: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Div {
+pub(crate) fn footer_note(text: impl Into<SharedString>, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     typography::centered(
         typography::line(text, font, text_size::CAPTION, theme.subtle_text),
         font,
@@ -225,7 +223,7 @@ fn card_foot(theme: ThemeSpec, radius: f32) -> impl IntoElement {
 
 /// A list's group band: its [`crate::ui::section_label`] on the bottom of
 /// its [`GROUP_HEIGHT`] so it hugs the rows it heads.
-pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Div {
+pub(crate) fn group_heading(label: impl Into<SharedString>, look: Look) -> Div {
     div()
         .w_full()
         .h(px(GROUP_HEIGHT))
@@ -235,7 +233,7 @@ pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: T
         .justify_end()
         .pb(px(theme::space::XS))
         .child(typography::baseline_row(
-            [crate::ui::section_label(label, None, font, theme)],
+            [ui::section_label(label, None, look)],
             0.0,
         ))
 }
@@ -243,18 +241,13 @@ pub(crate) fn group_heading(label: impl Into<SharedString>, font: Font, theme: T
 /// A warning card with an alert glyph: something the reader should know
 /// before they confirm, that doesn't stop them. `lead` takes the warning's
 /// ink, `detail` (the consequence, in plain words) the body's.
-pub(crate) fn callout(
-    lead: &Prose,
-    detail: Option<&Prose>,
-    font: Font,
-    mono: Font,
-    theme: ThemeSpec,
-) -> Div {
+pub(crate) fn callout(lead: &Prose, detail: Option<&Prose>, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     let text = |prose: &Prose, color: Color| {
         div()
             .font(font.gpui())
             .line_height(px(text_size::BODY * typography::DEFAULT_LINE_HEIGHT))
-            .child(prose.view(font, mono, color, theme))
+            .child(prose.view(look, color))
     };
     let mut banner = crate::ui::Banner::new(crate::ui::Tone::Warn)
         .icon(icons::ALERT_TRIANGLE)
@@ -262,7 +255,7 @@ pub(crate) fn callout(
     if let Some(detail) = detail {
         banner = banner.child(text(detail, theme.muted_text));
     }
-    banner.build(font, theme)
+    banner.build(look)
 }
 
 /// Width of a dialog that asks one question.
@@ -286,13 +279,12 @@ pub(crate) struct Dialog {
     body: Vec<gpui_kit::AnyElement>,
     hints: Vec<gpui_kit::AnyElement>,
     buttons: Vec<gpui_kit::AnyElement>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
 }
 
 impl Dialog {
-    pub(crate) fn new(title: &Prose, font: Font, mono: Font, theme: ThemeSpec) -> Self {
-        let title_font = theme::emphasis_font(font, Weight::SEMIBOLD);
+    pub(crate) fn new(title: &Prose, look: Look) -> Self {
+        let title_font = theme::emphasis_font(look.font, Weight::SEMIBOLD);
         Self {
             width: DIALOG_WIDTH,
             height: None,
@@ -305,13 +297,18 @@ impl Dialog {
                     div()
                         .w_full()
                         .text_size(px(text_size::TITLE))
-                        .child(title.view(title_font, mono, theme.text, theme)),
+                        .child(title.view(
+                            Look {
+                                font: title_font,
+                                ..look
+                            },
+                            look.theme.text,
+                        )),
                 ),
             body: Vec::new(),
             hints: Vec::new(),
             buttons: Vec::new(),
-            font,
-            theme,
+            look,
         }
     }
 
@@ -329,14 +326,14 @@ impl Dialog {
     }
 
     /// The plain words under the title: what happens, in a sentence.
-    pub(crate) fn lede(mut self, text: &Prose, mono: Font) -> Self {
+    pub(crate) fn lede(mut self, text: &Prose) -> Self {
         if !text.is_empty() {
             self.head = self.head.child(
                 div()
                     .w_full()
                     .text_size(px(text_size::BODY))
                     .line_height(px(text_size::BODY * 1.5))
-                    .child(text.view(self.font, mono, self.theme.muted_text, self.theme)),
+                    .child(text.view(self.look, self.look.theme.muted_text)),
             );
         }
         self
@@ -351,7 +348,7 @@ impl Dialog {
     /// A key hint in the footer's left end.
     pub(crate) fn hint(mut self, keys: &[&str], label: impl Into<SharedString>) -> Self {
         self.hints
-            .push(key_hint(keys, label, self.font, self.theme).into_any_element());
+            .push(key_hint(keys, label, self.look).into_any_element());
         self
     }
 
@@ -365,7 +362,7 @@ impl Dialog {
         label: impl Into<SharedString>,
     ) -> Self {
         self.hints.extend(
-            bound_hint(ui, context, commands, label, self.theme).map(IntoElement::into_any_element),
+            bound_hint(ui, context, commands, label, self.look).map(IntoElement::into_any_element),
         );
         self
     }
@@ -386,7 +383,7 @@ impl Dialog {
     }
 
     pub(crate) fn build(self) -> Div {
-        let theme = self.theme;
+        let theme = self.look.theme;
         let has_body = !self.body.is_empty();
         let head = self
             .head

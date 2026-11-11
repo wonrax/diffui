@@ -29,6 +29,7 @@ use crate::Diffui;
 use crate::commands::{self, CommandArg, CommandId, PaletteScope};
 use crate::theme::{self, ThemeSpec};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use diffui_core::RevisionSelection;
 
 /// `Id` for the active palette text input. Refocused whenever the
@@ -1159,7 +1160,7 @@ fn build_column(
 /// the input into a jj command line. The scopes are the query prefixes
 /// (`>`, `@`, `:`), so typing one presses its tab too.
 fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx) -> AnyElement {
-    let font = ui.config.ui_font;
+    let look = ui.look(theme);
     let command = column.command.is_some();
     let (mode, needle) = parse_query(&column.query);
     let needle = if command { "" } else { needle };
@@ -1188,9 +1189,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
                 label,
                 count,
                 !command && mode == scope,
-                font,
-                theme,
-                cx,
+                look,
             )
             .on_click(Diffui::listen(cx, move |this, _, _, cx| {
                 this.palette_set_query(query.clone(), cx);
@@ -1204,9 +1203,7 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
             "jj command",
             None,
             command,
-            font,
-            theme,
-            cx,
+            look,
         )
         .on_click(Diffui::listen(cx, |this, _, _, cx| {
             if this.command_line().is_none() {
@@ -1244,9 +1241,7 @@ fn segment(
     label: &'static str,
     count: Option<(usize, bool)>,
     pressed: bool,
-    font: Font,
-    theme: ThemeSpec,
-    cx: &mut Cx,
+    look: Look,
 ) -> ui::Button {
     ui::segment(
         id,
@@ -1258,9 +1253,7 @@ fn segment(
             enabled: true,
         },
         ui::Segmented::Small,
-        font,
-        theme,
-        cx,
+        look,
     )
 }
 
@@ -1268,17 +1261,11 @@ fn segment(
 /// the root column how to reach the command line; on an actions column, what
 /// the actions are for.
 fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyElement {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
-    let hint =
-        |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, font, theme);
+    let hint = |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, look);
     let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
-        crate::overlay_kit::bound_hint(
-            ui,
-            crate::commands::Context::Palette,
-            commands,
-            label,
-            theme,
-        )
+        crate::overlay_kit::bound_hint(ui, crate::commands::Context::Palette, commands, label, look)
     };
     let strip = crate::overlay_kit::footer(
         crate::overlay_kit::Density::Strip,
@@ -1305,13 +1292,9 @@ fn column_footer(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn) -> AnyEl
                         .flex_none()
                         .items_center()
                         .gap(px(theme::space::SM))
-                        .child(crate::overlay_kit::footer_note("Type", font, theme))
-                        .child(ui::keycap("jj", font, theme).view())
-                        .child(crate::overlay_kit::footer_note(
-                            "for a jj command",
-                            font,
-                            theme,
-                        )),
+                        .child(crate::overlay_kit::footer_note("Type", look))
+                        .child(ui::keycap("jj", look).view())
+                        .child(crate::overlay_kit::footer_note("for a jj command", look)),
                 )
                 .into_any_element()
         }
@@ -1354,6 +1337,7 @@ fn build_input(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let placeholder = match &column.source {
         ColumnSource::Root => "Run a command, or find a file, bookmark or revision",
         ColumnSource::Actions(_) => "Filter actions\u{2026}",
@@ -1374,8 +1358,7 @@ fn build_input(
         ));
     let esc = ui::chord(
         crate::overlay_kit::bound_keys(ui, crate::commands::Context::Palette, &["palette.back"]),
-        font,
-        theme,
+        look,
     );
     if !focused {
         // Older (left-of-center) columns are read-only previews. Only the rightmost
@@ -1445,6 +1428,7 @@ fn build_results(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     // `:` commit-search defers the all-commits scan to ⏎: show a prompt until it
     // runs, instead of an empty "No matches".
     let revision_prompt = revision_mode_needle(&column.query)
@@ -1468,7 +1452,6 @@ fn build_results(
         return empty_results(ui, theme, label).into_any_element();
     }
 
-    let font = ui.config.ui_font;
     let root = matches!(column.source, ColumnSource::Root);
     // The bar floats over the rows' right inset like the graph's does; the rows'
     // text padding keeps every label and hint clear of it.
@@ -1498,7 +1481,7 @@ fn build_results(
         &handle,
         viewport,
         ROW_HEIGHT,
-        |heading| group_heading(heading, font, theme).into_any_element(),
+        |heading| group_heading(heading, look).into_any_element(),
         |index| {
             let row = &column.matches[index];
             let selected = index == column.selected;
@@ -1609,8 +1592,8 @@ pub(crate) fn visible_results<G: PartialEq + Copy>(
 }
 
 /// A group's heading in a results list, its label on the rows' text edge.
-pub(crate) fn group_heading(label: &'static str, font: Font, theme: ThemeSpec) -> Div {
-    crate::overlay_kit::group_heading(label, font, theme).px(px(ROW_PAD_X))
+pub(crate) fn group_heading(label: &'static str, look: Look) -> Div {
+    crate::overlay_kit::group_heading(label, look).px(px(ROW_PAD_X))
 }
 
 /// What a results list says when it has no rows.
@@ -1661,6 +1644,7 @@ fn result_row_body(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let primary = theme.text;
     let muted = theme.subtle_text;
     let font = ui.config.ui_font;
@@ -1789,7 +1773,7 @@ fn result_row_body(
         .gap(px(theme::space::LG))
         .child(text);
     if !keys.is_empty() {
-        row = row.child(ui::chord(keys, font, theme));
+        row = row.child(ui::chord(keys, look));
     }
     row.into_any_element()
 }

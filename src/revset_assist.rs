@@ -401,6 +401,7 @@ pub(crate) fn dropdown(
     window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let field = &ui.active().cmdline.field;
     if !field.open || field.completions.is_empty() {
         return None;
@@ -462,7 +463,6 @@ pub(crate) fn dropdown(
     let list = div().w_full().flex().flex_col().children(items);
     // The keys the field answers while the list is open, as the palette's
     // footer tells its own.
-    let font = ui.config.ui_font;
     let footer = crate::overlay_kit::footer(
         crate::overlay_kit::Density::Strip,
         theme::radius::inner(CARD_RADIUS, theme::HAIRLINE),
@@ -471,20 +471,17 @@ pub(crate) fn dropdown(
     .child(crate::overlay_kit::key_hint(
         &[crate::keymap::key_label("tab")],
         "Complete",
-        font,
-        theme,
+        look,
     ))
     .child(crate::overlay_kit::key_hint(
         &[crate::keymap::key_label("enter")],
         "Apply",
-        font,
-        theme,
+        look,
     ))
     .child(crate::overlay_kit::key_hint(
         &[crate::keymap::key_label("esc")],
         "Close",
-        font,
-        theme,
+        look,
     ));
     Some(
         div()
@@ -549,17 +546,17 @@ pub(crate) fn error_strip(
     _window: &mut GpuiWindow,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let (lead, trail) = crate::field::list_field_insets();
     let error = shown_error(ui)?;
     let value = &ui.active().session.revset;
-    let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
     let message = div().w_full().text_size(px(text_size::BODY)).child(
         crate::prose::Prose::from_backticks(&crate::cmdline::sentence(
             &error.message,
             error.hint.as_deref(),
         ))
-        .view(font, mono, theme.removed_text, theme),
+        .view(look, theme.removed_text),
     );
     let mut banner = ui::Banner::new(ui::Tone::Danger)
         .icon(icons::ALERT_TRIANGLE)
@@ -582,7 +579,7 @@ pub(crate) fn error_strip(
             .pl(px(lead))
             .pr(px(trail))
             .pb(px(theme::space::SM))
-            .child(banner.build(font, theme))
+            .child(banner.build(look))
             .into_any_element(),
     )
 }

@@ -303,6 +303,7 @@ pub(crate) fn build_overlay(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(run) = ui.shown_cli_run() else {
         return div().into_any_element();
     };
@@ -347,69 +348,42 @@ pub(crate) fn build_overlay(
         text_size::CAPTION,
     );
     let mut buttons: Vec<AnyElement> = vec![
-        ui::text_button(
-            "cli-output-copy",
-            Some((icons::COPY, theme.muted_text)),
-            "Copy",
-            ui::Variant::Raised,
-            ui::Size::Standard,
-            font,
-            theme,
-            cx,
-        )
-        .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
-        .into_any_element(),
+        look.button("cli-output-copy", "Copy")
+            .icon(icons::COPY, theme.muted_text)
+            .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
+            .into_any_element(),
     ];
     if run.exit.is_none() {
         buttons.push(
-            ui::text_button(
-                "cli-output-stop",
-                None,
-                "Stop",
-                ui::Variant::Raised,
-                ui::Size::Standard,
-                font,
-                theme,
-                cx,
-            )
-            .on_click(send::<ClickEvent>(OutputAction::Stop, cx))
-            .into_any_element(),
+            look.button("cli-output-stop", "Stop")
+                .on_click(send::<ClickEvent>(OutputAction::Stop, cx))
+                .into_any_element(),
         );
     } else {
         buttons.push(
-            ui::text_button(
-                "cli-output-done",
-                None,
-                "Close",
-                ui::Variant::Raised,
-                ui::Size::Standard,
-                font,
-                theme,
-                cx,
-            )
-            .on_click(send::<ClickEvent>(OutputAction::Close, cx))
-            .into_any_element(),
+            look.button("cli-output-done", "Close")
+                .on_click(send::<ClickEvent>(OutputAction::Close, cx))
+                .into_any_element(),
         );
     }
-    let card =
-        crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), font, mono, theme)
-            .width(OUTPUT_WIDTH)
-            .child(output)
-            .bound_hint(
-                ui,
-                crate::commands::Context::Output,
-                &["output.copy"],
-                "Copy",
-            )
-            .bound_hint(
-                ui,
-                crate::commands::Context::Output,
-                &["output.close"],
-                "Close",
-            )
-            .note(status)
-            .buttons(buttons)
-            .build();
+    let card = crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), look)
+        .width(OUTPUT_WIDTH)
+        .child(output)
+        .bound_hint(
+            ui,
+            crate::commands::Context::Output,
+            &["output.copy"],
+            "Copy",
+        )
+        .bound_hint(
+            ui,
+            crate::commands::Context::Output,
+            &["output.close"],
+            "Close",
+        )
+        .note(status)
+        .buttons(buttons)
+        .build();
     let dismiss = send::<()>(OutputAction::Close, cx);
     ui::modal(
         "cli-output-modal",

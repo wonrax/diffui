@@ -98,24 +98,17 @@ pub(crate) fn revision_list_placeholder(
 /// "Reset to default" (the repo's own `revsets.log`, or jj's default), unless
 /// that is what is already applied.
 pub(crate) fn reset_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let tab = ui.active();
     let default = tab.default_revset().to_owned();
     if tab.repository.is_none() || tab.session.revset.trim() == default.trim() {
         return None;
     }
     Some(
-        ui::text_button(
-            "reset-revset",
-            None,
-            "Reset to default",
-            ui::Variant::Raised,
-            ui::Size::Compact,
-            ui.config.ui_font,
-            theme,
-            cx,
-        )
-        .on_click(Diffui::on_action(Action::SetRevset(default), cx))
-        .into_any_element(),
+        look.button("reset-revset", "Reset to default")
+            .compact()
+            .on_click(Diffui::on_action(Action::SetRevset(default), cx))
+            .into_any_element(),
     )
 }
 
@@ -123,6 +116,7 @@ pub(crate) fn reset_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option
 /// gets its own wording, the parser's message in mono (it points a caret at
 /// the offending column), and a way back to the default.
 pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx) -> AnyElement {
+    let look = ui.look(theme);
     let revset = is_revset_error(error);
     let (title, detail) = if revset {
         let detail = REVSET_ERROR_PREFIXES
@@ -168,12 +162,13 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
                 |reset| div().flex().pt(px(theme::space::XS)).child(reset),
             ),
         )
-        .build(ui.config.ui_font, theme);
+        .build(look);
     crate::field::panel_strip().child(card).into_any_element()
 }
 
 /// A strip over the diff saying so, when [`selection_outside_view`].
 pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyElement> {
+    let look = ui.look(theme);
     if !selection_outside_view(ui) {
         return None;
     }
@@ -181,12 +176,9 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
         RevisionSelection::WorkingCopy => Prose::from("The working copy ").rev("@"),
         selection => ui.active().revision_prose(selection),
     };
-    let sentence = label.text(" isn't in the current revset.").view(
-        ui.config.ui_font,
-        ui.config.mono_font,
-        theme.muted_text,
-        theme,
-    );
+    let sentence = label
+        .text(" isn't in the current revset.")
+        .view(look, theme.muted_text);
     Some(
         ui::Banner::new(ui::Tone::Accent)
             .shape(ui::BannerShape::Strip)
@@ -199,7 +191,7 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
                     .text_ellipsis()
                     .child(sentence),
             )
-            .build(ui.config.ui_font, theme)
+            .build(look)
             .into_any_element(),
     )
 }

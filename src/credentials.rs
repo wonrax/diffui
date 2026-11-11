@@ -216,13 +216,14 @@ pub(crate) fn build_overlay(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(dialog) = ui.credential_dialog() else {
         return div().into_any_element();
     };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let mono = ui.config.mono_font;
     let prompt = &dialog.current.prompt;
 
-    let mut card = Dialog::new(&title(&dialog.current), font, mono, theme);
+    let mut card = Dialog::new(&title(&dialog.current), look);
     let accept_label = match prompt.kind {
         PromptKind::Secret | PromptKind::Text => {
             // The title already says what goes here.
@@ -242,21 +243,20 @@ pub(crate) fn build_overlay(
             Some("Continue")
         }
         PromptKind::YesNo => {
-            card = card.lede(
-                &Prose::from("First connection to this host. Check its fingerprint."),
-                mono,
-            );
+            card = card.lede(&Prose::from(
+                "First connection to this host. Check its fingerprint.",
+            ));
             if let Some(detail) = &prompt.detail {
                 card = card.child(fingerprint(detail, mono, theme));
             }
             Some("Trust")
         }
         PromptKind::Confirm => {
-            card = card.lede(&Prose::from(prompt.text.clone()), mono);
+            card = card.lede(&Prose::from(prompt.text.clone()));
             Some("Yes")
         }
         PromptKind::Notice => {
-            card = card.lede(&Prose::from(prompt.text.clone()), mono);
+            card = card.lede(&Prose::from(prompt.text.clone()));
             None
         }
     };
@@ -269,26 +269,14 @@ pub(crate) fn build_overlay(
             label,
         );
     }
-    let raised = |label: &'static str, cx: &mut Cx| {
-        ui::text_button(
-            "credential-decline",
-            None,
-            label,
-            ui::Variant::Raised,
-            ui::Size::Standard,
-            font,
-            theme,
-            cx,
-        )
-    };
+    let raised = |label: &'static str| look.button("credential-decline", label);
     let (decline, decline_label) = match prompt.kind {
-        PromptKind::YesNo => (raised("Don't trust", cx), "Don't trust"),
-        PromptKind::Confirm => (raised("No", cx), "No"),
-        PromptKind::Notice => (raised("Dismiss", cx), "Dismiss"),
-        PromptKind::Secret | PromptKind::Text => (
-            ui::cancel_button("credential-decline", ui::Size::Standard, font, theme, cx),
-            "Cancel",
-        ),
+        PromptKind::YesNo => (raised("Don't trust"), "Don't trust"),
+        PromptKind::Confirm => (raised("No"), "No"),
+        PromptKind::Notice => (raised("Dismiss"), "Dismiss"),
+        PromptKind::Secret | PromptKind::Text => {
+            (look.cancel_button("credential-decline"), "Cancel")
+        }
     };
     card = card.bound_hint(
         ui,
@@ -300,8 +288,7 @@ pub(crate) fn build_overlay(
     if queued > 0 {
         card = card.note(crate::overlay_kit::footer_note(
             format!("{queued} more waiting"),
-            font,
-            theme,
+            look,
         ));
     }
     let decline = decline.on_click(Diffui::on_action(
@@ -311,21 +298,13 @@ pub(crate) fn build_overlay(
     let mut buttons: Vec<AnyElement> = vec![decline.into_any_element()];
     if let Some(label) = accept_label {
         buttons.push(
-            ui::text_button(
-                "credential-accept",
-                None,
-                label,
-                ui::Variant::Primary,
-                ui::Size::Standard,
-                font,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(
-                Action::Credential(CredentialAction::Submit),
-                cx,
-            ))
-            .into_any_element(),
+            look.button("credential-accept", label)
+                .primary()
+                .on_click(Diffui::on_action(
+                    Action::Credential(CredentialAction::Submit),
+                    cx,
+                ))
+                .into_any_element(),
         );
     }
     let card = card.buttons(buttons).build();

@@ -17,6 +17,7 @@ use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
 use crate::prose::Prose;
 use crate::theme::{ThemeSpec, Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Cx, Diffui, icons, ui};
 
 /// The revset "diff since trunk" measures from.
@@ -257,6 +258,7 @@ pub(crate) fn banner(
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let look = ui.look(theme);
     let mode = mode(ui)?;
     let font = ui.config.ui_font;
     let mono = ui.config.mono_font;
@@ -304,7 +306,14 @@ pub(crate) fn banner(
             .max(0.0);
             line.push(Aligned::text(
                 crate::plan::revset_prose(&revset)
-                    .line(mono, mono, theme.text, theme, text_size::BODY)
+                    .line(
+                        Look {
+                            font: look.mono,
+                            ..look
+                        },
+                        theme.text,
+                        text_size::BODY,
+                    )
                     .cut(room),
                 mono,
                 text_size::BODY,
@@ -328,36 +337,25 @@ pub(crate) fn banner(
     let mut controls = div();
     if refused.is_none() {
         controls = controls.child(
-            ui::icon_button(
-                "range-edit",
-                icons::PENCIL,
-                theme.muted_text,
-                ui::Size::Compact,
-                theme,
-                cx,
-            )
-            .on_click(Diffui::on_action(Action::Range(RangeAction::Edit), cx))
-            .tip("Edit as a jj command", font, theme),
+            look.icon_button("range-edit", icons::PENCIL, theme.muted_text)
+                .on_click(Diffui::on_action(Action::Range(RangeAction::Edit), cx))
+                .tip("Edit as a jj command"),
         );
     }
     controls = controls.child(
-        ui::close_button("range-exit", theme.muted_text, theme, cx)
+        look.close_button("range-exit", theme.muted_text)
             .on_click(Diffui::on_action(
                 Action::Compare(crate::compare::CompareAction::Exit),
                 cx,
             ))
-            .tip(
-                match mode {
-                    RangeMode::Since => "Stop diffing since trunk",
-                    RangeMode::Span(_) => "Clear the marks",
-                    RangeMode::Fixed => "Leave the range",
-                },
-                font,
-                theme,
-            ),
+            .tip(match mode {
+                RangeMode::Since => "Stop diffing since trunk",
+                RangeMode::Span(_) => "Clear the marks",
+                RangeMode::Fixed => "Leave the range",
+            }),
     );
 
-    Some(crate::compare::banner_strip(sides, controls, font, theme))
+    Some(crate::compare::banner_strip(sides, controls, look))
 }
 
 /// The pane when the marked rows can't be one diff: jj's reason, with the
@@ -369,8 +367,8 @@ pub(crate) fn refused_state(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
     let mut detail = Prose::from("jj diff -r needs the marked revisions to have no gaps.");
     if let Some(hint) = &error.hint {
         detail = detail.text(" ");
@@ -420,7 +418,7 @@ pub(crate) fn refused_state(
                         .w_full()
                         .text_center()
                         .text_size(px(text_size::BODY))
-                        .child(detail.view(font, mono, theme.muted_text, theme)),
+                        .child(detail.view(look, theme.muted_text)),
                 ),
         )
         .into_any_element()

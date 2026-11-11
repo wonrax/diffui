@@ -613,9 +613,9 @@ pub(crate) fn ref_count(tags: usize, total: usize) -> String {
 
 /// [`ref_noun`] for a push's moves.
 fn moves_noun<'a>(moves: impl IntoIterator<Item = &'a diffui_core::BookmarkMove>) -> &'static str {
-    let (tags, total) = moves
-        .into_iter()
-        .fold((0, 0), |(tags, total), m| (tags + usize::from(m.tag), total + 1));
+    let (tags, total) = moves.into_iter().fold((0, 0), |(tags, total), m| {
+        (tags + usize::from(m.tag), total + 1)
+    });
     ref_noun(tags, total, total > 1)
 }
 
@@ -639,7 +639,10 @@ pub(crate) fn push_explanation(moves: &[diffui_core::BookmarkMove], remote: &str
     if rewinds.clone().next().is_some() {
         return Prose::from("Not a fast-forward: revisions only ")
             .remote(remote)
-            .text(format!(" has are dropped from its {}.", moves_noun(rewinds)));
+            .text(format!(
+                " has are dropped from its {}.",
+                moves_noun(rewinds)
+            ));
     }
     if moves.iter().any(|m| m.kind == MoveKind::Delete) {
         return Prose::from("Deletes the bookmark on ")
@@ -698,10 +701,11 @@ pub(crate) fn build_name_prompt(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let Some(prompt) = ui.name_prompt() else {
         return div().into_any_element();
     };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let mono = ui.config.mono_font;
     let cancel = Action::Bookmark(BookmarkAction::PromptCancel);
     let submit = Action::Bookmark(BookmarkAction::PromptSubmit);
 
@@ -752,7 +756,7 @@ pub(crate) fn build_name_prompt(
         .placeholder("bookmark name")
         .on_input(move |value, window, cx| on_input(&value, window, cx))
         .on_submit(move |window, cx| on_submit(&(), window, cx));
-    let mut card = crate::overlay_kit::Dialog::new(&title, font, mono, theme)
+    let mut card = crate::overlay_kit::Dialog::new(&title, look)
         .child(crate::field::dialog_input(spec, mono, theme, window, cx));
     if !note.is_empty() {
         let color = if error {
@@ -764,26 +768,21 @@ pub(crate) fn build_name_prompt(
             div()
                 .w_full()
                 .text_size(px(theme::text_size::BODY))
-                .child(note.view(font, mono, color, theme)),
+                .child(note.view(look, color)),
         );
     }
 
     let enabled = !matches!(verdict, PromptVerdict::Invalid(_));
-    let mut accept = ui::primary_button(
-        "name-prompt-accept",
-        verb,
-        enabled,
-        ui::Size::Standard,
-        font,
-        theme,
-        cx,
-    );
+    let mut accept = look
+        .button("name-prompt-accept", verb)
+        .primary()
+        .disabled(!enabled);
     if enabled {
         accept = accept.on_click(Diffui::on_action(submit, cx));
     }
-    let cancel_button =
-        ui::cancel_button("name-prompt-cancel", ui::Size::Standard, font, theme, cx)
-            .on_click(Diffui::on_action(cancel, cx));
+    let cancel_button = look
+        .cancel_button("name-prompt-cancel")
+        .on_click(Diffui::on_action(cancel, cx));
 
     let card = card
         .hint(&[crate::keymap::key_label("enter")], verb)

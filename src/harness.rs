@@ -778,6 +778,7 @@ mod scenes {
             let font = ui.config.ui_font;
             let mono = ui.config.mono_font;
             let spec = ui::Size::Compact;
+            let look = ui.look(theme);
             let chip = chip::Chip {
                 label: "main".to_owned(),
                 font: mono,
@@ -817,56 +818,20 @@ mod scenes {
                         .flex_row()
                         .gap(px(8.0))
                         .items_center()
-                        .child(ui::text_button(
-                            "g",
-                            None,
-                            "Ghost",
-                            ui::Variant::Ghost,
-                            spec,
-                            font,
-                            theme,
-                            cx,
-                        ))
-                        .child(ui::text_button(
-                            "r",
-                            Some((icons::REFRESH, theme.muted_text)),
-                            "Raised",
-                            ui::Variant::Raised,
-                            spec,
-                            font,
-                            theme,
-                            cx,
-                        ))
-                        .child(ui::text_button(
-                            "p",
-                            None,
-                            "Primary",
-                            ui::Variant::Primary,
-                            spec,
-                            font,
-                            theme,
-                            cx,
-                        ))
-                        .child(ui::primary_button("o", "Off", false, spec, font, theme, cx))
-                        .child(ui::text_button(
-                            "d",
-                            None,
-                            "Destructive",
-                            ui::Variant::Destructive,
-                            ui::Size::Standard,
-                            font,
-                            theme,
-                            cx,
-                        ))
-                        .child(ui::icon_button(
-                            "i",
-                            icons::SEARCH,
-                            theme.muted_text,
-                            spec,
-                            theme,
-                            cx,
-                        ))
-                        .child(ui::close_button("c", theme.muted_text, theme, cx)),
+                        .child(look.button("g", "Ghost").ghost().step(spec))
+                        .child(
+                            look.button("r", "Raised")
+                                .step(spec)
+                                .icon(icons::REFRESH, theme.muted_text),
+                        )
+                        .child(look.button("p", "Primary").primary().step(spec))
+                        .child(look.button("o", "Off").primary().step(spec).disabled(true))
+                        .child(look.button("d", "Destructive").destructive())
+                        .child(
+                            look.icon_button("i", icons::SEARCH, theme.muted_text)
+                                .step(spec),
+                        )
+                        .child(look.close_button("c", theme.muted_text)),
                 )
                 .child(
                     div()
@@ -879,7 +844,7 @@ mod scenes {
                         .child(icons::icon(icons::HISTORY, 16.0, theme.accent)),
                 )
                 .child(typography::baseline_row(
-                    prose.runs(font, mono, theme.text, theme, theme::text_size::BODY),
+                    prose.runs(look, theme.text, theme::text_size::BODY),
                     0.0,
                 ))
                 .child(

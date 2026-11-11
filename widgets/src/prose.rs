@@ -9,8 +9,9 @@ use std::fmt;
 use gpui_kit::StyledText;
 
 use crate::ellipsis::{self, Span};
-use crate::theme::{Color, Font, ThemeSpec};
+use crate::theme::Color;
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 
 /// What a run of text names, which decides how it renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,26 +129,20 @@ impl Prose {
         self.parts.is_empty()
     }
 
-    /// Rich text in `font` and `color`, with the names in `mono` and their
-    /// own colours. Size, wrapping and width are the container's.
-    pub fn view(&self, font: Font, mono: Font, color: Color, theme: ThemeSpec) -> StyledText {
-        ellipsis::rich_text(&self.spans(mono, theme), font, color)
+    /// Rich text in the look's font and `color`, with the names in its mono
+    /// and their own colours. Size, wrapping and width are the container's.
+    pub fn view(&self, look: Look, color: Color) -> StyledText {
+        ellipsis::rich_text(&self.spans(look), look.font, color)
     }
 
     /// The same text as an [`ellipsis::Line`] at `size`: one line cut to
     /// fit, or wrapped in full.
-    pub fn line(
-        &self,
-        font: Font,
-        mono: Font,
-        color: Color,
-        theme: ThemeSpec,
-        size: f32,
-    ) -> ellipsis::Line<'static> {
-        ellipsis::Line::new(self.spans(mono, theme), font, size, color)
+    pub fn line(&self, look: Look, color: Color, size: f32) -> ellipsis::Line<'static> {
+        ellipsis::Line::new(self.spans(look), look.font, size, color)
     }
 
-    fn spans<'a>(&self, mono: Font, theme: ThemeSpec) -> Vec<Span<'a>> {
+    fn spans<'a>(&self, look: Look) -> Vec<Span<'a>> {
+        let Look { theme, mono, .. } = look;
         self.parts
             .iter()
             .map(|(kind, text)| {
@@ -166,14 +161,8 @@ impl Prose {
     /// to share a baseline with chips and glyphs (a rich text's runs aren't
     /// placed by [`crate::typography`], and drift off it). One line, no
     /// wrapping; the caller clips it.
-    pub fn runs(
-        &self,
-        font: Font,
-        mono: Font,
-        color: Color,
-        theme: ThemeSpec,
-        size: f32,
-    ) -> Vec<Aligned> {
+    pub fn runs(&self, look: Look, color: Color, size: f32) -> Vec<Aligned> {
+        let Look { theme, font, mono } = look;
         self.parts
             .iter()
             .map(|(kind, part)| {

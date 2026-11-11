@@ -102,88 +102,179 @@ pub enum Variant {
     Destructive,
 }
 
-fn style(variant: Variant, theme: ThemeSpec) -> theme::ButtonStyle {
+fn style(variant: Variant, disabled: bool, theme: ThemeSpec) -> theme::ButtonStyle {
     match variant {
         Variant::Ghost => theme::ghost_button_style(theme),
         Variant::Raised => theme::raised_button_style(theme),
+        Variant::Primary if disabled => theme::disabled_button_style(theme),
         Variant::Primary => theme::primary_button_style(theme),
         Variant::Destructive => theme::destructive_button_style(theme),
     }
 }
 
-/// kit's button in one of diffui's variants at one of its height steps. Add the
-/// content with `.child(...)` ([`label`] for the common case) and the action
-/// with `.on_click(...)`.
-pub fn button(
-    id: impl Into<ElementId>,
-    variant: Variant,
-    size: Size,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
-    frame(id, style(variant, theme), size, cx)
-        .h(px(size.height()))
-        .px(px(size.pad_x()))
+/// What every control is drawn in: the theme and the two fonts, built once
+/// per pane and handed down by value. Controls come from its methods
+/// (`look.button(id, "Fetch").icon(..).ghost()`).
+#[derive(Clone, Copy)]
+pub struct Look {
+    pub theme: ThemeSpec,
+    pub font: Font,
+    pub mono: Font,
 }
 
-fn frame(id: impl Into<ElementId>, style: theme::ButtonStyle, size: Size, cx: &App) -> Button {
-    let id = id.into();
-    // kit paints nothing of its own: its fill would be a circular quad. The
-    // squircle behind the label paints each state instead.
-    let clear = gpui_kit::Hsla::from(theme::TRANSPARENT);
-    let colors = ButtonCustomVariant::new(cx)
-        .color(clear)
-        .foreground(style.label.into())
-        .hover(clear)
-        .active(clear);
-    let mut inner = KitButton::new(id.clone())
-        .custom(colors)
-        .bg(theme::TRANSPARENT)
-        // The lift's shape: a shadow's blur hides its circular corner.
-        .rounded(px(size.radius()));
-    if let Some(lift) = style.lift {
-        inner = inner.shadow(vec![lift]);
+impl Look {
+    pub fn new(theme: ThemeSpec, font: Font, mono: Font) -> Self {
+        Self { theme, font, mono }
     }
-    let fill = |color: Option<Color>| {
-        let mut fill = squircle::Fill::new(squircle::Corners::all(size.radius()));
-        if let Some(color) = color {
-            fill = fill.background(color);
-        }
-        if let Some(ring) = style.ring {
-            fill = fill.border(1.0, ring);
-        }
-        fill
-    };
-    Button {
-        inner,
-        id,
-        states: squircle::States {
-            rest: fill(style.rest),
-            hover: fill(Some(style.hover)),
-            active: fill(Some(style.active)),
-        },
-        disabled: false,
-        tip: None,
-        children: Vec::new(),
+
+    /// A labelled button: [`Variant::Raised`] at [`Size::Standard`] until
+    /// told otherwise.
+    pub fn button(self, id: impl Into<ElementId>, text: impl Into<SharedString>) -> Button {
+        Button::new(
+            id,
+            self,
+            Content::Label {
+                icon: None,
+                text: text.into(),
+            },
+        )
     }
+
+    /// A button with no content of its own, [`Variant::Ghost`] at
+    /// [`Size::Compact`]: add it with `.child(...)` ([`label`] for the
+    /// common case).
+    pub fn bare_button(self, id: impl Into<ElementId>) -> Button {
+        Button::new(id, self, Content::Bare).ghost().compact()
+    }
+
+    /// A square ghost button holding one glyph, [`Size::Compact`] until told
+    /// otherwise.
+    pub fn icon_button(
+        self,
+        id: impl Into<ElementId>,
+        glyph: &'static str,
+        color: Color,
+    ) -> Button {
+        Button::new(id, self, Content::Glyph(glyph, color))
+            .ghost()
+            .compact()
+    }
+
+    /// The close (or clear) ✕ at the end of a banner, strip or row: a
+    /// [`Size::Small`] square wash, so it sits inside the banner with even
+    /// insets instead of filling its height.
+    pub fn close_button(self, id: impl Into<ElementId>, color: Color) -> Button {
+        self.icon_button(id, icons::CLOSE, color).small()
+    }
+
+    /// The Cancel of a dialog or editor footer: always the raised secondary
+    /// button, beside the footer's one filled call-to-action.
+    pub fn cancel_button(self, id: impl Into<ElementId>) -> Button {
+        self.button(id, "Cancel")
+    }
+}
+
+/// What a [`Button`] holds besides its children.
+enum Content {
+    Bare,
+    Label {
+        icon: Option<(&'static str, Color)>,
+        text: SharedString,
+    },
+    Glyph(&'static str, Color),
 }
 
 /// A diffui button: kit's button for what it does (clicks, focus, tooltips,
-/// accessibility), drawn as a squircle. kit lays its children out inside its
-/// padding and clips them there, so the button's padding moves onto a row of
-/// its own when it renders, and the squircle, its first child, covers the
-/// whole box.
+/// accessibility), drawn as a squircle. Its variant and size are settled when
+/// it renders, under whatever the caller styled. kit lays its children out
+/// inside its padding and clips them there, so the button's padding moves
+/// onto a row of its own when it renders, and the squircle, its first child,
+/// covers the whole box.
 #[derive(IntoElement)]
 pub struct Button {
     inner: KitButton,
     id: ElementId,
-    states: squircle::States,
+    look: Look,
+    variant: Variant,
+    size: Size,
+    content: Content,
+    radius: Option<f32>,
+    rest: Option<(Color, Option<Color>)>,
     disabled: bool,
-    tip: Option<(SharedString, Font, ThemeSpec)>,
+    tip: Option<SharedString>,
     children: Vec<gpui_kit::AnyElement>,
 }
 
 impl Button {
+    fn new(id: impl Into<ElementId>, look: Look, content: Content) -> Self {
+        let id = id.into();
+        Self {
+            inner: KitButton::new(id.clone()),
+            id,
+            look,
+            variant: Variant::Raised,
+            size: Size::Standard,
+            content,
+            radius: None,
+            rest: None,
+            disabled: false,
+            tip: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn variant(mut self, variant: Variant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    pub fn ghost(self) -> Self {
+        self.variant(Variant::Ghost)
+    }
+
+    pub fn raised(self) -> Self {
+        self.variant(Variant::Raised)
+    }
+
+    /// The call to action; greyed out, not faded, while disabled.
+    pub fn primary(self) -> Self {
+        self.variant(Variant::Primary)
+    }
+
+    pub fn destructive(self) -> Self {
+        self.variant(Variant::Destructive)
+    }
+
+    /// The height step, setting the height, insets, label and icon sizes.
+    pub fn step(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn small(self) -> Self {
+        self.step(Size::Small)
+    }
+
+    pub fn compact(self) -> Self {
+        self.step(Size::Compact)
+    }
+
+    /// A glyph in `color` before the label.
+    pub fn icon(mut self, glyph: &'static str, color: Color) -> Self {
+        if let Content::Label { icon, .. } = &mut self.content {
+            *icon = Some((glyph, color));
+        }
+        self
+    }
+
+    /// [`Button::icon`] when there is one.
+    pub fn maybe_icon(self, icon: Option<(&'static str, Color)>) -> Self {
+        match icon {
+            Some((glyph, color)) => self.icon(glyph, color),
+            None => self,
+        }
+    }
+
     pub fn on_click(
         mut self,
         handler: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
@@ -199,36 +290,29 @@ impl Button {
     }
 
     /// The app's hover label ([`Tip`]) on this button.
-    pub fn tip(mut self, label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Self {
-        self.tip = Some((label.into(), font, theme));
+    pub fn tip(mut self, label: impl Into<SharedString>) -> Self {
+        self.tip = Some(label.into());
         self
     }
 
     /// Rounds the button by `radius` in place of its size's: a segment's face,
     /// concentric with its track.
     pub fn corner_radius(mut self, radius: f32) -> Self {
-        let corners = squircle::Corners::all(radius);
-        self.states.rest.corners = corners;
-        self.states.hover.corners = corners;
-        self.states.active.corners = corners;
-        self.inner = self.inner.rounded(px(radius));
+        self.radius = Some(radius);
         self
     }
 
     /// The fill and edge at rest, in place of the variant's: a toggle while
     /// it's on. Hover and press keep the variant's.
     pub fn resting(mut self, fill: Color, ring: Option<Color>) -> Self {
-        let mut rest = squircle::Fill::new(self.states.rest.corners).background(fill);
-        if let Some(ring) = ring {
-            rest = rest.border(1.0, ring);
-        }
-        self.states.rest = rest;
+        self.rest = Some((fill, ring));
         self
     }
 
     /// [`Button::resting`] raised out of its track, as the active segment of a
     /// segmented control is.
-    pub fn raised(self, theme: ThemeSpec) -> Self {
+    pub fn lifted(self) -> Self {
+        let theme = self.look.theme;
         self.resting(
             theme.panel_background_elevated,
             Some(theme::firm_ring(theme)),
@@ -250,11 +334,75 @@ impl ParentElement for Button {
 }
 
 impl RenderOnce for Button {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Look { theme, font, .. } = self.look;
+        let size = self.size;
+        let style = style(self.variant, self.disabled, theme);
+        let radius = self.radius.unwrap_or(size.radius());
+        let fill = |color: Option<Color>, ring: Option<Color>| {
+            let mut fill = squircle::Fill::new(squircle::Corners::all(radius));
+            if let Some(color) = color {
+                fill = fill.background(color);
+            }
+            if let Some(ring) = ring {
+                fill = fill.border(1.0, ring);
+            }
+            fill
+        };
+        let rest = match self.rest {
+            Some((color, ring)) => fill(Some(color), ring),
+            None => fill(style.rest, style.ring),
+        };
+        // A disabled button doesn't answer the pointer.
+        let states = if self.disabled {
+            squircle::States {
+                rest,
+                hover: rest,
+                active: rest,
+            }
+        } else {
+            squircle::States {
+                rest,
+                hover: fill(Some(style.hover), style.ring),
+                active: fill(Some(style.active), style.ring),
+            }
+        };
+
+        // The size's frame first, then whatever the caller styled over it.
         let mut inner = self.inner;
+        let styled = std::mem::take(inner.style());
+        // kit paints nothing of its own: its fill would be a circular quad. The
+        // squircle behind the label paints each state instead.
+        let clear = gpui_kit::Hsla::from(theme::TRANSPARENT);
+        let colors = ButtonCustomVariant::new(cx)
+            .color(clear)
+            .foreground(style.label.into())
+            .hover(clear)
+            .active(clear);
+        let mut inner = inner
+            .custom(colors)
+            .bg(theme::TRANSPARENT)
+            // The lift's shape: a shadow's blur hides its circular corner.
+            .rounded(px(radius));
+        if let Some(lift) = style.lift {
+            inner = inner.shadow(vec![lift]);
+        }
+        let mut inner = match self.content {
+            Content::Glyph(..) => inner.size(px(size.height())).p(px(0.0)),
+            _ => inner.h(px(size.height())).px(px(size.pad_x())),
+        };
+        inner.style().refine(&styled);
+
         let padding = std::mem::take(&mut inner.style().padding);
         // An explicit zero: left unset, kit pads the button for its size.
         let inner = inner.p(px(0.0));
+        let content = match self.content {
+            Content::Bare => None,
+            Content::Label { icon, text } => Some(label(icon, text, size, font).into_any_element()),
+            Content::Glyph(glyph, color) => {
+                Some(icons::icon(glyph, size.icon_size(), color).into_any_element())
+            }
+        };
         let mut row = div()
             .h_full()
             .flex()
@@ -262,22 +410,13 @@ impl RenderOnce for Button {
             .items_center()
             .justify_center()
             .gap_2()
+            .children(content)
             .children(self.children);
         row.style().padding = padding;
-        // A disabled button doesn't answer the pointer, and its label and
-        // icon fade.
+        // A disabled button's label and icon fade.
         if self.disabled {
             row = row.opacity(DISABLED_OPACITY);
         }
-        let states = if self.disabled {
-            squircle::States {
-                hover: self.states.rest,
-                active: self.states.rest,
-                ..self.states
-            }
-        } else {
-            self.states
-        };
         let id = std::sync::Arc::new(self.id);
         let button = inner
             .child(squircle::interactive_background(
@@ -289,10 +428,10 @@ impl RenderOnce for Button {
         // kit's button takes only kit's tooltip, so the app's hangs off a
         // wrapper the size of the button.
         match self.tip {
-            Some((label, font, theme)) => div()
+            Some(label) => div()
                 .id(ElementId::NamedChild(id, "tip".into()))
                 .flex_none()
-                .tip(label, font, theme)
+                .tip(label, self.look)
                 .child(button)
                 .into_any_element(),
             None => button.into_any_element(),
@@ -301,7 +440,7 @@ impl RenderOnce for Button {
 }
 
 /// An optional leading icon and a label, sized for `size`. The building block
-/// of [`text_button`], exposed for buttons that dress the label themselves.
+/// of [`Look::button`], exposed for buttons that dress the label themselves.
 pub fn label(
     icon: Option<(&'static str, Color)>,
     label: impl Into<SharedString>,
@@ -327,82 +466,10 @@ pub fn label(
     }
 }
 
-/// The common button: an optional icon and a label.
-#[allow(clippy::too_many_arguments)]
-pub fn text_button(
-    id: impl Into<ElementId>,
-    icon: Option<(&'static str, Color)>,
-    text: impl Into<SharedString>,
-    variant: Variant,
-    size: Size,
-    font: Font,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
-    button(id, variant, size, theme, cx).child(label(icon, text, size, font))
-}
-
-/// [`text_button`] in the primary variant, greyed out and inert unless
-/// `enabled`.
-pub fn primary_button(
-    id: impl Into<ElementId>,
-    text: impl Into<SharedString>,
-    enabled: bool,
-    size: Size,
-    font: Font,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
-    let colors = if enabled {
-        theme::primary_button_style(theme)
-    } else {
-        theme::disabled_button_style(theme)
-    };
-    frame(id, colors, size, cx)
-        .h(px(size.height()))
-        .px(px(size.pad_x()))
-        .disabled(!enabled)
-        .child(label(None, text, size, font))
-}
-
 /// Gap between buttons sitting side by side, in dialogs, editors and bars.
 pub const BUTTON_GAP: f32 = theme::space::SM;
 
-/// The Cancel of a dialog or editor footer: always the raised secondary
-/// button, beside the footer's one filled call-to-action.
-pub fn cancel_button(
-    id: impl Into<ElementId>,
-    size: Size,
-    font: Font,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
-    text_button(id, None, "Cancel", Variant::Raised, size, font, theme, cx)
-}
-
-/// A square ghost button holding one glyph.
-pub fn icon_button(
-    id: impl Into<ElementId>,
-    glyph: &'static str,
-    color: Color,
-    size: Size,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
-    frame(id, theme::ghost_button_style(theme), size, cx)
-        .size(px(size.height()))
-        .p(px(0.0))
-        .child(icons::icon(glyph, size.icon_size(), color))
-}
-
-/// The close (or clear) ✕ at the end of a banner, strip or row: a
-/// [`Size::Small`] square wash, so it sits inside the banner with even
-/// insets instead of filling its height.
-pub fn close_button(id: impl Into<ElementId>, color: Color, theme: ThemeSpec, cx: &App) -> Button {
-    icon_button(id, icons::CLOSE, color, Size::Small, theme, cx)
-}
-
-/// Side of [`close_button`]'s square.
+/// Side of [`Look::close_button`]'s square.
 pub const CLOSE_SIDE: f32 = theme::control::SMALL;
 
 // ── Segmented control ───────────────────────────────────────────────────
@@ -481,14 +548,8 @@ pub struct Segment {
 
 /// A segment: a quiet label in the well, raised out of it as a ringed face
 /// while `active`. Add the action with `.on_click`.
-pub fn segment(
-    id: impl Into<ElementId>,
-    segment: Segment,
-    size: Segmented,
-    font: Font,
-    theme: ThemeSpec,
-    cx: &App,
-) -> Button {
+pub fn segment(id: impl Into<ElementId>, segment: Segment, size: Segmented, look: Look) -> Button {
+    let Look { theme, font, .. } = look;
     let label_font = theme::emphasis_font(font, Weight::MEDIUM);
     let text = size.text_size();
     let ink = if segment.active {
@@ -527,12 +588,12 @@ pub fn segment(
         }
     }
     let face = theme::radius::inner(theme::radius::CARD, SEGMENT_INSET);
-    button(id, Variant::Ghost, Size::Compact, theme, cx)
+    look.bare_button(id)
         .h(px(size.segment_height()))
         .px(px(pad_x))
         .corner_radius(face)
         .disabled(!segment.enabled)
-        .when(segment.active, |segment| segment.raised(theme))
+        .when(segment.active, Button::lifted)
         .child(typography::baseline_row(line, 0.0))
 }
 
@@ -556,9 +617,9 @@ pub fn panel_header() -> Div {
 pub fn panel_title(
     title: impl Into<SharedString>,
     count: Option<String>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> typography::Aligned {
+    let Look { theme, font, .. } = look;
     let title_font = theme::emphasis_font(font, Weight::SEMIBOLD);
     let size = text_size::BODY;
     let mut items = vec![
@@ -584,9 +645,9 @@ pub fn panel_title(
 pub fn section_label(
     label: impl Into<SharedString>,
     count: Option<String>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> typography::Aligned {
+    let Look { theme, font, .. } = look;
     let label_font = theme::emphasis_font(font, Weight::SEMIBOLD);
     let size = text_size::BODY;
     let mut items = vec![typography::Aligned::text(
@@ -821,7 +882,8 @@ impl Banner {
         width - 2.0 * shape.inset_x() - theme::icon::MD - theme::space::MD
     }
 
-    pub fn build(self, font: Font, theme: ThemeSpec) -> Div {
+    pub fn build(self, look: Look) -> Div {
+        let Look { theme, font, .. } = look;
         let (ink, wash) = (self.tone.ink(theme), self.tone.wash(theme));
         let banner = div()
             .w_full()
@@ -1040,7 +1102,8 @@ pub struct Keycap {
     edge: Color,
 }
 
-pub fn keycap(key: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Keycap {
+pub fn keycap(key: impl Into<SharedString>, look: Look) -> Keycap {
+    let Look { theme, font, .. } = look;
     Keycap {
         key: key.into(),
         font: theme::emphasis_font(font, Weight::MEDIUM),
@@ -1098,29 +1161,23 @@ impl Keycap {
 }
 
 /// A chord as one keycap per key.
-pub fn chord<S: Into<SharedString>>(
-    keys: impl IntoIterator<Item = S>,
-    font: Font,
-    theme: ThemeSpec,
-) -> Div {
+pub fn chord<S: Into<SharedString>>(keys: impl IntoIterator<Item = S>, look: Look) -> Div {
     div()
         .flex()
         .flex_row()
         .flex_none()
         .items_center()
         .gap(px(KEYCAP_GAP))
-        .children(keys.into_iter().map(|key| keycap(key, font, theme).view()))
+        .children(keys.into_iter().map(|key| keycap(key, look).view()))
 }
 
 /// [`chord`] on its text's baseline.
 pub fn chord_aligned<S: Into<SharedString>>(
     keys: impl IntoIterator<Item = S>,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> typography::Aligned {
     typography::group(
-        keys.into_iter()
-            .map(|key| keycap(key, font, theme).aligned()),
+        keys.into_iter().map(|key| keycap(key, look).aligned()),
         KEYCAP_GAP,
     )
 }
@@ -1332,7 +1389,8 @@ const TOOLTIP_PAD_Y: f32 = 3.0;
 
 /// The hover label every tooltip in the app shows: an 11px caption on a small
 /// card, like a macOS help tag. One line, never wrapped.
-pub fn tooltip_card(label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Div {
+pub fn tooltip_card(label: impl Into<SharedString>, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     let label = label.into();
     let (width, height) = tooltip_size(&label, font);
     theme::surface(div(), theme::Elevation::Tooltip, theme)
@@ -1385,25 +1443,24 @@ pub fn tooltip_origin(
 pub fn placed_tooltip(
     label: impl Into<SharedString>,
     target: crate::geometry::Rectangle,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
     window: &Window,
 ) -> (Div, gpui_kit::Point<Pixels>) {
     let label = label.into();
     let viewport = window.viewport_size();
     let (x, y) = tooltip_origin(
         target,
-        tooltip_size(&label, font),
+        tooltip_size(&label, look.font),
         (f32::from(viewport.width), f32::from(viewport.height)),
     );
-    (tooltip_card(label, font, theme), point(px(x), px(y)))
+    (tooltip_card(label, look), point(px(x), px(y)))
 }
 
-/// The hover label every chrome control uses: `.tip(label, font, theme)` on an
+/// The hover label every chrome control uses: `.tip(label, look)` on an
 /// element with an id. GPUI drops a tooltip at the cursor, over what's under
 /// it; this one is centred under the control instead (see [`tooltip_origin`]).
 pub trait Tip: StatefulInteractiveElement + ParentElement + Sized {
-    fn tip(self, label: impl Into<SharedString>, font: Font, theme: ThemeSpec) -> Self {
+    fn tip(self, label: impl Into<SharedString>, look: Look) -> Self {
         let anchor: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
         let recorded = anchor.clone();
         let label = label.into();
@@ -1422,8 +1479,7 @@ pub trait Tip: StatefulInteractiveElement + ParentElement + Sized {
             let anchor = anchor.clone();
             cx.new(|_| TooltipView {
                 label,
-                font,
-                theme,
+                look,
                 anchor,
             })
             .into()
@@ -1435,8 +1491,7 @@ impl<T: StatefulInteractiveElement + ParentElement + Sized> Tip for T {}
 
 struct TooltipView {
     label: SharedString,
-    font: Font,
-    theme: ThemeSpec,
+    look: Look,
     anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
@@ -1444,20 +1499,15 @@ impl Render for TooltipView {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         match self.anchor.get() {
             Some(control) => {
-                let (card, at) = placed_tooltip(
-                    self.label.clone(),
-                    control.into(),
-                    self.font,
-                    self.theme,
-                    window,
-                );
+                let (card, at) =
+                    placed_tooltip(self.label.clone(), control.into(), self.look, window);
                 anchored()
                     .position(at)
                     .snap_to_window_with_margin(px(TOOLTIP_MARGIN))
                     .child(card)
                     .into_any_element()
             }
-            None => tooltip_card(self.label.clone(), self.font, self.theme).into_any_element(),
+            None => tooltip_card(self.label.clone(), self.look).into_any_element(),
         }
     }
 }
