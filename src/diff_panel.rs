@@ -433,8 +433,9 @@ pub(crate) fn build_diff_panel(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     let body = build_diff_panel_body(ui, theme, window, cx);
-    match crate::empty_states::outside_view_banner(ui, theme) {
+    match crate::empty_states::outside_view_banner(ui, look) {
         Some(banner) => div()
             .flex()
             .flex_col()
@@ -599,7 +600,7 @@ fn build_diff_panel_body(
                     .min_h_0()
                     .child(crate::range::refused_state(ui, theme, error, window, cx)),
             )
-            .children(crate::mode_hints::strip(ui, theme, window, cx))
+            .children(crate::mode_hints::strip(ui, look, window, cx))
             .into_any_element();
     }
     if matches!(session.status, LoadStatus::Loading) && session.document.files.is_empty() {
@@ -640,7 +641,7 @@ fn build_diff_panel_body(
                     title_font,
                     theme.muted_text,
                 )))
-                .children(crate::mode_hints::strip(ui, theme, window, cx))
+                .children(crate::mode_hints::strip(ui, look, window, cx))
                 .into_any_element();
         }
 
@@ -747,7 +748,7 @@ fn build_diff_panel_body(
     panel
         .child(div().flex_none().w_full().child(summary))
         .child(layers)
-        .children(crate::mode_hints::strip(ui, theme, window, cx))
+        .children(crate::mode_hints::strip(ui, look, window, cx))
         .into_any_element()
 }
 

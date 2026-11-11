@@ -2079,7 +2079,6 @@ fn commit_line(
 
 /// One changed revision, a row of its table. `(first, last)`: where it sits
 /// in the table, whose rounded corners its selection wash follows.
-#[allow(clippy::too_many_arguments)]
 fn change_row(
     ui: &Diffui,
     theme: ThemeSpec,

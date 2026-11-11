@@ -35,6 +35,7 @@ use crate::geometry::{Point, Rectangle, Size};
 use crate::measure;
 use crate::theme::{self, Color, ThemeSpec, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Cx, Diffui, icons, ui};
 
 // ── Card geometry ───────────────────────────────────────────────────────────
@@ -587,10 +588,11 @@ pub(crate) fn anchor_tracker() -> (Rc<Cell<Rectangle>>, impl IntoElement) {
 /// cards are its children and don't occlude it.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let Some(menu) = ui.menu() else {
         return div().into_any_element();
     };
@@ -620,7 +622,7 @@ pub(crate) fn build_overlay(
     for (prefix, rect) in card_rects(ui, menu) {
         let entries = entries_at(&menu.root, &prefix).unwrap_or(&[]);
         layer = layer.child(build_card(
-            ui, theme, menu, entries, &prefix, rect, window, cx,
+            ui, look, menu, entries, &prefix, rect, window, cx,
         ));
     }
     push_trajectory_debug(layer, ui, menu).into_any_element()
@@ -687,7 +689,7 @@ fn push_trajectory_debug(
 #[allow(clippy::too_many_arguments)]
 fn build_card(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     menu: &OverlayMenu,
     entries: &[MenuEntry],
     prefix: &[usize],
@@ -695,12 +697,13 @@ fn build_card(
     window: &mut Window,
     cx: &mut Cx,
 ) -> impl IntoElement {
+    let Look { theme, .. } = look;
     let mut list = div().flex().flex_col().w_full();
     for (idx, entry) in entries.iter().enumerate() {
         let mut path = prefix.to_vec();
         path.push(idx);
         let active = row_active(menu, &path);
-        list = list.child(build_row(ui, theme, entry, path, active, cx));
+        list = list.child(build_row(look, entry, path, active, cx));
     }
 
     let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
@@ -755,15 +758,15 @@ fn build_card(
 }
 
 fn build_row(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     entry: &MenuEntry,
     path: Vec<usize>,
     active: bool,
     cx: &mut Cx,
 ) -> AnyElement {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
+    let mono = look.mono;
 
     let label_line = |label: &str, label_font, color: Color| {
         typography::line(label.to_owned(), label_font, MENU_LABEL_SIZE, color)

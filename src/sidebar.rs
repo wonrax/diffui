@@ -383,6 +383,7 @@ pub(crate) fn build_sidebar(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let look = ui.look(theme);
     // The "Changes" header is gone; the list starts flush at the top of the
     // pane. Each row carries its own internal vertical padding, so the first
     // row's content isn't cramped against the top edge — adding a panel-colored
@@ -425,10 +426,10 @@ pub(crate) fn build_sidebar(
         && !(crate::empty_states::is_revset_error(error)
             && crate::revset_assist::explains_revset_error(ui))
     {
-        body = body.child(crate::empty_states::load_error(ui, theme, error, cx));
+        body = body.child(crate::empty_states::load_error(ui, look, error, cx));
     }
     let list =
-        crate::empty_states::revision_list_placeholder(ui, theme, cx).unwrap_or(revision_list);
+        crate::empty_states::revision_list_placeholder(ui, look, cx).unwrap_or(revision_list);
     // The revset field's completions hang over the top of the list, which
     // recedes under a veil of the pane's colour while they're open. The veil
     // takes no presses: the list stays live.

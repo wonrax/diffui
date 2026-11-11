@@ -11,8 +11,9 @@ use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::commands::{self, CommandArg, CommandId, Context, REGISTRY};
 use crate::modes::{Mode, ModeKind};
-use crate::theme::{self, ThemeSpec, Weight, emphasis_font, text_size};
+use crate::theme::{self, Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, ui};
 
 const CARD_WIDTH: f32 = 760.0;
@@ -178,11 +179,10 @@ impl Diffui {
 /// The sheet over a scrim, or nothing when it is closed.
 pub(crate) fn build_overlay(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
     if ui.mode(ModeKind::Shortcuts).is_none() {
         return div().into_any_element();
     }
@@ -199,17 +199,7 @@ pub(crate) fn build_overlay(
     let rows_of = |entries: Vec<Entry>, window: &mut Window, cx: &mut Cx| -> Vec<AnyElement> {
         entries
             .into_iter()
-            .map(|entry| {
-                binding_row(
-                    ui,
-                    theme,
-                    entry.label,
-                    entry.keys,
-                    entry.disabled,
-                    window,
-                    cx,
-                )
-            })
+            .map(|entry| binding_row(look, entry.label, entry.keys, entry.disabled, window, cx))
             .collect()
     };
     // Revisions is the long one: it and the repository keys go left, the rest
@@ -229,7 +219,7 @@ pub(crate) fn build_overlay(
         if rows.is_empty() {
             continue;
         }
-        let block = section(ui, theme, title, rows_of(rows, window, cx));
+        let block = section(look, title, rows_of(rows, window, cx));
         if matches!(title, "Revisions" | "Repository and history") {
             left = left.child(block);
         } else {
@@ -241,14 +231,13 @@ pub(crate) fn build_overlay(
         if rows.is_empty() {
             continue;
         }
-        right = right.child(section(ui, theme, title, rows_of(rows, window, cx)));
+        right = right.child(section(look, title, rows_of(rows, window, cx)));
     }
     let gestures = GESTURES
         .iter()
         .map(|(gesture, what)| {
             binding_row(
-                ui,
-                theme,
+                look,
                 (*what).to_owned(),
                 vec![(*gesture).to_owned()],
                 None,
@@ -257,7 +246,7 @@ pub(crate) fn build_overlay(
             )
         })
         .collect();
-    let left = left.child(section(ui, theme, "Mouse", gestures));
+    let left = left.child(section(look, "Mouse", gestures));
 
     let columns = div()
         .flex()
@@ -305,13 +294,7 @@ pub(crate) fn build_overlay(
     .into_any_element()
 }
 
-fn section(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    title: &'static str,
-    rows: Vec<AnyElement>,
-) -> impl IntoElement {
-    let look = ui.look(theme);
+fn section(look: Look, title: &'static str, rows: Vec<AnyElement>) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -328,16 +311,15 @@ fn section(
 }
 
 fn binding_row(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     label: String,
     keys: Vec<String>,
     disabled: Option<commands::Reason>,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
     // The label and the mono keycaps share a baseline (see `crate::typography`). A
     // command that can't run right now greys out and says why after its label.
     let mut line = match disabled {
@@ -393,12 +375,12 @@ fn binding_row(
 /// shows up here too.
 pub(crate) fn welcome_hints(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+    let Look { theme, .. } = look;
+    let font = look.font;
     let chord = |id: CommandId| {
         ui.keymap
             .chord_for(Context::Base, id)

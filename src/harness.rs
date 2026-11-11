@@ -862,11 +862,11 @@ mod scenes {
                     div()
                         .w(px(420.0))
                         .h(px(200.0))
-                        .children(empty_states::revision_list_placeholder(ui, theme, cx)),
+                        .children(empty_states::revision_list_placeholder(ui, look, cx)),
                 )
                 .child(div().w(px(420.0)).child(empty_states::load_error(
                     ui,
-                    theme,
+                    look,
                     "failed to parse revset:  --> 1:4",
                     cx,
                 )))

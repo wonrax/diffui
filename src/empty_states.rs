@@ -8,8 +8,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, Weight, emphasis_font, text_size};
+use crate::theme::{self, Weight, emphasis_font, text_size};
 use crate::typography;
+use crate::ui::Look;
 use crate::{Action, Cx, Diffui, icons, ui};
 
 /// The prefixes jj-lib's revset errors arrive with once the actor has
@@ -42,14 +43,15 @@ pub(crate) fn selection_outside_view(ui: &Diffui) -> bool {
 /// which [`load_error`] reports above the list).
 pub(crate) fn revision_list_placeholder(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     if !tab.session.commits.is_empty() {
         return None;
     }
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let (ui_font, mono) = (look.font, look.mono);
     let state = match &tab.session.status {
         LoadStatus::Failed(_) => return None,
         LoadStatus::Loading => ui::empty_state(
@@ -87,8 +89,7 @@ pub(crate) fn revision_list_placeholder(
                     .child("Try another, or pick one from the presets menu on the filter."),
             )
             .children(
-                reset_button(ui, theme, cx)
-                    .map(|reset| div().pt(px(theme::space::XS)).child(reset)),
+                reset_button(ui, look, cx).map(|reset| div().pt(px(theme::space::XS)).child(reset)),
             )
         }
     };
@@ -97,8 +98,7 @@ pub(crate) fn revision_list_placeholder(
 
 /// "Reset to default" (the repo's own `revsets.log`, or jj's default), unless
 /// that is what is already applied.
-pub(crate) fn reset_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement> {
-    let look = ui.look(theme);
+pub(crate) fn reset_button(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<AnyElement> {
     let tab = ui.active();
     let default = tab.default_revset().to_owned();
     if tab.repository.is_none() || tab.session.revset.trim() == default.trim() {
@@ -115,8 +115,8 @@ pub(crate) fn reset_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option
 /// The alert card above the list when the graph load failed. A revset error
 /// gets its own wording, the parser's message in mono (it points a caret at
 /// the offending column), and a way back to the default.
-pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+pub(crate) fn load_error(ui: &Diffui, look: Look, error: &str, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let revset = is_revset_error(error);
     let (title, detail) = if revset {
         let detail = REVSET_ERROR_PREFIXES
@@ -128,7 +128,7 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
     } else {
         ("Couldn't load the history", error)
     };
-    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let title_font = emphasis_font(look.font, Weight::MEDIUM);
     let card = ui::Banner::new(ui::Tone::Danger)
         .icon(icons::ALERT_TRIANGLE)
         .child(typography::line(
@@ -139,21 +139,14 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
         ))
         .child(
             div()
-                .font(
-                    if revset {
-                        ui.config.mono_font
-                    } else {
-                        ui.config.ui_font
-                    }
-                    .gpui(),
-                )
+                .font(if revset { look.mono } else { look.font }.gpui())
                 .text_size(px(text_size::CAPTION))
                 .text_color(theme.text)
                 .child(detail.to_owned()),
         )
         .children(
             if revset {
-                reset_button(ui, theme, cx)
+                reset_button(ui, look, cx)
             } else {
                 None
             }
@@ -167,8 +160,8 @@ pub(crate) fn load_error(ui: &Diffui, theme: ThemeSpec, error: &str, cx: &mut Cx
 }
 
 /// A strip over the diff saying so, when [`selection_outside_view`].
-pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyElement> {
-    let look = ui.look(theme);
+pub(crate) fn outside_view_banner(ui: &Diffui, look: Look) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     if !selection_outside_view(ui) {
         return None;
     }
@@ -203,13 +196,9 @@ pub(crate) fn outside_view_banner(ui: &Diffui, theme: ThemeSpec) -> Option<AnyEl
 /// under the wordmark, then a few tips. Only an explicit `--path` that failed to
 /// resolve surfaces an error; the session and cwd fallbacks resolve silently to
 /// this screen instead.
-pub(crate) fn welcome(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
-    let font = ui.config.ui_font;
+pub(crate) fn welcome(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let font = look.font;
     // The wordmark alone is the identity: big enough to anchor the page.
     let mut body = div()
         .flex()
@@ -234,11 +223,9 @@ pub(crate) fn welcome(
     }
     // `reconcile` keeps the prompt's state alive whenever no tab is open.
     if let Some(dialog) = ui.open_repo_dialog() {
-        body = body.child(crate::tab_bar::open_repo_card(
-            ui, theme, dialog, window, cx,
-        ));
+        body = body.child(crate::tab_bar::open_repo_card(ui, look, dialog, window, cx));
     }
-    body = body.child(crate::shortcuts::welcome_hints(ui, theme, window, cx));
+    body = body.child(crate::shortcuts::welcome_hints(ui, look, window, cx));
 
     // Optically centered: a touch above the true middle, where a centered block
     // reads as centered rather than as sinking.

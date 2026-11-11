@@ -1234,7 +1234,6 @@ fn scope_tabs(ui: &Diffui, theme: ThemeSpec, column: &PaletteColumn, cx: &mut Cx
 }
 
 /// One scope tab: [`ui::segment`] at the card's small step.
-#[allow(clippy::too_many_arguments)]
 fn segment(
     id: impl Into<ElementId>,
     glyph: Option<&'static str>,

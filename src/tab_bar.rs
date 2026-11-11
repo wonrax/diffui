@@ -478,11 +478,11 @@ impl Diffui {
 /// screen owns the window in that case).
 pub(crate) fn build_tab_bar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if ui.tabs.is_empty() {
         return div().into_any_element();
     }
@@ -521,7 +521,7 @@ pub(crate) fn build_tab_bar(
         let lifted = raised == Some(tab.id);
         let body = tab_widget(
             ui,
-            theme,
+            look,
             tab,
             index == ui.active,
             lifted,
@@ -625,7 +625,7 @@ pub(crate) fn build_tab_bar(
                 .child(add_button(look, cx)),
         )
         .child(div().flex_1().min_w_0())
-        .child(palette_hint(ui, theme, cx));
+        .child(palette_hint(look, cx));
 
     // The window's chrome: recessed, with tabs floating on it.
     let bar = div()
@@ -691,7 +691,7 @@ pub(crate) fn build_tab_bar(
 #[allow(clippy::too_many_arguments)]
 fn tab_widget(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     tab: &crate::Tab,
     active: bool,
     lifted: bool,
@@ -699,14 +699,13 @@ fn tab_widget(
     dragging: bool,
     cx: &mut Cx,
 ) -> (gpui_kit::Stateful<gpui_kit::Div>, f32) {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let id = tab.id;
     let element = id.0 as usize;
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
     let hovered = !dragging && ui.hovered == Some(HoverTarget::Tab(id));
 
-    let badge = tab_badge(&tab.source, active, theme, mono);
+    let badge = tab_badge(&tab.source, active, look);
 
     let name_color = if active { theme.text } else { theme.muted_text };
     // owner + name as a tight unit (no gap), matching the design's RepoLabel:
@@ -850,7 +849,8 @@ fn tab_natural_width(ui: &Diffui, tab: &crate::Tab) -> f32 {
 /// A tab's `jj` / `git` / `pr` badge: says what the tab holds. Neutral, and
 /// in the accent on the active tab, so colour never competes with the state
 /// the panes below show.
-fn tab_badge(source: &crate::TabSource, active: bool, theme: ThemeSpec, mono: Font) -> Div {
+fn tab_badge(source: &crate::TabSource, active: bool, look: Look) -> Div {
+    let Look { theme, mono, .. } = look;
     let label = match source {
         crate::TabSource::Repo { vcs: Vcs::Jj, .. } => "jj",
         crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
@@ -896,10 +896,10 @@ fn add_button(look: Look, cx: &mut Cx) -> impl IntoElement {
 
 /// The right-hand search field: opens the command palette, and says what it
 /// searches and its key.
-fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
-    let look = ui.look(theme);
+fn palette_hint(look: Look, cx: &mut Cx) -> impl IntoElement {
+    let Look { theme, .. } = look;
     use gpui_kit::base::TestSupportExt as _;
-    let font = ui.config.ui_font;
+    let font = look.font;
     let placeholder = div()
         .flex_1()
         .min_w_0()
@@ -959,11 +959,11 @@ fn palette_hint(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement 
 /// bookmark it moves and any callouts; the buttons in a footer strip.
 pub(crate) fn build_confirm_dialog(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let Some(dialog) = ui.confirm() else {
         return div().into_any_element();
     };
@@ -989,7 +989,7 @@ pub(crate) fn build_confirm_dialog(
 
     let mut card = crate::overlay_kit::Dialog::new(&dialog.title, look).lede(&dialog.body);
     for (index, bookmark) in dialog.look.moves.iter().enumerate() {
-        card = card.child(push_row(ui, theme, index, bookmark));
+        card = card.child(push_row(look, index, bookmark));
     }
     for (lead, detail) in &dialog.look.callouts {
         card = card.child(crate::overlay_kit::callout(lead, detail.as_ref(), look));
@@ -1023,15 +1023,10 @@ pub(crate) fn build_confirm_dialog(
 
 /// One bookmark a push moves: its name, where the remote has it and where it
 /// goes, and whether that's a fast-forward and which revisions it publishes.
-fn push_row(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    index: usize,
-    bookmark: &diffui_core::BookmarkMove,
-) -> impl IntoElement {
-    let look = ui.look(theme);
+fn push_row(look: Look, index: usize, bookmark: &diffui_core::BookmarkMove) -> impl IntoElement {
+    let Look { theme, .. } = look;
     use diffui_core::MoveKind;
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let (font, mono) = (look.font, look.mono);
     let name_font = emphasis_font(font, Weight::SEMIBOLD);
     let hash = |text: &str, color: Color| {
         Aligned::text(
@@ -1132,7 +1127,7 @@ fn push_row(
 /// Esc cancel, so the card has no Cancel button.
 pub(crate) fn build_open_repo_dialog(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
@@ -1142,7 +1137,7 @@ pub(crate) fn build_open_repo_dialog(
     let dismiss = Diffui::on_action::<()>(Action::CloseRepoDialog, cx);
     ui::modal(
         "open-repo-dialog",
-        open_repo_card(ui, theme, dialog, window, cx),
+        open_repo_card(ui, look, dialog, window, cx),
         crate::toolbar::modal_top(),
         move |window, cx| dismiss(&(), window, cx),
     )
@@ -1155,13 +1150,13 @@ pub(crate) fn build_open_repo_dialog(
 /// then the recents, the folders under the path, or the pull request it names.
 pub(crate) fn open_repo_card(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     dialog: &crate::OpenRepoDialog,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
-    let mono = ui.config.mono_font;
+    let Look { theme, .. } = look;
+    let mono = look.mono;
     let on_input = cx.listener(|this: &mut Diffui, path: &String, _, cx| {
         this.act(cx, |this, cx| this.open_repo_typed(path.clone(), cx));
     });
@@ -1213,19 +1208,17 @@ pub(crate) fn open_repo_card(
         .filter(|status| !matches!(status, crate::path_browse::Status::NotRepository { .. }));
     if let Some(status) = told {
         body = body
-            .child(status_line(ui, theme, status))
+            .child(status_line(look, status))
             .child(crate::root::horizontal_divider(theme));
     }
 
     let path = dialog.path.trim();
     let list: Option<AnyElement> = match (&status, dialog.suggestions()) {
         (Some(crate::path_browse::Status::PullRequest(spec)), _) => {
-            Some(pull_request_card(ui, theme, spec).into_any_element())
+            Some(pull_request_card(look, spec).into_any_element())
         }
-        (_, Some((query, rows))) => {
-            Some(folder_section(ui, theme, dialog, query, rows, window, cx))
-        }
-        _ if path.is_empty() => recents_section(ui, theme, dialog, window, cx),
+        (_, Some((query, rows))) => Some(folder_section(ui, look, dialog, query, rows, window, cx)),
+        _ if path.is_empty() => recents_section(ui, look, dialog, window, cx),
         _ => None,
     };
     if let Some(list) = list {
@@ -1237,7 +1230,7 @@ pub(crate) fn open_repo_card(
                 .child(list),
         );
     }
-    body.child(open_repo_footer(ui, theme, dialog, status.as_ref()))
+    body.child(open_repo_footer(ui, look, dialog, status.as_ref()))
         .into_any_element()
 }
 
@@ -1404,9 +1397,9 @@ fn kind_box(status: Option<&crate::path_browse::Status>, theme: ThemeSpec) -> im
 /// The banner under the input saying what Enter will do with it, updated as
 /// it's typed. An open that failed for a reason only the open found says why
 /// here.
-fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Status) -> Div {
-    let look = ui.look(theme);
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+fn status_line(look: Look, status: &crate::path_browse::Status) -> Div {
+    let Look { theme, .. } = look;
+    let (font, mono) = (look.font, look.mono);
     let (tone, glyph, runs, enter) = status_parts(status);
     let banner = ui::Banner::new(tone)
         .shape(ui::BannerShape::Strip)
@@ -1449,9 +1442,9 @@ fn status_line(ui: &Diffui, theme: ThemeSpec, status: &crate::path_browse::Statu
 }
 
 /// The pull request a reference names, and what opening it does.
-fn pull_request_card(ui: &Diffui, theme: ThemeSpec, spec: &diffui_core::github::PrSpec) -> Div {
-    let look = ui.look(theme);
-    let font = ui.config.ui_font;
+fn pull_request_card(look: Look, spec: &diffui_core::github::PrSpec) -> Div {
+    let Look { theme, .. } = look;
+    let font = look.font;
     let title_font = emphasis_font(font, Weight::SEMIBOLD);
     let mut words = crate::prose::Prose::from(
         "Opens as its own tab, diffing the pull request's head against its base.",
@@ -1537,11 +1530,11 @@ fn pull_request_card(ui: &Diffui, theme: ThemeSpec, spec: &diffui_core::github::
 /// The prompt's footer: the keys that work in the state it's in.
 fn open_repo_footer(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     dialog: &crate::OpenRepoDialog,
     status: Option<&crate::path_browse::Status>,
 ) -> Div {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     use crate::overlay_kit::{Density, MODAL_FOOT, footer, footer_note, key_hint};
     let path = dialog.path.trim();
     let end = || {
@@ -1632,23 +1625,19 @@ fn section_head(label: &'static str, look: Look) -> Div {
 /// list.
 fn recents_section(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     dialog: &crate::OpenRepoDialog,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let recents = ui.open_repo_recents();
-    let font = ui.config.ui_font;
+    let font = look.font;
     if recents.is_empty() {
         return Some(
-            open_note(
-                "Nothing opened yet. Type a path to browse folders.",
-                font,
-                theme,
-            )
-            .py(px(theme::space::XL))
-            .into_any_element(),
+            open_note("Nothing opened yet. Type a path to browse folders.", look)
+                .py(px(theme::space::XL))
+                .into_any_element(),
         );
     }
     let clear = look
@@ -1679,8 +1668,7 @@ fn recents_section(
     let mut list = div().flex().flex_col().w_full();
     for (index, recent) in recents.iter().enumerate() {
         list = list.child(recent_repo_row(
-            ui,
-            theme,
+            look,
             recent,
             index,
             dialog.selected == Some(index),
@@ -1758,14 +1746,15 @@ fn scrolling(
 /// lists it), how many folders and repositories match, then the matches.
 fn folder_section(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     dialog: &crate::OpenRepoDialog,
     query: crate::path_browse::Query,
     rows: Vec<&crate::path_browse::Entry>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let Look { theme, .. } = look;
+    let (font, mono) = (look.font, look.mono);
     let listing = dialog.listing.as_ref();
     let (folders, repos) = listing.map_or((0, 0), |listing| query.count(listing));
 
@@ -1829,7 +1818,7 @@ fn folder_section(
     for (index, entry) in rows.into_iter().enumerate() {
         list = list.child(folder_row(
             ui,
-            theme,
+            look,
             &query,
             entry,
             index,
@@ -1847,21 +1836,23 @@ fn folder_section(
     );
     let mut section = div().w_full().flex().flex_col().child(header).child(list);
     if listing.is_some_and(|listing| listing.entries.is_empty()) {
-        section = section.child(open_note("This folder has no subfolders.", font, theme));
+        section = section.child(open_note("This folder has no subfolders.", look));
     }
     section.into_any_element()
 }
 
 /// What one of the open prompt's lists says in place of rows, on the rows'
 /// text column.
-fn open_note(text: &'static str, font: Font, theme: ThemeSpec) -> Div {
+fn open_note(text: &'static str, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     ui::empty_state(text, ui::Placement::Inline, font, theme.subtle_text)
         .pl(px(OPEN_ROW_PAD_X + OPEN_LEAD_BOX + OPEN_GLYPH_GAP))
         .pr(px(OPEN_ROW_PAD_X))
 }
 
 /// A row's lead: the jj/git badge of a repository, or a folder.
-fn row_lead(vcs: Option<Vcs>, theme: ThemeSpec, mono: Font) -> Aligned {
+fn row_lead(vcs: Option<Vcs>, look: Look) -> Aligned {
+    let Look { theme, mono, .. } = look;
     match vcs {
         Some(vcs) => {
             let badge = match vcs {
@@ -1906,7 +1897,8 @@ fn list_row(
 }
 
 /// The "Open" chip of a repository a tab has open.
-fn open_chip(font: Font, theme: ThemeSpec) -> impl IntoElement {
+fn open_chip(look: Look) -> impl IntoElement {
+    let Look { theme, font, .. } = look;
     let font = emphasis_font(font, Weight::MEDIUM);
     ui::tag("Open", theme.accent, ui::TagSize::Regular, font).view()
 }
@@ -1921,15 +1913,15 @@ fn row_hint(hint: &'static str, look: Look) -> impl IntoElement {
 /// repository opens, a folder is browsed into).
 fn folder_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     query: &crate::path_browse::Query,
     entry: &crate::path_browse::Entry,
     index: usize,
     selected: bool,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    let look = ui.look(theme);
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let Look { theme, .. } = look;
+    let font = look.font;
     let repo = entry.vcs.is_some();
     let open = entry
         .canonical
@@ -1969,7 +1961,7 @@ fn folder_row(
     .fill();
     let text = typography::baseline_row(
         [
-            row_lead(entry.vcs, theme, mono),
+            row_lead(entry.vcs, look),
             Aligned::gap(OPEN_GLYPH_GAP),
             name,
         ],
@@ -1998,7 +1990,7 @@ fn folder_row(
         .flex_none()
         .items_center()
         .gap(px(theme::space::MD))
-        .when(open, |end| end.child(open_chip(font, theme)))
+        .when(open, |end| end.child(open_chip(look)))
         .when(selected, |end| {
             end.child(row_hint(hint, look)).child(ui::chord(keys, look))
         });
@@ -2021,15 +2013,14 @@ fn folder_row(
 /// One line of the open prompt's recent list: badge, name, the folder it's in,
 /// whether a tab has it open, and a remove ✕ on the hovered or highlighted row.
 fn recent_repo_row(
-    ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     recent: &crate::path_browse::Recent,
     index: usize,
     selected: bool,
     cx: &mut Cx,
 ) -> impl IntoElement {
-    let look = ui.look(theme);
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
+    let Look { theme, .. } = look;
+    let (font, mono) = (look.font, look.mono);
     let root = std::path::Path::new(&recent.root);
     let name = root.file_name().map_or_else(
         || recent.root.clone(),
@@ -2055,7 +2046,7 @@ fn recent_repo_row(
         .max(0.0);
     let text = typography::baseline_row(
         [
-            row_lead(recent.vcs, theme, mono),
+            row_lead(recent.vcs, look),
             Aligned::gap(OPEN_GLYPH_GAP),
             // A name too long for the row gives up the path first, then
             // ellipsises.
@@ -2098,7 +2089,7 @@ fn recent_repo_row(
         .flex_none()
         .items_center()
         .gap(px(theme::space::MD))
-        .when(recent.open, |end| end.child(open_chip(font, theme)))
+        .when(recent.open, |end| end.child(open_chip(look)))
         .when(selected, |end| {
             end.child(row_hint(
                 if recent.open { "Switch to tab" } else { "Open" },

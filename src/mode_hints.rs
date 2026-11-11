@@ -13,7 +13,8 @@ use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::Diffui;
 use crate::commands::{CommandId, Context};
-use crate::theme::{self, ThemeSpec, text_size};
+use crate::theme::{self, text_size};
+use crate::ui::Look;
 
 /// A hint: the commands whose keys it shows (several for a pair like `j k`),
 /// and what pressing them does. No commands: a pointer gesture, shown as
@@ -145,13 +146,13 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
 /// The strip for the active mode, or `None` when no mode with keys is on.
 pub(crate) fn strip(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let (context, hints) = active_hints(ui)?;
-    let font = ui.config.ui_font;
+    let font = look.font;
     let mut line: Vec<Aligned> = Vec::new();
     let mut seen_what: Vec<&str> = Vec::new();
     let mut any_key = false;

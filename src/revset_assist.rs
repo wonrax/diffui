@@ -569,7 +569,7 @@ pub(crate) fn error_strip(
         }
     }
     // The way back, beside the only place the error is told.
-    if let Some(reset) = crate::empty_states::reset_button(ui, theme, cx) {
+    if let Some(reset) = crate::empty_states::reset_button(ui, look, cx) {
         // A column stretches its children; the button keeps its own width.
         banner = banner.child(div().pt(px(theme::space::XS)).flex().child(reset));
     }

@@ -1109,7 +1109,6 @@ fn activity_row(
 /// has output, or a line cut short; open, every line shows in full. The
 /// output sits outside it, so dragging to select text there doesn't
 /// collapse the row.
-#[allow(clippy::too_many_arguments)]
 fn activity_header(
     ui: &Diffui,
     theme: ThemeSpec,

@@ -13,8 +13,7 @@ use gpui_kit::{AnyElement, ElementId, MouseButton, MouseDownEvent, SharedString,
 
 use crate::repository::Vcs;
 use crate::theme::{
-    self, Color, Font, ThemeSpec, Weight, chip_background, chrome_fill, emphasis_font, radius,
-    text_size,
+    self, Color, ThemeSpec, Weight, chip_background, chrome_fill, emphasis_font, radius, text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::ui::Look;
@@ -117,15 +116,14 @@ pub(crate) fn caret_hover<E: Styled + ParentElement>(caret: E, theme: ThemeSpec,
 /// the window then).
 pub(crate) fn build_toolbar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if ui.tabs.is_empty() {
         return div().into_any_element();
     }
-    let font = ui.config.ui_font;
     let is_jj = matches!(
         ui.active().repository.as_ref().map(|r| r.vcs),
         Some(Vcs::Jj)
@@ -137,7 +135,7 @@ pub(crate) fn build_toolbar(
         .items_center()
         .gap(px(GROUP_GAP))
         .flex_none()
-        .child(panel_toggles(ui, theme, cx))
+        .child(panel_toggles(ui, look, cx))
         .child(separator(theme));
     // Diff ↔ Source view switcher, so the "what am I looking at" control leads
     // the bar after the panels. Repo tabs only: a PR has no tree to browse.
@@ -145,13 +143,13 @@ pub(crate) fn build_toolbar(
     let in_source = is_repo && ui.active().main_view == MainView::Source;
     if is_repo {
         actions = actions
-            .child(view_switcher(ui, theme, window, cx))
+            .child(view_switcher(ui, look, window, cx))
             .child(separator(theme));
     }
     if in_source {
         // The repo-mutating actions don't apply to browsing a snapshot; instead
         // say *what* is being browsed.
-        actions = actions.child(browsed_revision_label(ui, theme, is_jj));
+        actions = actions.child(browsed_revision_label(ui, look, is_jj));
     } else {
         actions = actions
             .child(toolbar_button(
@@ -169,7 +167,7 @@ pub(crate) fn build_toolbar(
             && ui.active().session.capabilities.mutate
             && !ui.active().session.bookmarks.remotes.is_empty()
         {
-            actions = actions.child(push_button(ui, theme, font, cx));
+            actions = actions.child(push_button(ui, look, cx));
         }
         // jj-only: git has no operation log to undo.
         if is_jj {
@@ -218,7 +216,7 @@ pub(crate) fn build_toolbar(
         ));
     }
     if crate::media::shows_svg_preview(ui) {
-        toggles = toggles.child(svg_switcher(ui, theme, window, cx));
+        toggles = toggles.child(svg_switcher(ui, look, window, cx));
     }
     toggles = toggles.child(toolbar_toggle_button(
         "toolbar-wrap",
@@ -294,8 +292,7 @@ pub(crate) fn build_toolbar(
 /// The Diff ↔ Source view switcher, a [`segmented`] control. Deliberately *not*
 /// the bordered-button-group look of the fetch split button: this switches what
 /// the window shows, so it reads as tabs, not as an action.
-fn view_switcher(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn view_switcher(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let segment = |icon: &'static str, label: &'static str, view: MainView| Segment {
         icon: Some(icon),
         label,
@@ -314,8 +311,7 @@ fn view_switcher(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
 
 /// How the diff shows SVG files: rendered, or as their markup's text diff. Only on
 /// screen while the diff holds an SVG it can render.
-fn svg_switcher(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn svg_switcher(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let segment = |icon: &'static str, label: &'static str, source: bool| Segment {
         icon: Some(icon),
         label,
@@ -393,7 +389,6 @@ fn toolbar_button(
 /// active so the on state reads at a glance. The label lives in a hover tooltip
 /// instead of beside the glyph: these are view options, not actions, so they stay
 /// compact.
-#[allow(clippy::too_many_arguments)]
 fn toolbar_toggle_button(
     id: &'static str,
     icon: &'static str,
@@ -407,7 +402,6 @@ fn toolbar_toggle_button(
 }
 
 /// [`toolbar_toggle_button`], inert (greyed, no press) without an action.
-#[allow(clippy::too_many_arguments)]
 fn toggle_button(
     id: &'static str,
     icon: &'static str,
@@ -445,8 +439,7 @@ pub(crate) fn with_shortcut(ui: &Diffui, label: &str, command: &'static str) -> 
 /// The two panel toggles that lead the bar: the revision list and the changed
 /// files beside the diff. Only the Diff view hides its panels; the others keep
 /// theirs, so there the toggles sit inert.
-fn panel_toggles(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement {
-    let look = ui.look(theme);
+fn panel_toggles(ui: &Diffui, look: Look, cx: &mut Cx) -> impl IntoElement {
     let tab = ui.active();
     let in_diff = tab.main_view == MainView::Diff;
     let toggle = |id: &'static str,
@@ -504,8 +497,8 @@ fn panel_toggles(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> impl IntoElement
 /// Push, saying what it pushes: the bookmark or tag a plain `jj git push`
 /// would send and how far it is ahead of the remote, or how many go. Plain
 /// "Push" when nothing would.
-fn push_button(ui: &Diffui, theme: ThemeSpec, font: Font, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn push_button(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, font, .. } = look;
     let session = &ui.active().session;
     let bookmarks = &session.bookmarks;
     let remote = bookmarks.default_push_remote();
@@ -628,8 +621,9 @@ fn separator(theme: ThemeSpec) -> impl IntoElement {
 /// first line of its description. The working copy trades the id for an
 /// accent-tinted "@ working copy" chip so a live, still-changing snapshot can't be
 /// mistaken for a pinned commit.
-fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl IntoElement {
-    let mono = ui.config.mono_font;
+fn browsed_revision_label(ui: &Diffui, look: Look, is_jj: bool) -> impl IntoElement {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
     let revision = crate::source_panel::browsed_revision(&ui.active().source);
     let commit = ui.active().session.commits.find(&revision);
     let working_copy = revision == RevisionSelection::WorkingCopy;
@@ -643,7 +637,7 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl In
                 "@ working copy",
                 theme.accent,
                 ui::TagSize::Regular,
-                ui.config.ui_font,
+                look.font,
             )
             .mono(mono)
             .aligned(),
@@ -677,8 +671,8 @@ fn browsed_revision_label(ui: &Diffui, theme: ThemeSpec, is_jj: bool) -> impl In
         };
         label.push(
             Aligned::text(
-                typography::line(line, ui.config.ui_font, text_size::BODY, color).text_ellipsis(),
-                ui.config.ui_font,
+                typography::line(line, look.font, text_size::BODY, color).text_ellipsis(),
+                look.font,
                 text_size::BODY,
             )
             .shrink(),

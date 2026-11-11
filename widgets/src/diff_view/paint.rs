@@ -346,7 +346,6 @@ impl Plan {
     }
 
     /// Paints a change-selection checkbox; see [`paint_checkbox`].
-    #[allow(clippy::too_many_arguments)]
     fn checkbox(
         &mut self,
         rect: Rectangle,

@@ -23,6 +23,7 @@ use gpui_kit::{
 
 use crate::keys;
 use crate::theme::{self, ThemeSpec};
+use crate::ui::Look;
 use crate::{
     Action, Cli, Cx, Diffui, MainView, WINDOW_STATE_DEBOUNCE, activity, chrome, diff_panel,
     empty_states, history_panel, icons, measure, menu, palette, resize_handle, sidebar,
@@ -546,6 +547,7 @@ impl Render for Diffui {
         self.media.release(window);
         self.restore_focus_after_modes(window, cx);
         let theme = self.resolved_theme().spec();
+        let look = self.look(theme);
 
         #[cfg(test)]
         if let Some(scene) = self.background.scene.clone() {
@@ -561,8 +563,8 @@ impl Render for Diffui {
             div()
                 .relative()
                 .size_full()
-                .child(empty_states::welcome(self, theme, window, cx))
-                .child(crate::shortcuts::build_overlay(self, theme, window, cx))
+                .child(empty_states::welcome(self, look, window, cx))
+                .child(crate::shortcuts::build_overlay(self, look, window, cx))
         } else {
             let panes = self.panes.clone().expect("a drawn app has its panes");
             self.shell(&panes, theme, window, cx)
@@ -677,7 +679,7 @@ pub(crate) struct Pane {
     _app_changed: Subscription,
 }
 
-type PaneBuild = fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement;
+type PaneBuild = fn(&Diffui, Look, &mut Window, &mut Cx) -> AnyElement;
 
 impl Pane {
     fn new(
@@ -706,8 +708,8 @@ impl Render for Pane {
         let build = self.build;
         frame_log::time(self.name, || match self.app.upgrade() {
             Some(app) => app.update(cx, |ui, cx| {
-                let theme = ui.resolved_theme().spec();
-                build(ui, theme, window, cx)
+                let look = ui.look(ui.resolved_theme().spec());
+                build(ui, look, window, cx)
             }),
             None => div().into_any_element(),
         })
@@ -799,7 +801,8 @@ impl Panes {
 }
 
 /// The revision list, or what the view shows in its place.
-fn left_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     match ui.active().main_view {
         MainView::Diff => sidebar::build_sidebar(ui, theme, window, cx),
         MainView::Source => source_panel::build_source_sidebar(ui, theme, window, cx),
@@ -809,7 +812,8 @@ fn left_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
 
 /// The changed files, in the Diff view: the panel, or the narrower tree that
 /// floats over the diff while the panel is hidden.
-fn files_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn files_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     if ui.active().files_panel_collapsed {
         diff_panel::build_file_navigator_peek(ui, theme, window, cx)
     } else {
@@ -818,7 +822,8 @@ fn files_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -
 }
 
 /// What the view is about: the diff, a source file, the history.
-fn main_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn main_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     match ui.active().main_view {
         MainView::Diff => diff_panel::build_diff_panel(ui, theme, window, cx),
         MainView::Source => source_panel::build_source_panel(ui, theme, window, cx),
@@ -828,24 +833,25 @@ fn main_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) ->
 
 /// Everything that floats above the shell. Each is empty when inactive, so they can
 /// always be stacked.
-fn floats_pane(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
+fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     request_overlay_frames(ui, window);
     div()
         .relative()
         .size_full()
         // Under every overlay: the picks' bar floats over the diff, not over them.
         .child(crate::changes::action_bar(ui, theme, window, cx))
-        .child(panel_peek(ui, theme, cx))
+        .child(panel_peek(ui, look, cx))
         .child(palette::build_overlay(ui, theme, window, cx))
         .child(activity::activity_popover(ui, theme, window, cx))
-        .child(menu::build_overlay(ui, theme, window, cx))
-        .child(tab_bar::build_open_repo_dialog(ui, theme, window, cx))
+        .child(menu::build_overlay(ui, look, window, cx))
+        .child(tab_bar::build_open_repo_dialog(ui, look, window, cx))
         .child(crate::bookmarks::build_name_prompt(ui, theme, window, cx))
         .child(crate::changes::split_modal(ui, theme, window, cx))
-        .child(tab_bar::build_confirm_dialog(ui, theme, window, cx))
+        .child(tab_bar::build_confirm_dialog(ui, look, window, cx))
         .child(crate::cli_output::build_overlay(ui, theme, window, cx))
         .child(crate::credentials::build_overlay(ui, theme, window, cx))
-        .child(crate::shortcuts::build_overlay(ui, theme, window, cx))
+        .child(crate::shortcuts::build_overlay(ui, look, window, cx))
         .child(activity::toast_layer(ui, theme, window, cx))
         .into_any_element()
 }
@@ -922,7 +928,8 @@ impl Diffui {
 /// would square them off: this keeps its corners inside the curve.
 const PEEK_CORNER_INSET: f32 = theme::radius::LG * (1.0 - std::f32::consts::FRAC_1_SQRT_2) + 0.5;
 
-fn panel_peek(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
+fn panel_peek(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let (Some(peek), Some(panes)) = (ui.panel_peek, ui.panes.as_ref()) else {
         return div().into_any_element();
     };

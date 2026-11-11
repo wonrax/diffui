@@ -9,8 +9,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::repository::Vcs;
-use crate::theme::{self, Color, ThemeSpec, Weight, emphasis_font};
+use crate::theme::{self, Color, Weight, emphasis_font};
 use crate::typography::{self, Aligned};
+use crate::ui::Look;
 use crate::ui::Tip as _;
 use crate::{Cx, Diffui, icons};
 
@@ -41,16 +42,16 @@ fn thousands(n: usize) -> String {
 
 pub(crate) fn build_status_bar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if ui.tabs.is_empty() {
         return div().into_any_element();
     }
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
+    let mono = look.mono;
     let dim = theme.muted_text;
     let text = |value: String, font, color: Color| {
         Aligned::text(
