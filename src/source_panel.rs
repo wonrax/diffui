@@ -728,7 +728,7 @@ fn build_info_bar(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> 
     );
     if crate::history_panel::can_annotate(ui) {
         bar = bar.child(crate::history_panel::source_bar_actions(
-            ui, theme, window, cx,
+            ui, look, window, cx,
         ));
     }
     bar.into_any_element()

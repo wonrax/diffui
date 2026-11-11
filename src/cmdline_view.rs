@@ -257,7 +257,7 @@ pub(crate) fn input(
                 crate::commands::Context::Palette,
                 &["palette.back"],
             ),
-            ui.look(theme),
+            look,
         ))
         .into_any_element()
 }

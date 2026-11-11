@@ -415,7 +415,7 @@ pub(crate) fn build_sidebar(
         )
         .children(crate::revset_assist::error_strip(ui, look, window, cx))
         .children(crate::history_panel::file_filter_banner(
-            ui, theme, window, cx,
+            ui, look, window, cx,
         ));
     // Load failures no longer have a header to live under — surface them as a
     // soft alert card above the list rather than bare red text.

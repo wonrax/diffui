@@ -802,11 +802,10 @@ impl Panes {
 
 /// The revision list, or what the view shows in its place.
 fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let Look { theme, .. } = look;
     match ui.active().main_view {
         MainView::Diff => sidebar::build_sidebar(ui, look, window, cx),
         MainView::Source => source_panel::build_source_sidebar(ui, look, window, cx),
-        MainView::History => history_panel::build_history_sidebar(ui, theme, window, cx),
+        MainView::History => history_panel::build_history_sidebar(ui, look, window, cx),
     }
 }
 
@@ -822,11 +821,10 @@ fn files_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyE
 
 /// What the view is about: the diff, a source file, the history.
 fn main_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let Look { theme, .. } = look;
     match ui.active().main_view {
         MainView::Diff => diff_panel::build_diff_panel(ui, look, window, cx),
         MainView::Source => source_panel::build_source_panel(ui, look, window, cx),
-        MainView::History => history_panel::build_history_panel(ui, theme, window, cx),
+        MainView::History => history_panel::build_history_panel(ui, look, window, cx),
     }
 }
 

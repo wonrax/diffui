@@ -1118,11 +1118,11 @@ impl<'a> OpRow<'a> {
 /// file's history.
 pub(crate) fn source_bar_actions(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let on = annotate_on(ui);
     let blame = look
         .button("source-blame", "Blame")
@@ -1162,11 +1162,11 @@ pub(crate) fn source_bar_actions(
 /// history.
 pub(crate) fn file_filter_banner(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if !file_filter_active(ui) {
         return None;
     }
@@ -1302,15 +1302,15 @@ fn select_op(id: &str) -> Action {
 
 fn op_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     op: &OperationEntry,
     now: i64,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     if op.is_snapshot {
-        return snapshot_row(ui, theme, op, now, window, cx);
+        return snapshot_row(ui, look, op, now, window, cx);
     }
     let history = &ui.active().history;
     let selected = history.selected_op.as_deref() == Some(op.id.as_str());
@@ -1341,12 +1341,12 @@ fn op_row(
                     CAPTION_TEXT_SIZE,
                 )
                 .view(),
-            ui.config.mono_font,
+            look.mono,
             CAPTION_TEXT_SIZE,
         )),
         None => meta.push(fill_on_line(
             caption_fill(op.user.clone(), theme.subtle_text, ui),
-            ui.config.ui_font,
+            look.font,
             text_size::CAPTION,
         )),
     }
@@ -1354,8 +1354,7 @@ fn op_row(
     let title = title_with_age(
         meta_line::description(op.summary(), SMALL_TEXT_SIZE, theme.text, look).view(),
         age,
-        ui,
-        theme,
+        look,
     );
     list_row(
         SharedString::from(format!("op-{}", op.id)),
@@ -1372,18 +1371,19 @@ fn op_row(
 /// A snapshot on one quiet line, on its own or inside an unfolded run.
 fn snapshot_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     op: &OperationEntry,
     now: i64,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let selected = ui.active().history.selected_op.as_deref() == Some(op.id.as_str());
     let mut line = vec![
         Aligned::glyph(snapshot_dot(theme), RUN_CHEVRON),
         Aligned::text(
             caption_fill(op.summary().to_owned(), theme.subtle_text, ui),
-            ui.config.ui_font,
+            look.font,
             text_size::CAPTION,
         )
         .shrink(),
@@ -1400,7 +1400,7 @@ fn snapshot_row(
     if op.is_current {
         line.push(meta_line::badge("current", theme.accent, ui, window, cx));
     }
-    line.push(fill_on_line(div(), ui.config.ui_font, text_size::CAPTION));
+    line.push(fill_on_line(div(), look.font, text_size::CAPTION));
     line.push(caption_on_line(
         caption(relative_age(op.time_millis, now), theme.subtle_text, ui),
         ui,
@@ -1437,8 +1437,9 @@ fn snapshot_dot(theme: ThemeSpec) -> Div {
 
 /// A two-line row's title: the text cut to fit, and the age right-aligned on
 /// its baseline.
-fn title_with_age(title: impl IntoElement, age: String, ui: &Diffui, theme: ThemeSpec) -> Div {
-    let font = ui.config.ui_font;
+fn title_with_age(title: impl IntoElement, age: String, look: Look) -> Div {
+    let Look { theme, .. } = look;
+    let font = look.font;
     typography::baseline_row(
         [
             fill_on_line(title, font, SMALL_TEXT_SIZE),
@@ -1458,7 +1459,7 @@ fn title_with_age(title: impl IntoElement, age: String, ui: &Diffui, theme: Them
 #[allow(clippy::too_many_arguments)]
 fn run_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     first: &OperationEntry,
     count: usize,
     oldest: &OperationEntry,
@@ -1467,6 +1468,7 @@ fn run_row(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let chevron = if children.is_some() {
         icons::CHEVRON_DOWN
     } else {
@@ -1502,7 +1504,7 @@ fn run_row(
                         theme.subtle_text,
                         ui,
                     ),
-                    ui.config.ui_font,
+                    look.font,
                     text_size::CAPTION,
                 ),
                 caption_on_line(caption(span, theme.subtle_text, ui), ui),
@@ -1523,7 +1525,7 @@ fn run_row(
         .flex_col()
         .gap(px(2.0 * ROW_CARD_INSET_Y));
     for op in children {
-        rows = rows.child(snapshot_row(ui, theme, op, now, window, cx));
+        rows = rows.child(snapshot_row(ui, look, op, now, window, cx));
     }
     // The guide hangs from the chevron's centre; the children's ids line up
     // with the run's label. Positions are within the list's padding, where
@@ -1553,13 +1555,14 @@ fn run_row(
 
 fn version_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     index: usize,
     entry: &EvologEntry,
     now: i64,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let selected = ui.active().history.selected_version == Some(index);
     let mut meta = vec![mono_on_line(
         entry.commit.short_commit_id().to_owned(),
@@ -1578,7 +1581,7 @@ fn version_row(
     );
     meta.push(fill_on_line(
         caption_fill(operation, theme.subtle_text, ui),
-        ui.config.ui_font,
+        look.font,
         text_size::CAPTION,
     ));
     meta.push(caption_on_line(
@@ -1590,7 +1593,7 @@ fn version_row(
         ui,
     ));
     let meta = typography::baseline_row(meta, space::SM);
-    let title = summary_line(&entry.commit, SMALL_TEXT_SIZE, ui.config.ui_font, theme);
+    let title = summary_line(&entry.commit, SMALL_TEXT_SIZE, look);
     list_row(
         SharedString::from(format!("version-{index}")),
         REVISION_ROW_HEIGHT,
@@ -1605,7 +1608,8 @@ fn version_row(
 
 /// A commit's first line, `(no description set)` in a quieter colour when it has
 /// none, cut to fit.
-fn summary_line(commit: &CommitBrief, size: f32, font: Font, theme: ThemeSpec) -> Div {
+fn summary_line(commit: &CommitBrief, size: f32, look: Look) -> Div {
+    let Look { theme, font, .. } = look;
     let (summary, color) = if commit.summary.is_empty() {
         ("(no description set)".to_owned(), theme.subtle_text)
     } else {
@@ -1635,11 +1639,11 @@ fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
 /// The History view's left pane: the op log, or the evolog it was switched to.
 pub(crate) fn build_history_sidebar(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let history = &ui.active().history;
     let now = now_millis();
     let reload = look
@@ -1731,20 +1735,20 @@ fn op_log_list(ui: &Diffui, cx: &mut Cx) -> AnyElement {
     let rows = move |index: usize, window: &mut Window, cx: &mut gpui_kit::App| {
         diffui_widgets::frame_log::time("oplog.row", || {
             app.update(cx, |ui, cx| {
-                let theme = ui.resolved_theme().spec();
+                let look = ui.look(ui.resolved_theme().spec());
                 let history = &ui.active().history;
                 let row = match spans
                     .get(index)
                     .and_then(|span| OpRow::of(history, span.clone()))
                 {
-                    Some(OpRow::Op(op)) => op_row(ui, theme, op, now, window, cx),
+                    Some(OpRow::Op(op)) => op_row(ui, look, op, now, window, cx),
                     Some(OpRow::Run {
                         first,
                         count,
                         oldest,
                         children,
-                    }) => run_row(ui, theme, first, count, oldest, children, now, window, cx),
-                    None => op_log_footer(ui, theme, cx),
+                    }) => run_row(ui, look, first, count, oldest, children, now, window, cx),
+                    None => op_log_footer(ui, look, cx),
                 };
                 // Half the gap on each side of a row: the gap between rows, and
                 // half of it at either end, as a stacked column would have.
@@ -1774,9 +1778,10 @@ fn evolog_list(ui: &Diffui, now: i64, cx: &mut Cx) -> AnyElement {
     let app = cx.entity();
     let rows = move |index: usize, window: &mut Window, cx: &mut gpui_kit::App| {
         app.update(cx, |ui, cx| {
-            let theme = ui.resolved_theme().spec();
+            let look = ui.look(ui.resolved_theme().spec());
+            let theme = look.theme;
             let row = match ui.active().history.evolog.get(index) {
-                Some(entry) => version_row(ui, theme, index, entry, now, window, cx),
+                Some(entry) => version_row(ui, look, index, entry, now, window, cx),
                 None => note(
                     "Reading the change's history\u{2026}",
                     theme.subtle_text,
@@ -2011,8 +2016,8 @@ fn op_log_keys(history: &HistoryState, spans: &[Range<usize>]) -> Vec<OpLogKey> 
 }
 
 /// Below the last operation: that more is on its way, or a button for it.
-fn op_log_footer(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn op_log_footer(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let history = &ui.active().history;
     if history.ops_job.is_some() {
         return note("Reading the operation log\u{2026}", theme.subtle_text, ui).into_any_element();
@@ -2040,11 +2045,12 @@ fn op_log_footer(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> AnyElement {
 /// A commit's change id, commit id, its states and its first line.
 fn commit_line(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     commit: &CommitBrief,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Vec<Aligned> {
+    let Look { theme, .. } = look;
     let mut line = vec![
         mono_on_line(commit.short_change_id().to_owned(), theme.change_id, ui),
         mono_on_line(commit.short_commit_id().to_owned(), theme.subtle_text, ui),
@@ -2062,8 +2068,8 @@ fn commit_line(
         line.push(meta_line::badge("empty", theme.subtle_text, ui, window, cx));
     }
     line.push(fill_on_line(
-        summary_line(commit, text_size::BODY, ui.config.ui_font, theme),
-        ui.config.ui_font,
+        summary_line(commit, text_size::BODY, look),
+        look.font,
         text_size::BODY,
     ));
     line
@@ -2073,14 +2079,14 @@ fn commit_line(
 /// in the table, whose rounded corners its selection wash follows.
 fn change_row(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     index: usize,
     change: &ChangedCommit,
     (first, last): (bool, bool),
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let selected = ui.active().history.selected_change == Some(index);
     let (glyph, color, verb) = match change.kind {
         CommitChangeKind::Created => ("+", theme.added_text, "created"),
@@ -2123,7 +2129,7 @@ fn change_row(
             .child(glyph)
             .into_any_element()
     })];
-    line.extend(commit_line(ui, theme, &change.commit, window, cx));
+    line.extend(commit_line(ui, look, &change.commit, window, cx));
     line.push(caption_on_line(caption(verb, theme.subtle_text, ui), ui));
     let inner = px(radius::inner(radius::CARD, crate::theme::HAIRLINE));
     let mut card = row_card(
@@ -2151,7 +2157,8 @@ fn change_row(
 /// A moved ref, laid out like a changed commit's row: a kind marker in the
 /// glyph column, the ref, where it moved from and to, and the kind where a
 /// commit row has its verb.
-fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
+fn ref_row(ui: &Diffui, look: Look, change: &RefChange) -> AnyElement {
+    let Look { theme, .. } = look;
     let glyph =
         |glyph: &'static str| Aligned::glyph(icons::icon(glyph, 12.0, theme.subtle_text), 12.0);
     let (marker, kind): (Aligned, &str) = match change.kind {
@@ -2192,12 +2199,12 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
                     Aligned::text(
                         typography::line(
                             change.name.clone(),
-                            ui.config.mono_font,
+                            look.mono,
                             CAPTION_TEXT_SIZE,
                             theme.text,
                         )
                         .text_ellipsis(),
-                        ui.config.mono_font,
+                        look.mono,
                         CAPTION_TEXT_SIZE,
                     )
                     .shrink(),
@@ -2219,8 +2226,7 @@ fn ref_row(ui: &Diffui, theme: ThemeSpec, change: &RefChange) -> AnyElement {
 }
 
 /// A section's label with its count: "Changed revisions 1".
-fn section_title(label: &str, count: String, ui: &Diffui, theme: ThemeSpec) -> Div {
-    let look = ui.look(theme);
+fn section_title(label: &str, count: String, look: Look) -> Div {
     div()
         .flex_none()
         .pt(px(space::LG))
@@ -2252,13 +2258,13 @@ fn table(rows: Vec<AnyElement>, theme: ThemeSpec) -> Div {
 /// The operation's header: description, metadata, and the two actions.
 fn operation_header(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     op: &OperationEntry,
     changes: Option<&OperationChanges>,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Div {
-    let look = ui.look(theme);
+    let Look { theme, .. } = look;
     let mut badges = Vec::new();
     if op.is_current {
         badges.push(meta_line::Badge {
@@ -2328,7 +2334,7 @@ fn operation_header(
         cx,
     );
 
-    let title_font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
+    let title_font = emphasis_font(look.font, Weight::SEMIBOLD);
     let mut block = div()
         .w_full()
         .flex_none()
@@ -2389,11 +2395,12 @@ fn operation_header(
 
 fn operation_changes(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     changes: &OperationChanges,
     window: &mut Window,
     cx: &mut Cx,
 ) -> Div {
+    let Look { theme, .. } = look;
     let scroll = ui::scroll_handle("op-changes-scroll", window, cx);
     let mut list = div()
         .w_full()
@@ -2413,7 +2420,7 @@ fn operation_changes(
         if changes.commits_truncated {
             count.push_str(", more not listed");
         }
-        list = list.child(section_title("Changed revisions", count, ui, theme));
+        list = list.child(section_title("Changed revisions", count, look));
         // Up to 200 rows, about eight in view: build those near the view, and
         // hold the rest's place with spacers. Rows are one height, and the table
         // starts less than a box's height down, so a box's height either side
@@ -2444,7 +2451,7 @@ fn operation_changes(
         {
             rows.push(change_row(
                 ui,
-                theme,
+                look,
                 index,
                 change,
                 (index == 0, index == last),
@@ -2461,13 +2468,12 @@ fn operation_changes(
         list = list.child(section_title(
             "Moved refs",
             changes.refs.len().to_string(),
-            ui,
-            theme,
+            look,
         ));
         let rows = changes
             .refs
             .iter()
-            .map(|change| ref_row(ui, theme, change))
+            .map(|change| ref_row(ui, look, change))
             .collect();
         list = list.child(table(rows, theme));
     }
@@ -2486,8 +2492,8 @@ fn operation_changes(
         .child(ui::scrollable_with("op-changes", scroll.read(cx), list))
 }
 
-fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> Option<Div> {
-    let look = ui.look(theme);
+fn evolog_header(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Option<Div> {
+    let Look { theme, .. } = look;
     let history = &ui.active().history;
     let entry = history.evolog.get(history.selected_version?)?;
     let has_previous = !entry.predecessor_ids.is_empty();
@@ -2554,7 +2560,7 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
                 )),
         );
     }
-    let title_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
+    let title_font = emphasis_font(look.font, Weight::MEDIUM);
     Some(
         div()
             .w_full()
@@ -2572,8 +2578,15 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
                         ui,
                     ),
                     fill_on_line(
-                        summary_line(&entry.commit, text_size::BODY_LG, title_font, theme)
-                            .text_color(theme.text),
+                        summary_line(
+                            &entry.commit,
+                            text_size::BODY_LG,
+                            Look {
+                                font: title_font,
+                                ..look
+                            },
+                        )
+                        .text_color(theme.text),
                         title_font,
                         text_size::BODY_LG,
                     ),
@@ -2586,7 +2599,8 @@ fn evolog_header(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx
 }
 
 /// A message filling the diff's slot.
-fn diff_message(message: String, ui: &Diffui, theme: ThemeSpec) -> AnyElement {
+fn diff_message(message: String, look: Look) -> AnyElement {
+    let Look { theme, .. } = look;
     div()
         .w_full()
         .flex_1()
@@ -2594,18 +2608,13 @@ fn diff_message(message: String, ui: &Diffui, theme: ThemeSpec) -> AnyElement {
         .child(ui::empty_state(
             message,
             ui::Placement::Centered,
-            ui.config.ui_font,
+            look.font,
             theme.subtle_text,
         ))
         .into_any_element()
 }
 
-fn history_diff_view(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+fn history_diff_view(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let history = &ui.active().history;
     let Some(diff) = &history.diff else {
         let no_commits = history.kind == HistoryKind::OpLog
@@ -2618,7 +2627,7 @@ fn history_diff_view(
         } else {
             "Select a change to see its diff"
         };
-        return diff_message(message.to_owned(), ui, theme);
+        return diff_message(message.to_owned(), look);
     };
     if diff.document.files.is_empty() {
         let message = match description_change(history) {
@@ -2627,14 +2636,14 @@ fn history_diff_view(
             ),
             None => "No file changes".to_owned(),
         };
-        return diff_message(message, ui, theme);
+        return diff_message(message, look);
     }
-    history_diff(ui, theme, window, cx)
+    history_diff(ui, look, window, cx)
 }
 
 /// The selected change's diff.
-fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let look = ui.look(theme);
+fn history_diff(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let history = &ui.active().history;
     let Some(diff) = &history.diff else {
         return div().into_any_element();
@@ -2653,7 +2662,7 @@ fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
         history.diff_file,
         format!("history:{}", diff.doc_id),
         diff_palette(theme),
-        ui.config.mono_font,
+        look.mono,
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
@@ -2702,10 +2711,11 @@ fn history_diff(ui: &Diffui, theme: ThemeSpec, window: &mut Window, cx: &mut Cx)
 /// The History view's right pane.
 pub(crate) fn build_history_panel(
     ui: &Diffui,
-    theme: ThemeSpec,
+    look: Look,
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    let Look { theme, .. } = look;
     let history = &ui.active().history;
     let divider = || div().w_full().flex_none().h(px(1.0)).bg(theme.border);
     let mut body = div()
@@ -2724,10 +2734,10 @@ pub(crate) fn build_history_panel(
                     .op_changes
                     .as_ref()
                     .filter(|changes| changes.operation.id == op.id);
-                body = body.child(operation_header(ui, theme, op, changes, window, cx));
+                body = body.child(operation_header(ui, look, op, changes, window, cx));
                 match changes {
                     Some(changes) => {
-                        body = body.child(operation_changes(ui, theme, changes, window, cx));
+                        body = body.child(operation_changes(ui, look, changes, window, cx));
                     }
                     None if history.op_job.is_some() => {
                         body = body.child(note(
@@ -2739,7 +2749,7 @@ pub(crate) fn build_history_panel(
                     None => {}
                 }
                 body = body.child(divider());
-                body = body.child(history_diff_view(ui, theme, window, cx));
+                body = body.child(history_diff_view(ui, look, window, cx));
             }
             None => {
                 let message = if history.ops_job.is_some() {
@@ -2747,15 +2757,15 @@ pub(crate) fn build_history_panel(
                 } else {
                     "Select an operation"
                 };
-                body = body.child(diff_message(message.to_owned(), ui, theme));
+                body = body.child(diff_message(message.to_owned(), look));
             }
         },
         HistoryKind::Evolog { .. } => {
-            if let Some(header) = evolog_header(ui, theme, window, cx) {
+            if let Some(header) = evolog_header(ui, look, window, cx) {
                 body = body.child(header);
                 body = body.child(divider());
             }
-            body = body.child(history_diff_view(ui, theme, window, cx));
+            body = body.child(history_diff_view(ui, look, window, cx));
         }
     }
     body.into_any_element()
@@ -3180,7 +3190,7 @@ mod scenes {
         crate::revision_rows::scenes::show_list(&mut h);
         h.show(|ui, theme, window, cx| {
             let look = ui.look(theme);
-            let banner = file_filter_banner(ui, theme, window, cx);
+            let banner = file_filter_banner(ui, look, window, cx);
             let list = crate::revision_rows::build_revision_list(ui, look, window, cx);
             div()
                 .w(px(ui.sidebar_width))
