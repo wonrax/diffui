@@ -170,6 +170,7 @@ impl Diffui {
         }
         // The open-tab set is changing — re-persist the session.
         self.mark_geometry_dirty();
+        self.repo_layouts.remember(&self.tabs[index]);
 
         if !closing_active {
             self.tabs.remove(index);
@@ -259,13 +260,8 @@ impl Diffui {
                     vcs: repository.vcs,
                     root: repository.root.clone(),
                 };
-                self.push_tab(
-                    owner,
-                    name,
-                    source,
-                    TabState::unloaded(Some(repository), None),
-                    cx,
-                )
+                let state = self.repo_layouts.tab_state(repository);
+                self.push_tab(owner, name, source, state, cx)
             }
             Err(error) => {
                 let message = format!("{error:#}");
@@ -457,6 +453,7 @@ pub(crate) mod tests {
             next_tab_id: 0,
             next_document_id: 0,
             recent_repos: Vec::new(),
+            repo_layouts: Default::default(),
             next_activity_id: 0,
             hovered: None,
             panel_peek: None,
@@ -476,7 +473,7 @@ pub(crate) mod tests {
 
     /// A git repository at `root` — git so `TabState::unloaded` takes its
     /// no-I/O default-revset path instead of reading jj's config.
-    fn repository(root: &str) -> Repository {
+    pub(crate) fn repository(root: &str) -> Repository {
         Repository {
             root: PathBuf::from(root),
             vcs: Vcs::Git,

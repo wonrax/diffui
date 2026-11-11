@@ -91,6 +91,65 @@ pub struct WindowState {
     pub recent_repos: Vec<String>,
 }
 
+/// Each repository's filter and panel layout, kept for the ones that aren't
+/// open too, so one reopens the way it was closed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RepoLayouts {
+    pub(crate) revsets: BTreeMap<String, String>,
+    pub(crate) history_panel_collapsed: BTreeMap<String, bool>,
+    pub(crate) files_panel_collapsed: BTreeMap<String, bool>,
+}
+
+impl RepoLayouts {
+    pub(crate) fn from_saved(saved: &WindowState) -> Self {
+        Self {
+            revsets: saved.revsets.clone(),
+            history_panel_collapsed: saved.history_panel_collapsed.clone(),
+            files_panel_collapsed: saved.files_panel_collapsed.clone(),
+        }
+    }
+
+    /// A never-loaded tab for `repository`, laid out as it was last left.
+    pub(crate) fn tab_state(&self, repository: crate::Repository) -> crate::TabState {
+        let key = repository.root.to_string_lossy().into_owned();
+        let revset = self
+            .revsets
+            .get(&key)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let mut state = crate::TabState::unloaded(Some(repository), revset);
+        state.history_panel_collapsed = self.history_panel_collapsed.get(&key) == Some(&true);
+        state.files_panel_collapsed = self.files_panel_collapsed.get(&key) == Some(&true);
+        state
+    }
+
+    /// Record how `tab` is laid out now. PR tabs have no root to key it by.
+    pub(crate) fn remember(&mut self, tab: &crate::Tab) {
+        let Some(root) = tab.root() else {
+            return;
+        };
+        let key = root.to_string_lossy().into_owned();
+        let state = &tab.state;
+        if state.session.revset.is_empty() {
+            self.revsets.remove(&key);
+        } else {
+            self.revsets
+                .insert(key.clone(), state.session.revset.clone());
+        }
+        self.history_panel_collapsed
+            .insert(key.clone(), state.history_panel_collapsed);
+        self.files_panel_collapsed
+            .insert(key, state.files_panel_collapsed);
+    }
+
+    /// Forget the repositories `keep` doesn't name.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.revsets.retain(|root, _| keep(root));
+        self.history_panel_collapsed.retain(|root, _| keep(root));
+        self.files_panel_collapsed.retain(|root, _| keep(root));
+    }
+}
+
 impl WindowState {
     /// Load persisted state. A missing file or unparseable contents both yield
     /// `WindowState::default()` (everything `None`); the unparseable case is

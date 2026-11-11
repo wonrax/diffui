@@ -137,15 +137,7 @@ impl Diffui {
             })
             .unwrap_or(0);
 
-        // A repo's persisted revset (keyed by root); `None` starts it on the
-        // repo's own default, which `TabState::unloaded` reads once.
-        let revset_for = |repository: &Repository| -> Option<String> {
-            saved
-                .revsets
-                .get(&repository.root.to_string_lossy().into_owned())
-                .filter(|value| !value.is_empty())
-                .cloned()
-        };
+        let repo_layouts = crate::window_state::RepoLayouts::from_saved(&saved);
 
         let mut next_tab_id = 0u64;
         let mut tabs = Vec::with_capacity(targets.len());
@@ -157,19 +149,7 @@ impl Diffui {
                         vcs: repository.vcs,
                         root: repository.root.clone(),
                     };
-                    let key = repository.root.to_string_lossy().into_owned();
-                    let mut state =
-                        TabState::unloaded(Some(repository.clone()), revset_for(repository));
-                    state.history_panel_collapsed = saved
-                        .history_panel_collapsed
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(false);
-                    state.files_panel_collapsed = saved
-                        .files_panel_collapsed
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(false);
+                    let state = repo_layouts.tab_state(repository.clone());
                     (owner, name, source, state)
                 }
                 BootTarget::Pr(spec) => (
@@ -248,6 +228,7 @@ impl Diffui {
             next_tab_id,
             next_document_id: 0,
             recent_repos,
+            repo_layouts,
             next_activity_id: 0,
             hovered: None,
             panel_peek: None,
@@ -4366,6 +4347,18 @@ impl Diffui {
 
     /// Snapshot the current geometry + sidebar width into the persisted form.
     pub(crate) fn current_window_state(&self) -> WindowState {
+        let mut layouts = self.repo_layouts.clone();
+        for tab in &self.tabs {
+            layouts.remember(tab);
+        }
+        // Closed repositories are remembered as long as the recents offer them.
+        layouts.retain(|root| {
+            self.recent_repos.iter().any(|recent| recent == root)
+                || self.tabs.iter().any(|tab| {
+                    tab.root()
+                        .is_some_and(|open| open.to_string_lossy() == root)
+                })
+        });
         WindowState {
             width: Some(self.window_size.width),
             height: Some(self.window_size.height),
@@ -4388,46 +4381,11 @@ impl Diffui {
                 .tabs
                 .get(self.active)
                 .and_then(|tab| Some(tab.root()?.to_string_lossy().into_owned())),
-            revsets: self.collect_revsets(),
-            history_panel_collapsed: self
-                .collect_panel_collapse_state(|state| state.history_panel_collapsed),
-            files_panel_collapsed: self
-                .collect_panel_collapse_state(|state| state.files_panel_collapsed),
+            revsets: layouts.revsets,
+            history_panel_collapsed: layouts.history_panel_collapsed,
+            files_panel_collapsed: layouts.files_panel_collapsed,
             recent_repos: self.recent_repos.clone(),
         }
-    }
-
-    /// Gather each open tab's revset, keyed by repo root, dropping empties so
-    /// the persisted map stays tidy.
-    pub(crate) fn collect_revsets(&self) -> BTreeMap<String, String> {
-        let mut revsets = BTreeMap::new();
-        for tab in &self.tabs {
-            let Some(root) = tab.root() else {
-                continue;
-            };
-            if !tab.state.session.revset.is_empty() {
-                revsets.insert(
-                    root.to_string_lossy().into_owned(),
-                    tab.state.session.revset.clone(),
-                );
-            }
-        }
-        revsets
-    }
-
-    fn collect_panel_collapse_state(
-        &self,
-        collapsed: impl Fn(&TabState) -> bool,
-    ) -> BTreeMap<String, bool> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| {
-                Some((
-                    tab.root()?.to_string_lossy().into_owned(),
-                    collapsed(&tab.state),
-                ))
-            })
-            .collect()
     }
 
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
@@ -4551,6 +4509,36 @@ mod tests {
             });
             assert!(ui.active().files_panel_collapsed);
             assert_eq!(ui.file_nav_width, 280.0);
+        });
+    }
+
+    /// Closing a tab keeps its revset and panels for when it reopens from
+    /// the recents.
+    #[test]
+    fn a_closed_repository_keeps_its_layout() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            push_tab(&mut ui, "/tmp/second");
+            ui.recent_repos = vec!["/tmp/first".to_owned(), "/tmp/second".to_owned()];
+            let state = ui.tab_mut(first).unwrap();
+            state.session.revset = "mine()".to_owned();
+            state.files_panel_collapsed = true;
+
+            ui.close_tab(first, cx);
+            let saved = ui.current_window_state();
+
+            assert_eq!(saved.open_repos, vec!["/tmp/second".to_owned()]);
+            assert_eq!(
+                saved.revsets.get("/tmp/first").map(String::as_str),
+                Some("mine()")
+            );
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&true));
+            let reopened = ui
+                .repo_layouts
+                .tab_state(crate::tabs::tests::repository("/tmp/first"));
+            assert_eq!(reopened.session.revset, "mine()");
+            assert!(reopened.files_panel_collapsed);
         });
     }
 

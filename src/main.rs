@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -384,6 +384,8 @@ pub(crate) struct Diffui {
     /// Most-recently-opened repo roots (newest first), surfaced as quick-pick
     /// rows in the open dialog. Seeded from / persisted to `WindowState`.
     pub(crate) recent_repos: Vec<String>,
+    /// Each repository's revset and panel layout, open or not.
+    pub(crate) repo_layouts: window_state::RepoLayouts,
 
     // ── Toolbar / activity / revset ─────────────────────────────────────
     /// Monotonic source of `ActivityId`s across every tab.
