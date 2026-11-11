@@ -35,13 +35,13 @@ use crate::geometry::{Point, Rectangle, Size};
 use crate::measure;
 use crate::theme::{self, Color, ThemeSpec, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
-use crate::{Cx, Diffui, icons};
+use crate::{Cx, Diffui, icons, ui};
 
 // ── Card geometry ───────────────────────────────────────────────────────────
 const MENU_MIN_WIDTH: f32 = 200.0;
 const MENU_MAX_WIDTH: f32 = 460.0;
-const MENU_CARD_PAD: f32 = 4.0;
-const MENU_ITEM_PAD_X: f32 = 8.0;
+const MENU_CARD_PAD: f32 = theme::list::INSET_TIGHT;
+const MENU_ITEM_PAD_X: f32 = theme::list::PAD_X_TIGHT;
 /// Row text runs one step above the chrome default so menus read as content,
 /// not controls. Width measurement ([`card_width`]) keys off the same sizes.
 const MENU_LABEL_SIZE: f32 = text_size::BODY;
@@ -53,18 +53,13 @@ const MENU_TEXT_SLACK: f32 = 2.0;
 const MENU_ROW_GAP: f32 = 16.0;
 /// Fixed per-row heights — fixed so flyout positions (which key off a parent
 /// row's offset down its card) are exact rather than guessed.
-const MENU_ROW_HEIGHT: f32 = 28.0;
+const MENU_ROW_HEIGHT: f32 = theme::list::height::MENU;
 const MENU_SEP_HEIGHT: f32 = 9.0;
 /// Gap between a trigger's bottom edge and the menu it drops (toolbar carets).
 const MENU_ANCHOR_GAP: f32 = 4.0;
 /// How far a flyout tucks under its parent card's edge, AppKit-style, so the
 /// two read as one connected surface rather than two cards touching.
 const MENU_FLYOUT_OVERLAP: f32 = 4.0;
-/// Hover highlight rounding. Strict concentricity with the card's
-/// [`theme::radius::POPOVER`] would be `POPOVER - border - MENU_CARD_PAD`,
-/// but that small a radius reads sharper than the card's; a step up looks
-/// matched.
-const MENU_ROW_RADIUS: f32 = theme::radius::CONTROL;
 /// Radians/second for the right-click glow pulse (~1.2 s period).
 const GLOW_PULSE_SPEED: f32 = 5.0;
 
@@ -873,31 +868,25 @@ fn build_row(
     // is carried along: the opening gesture's own release is dropped by the update
     // side. No press listener: presses fall through to the card's capture so they
     // don't reach the dismiss backdrop.
-    div()
-        .id(ElementId::Name(SharedString::from(format!(
-            "menu-row-{}",
-            id.join("-")
-        ))))
-        .flex()
-        .items_center()
-        .w_full()
-        .h(px(MENU_ROW_HEIGHT))
-        .px(px(MENU_ITEM_PAD_X))
-        .cursor_pointer()
-        // Same solid selection fill the palette's rows use, so "the row you're on"
-        // looks identical across every list overlay.
-        .when(active, |row| {
-            theme::squircle(row, MENU_ROW_RADIUS, Some(theme.selected_file), None)
-        })
-        .child(inner)
-        .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, _| {
-            if *entered {
-                this.menu_on_hover(hover_path.clone());
-            }
-        }))
-        .on_mouse_up(MouseButton::Left, pick(path.clone(), MouseButton::Left, cx))
-        .on_mouse_up(MouseButton::Right, pick(path, MouseButton::Right, cx))
-        .into_any_element()
+    // The pointer moves the highlight, so the row has no hover of its own.
+    ui::list_row(
+        ui::ListRow::new(MENU_ROW_HEIGHT, MENU_ITEM_PAD_X).no_hover(),
+        active,
+        theme,
+    )
+    .id(ElementId::Name(SharedString::from(format!(
+        "menu-row-{}",
+        id.join("-")
+    ))))
+    .child(inner)
+    .on_hover(Diffui::listen(cx, move |this, entered: &bool, _, _| {
+        if *entered {
+            this.menu_on_hover(hover_path.clone());
+        }
+    }))
+    .on_mouse_up(MouseButton::Left, pick(path.clone(), MouseButton::Left, cx))
+    .on_mouse_up(MouseButton::Right, pick(path, MouseButton::Right, cx))
+    .into_any_element()
 }
 
 fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl IntoElement {
@@ -906,7 +895,7 @@ fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl Into
         .as_secs_f32();
     let pulse = 0.5 + 0.5 * (elapsed * GLOW_PULSE_SPEED).sin();
     let accent = theme.accent;
-    let radius = crate::revision_list::row_card_radius(rect.height);
+    let radius = crate::theme::list::radius(rect.height);
     div()
         .absolute()
         .left(px(rect.x))

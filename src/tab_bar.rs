@@ -90,14 +90,14 @@ const OPEN_BAND_X: f32 = OPEN_LIST_INSET + OPEN_ROW_PAD_X - (OPEN_KIND_SIDE - OP
 /// The status line's text edge.
 const OPEN_CONTENT_X: f32 = theme::space::XL;
 /// Inset of the list's hover washes inside the card.
-const OPEN_LIST_INSET: f32 = theme::space::SM;
+const OPEN_LIST_INSET: f32 = theme::list::INSET;
 /// A row's inset from its wash to its lead.
-const OPEN_ROW_PAD_X: f32 = 10.0;
+const OPEN_ROW_PAD_X: f32 = theme::list::PAD_X;
 const OPEN_KIND_SIDE: f32 = 30.0;
 const OPEN_STATUS_HEIGHT: f32 = 40.0;
 const OPEN_SECTION_PILL: f32 = 22.0;
 const OPEN_SECTION_PILL_PAD_X: f32 = theme::space::SM;
-const OPEN_ROW_HEIGHT: f32 = 36.0;
+const OPEN_ROW_HEIGHT: f32 = theme::list::height::DIALOG;
 /// Rows the card's list shows before it scrolls: as many as the folder
 /// suggestions can be, so typing a path and clearing it again keeps the card
 /// the same size once the recents fill it.
@@ -1243,7 +1243,7 @@ pub(crate) fn open_repo_card(
         (_, Some((query, rows))) => {
             Some(folder_section(ui, theme, dialog, query, rows, window, cx))
         }
-        _ if path.is_empty() => recents_section(ui, theme, dialog, cx),
+        _ if path.is_empty() => recents_section(ui, theme, dialog, window, cx),
         _ => None,
     };
     if let Some(list) = list {
@@ -1669,6 +1669,7 @@ fn recents_section(
     ui: &Diffui,
     theme: ThemeSpec,
     dialog: &crate::OpenRepoDialog,
+    window: &mut Window,
     cx: &mut Cx,
 ) -> Option<AnyElement> {
     let recents = ui.open_repo_recents();
@@ -1727,7 +1728,6 @@ fn recents_section(
             recent,
             index,
             dialog.selected == Some(index),
-            rows,
             cx,
         ));
     }
@@ -1737,22 +1737,65 @@ fn recents_section(
             .flex()
             .flex_col()
             .child(header)
-            .child(scrolling(list, rows, "open-repo-list"))
+            .child(scrolling(
+                list,
+                rows,
+                "open-repo-list",
+                dialog.selected,
+                window,
+                cx,
+            ))
             .into_any_element(),
     )
 }
 
-/// `list`, scrolling past [`OPEN_LIST_ROWS`] rows so the card keeps its size.
-fn scrolling(list: Div, rows: usize, id: &'static str) -> AnyElement {
-    if rows > OPEN_LIST_ROWS {
-        div()
-            .w_full()
-            .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT))
-            .child(ui::scrollable(id, list))
-            .into_any_element()
-    } else {
-        list.into_any_element()
+/// `list`, scrolling past [`OPEN_LIST_ROWS`] rows so the card keeps its size,
+/// and moved to the row the arrow keys land on. Scrolling, it reaches out
+/// through the dialog's list inset and takes it back inside, so the bar runs
+/// along the card's edge, clear of the rows' text.
+fn scrolling(
+    list: Div,
+    rows: usize,
+    id: &'static str,
+    selected: Option<usize>,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    if rows <= OPEN_LIST_ROWS {
+        return list.into_any_element();
     }
+    let handle = ui::scroll_handle(id, window, cx).read(cx).clone();
+    ui::reveal_on_change(
+        gpui_kit::ElementId::Name(format!("{id}-revealed").into()),
+        &handle,
+        selected,
+        |row| {
+            let top = row as f32 * OPEN_ROW_HEIGHT;
+            (top, top + OPEN_ROW_HEIGHT)
+        },
+        window,
+        cx,
+    );
+    let inset = theme::Padding {
+        top: 0.0,
+        right: OPEN_LIST_INSET,
+        bottom: OPEN_LIST_INSET,
+        left: OPEN_LIST_INSET,
+    };
+    div()
+        .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT + OPEN_LIST_INSET))
+        .mx(px(-OPEN_LIST_INSET))
+        .mb(px(-OPEN_LIST_INSET))
+        .child(ui::scroll_list(
+            id,
+            &handle,
+            ui::ScrollList {
+                inset,
+                ..Default::default()
+            },
+            list,
+        ))
+        .into_any_element()
 }
 
 /// The folders under the typed path: the folder as breadcrumbs (a segment
@@ -1851,53 +1894,19 @@ fn folder_section(
                 theme.subtle_text,
             ))
     };
-    let list = if shown > OPEN_LIST_ROWS {
-        let handle = ui::scroll_handle("open-repo-folders", window, cx)
-            .read(cx)
-            .clone();
-        reveal_selected_folder(dialog.selected, &handle, window, cx);
-        div()
-            .w_full()
-            .h(px(OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT))
-            .child(ui::scrollable_with("open-repo-folder-list", &handle, list))
-            .into_any_element()
-    } else {
-        list.into_any_element()
-    };
+    let list = scrolling(
+        list,
+        shown,
+        "open-repo-folder-list",
+        dialog.selected,
+        window,
+        cx,
+    );
     let mut section = div().w_full().flex().flex_col().child(header).child(list);
     if listing.is_some_and(|listing| listing.entries.is_empty()) {
         section = section.child(note("This folder has no subfolders.".to_owned()));
     }
     section.into_any_element()
-}
-
-/// Scrolls the folder list so a row the arrow keys moved to is in view. Only on
-/// a move: a list the wheel scrolled stays where the wheel left it.
-fn reveal_selected_folder(
-    selected: Option<usize>,
-    handle: &gpui_kit::ScrollHandle,
-    window: &mut Window,
-    cx: &mut Cx,
-) {
-    let last = window.use_keyed_state("open-repo-folders-revealed", cx, |_, _| None::<usize>);
-    if *last.read(cx) == selected {
-        return;
-    }
-    last.update(cx, |last, _| *last = selected);
-    let Some(selected) = selected else {
-        return;
-    };
-    let view = OPEN_LIST_ROWS as f32 * OPEN_ROW_HEIGHT;
-    let top = selected as f32 * OPEN_ROW_HEIGHT;
-    let scrolled = -f32::from(handle.offset().y);
-    let to = if top < scrolled {
-        top
-    } else if top + OPEN_ROW_HEIGHT > scrolled + view {
-        top + OPEN_ROW_HEIGHT - view
-    } else {
-        return;
-    };
-    handle.set_offset(gpui_kit::point(px(0.0), px(-to)));
 }
 
 /// A row's lead: the jj/git badge of a repository, or a folder.
@@ -1944,27 +1953,14 @@ fn list_row(
     selected: bool,
     theme: ThemeSpec,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .h(px(OPEN_ROW_HEIGHT))
-        .px(px(OPEN_ROW_PAD_X))
-        .gap(px(theme::space::MD))
-        .cursor_pointer()
-        .when(selected, |row| {
-            theme::squircle(row, radius::CONTROL, Some(theme.selected_file), None)
-        })
-        .when(!selected, |row| {
-            row.child(crate::squircle::hover_background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(radius::CONTROL))
-                    .background(theme::hover_wash(theme)),
-                0.0,
-            ))
-        })
-        .child(content)
+    ui::list_row(
+        ui::ListRow::new(OPEN_ROW_HEIGHT, OPEN_ROW_PAD_X),
+        selected,
+        theme,
+    )
+    .id(id)
+    .gap(px(theme::space::MD))
+    .child(content)
 }
 
 /// The "Open" chip of a repository a tab has open.
@@ -2090,7 +2086,6 @@ fn recent_repo_row(
     recent: &crate::path_browse::Recent,
     index: usize,
     selected: bool,
-    rows: usize,
     cx: &mut Cx,
 ) -> impl IntoElement {
     let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
@@ -2105,17 +2100,11 @@ fn recent_repo_row(
         .unwrap_or_default();
     let name_font = emphasis_font(font, Weight::MEDIUM);
     let name_width = measure::line_width(&name, text_size::BODY, name_font);
-    let gutter = if rows > OPEN_LIST_ROWS {
-        crate::scrollbar::GUTTER
-    } else {
-        0.0
-    };
     let end_width = if recent.open { 44.0 } else { 0.0 }
         + if selected { 100.0 } else { 0.0 }
         + OPEN_REMOVE_SIDE;
     let where_width = (OPEN_DIALOG_WIDTH
         - 2.0 * OPEN_LIST_INSET
-        - gutter
         - 2.0 * OPEN_ROW_PAD_X
         - OPEN_LEAD_BOX
         - OPEN_GLYPH_GAP
@@ -2127,11 +2116,14 @@ fn recent_repo_row(
         [
             row_lead(recent.vcs, theme, mono),
             Aligned::gap(OPEN_GLYPH_GAP),
+            // A name too long for the row gives up the path first, then
+            // ellipsises.
             Aligned::text(
-                typography::line(name, name_font, text_size::BODY, theme.text),
+                typography::line(name, name_font, text_size::BODY, theme.text).text_ellipsis(),
                 name_font,
                 text_size::BODY,
-            ),
+            )
+            .shrink(),
             Aligned::gap(theme::space::MD),
             // Middle-ellipsized: a path's ends (where it lives, what it's called)
             // say more than its middle.

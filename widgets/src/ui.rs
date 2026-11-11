@@ -366,6 +366,88 @@ pub const CLOSE_SIDE: f32 = 20.0;
 pub const BANNER_INSET: f32 = (theme::control::COMPACT - CLOSE_SIDE) / 2.0;
 const CLOSE_ICON_SIZE: f32 = 12.0;
 
+// ── Lists ───────────────────────────────────────────────────────────────
+
+/// A list row's shell: its height, its text inset from the wash, its corner,
+/// and whether it washes under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListRow {
+    /// `None`: the content's height, for rows that wrap.
+    pub height: Option<f32>,
+    pub pad_x: f32,
+    pub radius: f32,
+    /// Off where the pointer moves the selection itself (the palette), so a
+    /// hovered row and the selected one never show at once.
+    pub hover: bool,
+}
+
+impl ListRow {
+    /// A row `height` tall, rounded for its height, washing under the cursor.
+    pub const fn new(height: f32, pad_x: f32) -> Self {
+        Self {
+            height: Some(height),
+            pad_x,
+            radius: theme::list::radius(height),
+            hover: true,
+        }
+    }
+
+    /// A row as tall as its content, rounded by `radius`.
+    pub const fn fit(pad_x: f32, radius: f32) -> Self {
+        Self {
+            height: None,
+            pad_x,
+            radius,
+            hover: true,
+        }
+    }
+
+    pub const fn radius(self, radius: f32) -> Self {
+        Self { radius, ..self }
+    }
+
+    pub const fn no_hover(self) -> Self {
+        Self {
+            hover: false,
+            ..self
+        }
+    }
+}
+
+/// A list row: a fixed-height flex row with its content centred and inset,
+/// the selection's squircle when `selected`, and the hover's otherwise. Add
+/// the content with `.child`, and an id and handlers as the list needs.
+pub fn list_row(row: ListRow, selected: bool, theme: ThemeSpec) -> Div {
+    let shell = div()
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(row.pad_x))
+        .cursor_pointer();
+    let shell = match row.height {
+        Some(height) => shell.h(px(height)),
+        None => shell,
+    };
+    if selected {
+        theme::squircle(
+            shell,
+            row.radius,
+            Some(theme::list::row_selected(theme)),
+            None,
+        )
+    } else if row.hover {
+        shell.child(squircle::hover_background(
+            squircle::Fill::new(squircle::Corners::all(row.radius))
+                .background(theme::list::row_hover(theme)),
+            0.0,
+        ))
+    } else {
+        shell
+    }
+}
+
 // ── Modals ──────────────────────────────────────────────────────────────
 
 /// A card over the scrim, hung `top` px below the window's top edge. A press
@@ -421,19 +503,36 @@ pub fn scrollable_with(
     handle: &ScrollHandle,
     content: impl IntoElement,
 ) -> Stateful<Div> {
-    scrollable_inset(id, handle, content, 0.0)
+    scroll_list(id, handle, ScrollList::default(), content)
 }
 
-/// [`scrollable_with`] whose bar's track stops `bar_inset` short of the top
-/// and bottom: for a list filling a rounded card, so the bar keeps clear of
-/// the corners. The list scrolls over the whole height all the same.
-pub fn scrollable_inset(
+/// How a [`scroll_list`] sits in its box.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScrollList {
+    /// The rows' inset from the box, inside the scroll view: the rows scroll
+    /// through it, and the bar stays on the box's edge.
+    pub inset: theme::Padding,
+    /// How far the bar's track stops short of the top and bottom: for a list
+    /// filling a rounded card, so the bar keeps clear of the corners.
+    pub bar_inset: f32,
+    /// The ground a fade over the top takes once the rows have scrolled
+    /// under it.
+    pub fade: Option<Color>,
+}
+
+/// A list scrolling vertically in its box under kit's bar, on a handle the
+/// caller holds. The rows run under the bar; their text keeps
+/// [`crate::scrollbar::GUTTER`] clear on the right
+/// ([`theme::list::PAD_END`]), which a modal list's inset and row inset make
+/// up between them.
+pub fn scroll_list(
     id: impl Into<ElementId>,
     handle: &ScrollHandle,
-    content: impl IntoElement,
-    bar_inset: f32,
+    list: ScrollList,
+    rows: impl IntoElement,
 ) -> Stateful<Div> {
     let id = id.into();
+    let scrolled = f32::from(handle.offset().y) < 0.0;
     div()
         .id(id.clone())
         .relative()
@@ -449,18 +548,68 @@ pub fn scrollable_inset(
                 .flex_col()
                 .track_scroll(handle)
                 .overflow_y_scroll()
-                .child(div().w_full().flex_none().child(content)),
+                .child(list.inset.apply(div().w_full().flex_none().child(rows))),
         )
+        .children(list.fade.filter(|_| scrolled).map(|ground| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(theme::list::TOP_FADE))
+                .bg(gpui_kit::linear_gradient(
+                    180.0,
+                    gpui_kit::linear_color_stop(ground, 0.0),
+                    gpui_kit::linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
+                ))
+        }))
         // The bar fills the box it's mounted on: one inset from the ends.
         .child(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                .top(px(bar_inset))
-                .bottom(px(bar_inset))
+                .top(px(list.bar_inset))
+                .bottom(px(list.bar_inset))
                 .vertical_scrollbar(handle),
         )
+}
+
+/// Scrolls `handle` just enough to show row `selected`, whose top and bottom
+/// in the list's content `span` gives, when `selected` changes since the last
+/// frame. Between changes the wheel owns the offset. The viewport is the
+/// handle's own bounds, so nothing keeps its height by hand.
+pub fn reveal_on_change(
+    key: impl Into<ElementId>,
+    handle: &ScrollHandle,
+    selected: Option<usize>,
+    span: impl FnOnce(usize) -> (f32, f32),
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let last = window.use_keyed_state(key, cx, |_, _| None::<usize>);
+    if *last.read(cx) == selected {
+        return;
+    }
+    let viewport = f32::from(handle.bounds().size.height);
+    if selected.is_some() && viewport <= 0.0 {
+        // Not laid out yet: try again on the next frame.
+        return;
+    }
+    last.update(cx, |last, _| *last = selected);
+    let Some(row) = selected else {
+        return;
+    };
+    let (top, bottom) = span(row);
+    let scrolled = -f32::from(handle.offset().y);
+    let to = if top < scrolled {
+        top
+    } else if bottom > scrolled + viewport {
+        bottom - viewport
+    } else {
+        return;
+    };
+    handle.set_offset(point(px(0.0), px(-to.max(0.0))));
 }
 
 /// The scroll handle of list `id`, kept while the list is on screen.

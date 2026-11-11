@@ -36,13 +36,12 @@ use crate::diff_view::{AnnotationLabel, DiffProps, DocSource};
 use crate::ellipsis::{Line, Span};
 use crate::prose::Prose;
 use crate::revision_list::{
-    CAPTION_TEXT_SIZE, CONTENT_PADDING, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING,
-    REVISION_ROW_HEIGHT, ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_CARD_RADIUS, ROW_LINE_GAP,
-    SMALL_TEXT_SIZE,
+    CAPTION_TEXT_SIZE, FILE_ROW_HEIGHT, GUTTER_LEFT_PADDING, GUTTER_PADDING, REVISION_ROW_HEIGHT,
+    ROW_CARD_INSET_X, ROW_CARD_INSET_Y, ROW_LINE_GAP, SMALL_TEXT_SIZE,
 };
 use crate::theme::{
-    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, emphasis_font, radius, space,
-    text_size,
+    Color, Font, ThemeSpec, Weight, chip_background, diff_palette, emphasis_font, list, radius,
+    space, text_size,
 };
 use crate::typography::{self, Aligned};
 use crate::{Action, ConfirmDialog, Diffui, MainView, TabId, icons, meta_line, ui};
@@ -1296,27 +1295,10 @@ fn row_card(
     theme: ThemeSpec,
     cx: &mut Cx,
 ) -> Stateful<Div> {
-    let mut card = div()
+    ui::list_row(ui::ListRow::new(height, 0.0), selected, theme)
         .id(id)
-        .w_full()
-        .h(px(height))
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .cursor_pointer()
         .text_color(theme.text)
-        .on_click(Diffui::on_action(action, cx));
-    if selected {
-        card = crate::theme::squircle(card, ROW_CARD_RADIUS, Some(theme.selected_file), None);
-    } else {
-        card = card.child(crate::squircle::hover_background(
-            crate::squircle::Fill::new(crate::squircle::Corners::all(ROW_CARD_RADIUS))
-                .background(chip_background(theme.muted_text)),
-            0.0,
-        ));
-    }
-    card
+        .on_click(Diffui::on_action(action, cx))
 }
 
 /// A row card holding one or two lines of content at the graph's inset.
@@ -1337,7 +1319,7 @@ fn list_row(
         cx,
     )
     .pl(px(card_left()))
-    .pr(px(CONTENT_PADDING - ROW_CARD_INSET_X))
+    .pr(px(list::PAD_END - ROW_CARD_INSET_X))
 }
 
 /// The graph's two-line stack: a title, and a caption-size line of ids and
@@ -1728,7 +1710,7 @@ fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec)
         .pl(px(
             ROW_CONTENT_LEFT - if leading_button { glyph_inset } else { 0.0 }
         ))
-        .pr(px((CONTENT_PADDING - glyph_inset).max(0.0)))
+        .pr(px((list::PAD_END - glyph_inset).max(0.0)))
         .bg(theme.panel_background)
         .child(content)
 }
@@ -2286,7 +2268,7 @@ fn change_row(
     })];
     line.extend(commit_line(ui, theme, &change.commit, window, cx));
     line.push(caption_on_line(caption(verb, theme.subtle_text, ui), ui));
-    let inner = px(radius::MD - 1.0);
+    let inner = px(radius::inner(radius::CARD, crate::theme::HAIRLINE));
     let mut card = row_card(
         SharedString::from(format!("change-{index}")),
         CHANGE_ROW_HEIGHT,

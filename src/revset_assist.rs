@@ -12,8 +12,7 @@ use crate::{icons, ui};
 use gpui_kit::Window as GpuiWindow;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, HighlightStyle, MouseButton, MouseMoveEvent, ScrollHandle, StyledText,
-    UnderlineStyle, div, point, px,
+    AnyElement, HighlightStyle, MouseButton, MouseMoveEvent, StyledText, UnderlineStyle, div, px,
 };
 use std::ops::Range;
 use std::time::Duration;
@@ -32,14 +31,14 @@ const SETTLE: Duration = Duration::from_millis(300);
 const VISIBLE_ROWS: usize = 10;
 /// A completion row: tighter than the palette's, so a narrow sidebar's
 /// dropdown shows more of them.
-const ROW_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = theme::list::height::MENU;
 /// The list's inset from the card's edges.
-const RESULTS_INSET: f32 = theme::space::XS;
+const RESULTS_INSET: f32 = theme::list::INSET_TIGHT;
 /// A row's text inset from its wash.
-const ROW_PAD_X: f32 = theme::space::MD;
+const ROW_PAD_X: f32 = theme::list::PAD_X_TIGHT;
 /// The card's corner radius: a step under a popover's, for a dropdown
 /// hanging off a field.
-const CARD_RADIUS: f32 = theme::radius::MD;
+const CARD_RADIUS: f32 = theme::radius::CARD;
 /// How far the list's scrollbar stops short of the card's rounded top.
 const BAR_INSET: f32 = CARD_RADIUS / 2.0;
 
@@ -410,7 +409,22 @@ pub(crate) fn dropdown(
     let rows = field.completions.len().min(VISIBLE_ROWS);
     let height = rows as f32 * ROW_HEIGHT + 2.0 * RESULTS_INSET;
     let selected = field.navigated.then_some(field.selected);
-    let handle = dropdown_scroll(selected, height, window, cx);
+    let inset = [RESULTS_INSET, RESULTS_INSET];
+    let handle = ui::scroll_handle("revset-dropdown-scroll", window, cx)
+        .read(cx)
+        .clone();
+    // Only a row ↑/↓ landed on: a row the pointer picks is one it can see.
+    ui::reveal_on_change(
+        "revset-dropdown-revealed",
+        &handle,
+        selected,
+        |row| {
+            let top = row as f32 * ROW_HEIGHT;
+            (top, top + ROW_HEIGHT + 2.0 * RESULTS_INSET)
+        },
+        window,
+        cx,
+    );
     let items = crate::palette::visible_results(
         field
             .completions
@@ -446,29 +460,27 @@ pub(crate) fn dropdown(
                 .into_any_element()
         },
     );
-    let list = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .p(px(RESULTS_INSET))
-        .children(items);
+    let list = div().w_full().flex().flex_col().children(items);
     // The keys the field answers while the list is open, as the palette's
     // footer tells its own.
     let font = ui.config.ui_font;
-    let footer = crate::overlay_kit::footer_strip_rounded(theme, CARD_RADIUS - 1.0)
-        .child(crate::overlay_kit::key_hint(
-            &["\u{21e5}"],
-            "Complete",
-            font,
-            theme,
-        ))
-        .child(crate::overlay_kit::key_hint(
-            &["\u{21b5}"],
-            "Apply",
-            font,
-            theme,
-        ))
-        .child(crate::overlay_kit::key_hint(&["esc"], "Close", font, theme));
+    let footer = crate::overlay_kit::footer_strip_rounded(
+        theme,
+        theme::radius::inner(CARD_RADIUS, theme::HAIRLINE),
+    )
+    .child(crate::overlay_kit::key_hint(
+        &["\u{21e5}"],
+        "Complete",
+        font,
+        theme,
+    ))
+    .child(crate::overlay_kit::key_hint(
+        &["\u{21b5}"],
+        "Apply",
+        font,
+        theme,
+    ))
+    .child(crate::overlay_kit::key_hint(&["esc"], "Close", font, theme));
     Some(
         div()
             .w_full()
@@ -495,15 +507,19 @@ pub(crate) fn dropdown(
                 .overflow_hidden()
                 .occlude()
                 .child(if field.completions.len() > VISIBLE_ROWS {
-                    div().w_full().h(px(height)).child(ui::scrollable_inset(
+                    div().w_full().h(px(height)).child(ui::scroll_list(
                         DROPDOWN_ID,
                         &handle,
+                        ui::ScrollList {
+                            inset: inset.into(),
+                            bar_inset: BAR_INSET,
+                            fade: None,
+                        },
                         list,
-                        BAR_INSET,
                     ))
                 } else {
                     // All of it fits: nothing to scroll, and no bar.
-                    list
+                    div().w_full().p(px(RESULTS_INSET)).child(list)
                 })
                 .child(footer),
             )
@@ -511,62 +527,17 @@ pub(crate) fn dropdown(
     )
 }
 
-/// A completion row's box: its wash when highlighted.
+/// A completion row's box: its wash when highlighted, concentric with the
+/// card around it. ↑/↓ and the pointer's press pick a row, so no hover.
 fn row_shell(body: AnyElement, selected: bool, theme: ThemeSpec) -> gpui_kit::Div {
-    div()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .px(px(ROW_PAD_X))
-        // Concentric with the card around it.
-        .when(selected, |row| {
-            theme::squircle(
-                row,
-                CARD_RADIUS - RESULTS_INSET,
-                Some(theme.selected_file),
-                None,
-            )
-        })
-        .child(body)
-}
-
-/// The dropdown's handle, moved just enough to show the row ↑/↓ landed on. Only
-/// when that row changes: the wheel owns the offset otherwise, and a row the
-/// pointer picks is one it can already see.
-fn dropdown_scroll(
-    selected: Option<usize>,
-    viewport: f32,
-    window: &mut GpuiWindow,
-    cx: &mut Cx,
-) -> ScrollHandle {
-    struct Reveal(ScrollHandle, Option<usize>);
-    let entry = window.use_keyed_state("revset-dropdown-scroll", cx, |_, _| {
-        Reveal(ScrollHandle::default(), None)
-    });
-    let handle = entry.read(cx).0.clone();
-    if entry.read(cx).1 != selected {
-        entry.update(cx, |entry, _| entry.1 = selected);
-        if let Some(row) = selected {
-            let current = -f32::from(handle.offset().y);
-            let y = reveal_offset(row, current, viewport);
-            handle.set_offset(point(px(0.0), px(-y)));
-        }
-    }
-    handle
-}
-
-/// The list offset that shows `row`, moving from `current` as little as it can.
-fn reveal_offset(row: usize, current: f32, viewport: f32) -> f32 {
-    let top = RESULTS_INSET + row as f32 * ROW_HEIGHT;
-    let bottom = top + ROW_HEIGHT;
-    if top - RESULTS_INSET < current {
-        (top - RESULTS_INSET).max(0.0)
-    } else if bottom + RESULTS_INSET > current + viewport {
-        bottom + RESULTS_INSET - viewport
-    } else {
-        current
-    }
+    ui::list_row(
+        ui::ListRow::new(ROW_HEIGHT, ROW_PAD_X)
+            .radius(theme::radius::inner(CARD_RADIUS, RESULTS_INSET))
+            .no_hover(),
+        selected,
+        theme,
+    )
+    .child(body)
 }
 
 /// jj's error under the field: the message, the revset with the bad part

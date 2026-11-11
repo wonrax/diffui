@@ -970,7 +970,7 @@ fn activity_row(
         .when(error, |row| {
             theme::squircle(
                 row,
-                theme::radius::MD,
+                theme::radius::CARD,
                 Some(Color {
                     a: 0.07,
                     ..theme.removed_text
@@ -980,11 +980,8 @@ fn activity_row(
         })
         .when(!error, |row| {
             row.child(crate::squircle::hover_background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::MD))
-                    .background(Color {
-                        a: 0.045,
-                        ..theme.text
-                    }),
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::CARD))
+                    .background(theme::list::row_hover(theme)),
                 0.0,
             ))
         })

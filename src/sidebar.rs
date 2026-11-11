@@ -55,13 +55,8 @@ pub fn min_width(config: AppConfig) -> f32 {
         + chip_gap
         + conflict_w;
     let working_copy_row = label_w + id_gap + change_id_w + chip_gap + conflict_w;
-    revision_list::revision_gutter_width(1) + row.max(working_copy_row) + REVISION_CONTENT_RIGHT_PAD
+    revision_list::revision_gutter_width(1) + row.max(working_copy_row) + theme::list::PAD_END
 }
-
-/// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
-/// inside a revision row. Kept here so `min_width` can budget the row
-/// without exposing the constant through `revision_list`.
-const REVISION_CONTENT_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 
 const CAPTION_TEXT_SIZE: f32 = theme::text_size::CAPTION;
 pub(crate) const REVISION_ID_CHARS: usize = 8;
@@ -554,36 +549,33 @@ fn op_target_row(
         ));
     }
     if let Some(description) = description {
-        content.push(Aligned::text(
-            typography::line(description, ui_font, text_size::BODY, desc_color),
-            ui_font,
-            text_size::BODY,
-        ));
-    }
-    let hover = chip_background(theme.subtle_text);
-    let mut row = div()
-        .id(id)
-        .w_full()
-        .overflow_hidden()
-        .py(px(6.0))
-        .px(px(10.0))
-        .when(tone == RowTone::Armed, |row| {
-            theme::squircle(
-                row,
-                theme::radius::CONTROL,
-                Some(chip_background(theme.accent)),
-                None,
+        // A long description ellipsises rather than running off the strip.
+        content.push(
+            Aligned::text(
+                typography::line(description, ui_font, text_size::BODY, desc_color).text_ellipsis(),
+                ui_font,
+                text_size::BODY,
             )
-        })
-        .when(tone != RowTone::Armed, |row| {
-            row.child(crate::squircle::hover_background(
-                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::CONTROL))
-                    .background(hover),
-                0.0,
-            ))
-        })
-        .test_support()
-        .child(typography::baseline_row(content, 8.0));
+            .shrink(),
+        );
+    }
+    let shell = ui::ListRow::fit(theme::list::PAD_X, theme::radius::CONTROL);
+    let mut row = if tone == RowTone::Armed {
+        theme::squircle(
+            div().w_full().flex().items_center().px(px(shell.pad_x)),
+            shell.radius,
+            Some(chip_background(theme.accent)),
+            None,
+        )
+    } else {
+        ui::list_row(shell, false, theme)
+    }
+    .id(id)
+    .when(on_press.is_none(), |row| row.cursor_default())
+    .overflow_hidden()
+    .py(px(6.0))
+    .test_support()
+    .child(typography::baseline_row(content, 8.0).flex_1().min_w_0());
     if let Some(action) = on_press {
         row = row.on_click(Diffui::on_action(action, cx));
     }

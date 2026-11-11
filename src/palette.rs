@@ -71,12 +71,12 @@ const COLUMN_HEIGHT: f32 = 500.0;
 const COLUMN_HORIZONTAL_GAP: f32 = 16.0;
 /// Height of the input band at the card's top.
 pub(crate) const INPUT_BAND: f32 = 52.0;
-pub(crate) const ROW_HEIGHT: f32 = 34.0;
+pub(crate) const ROW_HEIGHT: f32 = theme::list::height::RESULT;
 pub(crate) use crate::overlay_kit::FOOTER_HEIGHT;
 /// Inset of the results list inside the card. A result row pads its content
 /// by [`ROW_PAD_X`], so row glyphs, the input's glyph and the group headings
 /// all start on the one [`CONTENT_X`] edge.
-pub(crate) const RESULTS_INSET: f32 = theme::space::SM;
+pub(crate) const RESULTS_INSET: f32 = theme::list::INSET;
 const ROW_PAD_X: f32 = CONTENT_X - RESULTS_INSET;
 pub(crate) const CONTENT_X: f32 = theme::space::XL;
 /// Fixed box for a row's leading glyph, so icon and `@` rows start their
@@ -1713,7 +1713,7 @@ pub(crate) fn empty_results(ui: &Diffui, theme: ThemeSpec, label: String) -> Div
 }
 
 /// A result row's cell: fixed height, the label inset on the content edge,
-/// washed when highlighted.
+/// washed when highlighted. The pointer moves the highlight, so no hover.
 pub(crate) fn row_shell(
     body: impl gpui_kit::IntoElement,
     selected: bool,
@@ -1721,17 +1721,13 @@ pub(crate) fn row_shell(
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .px(px(ROW_PAD_X))
-        .when(selected, |row| {
-            theme::squircle(row, theme::radius::CONTROL, Some(theme.selected_file), None)
-        })
-        .child(body)
-        .into_any_element()
+    ui::list_row(
+        ui::ListRow::new(ROW_HEIGHT, ROW_PAD_X).no_hover(),
+        selected,
+        theme,
+    )
+    .child(body)
+    .into_any_element()
 }
 
 /// The ink of a row's leading glyph: quiet, the accent on the highlighted row.

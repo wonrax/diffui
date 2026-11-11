@@ -508,6 +508,65 @@ pub mod radius {
     }
 }
 
+/// Lists: every row shell, scroll list and bespoke list (the revision list,
+/// the file trees, the diff) reads its geometry and washes from here.
+pub mod list {
+    use super::{Color, ThemeSpec, space};
+
+    /// A modal list's inset from its card (the palette, the open-repo dialog,
+    /// the activity popover).
+    pub const INSET: f32 = space::SM;
+    /// A dropdown's or a menu's list inset from its card.
+    pub const INSET_TIGHT: f32 = space::XS;
+    /// A row's text inset from its wash, in a modal list.
+    pub const PAD_X: f32 = space::MD_LG;
+    /// The same in a dropdown or a menu.
+    pub const PAD_X_TIGHT: f32 = space::MD;
+    /// A row's text inset from a list's right edge where the scrollbar runs
+    /// over the rows: the bar's footprint.
+    pub const PAD_END: f32 = crate::scrollbar::GUTTER;
+    /// How far the fade under a pane's header reaches into its list.
+    pub const TOP_FADE: f32 = 28.0;
+
+    /// Row heights in use: one step per kind of row.
+    pub mod height {
+        /// File tree rows.
+        pub const FILE: f32 = 26.0;
+        /// Menu rows, dropdown completions, op log snapshot runs.
+        pub const MENU: f32 = 28.0;
+        /// An operation's changed commits.
+        pub const CHANGE: f32 = 32.0;
+        /// Palette and command line results.
+        pub const RESULT: f32 = 34.0;
+        /// Open-repo recents and folders.
+        pub const DIALOG: f32 = 36.0;
+        /// Revisions and operations: two lines.
+        pub const REVISION: f32 = 46.0;
+    }
+
+    /// The corner of a row `height` tall: rounder rows for taller ones, never
+    /// a capsule.
+    pub const fn radius(height: f32) -> f32 {
+        if height < 28.0 {
+            super::radius::XS
+        } else if height <= 36.0 {
+            super::radius::SM
+        } else {
+            super::radius::MD
+        }
+    }
+
+    /// A row under the cursor.
+    pub fn row_hover(theme: ThemeSpec) -> Color {
+        super::hover_wash(theme)
+    }
+
+    /// The selected or highlighted row.
+    pub fn row_selected(theme: ThemeSpec) -> Color {
+        theme.selected_file
+    }
+}
+
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
 /// raised buttons' bezel stops from surface tokens without growing the spec,
 /// and the sidebar's target-mode wash.

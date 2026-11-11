@@ -48,8 +48,8 @@ use crate::typography::{self, TextBox};
 use crate::width_memo::WidthMemo;
 use gpui_kit::component::scroll::ScrollableElement as _;
 
-pub const REVISION_ROW_HEIGHT: f32 = 46.0;
-pub const FILE_ROW_HEIGHT: f32 = 26.0;
+pub const REVISION_ROW_HEIGHT: f32 = crate::theme::list::height::REVISION;
+pub const FILE_ROW_HEIGHT: f32 = crate::theme::list::height::FILE;
 /// Selection/hover chrome is an inset rounded card, not an edge-to-edge
 /// band: rows separate by whitespace, and the card gives the active row a
 /// modern object-like read. Y-inset keeps consecutive cards from fusing
@@ -58,21 +58,11 @@ pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// spacing between rows.
 pub const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
 pub const ROW_CARD_INSET_Y: f32 = 1.0;
-/// Corner radius of a row's card — and of the highlight a context menu puts
-/// over it, which must sit exactly on the card.
-pub const ROW_CARD_RADIUS: f32 = crate::theme::radius::CARD;
-/// The same for a file row's shorter card, which `ROW_CARD_RADIUS` would turn
-/// into a capsule.
-pub const FILE_ROW_CARD_RADIUS: f32 = crate::theme::radius::XS;
-
-/// The card radius for a row card `height` tall: file rows get the smaller one.
-pub fn row_card_radius(height: f32) -> f32 {
-    if height <= FILE_ROW_HEIGHT {
-        FILE_ROW_CARD_RADIUS
-    } else {
-        ROW_CARD_RADIUS
-    }
-}
+/// Corner radius of a revision row's card. A context menu's highlight over a
+/// row takes [`crate::theme::list::radius`] of the row's height, which is this.
+const ROW_CARD_RADIUS: f32 = crate::theme::list::radius(REVISION_ROW_HEIGHT);
+/// The same for a file row's shorter card.
+const FILE_ROW_CARD_RADIUS: f32 = crate::theme::list::radius(FILE_ROW_HEIGHT);
 /// Horizontal indent per tree depth level for file/directory rows.
 pub const FILE_TREE_INDENT: f32 = 14.0;
 /// [`FileRowLayout::Changes`]: the column a directory's chevron and a file's
@@ -99,9 +89,6 @@ const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
 
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
-/// Right inset of row content: the scrollbar's gutter, so text stays clear
-/// of the bar the row cards run under.
-pub const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
 pub const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
 pub const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Gap between a revision row's description and its id line.
@@ -119,9 +106,8 @@ const WORKING_COPY_PAD_X: f32 = chip::PAD_X;
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
 
 pub const FILE_ROW_GAP: f32 = 6.0;
-pub const FILE_ROW_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 const TOOLTIP_RADIUS: f32 = crate::theme::radius::POPOVER;
-// Wider horizontally than vertically: the SURFACE radius eats into the
+// Wider horizontally than vertically: the POPOVER radius eats into the
 // card's left/right ends, so the text needs extra x inset to read centered.
 const TOOLTIP_PADDING_X: f32 = 9.0;
 const TOOLTIP_PADDING_Y: f32 = 6.0;
@@ -147,9 +133,6 @@ const REVISION_LANES: LaneGeometry = LaneGeometry {
     first: FIRST_LANE_X,
     spacing: LANE_SPACING,
 };
-/// How far the fade under the header reaches into the list: see
-/// [`RevisionListProps::top_fade`].
-pub const TOP_FADE: f32 = 28.0;
 /// The working-copy pin shown while its row is scrolled away.
 const PIN_HEIGHT: f32 = 28.0;
 const PIN_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
@@ -825,14 +808,14 @@ impl RevisionListProps {
             return self.changes_row_columns(row_x, row_width, gutter_total, file);
         }
         let chip_col = self.style.file_badge_width;
-        let chip_left = row_x + row_width - CONTENT_PADDING - chip_col;
+        let chip_left = row_x + row_width - crate::theme::list::PAD_END - chip_col;
         let chip_gap = if chip_col > 0.0 { FILE_ROW_GAP } else { 0.0 };
         let minus_x = chip_left - chip_gap - file.deletions_width;
         let plus_x = minus_x - FILE_ROW_GAP - file.additions_width;
         let path_x =
             row_x + gutter_total + file.indent + FILE_CHEVRON_COL + FILE_ICON_COL + FILE_ROW_GAP;
         let path_right = if file.chevron.is_some() {
-            row_x + row_width - FILE_ROW_RIGHT_PAD
+            row_x + row_width - crate::theme::list::PAD_END
         } else {
             plus_x - FILE_ROW_GAP
         };
@@ -861,7 +844,7 @@ impl RevisionListProps {
         // No lanes run through this tree: the strip's own padding goes.
         let mark_x = row_x + (gutter_total - GUTTER_PADDING).max(0.0) + file.indent;
         let path_x = mark_x + CHANGES_MARK_COL + CHANGES_GAP;
-        let right = row_x + row_width - FILE_ROW_RIGHT_PAD;
+        let right = row_x + row_width - crate::theme::list::PAD_END;
         let (check_center, stats_right) = match file.check {
             Some(_) => (
                 Some(right - CHANGES_CHECK_COL / 2.0),
@@ -2081,7 +2064,7 @@ impl RevisionList {
             if let Some(ground) = self.props.top_fade.filter(|_| self.vertical_offset > 0.0) {
                 window.paint_quad(fill(
                     Rectangle {
-                        height: TOP_FADE.min(self.bounds.height),
+                        height: crate::theme::list::TOP_FADE.min(self.bounds.height),
                         ..self.bounds
                     }
                     .bounds(),
@@ -2240,7 +2223,7 @@ impl RevisionList {
         }
 
         let content_left = row.x + gutter_total;
-        let content_right_pad = CONTENT_PADDING;
+        let content_right_pad = crate::theme::list::PAD_END;
         let content_width = (row.width - gutter_total - content_right_pad).max(1.0);
 
         // Two-line stack: human-readable description first, identifiers and
@@ -3295,7 +3278,7 @@ fn paint_insertion_line(
         row.y + row.height - 1.0
     };
     let x = row.x + gutter_total.min(row.width);
-    let width = (row.x + row.width - CONTENT_PADDING - x).max(0.0);
+    let width = (row.x + row.width - crate::theme::list::PAD_END - x).max(0.0);
     fill_rounded(
         Rectangle {
             x,

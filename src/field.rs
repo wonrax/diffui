@@ -232,7 +232,7 @@ pub(crate) fn scroll_fade(offset: f64, ground: Color) -> Option<Div> {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(crate::revision_list::TOP_FADE))
+            .h(px(theme::list::TOP_FADE))
             .bg(gpui_kit::linear_gradient(
                 180.0,
                 gpui_kit::linear_color_stop(ground, 0.0),
