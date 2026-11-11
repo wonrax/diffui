@@ -111,7 +111,7 @@ pub(crate) fn revision_list_placeholder(
 /// that is what is already applied.
 pub(crate) fn reset_button(ui: &Diffui, theme: ThemeSpec, cx: &mut Cx) -> Option<AnyElement> {
     let tab = ui.active();
-    let default = tab.default_revset.clone();
+    let default = tab.default_revset().to_owned();
     if tab.repository.is_none() || tab.session.revset.trim() == default.trim() {
         return None;
     }

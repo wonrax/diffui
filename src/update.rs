@@ -3771,6 +3771,15 @@ impl Diffui {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
+        if target.default_revset.is_none() {
+            target.default_revset = Some(
+                target
+                    .repository
+                    .as_ref()
+                    .map(default_revset)
+                    .unwrap_or_default(),
+            );
+        }
         if matches!(target.session.status, LoadStatus::Loaded) {
             return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
         }
@@ -4351,8 +4360,8 @@ impl Diffui {
         let tab = self.active();
         let presets = revset_presets(tab.repository.as_ref().map(|r| r.vcs));
         let mut entries = Vec::with_capacity(presets.len() + 1);
-        if !tab.default_revset.is_empty() {
-            entries.push(("Default".to_owned(), tab.default_revset.clone()));
+        if !tab.default_revset().is_empty() {
+            entries.push(("Default".to_owned(), tab.default_revset().to_owned()));
         }
         entries.extend(presets);
         entries

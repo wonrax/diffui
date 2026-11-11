@@ -1026,7 +1026,7 @@ impl Diffui {
                 }
             }
             ResolvedView::Log(revset) => {
-                let revset = revset.unwrap_or_else(|| self.active().default_revset.clone());
+                let revset = revset.unwrap_or_else(|| self.active().default_revset().to_owned());
                 self.perform(Action::SetRevset(revset), cx)
             }
             ResolvedView::Evolog(revision) => self.perform(

@@ -684,9 +684,11 @@ pub(crate) struct TabState {
     pub(crate) queued_mutations: VecDeque<PendingMutation>,
     /// This repo's default revset (its `revsets.log`, or jj's default) — what
     /// the "Default" preset in the revset menu applies. Read from jj's config
-    /// on disk once, when the tab is created, so neither a render nor a tab
-    /// switch does config-file I/O on the UI thread.
-    pub(crate) default_revset: String,
+    /// on disk once: when the tab is created without a revset of its own, else
+    /// on its first load, so a restored session doesn't read every tab's
+    /// config before the window opens and neither a render nor a tab switch
+    /// does config-file I/O. `None` until then.
+    pub(crate) default_revset: Option<String>,
     /// Per-tab pane visibility so a focused review layout survives tab hops.
     pub(crate) history_panel_collapsed: bool,
     pub(crate) files_panel_collapsed: bool,
@@ -774,8 +776,13 @@ impl TabState {
     /// becomes the active tab (`status != Loaded`). `revset` is the persisted
     /// filter for this repo, or `None` to start on its default.
     fn unloaded(repository: Option<Repository>, revset: Option<String>) -> Self {
-        let default_revset = repository.as_ref().map(default_revset).unwrap_or_default();
-        let revset = revset.unwrap_or_else(|| default_revset.clone());
+        let (revset, default_revset) = match revset {
+            Some(revset) => (revset, None),
+            None => {
+                let default = repository.as_ref().map(default_revset).unwrap_or_default();
+                (default.clone(), Some(default))
+            }
+        };
         Self {
             session: Session::unloaded(revset),
             repository,
@@ -827,6 +834,11 @@ impl TabState {
             session: Session::empty(),
             ..Self::unloaded(None, Some(String::new()))
         }
+    }
+
+    /// [`Self::default_revset`], or nothing before the tab first loads.
+    pub(crate) fn default_revset(&self) -> &str {
+        self.default_revset.as_deref().unwrap_or_default()
     }
 
     /// Finish the activity wrapping this tab's in-flight graph (re)load, if one

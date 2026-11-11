@@ -768,7 +768,7 @@ mod scenes {
         h.act(|ui, _| {
             let state = ui.active_mut();
             state.session.revset = "nope()".to_owned();
-            state.default_revset = "all()".to_owned();
+            state.default_revset = Some("all()".to_owned());
         });
         h.perform(Action::SetTheme(ThemePreference::Dark));
         h.show(|ui, theme, window, cx| {
