@@ -461,6 +461,21 @@ fn height_index_rebuilds_on_shape_or_width_change() {
 }
 
 #[test]
+fn height_index_rebuilds_when_the_type_changes() {
+    let hunks = test_hunks();
+    let mut props = test_props(hunks.len());
+    let cells = TestCaches::default();
+    view_of(&props, &hunks).ensure_height_index(&cells.index, &cells.geometry, 400.0);
+    let total = cells.index.borrow().total_height;
+
+    // Taller rows over the same document: every row moves, though nothing in
+    // the document or the pane did.
+    props.typography.line_height *= 1.5;
+    view_of(&props, &hunks).ensure_height_index(&cells.index, &cells.geometry, 400.0);
+    assert!(cells.index.borrow().total_height > total);
+}
+
+#[test]
 fn header_spacer_reserves_variable_height_and_maps_following_rows() {
     let hunks = test_hunks();
     let props = test_props(hunks.len()).with_header(vec![

@@ -144,6 +144,29 @@ pub(super) struct LayoutMetrics {
 }
 
 impl LayoutMetrics {
+    /// Every metric as one hash, for a cache that has to rebuild when the
+    /// type changes under it (the settings dialog's font or size).
+    fn key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for metric in [
+            self.row_height,
+            self.text_y_pad,
+            self.file_header_height,
+            self.hunk_header_height,
+            self.note_height,
+            self.prefix_width,
+            self.top_inset,
+            self.gutter_width,
+            self.number_column,
+            self.char_width,
+        ] {
+            metric.to_bits().hash(&mut hasher);
+        }
+        self.gutter_digit_count.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(super) fn new(
         typography: CodeTypography,
         gutter_digit_count: usize,
@@ -224,7 +247,7 @@ fn char_advance(font: Font, size: f32) -> f32 {
 }
 
 /// The shape of [`HeightIndex::key`].
-pub(super) type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>, u64);
+pub(super) type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>, u64, u64);
 
 /// `pair_lines` sentinel: this side of the row has no line (padding).
 pub(super) const NO_LINE: u32 = u32::MAX;
@@ -244,12 +267,13 @@ pub(super) const WIDTH_AGNOSTIC: u32 = u32::MAX;
 #[derive(Debug, Default)]
 pub(super) struct HeightIndex {
     /// Rebuild key: `(layout_version, files.len(), header height bits, wrap width
-    /// bits, wrap, side_by_side, media key, file strips key)`. The file/header
+    /// bits, wrap, side_by_side, media key, file strips key, metrics key)`. The file/header
     /// counts are part of the key because streaming PR loads *append* files (and
     /// the header appears when `gh pr view` lands) without replacing the document.
     /// Keyed on the layout id, NOT the paint `content_version`: highlight merges
     /// bump the latter to re-shape paint without moving anything. The wrap and
-    /// side-by-side flags are in the key because toggling either moves every row.
+    /// side-by-side flags are in the key because toggling either moves every row,
+    /// and the metrics because a new font or size moves every row too.
     ///
     /// The width component is [`WIDTH_AGNOSTIC`] with wrapping off: every row is
     /// then exactly one line tall no matter how wide the pane is, so a sidebar
@@ -1360,6 +1384,7 @@ impl<'a> View<'a> {
             props.side_by_side,
             props.media_key,
             self.file_strips_key(),
+            self.metrics.key(),
         ));
         if cell.borrow().key == key {
             return;
