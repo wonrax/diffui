@@ -476,13 +476,13 @@ fn hinted_row(
             .flex_col()
             .flex_1()
             .min_w_0()
-            .gap(px(theme::space::XS))
+            .gap(px(theme::space::XXS))
             .child(label)
             .child(
                 div()
                     .font(font.gpui())
                     .text_size(px(text_size::CAPTION))
-                    .text_color(theme.muted_text)
+                    .text_color(theme.subtle_text)
                     .child(hint),
             ),
         None => label,
