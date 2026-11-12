@@ -27,6 +27,8 @@ use crate::{Action, Cx, Diffui, icons, menu};
 
 const CARD_WIDTH: f32 = 560.0;
 const ROW_HEIGHT: f32 = 44.0;
+/// A row with a line of explanation under its name, wrapped to two lines.
+const HINT_ROW_HEIGHT: f32 = 64.0;
 /// A row's inset inside its group's card, and its divider's.
 const ROW_INSET: f32 = theme::space::LG;
 /// Between one group's card and the next group's heading.
@@ -240,11 +242,12 @@ pub(crate) fn build_overlay(
     ];
 
     let code = config.code_type;
-    let number_row = |name, number: Numeric, cx: &mut Cx| {
+    let number_row = |name, hint, number: Numeric, cx: &mut Cx| {
         let key = number.key;
-        row(
+        hinted_row(
             look,
             name,
+            hint,
             locked(key),
             stepper(look, number, locked(key), cx),
         )
@@ -252,6 +255,7 @@ pub(crate) fn build_overlay(
     let code_rows = vec![
         number_row(
             "Size",
+            None,
             Numeric {
                 key: Key::CodeFontSize,
                 shown: format!("{} px", code.size),
@@ -264,6 +268,7 @@ pub(crate) fn build_overlay(
         ),
         number_row(
             "Line height",
+            None,
             Numeric {
                 key: Key::CodeLineHeight,
                 shown: format!("{:.2}", code.line_height),
@@ -276,6 +281,7 @@ pub(crate) fn build_overlay(
         ),
         number_row(
             "Baseline offset",
+            Some("Moves code text up or down within its line, for fonts that sit too high or low."),
             Numeric {
                 key: Key::CodeBaselineOffset,
                 shown: match code.baseline_offset {
@@ -321,9 +327,19 @@ pub(crate) fn build_overlay(
             .on_click(Diffui::on_action(Action::SetRefreshMode(mode), cx))
         }));
     let behaviour = vec![
-        row(look, "Refresh", locked(Key::Refresh), refresh_control),
+        hinted_row(
+            look,
+            "Refresh",
+            Some(
+                "Automatic snapshots your edits and updates a stale working copy as it happens. \
+                 Manual leaves both to the Refresh button.",
+            ),
+            locked(Key::Refresh),
+            refresh_control,
+        ),
         number_row(
             "Double-click speed",
+            None,
             Numeric {
                 key: Key::MultiClickMs,
                 shown: format!("{} ms", config.multi_click_ms),
@@ -342,6 +358,8 @@ pub(crate) fn build_overlay(
         ("Behaviour", behaviour),
     ];
     let rows: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+    // Refresh and Baseline offset carry a line of explanation.
+    let hinted_rows = 2.0;
     for (index, (title, rows)) in groups.into_iter().enumerate() {
         body = body.child(group(look, title, index > 0, rows));
     }
@@ -352,6 +370,7 @@ pub(crate) fn build_overlay(
         + 3.0 * (overlay_kit::GROUP_HEIGHT + 2.0 * theme::HAIRLINE)
         + 2.0 * GROUP_GAP
         + rows as f32 * (ROW_HEIGHT + theme::HAIRLINE)
+        + hinted_rows * (HINT_ROW_HEIGHT - ROW_HEIGHT)
         + errors as f32 * BANNER_HEIGHT;
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
         .min(content)
@@ -415,6 +434,18 @@ fn group(look: Look, title: &'static str, after: bool, rows: Vec<AnyElement>) ->
 /// One setting: its name, a lock when `config.toml` sets it, and its control
 /// at the end.
 fn row(look: Look, name: &'static str, locked: bool, control: impl IntoElement) -> AnyElement {
+    hinted_row(look, name, None, locked, control)
+}
+
+/// [`row`], with `hint` wrapped under the name when the name alone doesn't
+/// say what the setting does.
+fn hinted_row(
+    look: Look,
+    name: &'static str,
+    hint: Option<&'static str>,
+    locked: bool,
+    control: impl IntoElement,
+) -> AnyElement {
     let Look { theme, font, .. } = look;
     let mut label = div()
         .flex()
@@ -439,12 +470,33 @@ fn row(look: Look, name: &'static str, locked: bool, control: impl IntoElement) 
                 )),
         );
     }
+    let label = match hint {
+        Some(hint) => div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(theme::space::XS))
+            .child(label)
+            .child(
+                div()
+                    .font(font.gpui())
+                    .text_size(px(text_size::CAPTION))
+                    .text_color(theme.muted_text)
+                    .child(hint),
+            ),
+        None => label,
+    };
     div()
         .flex()
         .flex_row()
         .items_center()
         .w_full()
-        .h(px(ROW_HEIGHT))
+        .h(px(if hint.is_some() {
+            HINT_ROW_HEIGHT
+        } else {
+            ROW_HEIGHT
+        }))
         .px(px(ROW_INSET))
         .gap(px(theme::space::XL))
         .child(label)
