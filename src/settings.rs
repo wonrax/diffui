@@ -8,11 +8,13 @@
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, MouseButton, MouseDownEvent, Window, div, px};
 
+use std::path::Path;
+
 use diffui_core::RefreshMode;
 
 use crate::commands::{CommandArg, Context};
 use crate::config::{
-    CODE_BASELINE_OFFSET, CODE_FONT_SIZE, CODE_LINE_HEIGHT, Key, Setting, display_path,
+    CODE_BASELINE_OFFSET, CODE_FONT_SIZE, CODE_LINE_HEIGHT, ConfigFile, Key, Setting,
 };
 use crate::geometry::Rectangle;
 use crate::modes::{Mode, ModeKind};
@@ -20,12 +22,26 @@ use crate::overlay_kit::{self, DIALOG_PAD};
 use crate::prose::Prose;
 use crate::theme::{self, Font, ThemePreference, text_size};
 use crate::typography;
-use crate::ui::{self, Look, Segment, Segmented};
+use crate::ui::{self, Look, Segment, Segmented, Tip as _};
 use crate::{Action, Cx, Diffui, icons, menu};
 
-const CARD_WIDTH: f32 = 600.0;
-const CARD_MAX_HEIGHT: f32 = 740.0;
+const CARD_WIDTH: f32 = 560.0;
 const ROW_HEIGHT: f32 = 44.0;
+/// A row's inset inside its group's card, and its divider's.
+const ROW_INSET: f32 = theme::space::LG;
+/// Between one group's card and the next group's heading.
+const GROUP_GAP: f32 = theme::space::XL;
+/// The dialog's title, footer and insets around the groups.
+const DIALOG_HEAD: f32 = 146.0;
+/// Room a parse error's banner takes: a line, a wrapped error, its gap.
+const BANNER_HEIGHT: f32 = 88.0;
+/// A pop-up button's label is cut with an ellipsis past this.
+const SELECT_TEXT_MAX: f32 = 180.0;
+const REVEAL_TIP: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else {
+    "Show in folder"
+};
 /// The double-click window the dialog steps through, ms. Loading doesn't
 /// clamp it; the dialog keeps to what a hand can tell apart.
 const MULTI_CLICK_MS: std::ops::RangeInclusive<f32> = 150.0..=1000.0;
@@ -120,30 +136,27 @@ impl Diffui {
         }
     }
 
-    /// Show `config.toml` in the file manager, or the nearest folder it
-    /// would be in when it doesn't exist. Creates nothing.
-    pub(crate) fn reveal_config_file(&self) {
-        let Some(path) = self.config_files.config_path.as_deref() else {
-            tracing::warn!("no config file location: HOME is not set");
-            return;
-        };
-        let Some(folder) = path.ancestors().skip(1).find(|dir| dir.is_dir()) else {
+    /// Show `file` in the file manager. Creates nothing: a file that
+    /// isn't there isn't shown.
+    pub(crate) fn reveal_config_file(&self, file: ConfigFile) {
+        let Some(path) = self.config_files.path(file).filter(|path| path.exists()) else {
             return;
         };
         let mut command = if cfg!(target_os = "macos") {
-            std::process::Command::new("open")
-        } else if cfg!(windows) {
-            std::process::Command::new("explorer")
+            let mut open = std::process::Command::new("open");
+            open.arg("-R").arg(path);
+            open
         } else {
-            std::process::Command::new("xdg-open")
+            let mut open = std::process::Command::new(if cfg!(windows) {
+                "explorer"
+            } else {
+                "xdg-open"
+            });
+            open.arg(path.parent().unwrap_or(path));
+            open
         };
-        if cfg!(target_os = "macos") && path.exists() {
-            command.arg("-R").arg(path);
-        } else {
-            command.arg(folder);
-        }
         if let Err(error) = command.spawn() {
-            tracing::warn!(%error, path = %path.display(), "failed to reveal the config file");
+            tracing::warn!(%error, path = %path.display(), "failed to reveal a config file");
         }
     }
 }
@@ -183,24 +196,22 @@ pub(crate) fn build_overlay(
     // The list scrolls out to the card's right edge, so the bar sits where
     // every other scroll view's does; the inset moves inside.
     let mut body = div().flex().flex_col().w_full().pr(px(DIALOG_PAD));
-    for (file, error) in [
-        ("config.toml", &ui.config_files.config_error),
-        ("settings.toml", &ui.config_files.settings_error),
-    ] {
-        if let Some(error) = error {
+    let mut errors = 0;
+    for file in [ConfigFile::Config, ConfigFile::Settings] {
+        if let Some(error) = ui.config_files.error(file) {
+            errors += 1;
             body = body.child(
-                div().pb(px(theme::space::MD)).child(overlay_kit::callout(
+                div().pb(px(theme::space::LG)).child(overlay_kit::callout(
                     &Prose::new()
-                        .path(file)
-                        .text(" didn't parse, so none of it applies"),
-                    Some(&Prose::new().path(error.clone())),
+                        .path(file.name())
+                        .text(" has an error and isn't used"),
+                    Some(&Prose::new().path(error)),
                     look,
                 )),
             );
         }
     }
 
-    // ── Appearance ──────────────────────────────────────────────────────
     let themes = [
         (ThemePreference::System, "System"),
         (ThemePreference::Light, "Light"),
@@ -222,163 +233,142 @@ pub(crate) fn build_overlay(
         )
         .on_click(Diffui::on_action(Action::SetTheme(choice), cx))
     }));
-    body = body
-        .child(overlay_kit::group_heading("Appearance", look))
-        .child(row(
-            look,
-            Key::Theme,
-            None,
-            locked(Key::Theme),
-            theme_control,
-        ));
-
-    // ── Repository ──────────────────────────────────────────────────────
-    let modes = [
-        (RefreshMode::Auto, "Automatic"),
-        (RefreshMode::Manual, "Manual"),
+    let appearance = vec![
+        row(look, "Theme", locked(Key::Theme), theme_control),
+        font_row(ui, look, "UI font", Key::UiFont, config.ui_font, cx),
+        font_row(ui, look, "Code font", Key::MonoFont, config.mono_font, cx),
     ];
-    let refresh_control = ui::segmented(theme).children(modes.into_iter().map(|(mode, label)| {
-        ui::segment(
-            ("settings-refresh", mode as usize),
-            Segment {
-                icon: None,
-                label: label.into(),
-                count: None,
-                active: config.refresh == mode,
-                enabled: !locked(Key::Refresh),
-            },
-            Segmented::Compact,
-            look,
-        )
-        .on_click(Diffui::on_action(Action::SetRefreshMode(mode), cx))
-    }));
-    let refresh_note = match config.refresh {
-        RefreshMode::Auto => "Snapshots edits and updates a stale working copy on its own",
-        RefreshMode::Manual => "Leaves snapshots and stale updates to the Refresh button",
-    };
-    body = body.child(heading("Repository", look)).child(row(
-        look,
-        Key::Refresh,
-        Some(Prose::from(refresh_note)),
-        locked(Key::Refresh),
-        refresh_control,
-    ));
 
-    // ── Text ────────────────────────────────────────────────────────────
-    body = body
-        .child(heading("Text", look))
-        .child(font_row(ui, look, Key::UiFont, config.ui_font, cx))
-        .child(font_row(ui, look, Key::MonoFont, config.mono_font, cx));
     let code = config.code_type;
-    let numbers = [
-        Numeric {
-            key: Key::CodeFontSize,
-            shown: format!("{} px", code.size),
-            value: code.size,
-            step: 1.0,
-            range: CODE_FONT_SIZE,
-            setting: Setting::CodeFontSize,
-        },
-        Numeric {
-            key: Key::CodeLineHeight,
-            shown: format!("{:.2}", code.line_height),
-            value: code.line_height,
-            step: 0.05,
-            range: CODE_LINE_HEIGHT,
-            setting: Setting::CodeLineHeight,
-        },
-        Numeric {
-            key: Key::CodeBaselineOffset,
-            shown: match code.baseline_offset {
-                offset if offset > 0.0 => format!("+{offset} px"),
-                offset => format!("{offset} px"),
-            },
-            value: code.baseline_offset,
-            step: 0.5,
-            range: CODE_BASELINE_OFFSET,
-            setting: Setting::CodeBaselineOffset,
-        },
-        Numeric {
-            key: Key::MultiClickMs,
-            shown: format!("{} ms", config.multi_click_ms),
-            value: config.multi_click_ms as f32,
-            step: 50.0,
-            range: MULTI_CLICK_MS,
-            setting: |ms| Setting::MultiClickMs(ms as u64),
-        },
-    ];
-    for number in numbers {
+    let number_row = |name, number: Numeric, cx: &mut Cx| {
         let key = number.key;
-        let note = (key == Key::MultiClickMs)
-            .then(|| Prose::from("Longest pause between the clicks of a double click in code"));
-        body = body.child(row(
+        row(
             look,
-            key,
-            note,
+            name,
             locked(key),
             stepper(look, number, locked(key), cx),
-        ));
-    }
-
-    // ── Files ───────────────────────────────────────────────────────────
-    body = body.child(heading("Files", look));
-    for (label, path) in [
-        ("Yours", &ui.config_files.config_path),
-        ("Saved here", &ui.config_files.settings_path),
-    ] {
-        let path = path
-            .as_deref()
-            .map_or_else(|| "unknown".to_owned(), display_path);
-        body = body.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .h(px(28.0))
-                .gap(px(theme::space::XL))
-                .child(div().w(px(96.0)).flex_none().child(typography::line(
-                    label,
-                    look.font,
-                    text_size::BODY,
-                    theme.muted_text,
-                )))
-                .child(
-                    Prose::new()
-                        .path(path)
-                        .line(look, theme.text, text_size::BODY)
-                        .view(),
-                ),
-        );
-    }
-
-    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
-        .clamp(240.0, CARD_MAX_HEIGHT);
-    let reveal_label = if cfg!(target_os = "macos") {
-        "Reveal config.toml in Finder"
-    } else {
-        "Reveal config.toml"
+        )
     };
-    let reveal = look
-        .button("settings-reveal-config", reveal_label)
-        .on_click(Diffui::on_action(Action::RevealConfigFile, cx));
+    let code_rows = vec![
+        number_row(
+            "Size",
+            Numeric {
+                key: Key::CodeFontSize,
+                shown: format!("{} px", code.size),
+                value: code.size,
+                step: 1.0,
+                range: CODE_FONT_SIZE,
+                setting: Setting::CodeFontSize,
+            },
+            cx,
+        ),
+        number_row(
+            "Line height",
+            Numeric {
+                key: Key::CodeLineHeight,
+                shown: format!("{:.2}", code.line_height),
+                value: code.line_height,
+                step: 0.05,
+                range: CODE_LINE_HEIGHT,
+                setting: Setting::CodeLineHeight,
+            },
+            cx,
+        ),
+        number_row(
+            "Baseline offset",
+            Numeric {
+                key: Key::CodeBaselineOffset,
+                shown: match code.baseline_offset {
+                    offset if offset > 0.0 => format!("+{offset} px"),
+                    offset => format!("{offset} px"),
+                },
+                value: code.baseline_offset,
+                step: 0.5,
+                range: CODE_BASELINE_OFFSET,
+                setting: Setting::CodeBaselineOffset,
+            },
+            cx,
+        ),
+    ];
+
+    let modes = [
+        (
+            RefreshMode::Auto,
+            "Automatic",
+            "Picks up edits and stale checkouts by itself",
+        ),
+        (
+            RefreshMode::Manual,
+            "Manual",
+            "Waits for you to press Refresh",
+        ),
+    ];
+    let refresh_control =
+        ui::segmented(theme).children(modes.into_iter().map(|(mode, label, tip)| {
+            ui::segment(
+                ("settings-refresh", mode as usize),
+                Segment {
+                    icon: None,
+                    label: label.into(),
+                    count: None,
+                    active: config.refresh == mode,
+                    enabled: !locked(Key::Refresh),
+                },
+                Segmented::Compact,
+                look,
+            )
+            .tip(tip)
+            .on_click(Diffui::on_action(Action::SetRefreshMode(mode), cx))
+        }));
+    let behaviour = vec![
+        row(look, "Refresh", locked(Key::Refresh), refresh_control),
+        number_row(
+            "Double-click speed",
+            Numeric {
+                key: Key::MultiClickMs,
+                shown: format!("{} ms", config.multi_click_ms),
+                value: config.multi_click_ms as f32,
+                step: 50.0,
+                range: MULTI_CLICK_MS,
+                setting: |ms| Setting::MultiClickMs(ms as u64),
+            },
+            cx,
+        ),
+    ];
+
+    let groups = [
+        ("Appearance", appearance),
+        ("Code", code_rows),
+        ("Behaviour", behaviour),
+    ];
+    let rows: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
+    for (index, (title, rows)) in groups.into_iter().enumerate() {
+        body = body.child(group(look, title, index > 0, rows));
+    }
+
+    // As tall as the groups, so nothing scrolls on a usual window; a parse
+    // error's banner may push the last rows under the fold.
+    let content = DIALOG_HEAD
+        + 3.0 * (overlay_kit::GROUP_HEIGHT + 2.0 * theme::HAIRLINE)
+        + 2.0 * GROUP_GAP
+        + rows as f32 * (ROW_HEIGHT + theme::HAIRLINE)
+        + errors as f32 * BANNER_HEIGHT;
+    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
+        .min(content)
+        .max(240.0);
     let card = overlay_kit::Dialog::new(&Prose::from("Settings"), look)
         .width(CARD_WIDTH)
         .height(height)
-        .lede(
-            &Prose::from("Saved to ")
-                .path("settings.toml")
-                .text(". A key set in ")
-                .path("config.toml")
-                .text(" wins, and keys and revset presets are set only there."),
-        )
         .child(
             div()
                 .size_full()
                 .child(ui::scrollable("settings-list", body)),
         )
         .bound_hint(ui, Context::Settings, &["settings.close"], "Close")
-        .buttons([reveal.into_any_element()])
+        .buttons([
+            file_button(ui, look, ConfigFile::Settings, cx),
+            file_button(ui, look, ConfigFile::Config, cx),
+        ])
         .build();
     let dismiss = Diffui::on_action::<()>(Action::CloseSettings, cx);
     ui::modal(
@@ -390,42 +380,63 @@ pub(crate) fn build_overlay(
     .into_any_element()
 }
 
-/// A group after the first, set off from the rows above it.
-fn heading(label: &'static str, look: Look) -> impl IntoElement {
-    div()
-        .pt(px(theme::space::MD))
-        .child(overlay_kit::group_heading(label, look))
-}
-
-/// One setting: its name over a quiet note (or where it is locked), and its
-/// control at the end.
-fn row(
-    look: Look,
-    key: Key,
-    note: Option<Prose>,
-    locked: bool,
-    control: impl IntoElement,
-) -> AnyElement {
-    let Look { theme, font, .. } = look;
-    let note = if locked {
-        Some(Prose::from("Set in ").path("config.toml"))
-    } else {
-        note
-    };
-    let name = typography::line(key.label(), font, text_size::BODY, theme.text).text_ellipsis();
-    let mut label = div()
+/// A titled card of rows split by inset hairlines, set off from the group
+/// above it.
+fn group(look: Look, title: &'static str, after: bool, rows: Vec<AnyElement>) -> impl IntoElement {
+    let Look { theme, .. } = look;
+    let count = rows.len();
+    let mut card = div()
         .flex()
         .flex_col()
+        .w_full()
+        .border_1()
+        .border_color(theme::TRANSPARENT);
+    for (index, row) in rows.into_iter().enumerate() {
+        card = card.child(row);
+        if index + 1 < count {
+            card = card.child(
+                div()
+                    .mx(px(ROW_INSET))
+                    .h(px(theme::HAIRLINE))
+                    .bg(theme.border),
+            );
+        }
+    }
+    let card = theme::squircle(card, theme::radius::CARD, None, Some(theme.border));
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .when(after, |group| group.pt(px(GROUP_GAP)))
+        .child(overlay_kit::group_heading(title, look))
+        .child(card)
+}
+
+/// One setting: its name, a lock when `config.toml` sets it, and its control
+/// at the end.
+fn row(look: Look, name: &'static str, locked: bool, control: impl IntoElement) -> AnyElement {
+    let Look { theme, font, .. } = look;
+    let mut label = div()
+        .flex()
+        .flex_row()
+        .items_center()
         .flex_1()
         .min_w_0()
-        .gap(px(theme::space::XXS))
-        .child(name);
-    if let Some(note) = note {
+        .gap(px(theme::space::SM))
+        .child(typography::line(name, font, text_size::BODY, theme.text).text_ellipsis());
+    if locked {
         label = label.child(
             div()
-                .flex()
-                .w_full()
-                .child(note.line(look, theme.muted_text, text_size::CAPTION).view()),
+                .id(gpui_kit::ElementId::Name(
+                    format!("settings-locked-{name}").into(),
+                ))
+                .flex_none()
+                .tip("Set in config.toml", look)
+                .child(icons::icon(
+                    overlay_kit::glyph::LOCK,
+                    theme::icon::SM,
+                    theme.subtle_text,
+                )),
         );
     }
     div()
@@ -434,15 +445,23 @@ fn row(
         .items_center()
         .w_full()
         .h(px(ROW_HEIGHT))
+        .px(px(ROW_INSET))
         .gap(px(theme::space::XL))
         .child(label)
         .child(div().flex().flex_none().child(control))
         .into_any_element()
 }
 
-/// A font setting: a button naming the family, which lists the installed
-/// ones.
-fn font_row(ui: &Diffui, look: Look, key: Key, current: Font, cx: &mut Cx) -> AnyElement {
+/// A font setting: a pop-up button naming the family, as wide as the name
+/// up to a cap, which lists the installed ones.
+fn font_row(
+    ui: &Diffui,
+    look: Look,
+    name: &'static str,
+    key: Key,
+    current: Font,
+    cx: &mut Cx,
+) -> AnyElement {
     let Look { theme, font, .. } = look;
     let locked = ui.config.locked.contains(key);
     let (anchor, tracker) = menu::anchor_tracker();
@@ -460,11 +479,13 @@ fn font_row(ui: &Diffui, look: Look, key: Key, current: Font, cx: &mut Cx) -> An
         .flex()
         .flex_row()
         .items_center()
-        .w_full()
         .gap(px(theme::space::SM))
-        .child(div().flex_1().min_w_0().child(
-            typography::line(font_label(current), font, text_size::BODY, ink).text_ellipsis(),
-        ))
+        .child(
+            typography::line(font_label(current), font, text_size::BODY, ink)
+                .max_w(px(SELECT_TEXT_MAX))
+                .overflow_hidden()
+                .text_ellipsis(),
+        )
         .child(icons::icon(
             icons::CHEVRON_DOWN,
             theme::icon::SM,
@@ -473,7 +494,6 @@ fn font_row(ui: &Diffui, look: Look, key: Key, current: Font, cx: &mut Cx) -> An
     let button = look
         .bare_button(("settings-font", key as usize))
         .raised()
-        .w(px(200.0))
         .disabled(locked)
         .child(face);
     let button = div()
@@ -481,7 +501,62 @@ fn font_row(ui: &Diffui, look: Look, key: Key, current: Font, cx: &mut Cx) -> An
         .child(tracker)
         .when(!locked, |wrap| wrap.on_mouse_down(MouseButton::Left, open))
         .child(button);
-    row(look, key, None, locked, button)
+    row(look, name, locked, button)
+}
+
+/// `settings.toml` or `config.toml`, in mono: the name reveals the file,
+/// the glyph beside it copies its path. A file that isn't there can't be
+/// revealed.
+fn file_button(ui: &Diffui, look: Look, file: ConfigFile, cx: &mut Cx) -> AnyElement {
+    let Look { theme, mono, .. } = look;
+    let path = ui.config_files.path(file).map(Path::to_path_buf);
+    let exists = path.as_deref().is_some_and(Path::exists);
+    let face = theme::radius::inner(theme::radius::CARD, theme::space::XXS);
+    let side = theme::control::COMPACT - 2.0 * theme::space::XXS;
+    let reveal = look
+        .bare_button(("settings-reveal", file as usize))
+        .h(px(side))
+        .px(px(theme::space::MD))
+        .corner_radius(face)
+        .disabled(!exists)
+        .tip(if exists { REVEAL_TIP } else { "Doesn't exist" })
+        .child(typography::centered(
+            typography::line(
+                file.name(),
+                mono,
+                text_size::BODY,
+                if exists {
+                    theme.text
+                } else {
+                    theme.subtle_text
+                },
+            ),
+            mono,
+            text_size::BODY,
+        ))
+        .when(exists, |button| {
+            button.on_click(Diffui::on_action(Action::RevealConfigFile(file), cx))
+        });
+    let copy = look
+        .icon_button(
+            ("settings-copy", file as usize),
+            icons::COPY,
+            theme.muted_text,
+        )
+        .size(px(side))
+        .corner_radius(face)
+        .tip("Copy path")
+        .disabled(path.is_none())
+        .when_some(path, |button, path| {
+            button.on_click(Diffui::on_action(
+                Action::Copy(path.to_string_lossy().into_owned()),
+                cx,
+            ))
+        });
+    ui::segmented(theme)
+        .child(reveal)
+        .child(copy)
+        .into_any_element()
 }
 
 /// A number setting the dialog steps through.

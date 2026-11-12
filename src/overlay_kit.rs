@@ -28,6 +28,7 @@ pub(crate) mod glyph {
     pub(crate) const KEYBOARD: &str = "\u{e284}"; // keyboard
     pub(crate) const FILE_TEXT: &str = "\u{e0cc}"; // file-text
     pub(crate) const GIT_COMMIT: &str = "\u{e0e3}"; // git-commit-horizontal
+    pub(crate) const LOCK: &str = "\u{e10b}"; // lock
 }
 
 /// Height of a card's footer strip of key hints.

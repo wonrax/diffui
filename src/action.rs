@@ -205,8 +205,8 @@ pub(crate) enum Action {
     // ── Diagnostics ─────────────────────────────────────────────────────
     /// Show diffui's log file in the file manager.
     RevealLogFile,
-    /// Show `config.toml` in the file manager.
-    RevealConfigFile,
+    /// Show `config.toml` or `settings.toml` in the file manager.
+    RevealConfigFile(crate::config::ConfigFile),
 
     // ── Comparing ───────────────────────────────────────────────────────
     /// Diff two revisions against each other (see [`crate::compare`]).

@@ -1168,7 +1168,7 @@ impl Diffui {
             Action::RevealLogFile => {
                 crate::logging::reveal_log_file();
             }
-            Action::RevealConfigFile => self.reveal_config_file(),
+            Action::RevealConfigFile(file) => self.reveal_config_file(file),
             Action::Compare(action) => self.perform_compare(action),
             Action::Range(action) => self.perform_range(action, cx),
             Action::ExpandFile(index) => self.expand_collapsed_file(index),

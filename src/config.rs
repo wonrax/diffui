@@ -212,7 +212,7 @@ impl Key {
             Key::Theme => "Theme",
             Key::Refresh => "Refresh",
             Key::UiFont => "UI font",
-            Key::MonoFont => "Mono font",
+            Key::MonoFont => "Code font",
             Key::CodeFontSize => "Code font size",
             Key::CodeLineHeight => "Line height",
             Key::CodeBaselineOffset => "Baseline offset",
@@ -314,6 +314,22 @@ impl Setting {
     }
 }
 
+/// One of the two files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFile {
+    Config,
+    Settings,
+}
+
+impl ConfigFile {
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfigFile::Config => "config.toml",
+            ConfigFile::Settings => "settings.toml",
+        }
+    }
+}
+
 /// The two files, and what became of reading them.
 #[derive(Debug, Default)]
 pub struct ConfigFiles {
@@ -330,6 +346,25 @@ pub struct ConfigFiles {
 }
 
 impl ConfigFiles {
+    pub fn path(&self, file: ConfigFile) -> Option<&Path> {
+        match file {
+            ConfigFile::Config => self.config_path.as_deref(),
+            ConfigFile::Settings => self.settings_path.as_deref(),
+        }
+    }
+
+    pub fn exists(&self, file: ConfigFile) -> bool {
+        self.path(file).is_some_and(Path::exists)
+    }
+
+    /// Why `file` was ignored, if it was.
+    pub fn error(&self, file: ConfigFile) -> Option<&str> {
+        match file {
+            ConfigFile::Config => self.config_error.as_deref(),
+            ConfigFile::Settings => self.settings_error.as_deref(),
+        }
+    }
+
     /// Save `setting` to `settings.toml`, keeping what else it holds. The one
     /// way anything is written to either file. A file that didn't parse is
     /// replaced: the app owns it, and nothing in it was being used.

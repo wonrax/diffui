@@ -2962,8 +2962,13 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: always,
-        build: |_ui, _arg| Some(Action::RevealConfigFile),
+        enabled: |ui, _arg| {
+            require(
+                ui.config_files.exists(crate::config::ConfigFile::Config),
+                "No config.toml",
+            )
+        },
+        build: |_ui, _arg| Some(Action::RevealConfigFile(crate::config::ConfigFile::Config)),
         palette: PaletteScope::Root,
     },
     Command {
