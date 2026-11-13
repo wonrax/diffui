@@ -44,6 +44,9 @@ pub(crate) struct Scene {
     /// Something on screen moves with time, so two draws can't be compared.
     animated: bool,
     prepare: fn(&Path),
+    /// What else the launch finds in its home (a plugin's folder), written
+    /// once the home is cleared.
+    home: fn(&Path),
     steps: fn(&mut Ctx),
 }
 
@@ -89,6 +92,10 @@ impl Scene {
         self.prepare = prepare;
         self
     }
+    fn home(mut self, home: fn(&Path)) -> Self {
+        self.home = home;
+        self
+    }
 }
 
 #[derive(Default)]
@@ -115,6 +122,7 @@ fn s(id: &'static str, _state: &'static str, _steps: &'static str, steps: fn(&mu
         cold: false,
         animated: false,
         prepare: |_| {},
+        home: |_| {},
         steps,
     }
 }
@@ -2695,7 +2703,137 @@ fn all() -> Vec<Scene> {
         },
     ));
 
+    t.group("Plugins");
+    t.add(
+        s(
+            "plugins-permission",
+            "The dialog that asks whether a plugin may run: its id, version and folder, each thing it could do, Don't allow and Allow.",
+            "Launch with a plugin nobody has answered for.",
+            plugins_loaded,
+        )
+        .home(|home| forge_plugin().write(home)),
+    );
+    t.add(
+        s(
+            "plugins-settings",
+            "Settings, Plugins: one running, one that failed with where, one not allowed, each with its folder, actions and toggle; then the plugins folder.",
+            "Launch with three plugins (two allowed, one refused); press cmd+, and scroll to Plugins.",
+            plugins_in_settings,
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS),
+    );
+    t.add(
+        s(
+            "plugins-settings-dark",
+            "plugins-settings in dark.",
+            "As plugins-settings, theme Dark.",
+            plugins_in_settings,
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS)
+        .dark(),
+    );
+    t.add(
+        s(
+            "plugins-palette",
+            "A plugin's commands in the palette under the plugin's name: one runs, one of a plugin that isn't allowed is greyed with why.",
+            "Launch with the three plugins; cmd+K, type >labels.",
+            |c| {
+                plugins_loaded(c);
+                c.key("cmd+k");
+                c.typed(">labels");
+            },
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS),
+    );
+
     t.scenes
+}
+
+/// A forge plugin that asks for a bit of everything.
+fn forge_plugin() -> crate::plugins::PluginDir {
+    let mut plugin = crate::plugins::PluginDir::new(
+        "forgejo",
+        "http = [\"codeberg.org\", \"*.forgejo.example\"]\nexec = [[\"git\", \"config\"]]\njj = \"write\"",
+        &[],
+        "",
+    );
+    plugin
+        .manifest
+        .push_str("\n[provides]\nforge = { hosts = [\"codeberg.org\"] }\n");
+    plugin
+}
+
+/// Three plugins: `labels` loads, `review-queue` throws while loading, and
+/// `telemetry` is one the user refused.
+fn three_plugins(home: &Path) {
+    use crate::plugins::PluginDir;
+    let labels = "import { commands, ui } from \"diffui\";\n\
+                  commands.register(\"labels.sync\", () => {});\n\
+                  commands.register(\"labels.open\", () => {});\n\
+                  await ui.status.set(\"3 labels\");\n";
+    PluginDir::new("labels", "jj = \"read\"", &["sync", "open"], labels).write(home);
+    PluginDir::new(
+        "review-queue",
+        "http = [\"codeberg.org\"]",
+        &[],
+        "import { config } from \"diffui\";\n\nconst team = config.team.toLowerCase();\n",
+    )
+    .write(home);
+    PluginDir::new(
+        "telemetry",
+        "http = [\"metrics.example.com\"]\njj = \"read\"",
+        &["labels-report"],
+        "",
+    )
+    .write(home);
+}
+
+/// What the user answered for [`three_plugins`].
+const THREE_PLUGINS: &str = r#"
+[plugins.labels]
+allowed = true
+[plugins.labels.permissions]
+http = []
+exec = []
+jj = "read"
+
+[plugins.review-queue]
+allowed = true
+[plugins.review-queue.permissions]
+http = ["codeberg.org"]
+exec = []
+jj = "none"
+
+[plugins.telemetry]
+allowed = false
+[plugins.telemetry.permissions]
+http = ["metrics.example.com"]
+exec = []
+jj = "read"
+"#;
+
+/// Wait for every plugin to have loaded or failed, and put the toasts that
+/// said so away: they go by the clock.
+fn plugins_loaded(c: &mut Ctx) {
+    c.h.wait_until("the plugins", |ui| {
+        ui.plugins
+            .found
+            .iter()
+            .all(|found| found.state != crate::plugins::State::Loading)
+    });
+    c.h.act(|ui, _| ui.toasts.clear());
+    c.settle();
+}
+
+fn plugins_in_settings(c: &mut Ctx) {
+    plugins_loaded(c);
+    c.key("cmd+,");
+    // The group is the dialog's last: bring it up.
+    c.h.wheel(at(W / 2.0, H / 2.0), -600.0);
+    c.settle();
 }
 
 /// The `config.toml` the declared-command scenes run with.
@@ -2769,7 +2907,13 @@ fn run(scene: &Scene) -> Result<(), String> {
     // In `settings.toml`, where the dialog would put it, so a scene's
     // `config.toml` holds only what the scene sets.
     let settings = format!("theme = \"{theme}\"\n{}", scene.settings);
-    let h = Harness::open_fresh(open.as_deref(), scene.size, scene.config, &settings);
+    let h = Harness::open_prepared(
+        open.as_deref(),
+        scene.size,
+        scene.config,
+        &settings,
+        scene.home,
+    );
     let mut c = Ctx {
         h,
         manifest,

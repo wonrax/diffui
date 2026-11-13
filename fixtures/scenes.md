@@ -1445,3 +1445,32 @@ scenes are new in the port; there is no iced capture for them.
 - Window: 1440x900, light
 - State: A GitLab merge request open as a tab: the tab reads render-toolkit!7, the header says Merge request.
 - Steps: Open acme/render-toolkit!7.
+
+## Plugins
+
+Script plugins from `~/.config/diffui/plugins` (see the "Writing a plugin"
+section of `assets/agent/SKILL.md`). New in the port.
+
+### `plugins-permission`
+
+- Window: 1440x900, light
+- State: The dialog that asks whether a plugin may run: its id, version and folder, each thing it could do, Don't allow and Allow.
+- Steps: Launch with a plugin nobody has answered for.
+
+### `plugins-settings`
+
+- Window: 1440x900, light
+- State: Settings, Plugins: one running, one that failed with where, one not allowed, each with its folder, actions and toggle; then the plugins folder.
+- Steps: Launch with three plugins (two allowed, one refused); press cmd+, and scroll to Plugins.
+
+### `plugins-settings-dark`
+
+- Window: 1440x900, dark
+- State: plugins-settings in dark.
+- Steps: As plugins-settings, theme Dark.
+
+### `plugins-palette`
+
+- Window: 1440x900, light
+- State: A plugin's commands in the palette under the plugin's name: one runs, one of a plugin that isn't allowed is greyed with why.
+- Steps: Launch with the three plugins; cmd+K, type >labels.
