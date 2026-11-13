@@ -29,6 +29,13 @@ pub(crate) fn check_once(cx: &mut Cx) {
     });
 }
 
+/// Treat the check as done for this process, so it never runs: the test
+/// harness, whose shots mustn't depend on the jj it finds on PATH.
+#[cfg(test)]
+pub(crate) fn skip_check() {
+    CHECKED.store(true, atomic::Ordering::Relaxed);
+}
+
 /// `jj --version`'s version, or `None` when there is no `jj` on PATH (or it
 /// didn't answer) — nothing to be out of step with then.
 async fn cli_version() -> Option<String> {
@@ -102,6 +109,16 @@ mod tests {
     #[test]
     fn the_embedded_version_was_found() {
         assert!(parse(EMBEDDED).is_some(), "build.rs embedded {EMBEDDED:?}");
+    }
+
+    /// Shots don't depend on which jj the test environment has on PATH.
+    #[test]
+    fn the_harness_never_asks_the_jj_on_path() {
+        use crate::harness::{Harness, fixture_repo};
+        let mut h = Harness::open(Some(&fixture_repo()));
+        h.wait_for_graph();
+        h.settle();
+        assert!(h.read(|ui| ui.toasts.is_empty()));
     }
 
     #[test]

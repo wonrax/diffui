@@ -85,12 +85,6 @@ pub(crate) fn scratch_home() -> &'static Path {
             )
             .expect("write the jj config");
             std::env::set_var("JJ_CONFIG", config);
-            // The app warns when the jj on PATH doesn't match its jj-lib, with a
-            // toast that sits over every shot.
-            if let Some(dir) = fixture_jj().parent() {
-                let path = std::env::var("PATH").unwrap_or_default();
-                std::env::set_var("PATH", format!("{}:{path}", dir.display()));
-            }
             // A test never reaches a forge: `gh` and `glab` are fakes that answer
             // only what a test told them to (see [`answer_forge`]).
             let forge_bin = home.join("forge-bin");
@@ -104,6 +98,10 @@ pub(crate) fn scratch_home() -> &'static Path {
             let path = std::env::var("PATH").unwrap_or_default();
             std::env::set_var("PATH", format!("{}:{path}", forge_bin.display()));
         }
+        // The app warns when the jj on PATH isn't its jj-lib's minor version.
+        // Whichever jj the test environment has, that toast would sit over
+        // shots and come and go with timing, so the harness never asks.
+        crate::jj_version::skip_check();
         // `Diffui::new` opens the repository it's started in, and these tests start
         // inside a workspace: that must not become the repo under test.
         std::env::set_current_dir(&home).expect("enter the scratch home");
