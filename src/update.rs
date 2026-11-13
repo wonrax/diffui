@@ -543,6 +543,9 @@ impl Diffui {
             (Pending::CommandRevset(_), Payload::RevsetResolved { revset, result, .. }) => {
                 self.command_revset_resolved(tab, job, &revset, result, cx)
             }
+            (Pending::LineRevset(line, _), Payload::RevsetResolved { revset, result, .. }) => {
+                self.line_revset_resolved(tab, line, job, &revset, result, cx)
+            }
             (Pending::RevsetField(_), Payload::RevsetResolved { revset, result, .. }) => {
                 self.revset_field_resolved(tab, &revset, result)
             }
@@ -616,6 +619,10 @@ impl Diffui {
                 let refused = Err(diffui_core::RevsetError::new(error.to_string()));
                 self.command_revset_resolved(tab, job, &revset, refused, cx)
             }
+            Pending::LineRevset(line, revset) => {
+                let refused = Err(diffui_core::RevsetError::new(error.to_string()));
+                self.line_revset_resolved(tab, line, job, &revset, refused, cx)
+            }
             Pending::RevsetField(revset) => {
                 let refused = Err(diffui_core::RevsetError::new(error.to_string()));
                 self.revset_field_resolved(tab, &revset, refused)
@@ -645,6 +652,7 @@ impl Diffui {
             | Pending::Tree(_)
             | Pending::File(_)
             | Pending::CommandRevset(_)
+            | Pending::LineRevset(..)
             | Pending::RevsetField(_)
             | Pending::DetailCopy(..) => return,
         };
@@ -1042,7 +1050,9 @@ impl Diffui {
             Action::Undo => self.start_undo(),
             Action::Redo => self.start_redo(),
             Action::UpdateStaleWorkingCopy => {
-                self.start_cli_run(vec!["workspace".to_owned(), "update-stale".to_owned()])
+                if let Some(tab) = self.active_tab_id() {
+                    self.start_cli_run(tab, vec!["workspace".to_owned(), "update-stale".to_owned()])
+                }
             }
             Action::UndoOperation(activity_id, operation_id) => {
                 let Some(tab_id) = self.active_tab_id() else {
@@ -4309,10 +4319,17 @@ impl Diffui {
     /// The actor runs it inside the same working-copy lock every other write
     /// takes, so it can no longer overlap a mutation.
     pub(crate) fn start_fetch(&mut self, target: FetchTarget) {
-        let Some(tab) = self.active_tab_id() else {
-            return;
-        };
-        if !self.active().session.capabilities.fetch {
+        if let Some(tab) = self.active_tab_id() {
+            self.start_fetch_on(tab, target);
+        }
+    }
+
+    /// [`Self::start_fetch`] on `tab`, whichever tab is on screen.
+    pub(crate) fn start_fetch_on(&mut self, tab: TabId, target: FetchTarget) {
+        if !self
+            .tab(tab)
+            .is_some_and(|state| state.session.capabilities.fetch)
+        {
             return;
         }
         self.pop_mode(ModeKind::Menu);

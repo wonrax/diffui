@@ -10,16 +10,31 @@ use diffui_core::cli::{
 use diffui_core::revset::union_revsets;
 use diffui_core::{DiffRequest, MutationOp, RevisionSelection};
 
+use std::collections::HashMap;
+
+use diffui_core::cli::{ParseError, ParsedCommand};
+
 use super::{CommandLine, Resolution};
-use crate::Diffui;
 use crate::prose::Prose;
+use crate::{Diffui, TabState};
 
 impl Diffui {
     // ── the plan ────────────────────────────────────────────────────────
 
-    /// What Enter does with the line as it stands, in words.
+    /// What Enter does with the palette's line as it stands, in words.
     pub(crate) fn plan(&self, command: &CommandLine) -> Plan {
-        let parsed = match &command.parsed {
+        self.plan_line(self.active(), &command.parsed, &command.resolved)
+    }
+
+    /// What running `parsed` on `tab` does, given the revsets `resolved` so
+    /// far.
+    pub(crate) fn plan_line(
+        &self,
+        tab: &TabState,
+        parsed: &Result<ParsedCommand, ParseError>,
+        resolved: &HashMap<String, Resolution>,
+    ) -> Plan {
+        let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 return Plan {
@@ -32,9 +47,8 @@ impl Diffui {
                 };
             }
         };
-        let tab = self.active();
         let context = Resolver {
-            command,
+            resolved,
             working_copy: tab
                 .session
                 .bookmarks
@@ -53,13 +67,13 @@ impl Diffui {
                 .map(str::to_owned),
             bookmarks: &tab.session.bookmarks,
         };
-        let words = Words { ui: self, command };
+        let words = Words { tab, resolved };
         // A revset that didn't resolve stops everything, whatever the kind:
         // the CLI would refuse it just the same.
         for slot in &parsed.revsets {
             if let Some(Resolution {
                 result: Err(error), ..
-            }) = command.resolved.get(&slot.revset)
+            }) = resolved.get(&slot.revset)
             {
                 let span = error
                     .span
@@ -82,7 +96,7 @@ impl Diffui {
         let pending = parsed
             .revsets
             .iter()
-            .any(|slot| !command.resolved.contains_key(&slot.revset));
+            .any(|slot| !resolved.contains_key(&slot.revset));
         let cli_plan = |reason: Option<String>| {
             let mut words = Prose::from("Runs ")
                 .code(format!("jj {}", parsed.passthrough_args.join(" ")))
@@ -292,7 +306,7 @@ fn resolve_view(view: &ViewCommand, context: &Resolver<'_>) -> Result<ResolvedVi
 
 /// Answers lowering from the revsets the command line already resolved.
 struct Resolver<'a> {
-    command: &'a CommandLine,
+    resolved: &'a HashMap<String, Resolution>,
     working_copy: Option<&'a str>,
     push_remote: Option<String>,
     bookmarks: &'a diffui_core::model::BookmarksInfo,
@@ -331,7 +345,7 @@ impl LowerContext for Resolver<'_> {
         if revset.trim() == "@" {
             return Ok(vec![RevisionSelection::WorkingCopy]);
         }
-        match self.command.resolved.get(revset).map(|r| &r.result) {
+        match self.resolved.get(revset).map(|r| &r.result) {
             Some(Ok(found)) if found.commits.len() < found.count => Err(format!(
                 "Revset `{revset}` matches {} revisions, more than diffui acts on at once",
                 found.count
@@ -361,8 +375,8 @@ impl LowerContext for Resolver<'_> {
 
 /// Builds the plan's sentence, naming revisions the way the graph does.
 struct Words<'a> {
-    ui: &'a Diffui,
-    command: &'a CommandLine,
+    tab: &'a TabState,
+    resolved: &'a HashMap<String, Resolution>,
 }
 
 impl Words<'_> {
@@ -373,11 +387,11 @@ impl Words<'_> {
         if arg.is_implicit() || text == "@" {
             return Prose::new().rev("@");
         }
-        let session = &self.ui.active().session;
+        let session = &self.tab.session;
         if session.bookmarks.entry(text).is_some() {
             return Prose::new().bookmark(text);
         }
-        match self.command.resolved.get(&arg.revset).map(|r| &r.result) {
+        match self.resolved.get(&arg.revset).map(|r| &r.result) {
             Some(Ok(found)) if found.count == 1 => {
                 let hex = found
                     .commits
@@ -473,7 +487,7 @@ impl Words<'_> {
     fn single(&self, arg: &RevsetArg) -> bool {
         arg.is_implicit()
             || matches!(
-                self.command.resolved.get(&arg.revset).map(|r| &r.result),
+                self.resolved.get(&arg.revset).map(|r| &r.result),
                 Some(Ok(found)) if found.count == 1
             )
     }

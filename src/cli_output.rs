@@ -102,12 +102,9 @@ pub(crate) struct OutputView {
 }
 
 impl Diffui {
-    /// Run `args` through the jj CLI in the active tab's workspace, and show
+    /// Run `args` through the jj CLI in `tab`'s workspace, and show
     /// the output as it comes.
-    pub(crate) fn start_cli_run(&mut self, args: Vec<String>) {
-        let Some(tab) = self.active_tab_id() else {
-            return;
-        };
+    pub(crate) fn start_cli_run(&mut self, tab: TabId, args: Vec<String>) {
         let program = match std::env::current_exe() {
             Ok(program) => program,
             Err(error) => {

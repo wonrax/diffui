@@ -27,7 +27,10 @@ use crate::modes::ModeKind;
 use crate::palette;
 use crate::{Action, Diffui, MainView, TabId};
 
+mod headless;
 mod plan;
+use headless::Arm;
+pub(crate) use headless::{LineError, LineId, LineReply};
 pub(crate) use plan::sentence;
 
 pub(crate) use plan::{PlanState, ResolvedView, Run};
@@ -490,7 +493,17 @@ impl Diffui {
     /// The jj grammar and aliases for the active tab's repository, loaded
     /// once per tab.
     pub(crate) fn command_line_cli(&mut self) -> JjCli {
-        let state = self.active_mut();
+        match self.active_tab_id() {
+            Some(tab) => self.cli_for(tab),
+            None => JjCli::default(),
+        }
+    }
+
+    /// The jj grammar and aliases for `tab`'s repository, loaded once per tab.
+    pub(crate) fn cli_for(&mut self, tab: TabId) -> JjCli {
+        let Some(state) = self.tab_mut(tab) else {
+            return JjCli::default();
+        };
         if state.cmdline.cli.is_none() {
             let cli = state
                 .repository
@@ -958,26 +971,39 @@ impl Diffui {
                     self.cancel_command_jobs(&command);
                 }
                 self.pop_mode(ModeKind::Palette);
-                self.execute(run, cx)
+                if let Some(tab) = self.active_tab_id() {
+                    self.execute(tab, run, Arm::Drafts, cx)
+                }
             }
         }
     }
 
-    fn execute(&mut self, run: Run, cx: &mut Cx) {
+    /// Carry out a planned line on `tab`. A view or an editor it opens is
+    /// shown, so the tab comes forward; a mutation or a CLI run goes on in
+    /// the background where it is.
+    fn execute(&mut self, tab: TabId, run: Run, arm: Arm, cx: &mut Cx) {
         // What the typed line does replaces a draft in progress; a view
         // leaves it alone.
-        if !matches!(run, Run::View(_)) {
-            self.active_mut().pop_mode(ModeKind::Draft);
+        if !matches!(run, Run::View(_))
+            && let Some(state) = self.tab_mut(tab)
+        {
+            state.pop_mode(ModeKind::Draft);
         }
         match run {
-            Run::View(view) => self.run_view(view, cx),
+            Run::View(view) => {
+                self.activate_tab(tab, cx);
+                self.run_view(view, cx)
+            }
             Run::Native {
                 action,
                 command,
                 ignore_immutable,
-            } => self.run_native(action, command, ignore_immutable, cx),
-            Run::Ui { command, target } => self.run_ui(command, target, cx),
-            Run::Cli { args } => self.start_cli_run(args),
+            } => self.run_native(tab, action, command, ignore_immutable, arm, cx),
+            Run::Ui { command, target } => {
+                self.activate_tab(tab, cx);
+                self.run_ui(command, target, cx)
+            }
+            Run::Cli { args } => self.start_cli_run(tab, args),
         }
     }
 
@@ -1035,18 +1061,22 @@ impl Diffui {
 
     fn run_native(
         &mut self,
+        tab: TabId,
         action: NativeAction,
         command: MutationCommand,
         ignore_immutable: bool,
+        arm: Arm,
         cx: &mut Cx,
     ) {
         let op = match action {
-            NativeAction::Fetch(target) => return self.start_fetch(target),
+            NativeAction::Fetch(target) => return self.start_fetch_on(tab, target),
             NativeAction::Mutate(op) => op,
         };
         // `--ignore-immutable` runs as typed: a draft's Enter would ask about
         // immutable commits again.
         if !ignore_immutable
+            && arm == Arm::Drafts
+            && self.is_active(tab)
             && let Some((kind, placement)) = command.draft_kind()
             && self.draft_from_op(kind, placement, &op, cx).is_some()
         {
@@ -1062,9 +1092,7 @@ impl Diffui {
                 ..
             }
         );
-        if let Some(tab) = self.active_tab_id() {
-            self.start_mutation_on(tab, op, allow_backwards, ignore_immutable);
-        }
+        self.start_mutation_on(tab, op, allow_backwards, ignore_immutable);
     }
 
     /// Land a typed rebase / squash / placed new or duplicate / parallelize
@@ -1182,6 +1210,8 @@ pub(crate) struct TabCommandLine {
     pub(crate) cli: Option<JjCli>,
     pub(crate) runs: Vec<crate::cli_output::CliRun>,
     pub(crate) field: crate::revset_assist::FieldAssist,
+    /// Lines run without the palette, waiting on their revsets.
+    pub(crate) headless: headless::HeadlessLines,
 }
 
 #[cfg(test)]

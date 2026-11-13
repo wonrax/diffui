@@ -1013,6 +1013,8 @@ pub(crate) enum Pending {
     FilePair(u64, usize),
     /// One of the command line's revsets.
     CommandRevset(String),
+    /// One of a headless jj line's revsets.
+    LineRevset(cmdline::LineId, String),
     /// The revset field's check of this revset.
     RevsetField(String),
     /// A passthrough jj CLI run, with its activity row. Its output streams,
@@ -1029,7 +1031,7 @@ impl Pending {
     fn is_slot(&self) -> bool {
         !matches!(
             self,
-            Self::FilePair(..) | Self::CommandRevset(_) | Self::Cli(_)
+            Self::FilePair(..) | Self::CommandRevset(_) | Self::LineRevset(..) | Self::Cli(_)
         )
     }
 }
