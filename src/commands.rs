@@ -89,6 +89,8 @@ contexts! {
     ConflictEdit = "conflict-edit",
     /// The create / update pull request dialog.
     PullRequest = "pull-request",
+    /// The dialog that asks whether a plugin may run.
+    PluginPermission = "plugin-permission",
 }
 
 impl Context {
@@ -3224,6 +3226,29 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: always,
         build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Cancel)),
         palette: PaletteScope::Hidden,
+    },
+    // ── Plugins ─────────────────────────────────────────────────────────
+    Command {
+        id: "plugin.dont-allow",
+        label: "Don't allow",
+        hint: "Refuse the plugin the permissions it asks for",
+        contexts: &[Context::PluginPermission],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Plugin(crate::plugins::PluginAction::Answer(false))),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "app.reveal-plugins",
+        label: "Reveal plugins folder",
+        hint: "Show the folder plugins are installed in",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Plugin(crate::plugins::PluginAction::Reveal(None))),
+        palette: PaletteScope::Root,
     },
 ];
 

@@ -482,6 +482,13 @@ impl PaletteState {
         }
     }
 
+    /// Whether this is the `choose` prompt `run` asked.
+    pub(crate) fn chooses_for(&self, run: crate::user_commands::RunId) -> bool {
+        self.stack.iter().any(
+            |column| matches!(column.source, ColumnSource::Choose { run: asked, .. } if asked == run),
+        )
+    }
+
     /// The palette as one column offering `choices`, for a declared
     /// command's `choose` prompt.
     pub(crate) fn choose(
@@ -779,12 +786,14 @@ fn label_leads_haystack(item: &ResultRef) -> bool {
 }
 
 /// The heading a result lists under.
-pub(crate) fn group_of(registry: &commands::Registry, item: &ResultRef) -> &'static str {
+pub(crate) fn group_of<'a>(registry: &'a commands::Registry, item: &ResultRef) -> &'a str {
     match item {
         ResultRef::WorkingCopy | ResultRef::Commit { .. } => "Revisions",
         ResultRef::Bookmark(_) => "Bookmarks",
         ResultRef::File(_) => "Files",
-        ResultRef::Command(id) => registry.get(id).map_or("Commands", |command| command.group),
+        ResultRef::Command(id) => registry
+            .get(id)
+            .map_or("Commands", |command| &*command.group),
         ResultRef::Choice(_) => "Choices",
     }
 }
@@ -793,7 +802,7 @@ pub(crate) fn group_of(registry: &commands::Registry, item: &ResultRef) -> &'sta
 /// row ranked and the rows keeping their rank inside a group, so the best
 /// match still leads the list.
 fn group_rows(registry: &commands::Registry, matches: &mut [PaletteMatch]) {
-    let mut order: Vec<&'static str> = Vec::new();
+    let mut order: Vec<&str> = Vec::new();
     for entry in matches.iter() {
         let group = group_of(registry, &entry.item);
         if !order.contains(&group) {
@@ -1632,8 +1641,8 @@ pub(crate) fn visible_results<G: PartialEq + Copy>(
 }
 
 /// A group's heading in a results list, its label on the rows' text edge.
-pub(crate) fn group_heading(label: &'static str, look: Look) -> Div {
-    crate::overlay_kit::group_heading(label, look).px(px(ROW_PAD_X))
+pub(crate) fn group_heading(label: &str, look: Look) -> Div {
+    crate::overlay_kit::group_heading(label.to_owned(), look).px(px(ROW_PAD_X))
 }
 
 /// What a results list says when it has no rows.
@@ -1795,7 +1804,8 @@ fn result_row_body(
             ResultRef::Choice(choice) => (
                 glyph_icon(icons::CHEVRON_RIGHT, ink, window, cx),
                 highlighted(choice, indices, primary, look),
-                None,
+                // A plugin's choice may come with one.
+                ui.plugin_choice_hint(choice).and_then(hint),
                 Vec::new(),
             ),
         };

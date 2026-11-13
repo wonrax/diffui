@@ -18,7 +18,8 @@ impl Diffui {
         // A keymap or command problem is never fatal: a config written against
         // another build still opens the app, having said once what it had to
         // skip.
-        let (registry, keymap, problems) = Self::derive_commands(&user_config);
+        let plugins = crate::plugins::Plugins::scan(&config_files.plugins);
+        let (registry, keymap, problems) = Self::derive_commands(&user_config, &plugins);
         let sidebar_min_width = sidebar::min_width(config);
         // Restore the persisted sidebar split and window geometry. The window
         // size/position seed the in-memory tracking; the compositor's `Opened`
@@ -244,6 +245,7 @@ impl Diffui {
             command_line_settle: Default::default(),
             panes: None,
             forge: Default::default(),
+            plugins,
             #[cfg(test)]
             renders: 0,
         };
@@ -256,6 +258,7 @@ impl Diffui {
         } else {
             app.report_command_problems(&problems);
         }
+        app.start_plugins();
         // Kicks the streaming load for whatever the active tab is: a repo walk,
         // a PR stream, or nothing when no tab opened.
         app.ensure_active_loaded();
@@ -794,6 +797,10 @@ impl Diffui {
             Action::RunUserCommand { command, tab, arg } => {
                 self.start_user_command(command, tab, arg, cx)
             }
+            Action::RunPluginCommand { command, tab, arg } => {
+                self.run_plugin_command(command, tab, arg)
+            }
+            Action::Plugin(action) => self.update_plugins(action, cx),
             Action::StopGenerating => self.stop_generating(),
             Action::ReloadCommands => {
                 if let Err(error) = self.reload_commands() {
@@ -2869,6 +2876,7 @@ impl Diffui {
         });
         let ok = result.is_ok();
         self.forge_after_fetch(tab, ok);
+        self.plugins_after_fetch(tab, ok);
         self.finish_activity_row(tab, activity_id, result, summary);
         if ok {
             let effects = match self.tab_mut(tab) {
@@ -2891,6 +2899,7 @@ impl Diffui {
         result: Result<mutations::MutationOutcome, diffui_core::RepoError>,
     ) {
         self.forge_after_mutation(tab, &pending, &result);
+        self.plugins_after_mutation(tab, &pending, &result);
         let activity_id = pending.activity_id;
         let description_save = self.tab_mut(tab).is_some_and(|target| {
             target
@@ -4048,9 +4057,11 @@ impl Diffui {
     }
 
     /// The registry, the keymap and what was wrong with either, from the
-    /// built-ins, the commands diffui ships and what `user_config` declares.
+    /// built-ins, the commands diffui ships, what `user_config` declares and
+    /// what the plugins' manifests declare.
     pub(crate) fn derive_commands(
         user_config: &crate::config::UserConfig,
+        plugins: &crate::plugins::Plugins,
     ) -> (std::rc::Rc<commands::Registry>, Keymap, Vec<String>) {
         let shipped: Vec<std::sync::Arc<crate::user_commands::UserCommand>> =
             crate::user_commands::parse_commands(
@@ -4061,8 +4072,10 @@ impl Diffui {
             .into_iter()
             .map(std::sync::Arc::new)
             .collect();
-        let (registry, mut problems) = commands::Registry::build(&shipped, &user_config.commands);
+        let (registry, mut problems) =
+            commands::Registry::build(&shipped, &user_config.commands, &plugins.rows());
         let (keymap, key_problems) = Keymap::build(&registry, &user_config.keys);
+        problems.splice(0..0, plugins.problems());
         problems.splice(0..0, user_config.problems.iter().cloned());
         problems.extend(key_problems);
         for problem in &problems {
@@ -4073,7 +4086,7 @@ impl Diffui {
 
     /// Say once, in a toast that stays, what of `config.toml`'s keys and
     /// commands was skipped.
-    fn report_command_problems(&mut self, problems: &[String]) {
+    pub(crate) fn report_command_problems(&mut self, problems: &[String]) {
         let Some(first) = problems.first() else {
             return;
         };
@@ -4087,16 +4100,13 @@ impl Diffui {
         );
     }
 
-    /// Read `config.toml`'s keys and commands again and rebuild what derives
-    /// from them. `Err` (and nothing changes) when the file doesn't parse.
+    /// Read `config.toml`'s keys and commands and the plugins folder again,
+    /// rebuild what derives from them and start the plugins afresh. `Err`
+    /// (and nothing changes) when the file doesn't parse.
     pub(crate) fn reload_commands(&mut self) -> Result<Vec<String>, String> {
-        let user_config = crate::config::UserConfig::reload()?;
-        let (registry, keymap, problems) = Self::derive_commands(&user_config);
-        self.registry = registry;
-        self.keymap = keymap;
-        self.user_config = user_config;
+        self.user_config = crate::config::UserConfig::reload()?;
+        let problems = self.reload_plugins();
         self.report_command_problems(&problems);
-        crate::app_menu::install(self);
         Ok(problems)
     }
 

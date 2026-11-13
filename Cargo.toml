@@ -24,12 +24,18 @@ trajectory-debug = []
 [dependencies]
 anyhow = "1.0"
 diffui-core = { path = "core" }
+# Script plugins: QuickJS, the type stripper and the plugins' HTTP client
+# live in this crate, so the app's own rebuilds don't carry them.
+diffui-plugins = { path = "plugins" }
 diffui-widgets = { path = "widgets" }
 clap = { version = "4.5", features = ["derive"] }
 gpui-kit = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 jj-lib = "0.47"
 mimalloc = "0.1"
+# Already in the tree through the core's repository watcher: watches the
+# plugins folder for edits.
+notify = "8"
 futures = "0.3"
 nucleo-matcher = "0.3"
 raw-window-handle = "0.6"

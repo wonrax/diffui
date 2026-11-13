@@ -227,6 +227,14 @@ pub(crate) enum Action {
         tab: TabId,
         arg: crate::commands::CommandArg,
     },
+    /// Run a plugin's command on `arg`, on `tab`: the tab it was offered on.
+    RunPluginCommand {
+        command: std::sync::Arc<crate::plugins::PluginCommand>,
+        tab: TabId,
+        arg: crate::commands::CommandArg,
+    },
+    /// The permission dialog's answer, and what Settings does to a plugin.
+    Plugin(crate::plugins::PluginAction),
     /// Stop the program writing into the description editor.
     StopGenerating,
     /// Read `config.toml`'s keys and commands again.

@@ -3,7 +3,7 @@
 //!
 //! Left to right: the bookmark `@` builds on, with how far it is ahead of and
 //! behind its upstream (or "in sync"), then how many revisions the log holds.
-//! A right-hand group is laid out for whatever joins them later.
+//! The right-hand group is the plugins': an item each, set by `ui.status.set`.
 
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
@@ -141,8 +141,11 @@ pub(crate) fn build_status_bar(
                         .overflow_hidden()
                         .child(typography::baseline_row(left, ITEM_GAP)),
                 )
-                // Pinned right, for what joins the bar later.
-                .child(div().flex_none()),
+                // Pinned right.
+                .child(div().flex_none().child(typography::baseline_row(
+                    crate::plugins::status_items(ui, look),
+                    ITEM_GAP,
+                ))),
         )
         .into_any_element()
 }

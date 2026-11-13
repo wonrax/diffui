@@ -946,6 +946,12 @@ impl Session {
         self.graph_version
     }
 
+    /// The jj operation the graph on screen was loaded at (its id, hex), or
+    /// `None` before a graph has loaded and in a git repository.
+    pub fn graph_operation(&self) -> Option<&str> {
+        self.graph_fingerprint.as_deref()
+    }
+
     /// Cancel the graph load in flight, if any. A superseded walk that runs to
     /// completion competes for the same disk as the walk that replaced it.
     fn cancel_graph(&mut self) -> Vec<Effect> {

@@ -65,10 +65,12 @@ pub(crate) enum PromptKind {
     Rename {
         old: String,
     },
-    /// A declared command's `input` prompt: any line of text, for `run`.
+    /// A declared command's `input` prompt (or a plugin's): any line of
+    /// text, for `run`.
     Value {
         run: crate::user_commands::RunId,
         label: String,
+        placeholder: String,
     },
 }
 
@@ -233,13 +235,22 @@ impl Diffui {
         crate::input::focus_and_select_all(NAME_PROMPT_INPUT_ID, cx);
     }
 
-    /// Ask a declared command's `input` prompt in the name prompt.
-    pub(crate) fn ask_input(&mut self, run: crate::user_commands::RunId, label: &str, cx: &mut Cx) {
+    /// Ask a declared command's `input` prompt (or a plugin's) in the name
+    /// prompt, starting from `value`.
+    pub(crate) fn ask_input(
+        &mut self,
+        run: crate::user_commands::RunId,
+        label: &str,
+        value: &str,
+        placeholder: &str,
+        cx: &mut Cx,
+    ) {
         let kind = PromptKind::Value {
             run,
             label: label.to_owned(),
+            placeholder: placeholder.to_owned(),
         };
-        self.open_name_prompt(kind, "", cx)
+        self.open_name_prompt(kind, value, cx)
     }
 
     pub(crate) fn name_prompt(&self) -> Option<&NamePrompt> {
@@ -789,8 +800,8 @@ pub(crate) fn build_name_prompt(
         );
     });
     let on_submit = Diffui::on_action(submit.clone(), cx);
-    let placeholder = match prompt.kind {
-        PromptKind::Value { .. } => "",
+    let placeholder = match &prompt.kind {
+        PromptKind::Value { placeholder, .. } => placeholder.as_str(),
         _ => "bookmark name",
     };
     let spec = input::FieldSpec::new(NAME_PROMPT_INPUT_ID, &prompt.value)

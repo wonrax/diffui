@@ -318,6 +318,7 @@ impl Diffui {
         self.sync_history(cx);
         self.sync_media(cx);
         self.sync_forge(cx);
+        self.sync_plugins(cx);
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         if let Some(tab) = self.active_tab_id() {
@@ -441,6 +442,7 @@ impl Diffui {
         crate::app_menu::start(cx);
         crate::credentials::start(cx);
         crate::ctl::start(cx);
+        crate::plugins::start(self, cx);
         self.sync_background(cx);
     }
 
@@ -851,6 +853,9 @@ fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Any
         .child(crate::forge_dialog::build_dialog(ui, look, window, cx))
         .child(crate::changes::split_modal(ui, look, window, cx))
         .child(tab_bar::build_confirm_dialog(ui, look, window, cx))
+        .child(crate::plugins::build_permission_dialog(
+            ui, look, window, cx,
+        ))
         .child(crate::cli_output::build_overlay(ui, look, window, cx))
         .child(crate::credentials::build_overlay(ui, look, window, cx))
         .child(crate::shortcuts::build_overlay(ui, look, window, cx))

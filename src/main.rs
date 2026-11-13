@@ -59,6 +59,7 @@ mod pane_scenes;
 mod panels_scenes;
 mod path_browse;
 mod plan;
+mod plugins;
 mod range;
 mod revision_rows;
 mod revops;
@@ -211,6 +212,10 @@ fn main() {
     }
     // `diffui ctl …` talks to the running app; `diffui skill` prints its guide.
     if let Some(code) = ctl::client_main() {
+        std::process::exit(code);
+    }
+    // `diffui plugin …` starts, checks and lists plugins.
+    if let Some(code) = plugins::client_main() {
         std::process::exit(code);
     }
     // First, while the process is still single-threaded: it may `set_var`.
@@ -446,6 +451,8 @@ pub(crate) struct Diffui {
     pub(crate) panes: Option<root::Panes>,
     /// The forges, and when to ask them again.
     pub(crate) forge: forge::ForgeUi,
+    /// The plugins found in the plugins folder, and what runs of them.
+    pub(crate) plugins: plugins::Plugins,
     /// How many times the root has rendered.
     #[cfg(test)]
     pub(crate) renders: usize,
@@ -570,7 +577,8 @@ pub(crate) enum Held {
     /// A mutation, run on accept.
     Mutation(PendingMutation),
     /// A declared command's run, which carries on past its `confirm` on
-    /// accept and stops on cancel.
+    /// accept and stops on cancel; or a plugin's confirm prompt, which
+    /// resolves with the answer.
     Command(user_commands::RunId),
 }
 
@@ -830,6 +838,8 @@ pub(crate) struct TabState {
     pub(crate) preview_debounce: spawn::Debounce,
     /// This repository's pull requests.
     pub(crate) forge: forge::TabForge,
+    /// What this tab last told plugins.
+    pub(crate) plugins: plugins::TabPlugins,
 }
 
 impl TabState {
@@ -880,6 +890,7 @@ impl TabState {
             find_debounce: Default::default(),
             preview_debounce: Default::default(),
             forge: Default::default(),
+            plugins: Default::default(),
         }
     }
 

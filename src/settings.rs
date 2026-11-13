@@ -28,9 +28,9 @@ use crate::{Action, Cx, Diffui, icons, menu};
 const CARD_WIDTH: f32 = 560.0;
 const ROW_HEIGHT: f32 = 44.0;
 /// A row with a line of explanation under its name, wrapped to two lines.
-const HINT_ROW_HEIGHT: f32 = 64.0;
+pub(crate) const HINT_ROW_HEIGHT: f32 = 64.0;
 /// A row's inset inside its group's card, and its divider's.
-const ROW_INSET: f32 = theme::space::LG;
+pub(crate) const ROW_INSET: f32 = theme::space::LG;
 /// Between one group's card and the next group's heading.
 const GROUP_GAP: f32 = theme::space::XL;
 /// The dialog's title, footer and insets around the groups.
@@ -141,25 +141,30 @@ impl Diffui {
     /// Show `file` in the file manager. Creates nothing: a file that
     /// isn't there isn't shown.
     pub(crate) fn reveal_config_file(&self, file: ConfigFile) {
-        let Some(path) = self.config_files.path(file).filter(|path| path.exists()) else {
-            return;
-        };
-        let mut command = if cfg!(target_os = "macos") {
-            let mut open = std::process::Command::new("open");
-            open.arg("-R").arg(path);
-            open
-        } else {
-            let mut open = std::process::Command::new(if cfg!(windows) {
-                "explorer"
-            } else {
-                "xdg-open"
-            });
-            open.arg(path.parent().unwrap_or(path));
-            open
-        };
-        if let Err(error) = command.spawn() {
-            tracing::warn!(%error, path = %path.display(), "failed to reveal a config file");
+        if let Some(path) = self.config_files.path(file).filter(|path| path.exists()) {
+            reveal_path(path);
         }
+    }
+}
+
+/// Show `path` in the file manager, selected in its folder where the
+/// platform can.
+pub(crate) fn reveal_path(path: &Path) {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut open = std::process::Command::new("open");
+        open.arg("-R").arg(path);
+        open
+    } else {
+        let mut open = std::process::Command::new(if cfg!(windows) {
+            "explorer"
+        } else {
+            "xdg-open"
+        });
+        open.arg(path.parent().unwrap_or(path));
+        open
+    };
+    if let Err(error) = command.spawn() {
+        tracing::warn!(%error, path = %path.display(), "failed to reveal a path");
     }
 }
 
@@ -352,25 +357,32 @@ pub(crate) fn build_overlay(
         ),
     ];
 
+    // Refresh and Baseline offset carry a line of explanation.
+    let hinted_rows = 2.0;
+    let (plugins, plugins_height) = crate::plugins::settings_group(ui, look, cx);
+    let plugin_rows = plugins.len();
     let groups = [
         ("Appearance", appearance),
         ("Code", code_rows),
         ("Behaviour", behaviour),
+        ("Plugins", plugins),
     ];
-    let rows: usize = groups.iter().map(|(_, rows)| rows.len()).sum();
-    // Refresh and Baseline offset carry a line of explanation.
-    let hinted_rows = 2.0;
+    let count = groups.len() as f32;
+    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>() - plugin_rows;
     for (index, (title, rows)) in groups.into_iter().enumerate() {
         body = body.child(group(look, title, index > 0, rows));
     }
 
     // As tall as the groups, so nothing scrolls on a usual window; a parse
-    // error's banner may push the last rows under the fold.
+    // error's banner (or a long list of plugins) may push the last rows
+    // under the fold.
     let content = DIALOG_HEAD
-        + 3.0 * (overlay_kit::GROUP_HEIGHT + 2.0 * theme::HAIRLINE)
-        + 2.0 * GROUP_GAP
+        + count * (overlay_kit::GROUP_HEIGHT + 2.0 * theme::HAIRLINE)
+        + (count - 1.0) * GROUP_GAP
         + rows as f32 * (ROW_HEIGHT + theme::HAIRLINE)
         + hinted_rows * (HINT_ROW_HEIGHT - ROW_HEIGHT)
+        + plugins_height
+        + plugin_rows as f32 * theme::HAIRLINE
         + errors as f32 * BANNER_HEIGHT;
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
         .min(content)

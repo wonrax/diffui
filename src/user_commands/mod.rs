@@ -18,7 +18,7 @@ mod template;
 use std::borrow::Cow;
 use std::time::Duration;
 
-pub(crate) use run::{Generation, RunId, Runs, jj_line};
+pub(crate) use run::{Generation, RunId, Runs, jj as embedded_jj, jj_line};
 pub(crate) use spec::{SHIPPED, parse_commands};
 #[cfg(test)]
 pub(crate) use template::VARS;

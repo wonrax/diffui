@@ -474,6 +474,7 @@ pub(crate) mod tests {
             command_line_settle: Default::default(),
             panes: None,
             forge: Default::default(),
+            plugins: Default::default(),
             #[cfg(test)]
             renders: 0,
             modifiers: crate::keys::Modifiers::default(),

@@ -313,6 +313,10 @@ impl Diffui {
         let home = forges.pick_remote(&remotes, None);
         state.forge.remotes = remotes.clone();
         state.forge.home = home.clone();
+        self.note_forge_handles(tab, &remotes);
+        let Some(state) = self.tab_mut(tab) else {
+            return;
+        };
         if home.is_none() {
             if !state.forge.decorations.is_empty() {
                 state.forge.decorations.clear();

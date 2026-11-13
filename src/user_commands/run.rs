@@ -38,6 +38,18 @@ pub(crate) struct Runs {
     waiting: Option<Waiting>,
 }
 
+impl Runs {
+    /// An id for something that asks the user on `tab` without being a
+    /// declared command's run: a plugin's prompt.
+    pub(crate) fn mint(&mut self, tab: TabId) -> RunId {
+        self.next += 1;
+        RunId {
+            tab,
+            serial: self.next,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Waiting {
     id: RunId,
@@ -129,7 +141,7 @@ impl Diffui {
         let command = run.command.clone();
         if let Some(prompt) = command.prompts.get(run.answered) {
             match &prompt.kind {
-                PromptKind::Input => self.ask_input(id, &prompt.label, cx),
+                PromptKind::Input => self.ask_input(id, &prompt.label, "", "", cx),
                 PromptKind::Confirm => self.ask(crate::ConfirmDialog {
                     title: Prose::from(prompt.label.clone()),
                     body: Prose::new(),
@@ -184,6 +196,10 @@ impl Diffui {
 
     /// The prompt in front of `id` was answered (`None`: cancelled).
     pub(crate) fn user_prompt_answered(&mut self, id: RunId, answer: Option<String>, cx: &mut Cx) {
+        let answer = match self.plugin_prompt_answered(id, answer) {
+            Ok(()) => return,
+            Err(answer) => answer,
+        };
         let Some(run) = self.user_runs.waiting.as_mut().filter(|run| run.id == id) else {
             return;
         };
@@ -202,6 +218,10 @@ impl Diffui {
     /// The confirm dialog in front of `id` was answered: a confirm prompt,
     /// or the command's own `confirm`.
     pub(crate) fn user_run_confirmed(&mut self, id: RunId, accepted: bool, cx: &mut Cx) {
+        let answer = accepted.then(String::new);
+        if self.plugin_prompt_answered(id, answer).is_ok() {
+            return;
+        }
         let Some(run) = self.user_runs.waiting.as_mut().filter(|run| run.id == id) else {
             return;
         };
@@ -651,7 +671,7 @@ fn display_argv(argv: &[String]) -> String {
 }
 
 /// The jj CLI this binary embeds, as a child process.
-fn jj() -> tokio::process::Command {
+pub(crate) fn jj() -> tokio::process::Command {
     #[cfg(test)]
     return tokio::process::Command::new(crate::harness::fixture_jj());
     #[cfg(not(test))]

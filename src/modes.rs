@@ -115,6 +115,8 @@ modes! {
         Credential(crate::credentials::CredentialDialog) => Credential,
         /// A jj CLI run's output.
         CliOutput(crate::cli_output::OutputView) => Output,
+        /// Asking whether a plugin may run.
+        PluginPermission(crate::plugins::PermissionDialog) => PluginPermission,
     }
 
     /// A mode bound to one tab: it names rows, files, or text that belong to

@@ -56,6 +56,9 @@ pub(crate) struct CliRun {
     /// What Stop raises for a program the app runs itself; a passthrough
     /// is stopped through its repository's actor instead.
     cancel: Option<diffui_core::repo::CancelFlag>,
+    /// Text to read rather than a run: `program` is its title, and there is
+    /// no exit status to show.
+    transcript: bool,
 }
 
 impl CliRun {
@@ -78,6 +81,7 @@ impl CliRun {
             started: Instant::now(),
             scope: None,
             cancel: Some(cancel),
+            transcript: false,
         }
     }
 
@@ -199,9 +203,41 @@ impl Diffui {
                 started: Instant::now(),
                 scope: scope.map(Scope),
                 cancel: None,
+                transcript: false,
             },
         );
         handle.send(diffui_core::Command::RunCli { job, invocation });
+        self.open_cli_output(tab, activity);
+    }
+
+    /// Show `lines` under `title` in the output panel: something to read
+    /// that no run printed (a plugin's log). It is kept with the active
+    /// tab's runs, without an activity row.
+    pub(crate) fn show_transcript(&mut self, title: String, lines: Vec<CliLine>) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let activity = self.allocate_activity_id();
+        let Some(state) = self.tab_mut(tab) else {
+            return;
+        };
+        let job = state.session.next_job();
+        keep_run(
+            &mut state.cmdline.runs,
+            CliRun {
+                activity,
+                job,
+                program: title,
+                args: Vec::new(),
+                lines,
+                dropped: 0,
+                exit: Some(Exit::Code(Some(0))),
+                started: Instant::now(),
+                scope: None,
+                cancel: None,
+                transcript: true,
+            },
+        );
         self.open_cli_output(tab, activity);
     }
 
@@ -409,7 +445,12 @@ pub(crate) fn build_overlay(
                 .into_any_element(),
         );
     }
-    let card = crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), look)
+    let title = if run.transcript {
+        Prose::from(run.program.clone())
+    } else {
+        Prose::new().code(run.command())
+    };
+    let mut card = crate::overlay_kit::Dialog::new(&title, look)
         .width(OUTPUT_WIDTH)
         .child(output)
         .bound_hint(
@@ -423,10 +464,11 @@ pub(crate) fn build_overlay(
             crate::commands::Context::Output,
             &["output.close"],
             "Close",
-        )
-        .note(status)
-        .buttons(buttons)
-        .build();
+        );
+    if !run.transcript {
+        card = card.note(status);
+    }
+    let card = card.buttons(buttons).build();
     let dismiss = send::<()>(OutputAction::Close, cx);
     ui::modal(
         "cli-output-modal",

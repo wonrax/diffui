@@ -16,7 +16,9 @@ use super::{Availability, Command, CommandArg, Context, PaletteScope};
 use crate::Diffui;
 use crate::action::Action;
 use crate::palette::ResultRef;
-use crate::user_commands::UserCommand;
+use crate::plugins::PluginCommand;
+use crate::user_commands::{Places, UserCommand};
+use crate::when::When;
 
 /// A command's stable identity: a string, so it survives in a config file and
 /// in the persisted palette recents, and owned, so commands that config
@@ -96,6 +98,19 @@ pub(crate) enum Handler {
     /// rows diffui ships. Its when-clause and the variables it names decide
     /// whether it runs; running it is [`Action::RunUserCommand`].
     User(Arc<UserCommand>),
+    /// A command a plugin's manifest declares. Its when-clause and the
+    /// plugin's state decide whether it runs; running it calls the plugin's
+    /// handler ([`Action::RunPluginCommand`]).
+    Plugin(Arc<PluginCommand>),
+}
+
+/// What a command that was declared (in config, or by a plugin's manifest)
+/// says about itself, where a built-in has fields and predicates.
+pub(crate) struct Declared<'a> {
+    pub(crate) places: Places,
+    pub(crate) when: Option<&'a When>,
+    /// Where it was declared, `path:line:col`.
+    pub(crate) source: &'a str,
 }
 
 /// One command, wherever it was declared.
@@ -108,7 +123,7 @@ pub(crate) struct Entry {
     pub(crate) palette_label: Cow<'static, str>,
     pub(crate) hint: Cow<'static, str>,
     /// The palette heading it lists under.
-    pub(crate) group: &'static str,
+    pub(crate) group: Cow<'static, str>,
     /// Its glyph in the palette.
     pub(crate) icon: &'static str,
     pub(crate) contexts: &'static [Context],
@@ -131,7 +146,7 @@ impl Entry {
             label: Cow::Borrowed(command.label),
             palette_label: Cow::Borrowed(builtin_palette_label(command)),
             hint: Cow::Borrowed(command.hint),
-            group: builtin_group(command.id),
+            group: Cow::Borrowed(builtin_group(command.id)),
             icon: builtin_icon(command.id),
             contexts: command.contexts,
             chords: command
@@ -155,7 +170,7 @@ impl Entry {
             label: Cow::Owned(command.label.clone()),
             palette_label: Cow::Owned(command.label.clone()),
             hint: Cow::Owned(command.hint.clone()),
-            group: command.group,
+            group: Cow::Borrowed(command.group),
             icon: crate::icons::TERMINAL,
             contexts: &[Context::Base],
             chords: command.keys.iter().cloned().map(Cow::Owned).collect(),
@@ -164,6 +179,23 @@ impl Entry {
             aliases: &[],
             relabel: None,
             handler: Handler::User(command),
+        }
+    }
+
+    fn plugin(command: Arc<PluginCommand>) -> Self {
+        Self {
+            id: command.id.as_str().into(),
+            label: Cow::Owned(command.label.clone()),
+            palette_label: Cow::Owned(command.label.clone()),
+            hint: Cow::Owned(command.hint.clone()),
+            group: Cow::Owned(command.group.clone()),
+            icon: crate::overlay_kit::glyph::PUZZLE,
+            contexts: &[Context::Base],
+            chords: command.keys.iter().cloned().map(Cow::Owned).collect(),
+            palette: PaletteScope::Hidden,
+            aliases: &[],
+            relabel: None,
+            handler: Handler::Plugin(command),
         }
     }
 
@@ -188,6 +220,7 @@ impl Entry {
         match &self.handler {
             Handler::Builtin { enabled, .. } => enabled(ui, arg).map_err(Cow::Borrowed),
             Handler::User(command) => command.availability(ui, arg),
+            Handler::Plugin(command) => command.availability(ui, arg),
         }
     }
 
@@ -201,25 +234,44 @@ impl Entry {
                 tab: ui.active_tab_id()?,
                 arg,
             }),
+            Handler::Plugin(command) => Some(Action::RunPluginCommand {
+                command: command.clone(),
+                tab: ui.active_tab_id()?,
+                arg,
+            }),
         }
     }
 
-    /// The declared command behind this entry, if it is one.
+    /// The command config declared behind this entry, if it is one.
     pub(crate) fn declared(&self) -> Option<&Arc<UserCommand>> {
         match &self.handler {
             Handler::User(command) => Some(command),
-            Handler::Builtin { .. } => None,
+            Handler::Builtin { .. } | Handler::Plugin(_) => None,
         }
+    }
+
+    /// Where this entry is offered and when, for one that config or a plugin
+    /// declared.
+    pub(crate) fn declaration(&self) -> Option<Declared<'_>> {
+        let (places, when, source) = match &self.handler {
+            Handler::Builtin { .. } => return None,
+            Handler::User(command) => (command.places, &command.when, &command.source),
+            Handler::Plugin(command) => (command.places, &command.when, &command.source),
+        };
+        Some(Declared {
+            places,
+            when: when.as_ref().map(|(_, when)| when),
+            source,
+        })
     }
 
     /// Whether the palette lists it in `scope`, run on `arg`.
     fn listed_in(&self, scope: PaletteScope, arg: &CommandArg) -> bool {
-        let Some(command) = self.declared() else {
+        let Some(Declared { places, .. }) = self.declaration() else {
             return self.palette == scope
                 || (self.palette == PaletteScope::RevisionVerb
                     && matches!(scope, PaletteScope::Root | PaletteScope::Revision));
         };
-        let places = command.places;
         match scope {
             PaletteScope::Root => places.palette,
             PaletteScope::Revision => match arg {
@@ -259,12 +311,15 @@ impl Registry {
     }
 
     /// The built-ins, then `shipped` (the rows diffui declares), then
-    /// `declared` (config's), and what was wrong with the declarations. A
-    /// declared command whose id a built-in or a shipped row already has
-    /// takes its place only with `override = true`; otherwise it is left out.
+    /// `declared` (config's), then `plugins` (the plugins' manifests'), and
+    /// what was wrong with the declarations. A declared command whose id a
+    /// built-in or a shipped row already has takes its place only with
+    /// `override = true`; otherwise it is left out. A plugin's command never
+    /// takes an id that is in use.
     pub(crate) fn build(
         shipped: &[Arc<UserCommand>],
         declared: &[Arc<UserCommand>],
+        plugins: &[Arc<PluginCommand>],
     ) -> (Self, Vec<String>) {
         let mut entries: Vec<Entry> = super::REGISTRY.iter().map(Entry::builtin).collect();
         let mut problems = Vec::new();
@@ -296,6 +351,16 @@ impl Registry {
                 None => entries.push(Entry::user(command.clone())),
             }
         }
+        for command in plugins {
+            if entries.iter().any(|entry| entry.id == command.id.as_str()) {
+                problems.push(format!(
+                    "{}: [[commands]] {:?} is already a command; this one is left out",
+                    command.source, command.id
+                ));
+            } else {
+                entries.push(Entry::plugin(command.clone()));
+            }
+        }
         let registry = Self::from_entries(entries);
         problems.extend(registry.chord_collisions());
         (registry, problems)
@@ -308,7 +373,7 @@ impl Registry {
         use crate::keymap::Chord;
         let mut problems = Vec::new();
         for entry in &self.entries {
-            let Some(command) = entry.declared() else {
+            let Some(declared) = entry.declaration() else {
                 continue;
             };
             for raw in &entry.chords {
@@ -327,8 +392,8 @@ impl Registry {
                     if let Some(other) = other {
                         problems.push(format!(
                             "{}: [[commands]] {:?}: {raw} is also {}'s in {}; this one wins",
-                            command.source,
-                            command.id,
+                            declared.source,
+                            entry.id,
                             other.id,
                             context.name()
                         ));
@@ -566,6 +631,7 @@ label = "Mine"
 exec = ["true"]
 "#,
             ),
+            &[],
         );
         assert!(problems[0].contains("override = true"), "{problems:?}");
         assert!(registry.get("repo.refresh").unwrap().declared().is_none());
@@ -581,6 +647,7 @@ exec = ["true"]
 override = true
 "#,
             ),
+            &[],
         );
         assert!(problems.is_empty(), "{problems:?}");
         let entry = registry.get("repo.refresh").unwrap();
@@ -613,7 +680,7 @@ label = "Mine"
 exec = ["true"]
 "#,
         );
-        let (registry, problems) = Registry::build(&shipped, &mine);
+        let (registry, problems) = Registry::build(&shipped, &mine, &[]);
         assert!(problems[0].contains("ships"), "{problems:?}");
         assert_eq!(
             registry.get("file.open-in-editor").unwrap().label,
@@ -645,7 +712,7 @@ keys = ["cmd+k"]
 exec = ["true"]
 "#,
         );
-        let (registry, problems) = Registry::build(&[], &late);
+        let (registry, problems) = Registry::build(&[], &late, &[]);
         assert!(problems[0].contains("palette.toggle"), "{problems:?}");
         let (map, problems) = Keymap::build(&registry, &keys);
         assert!(problems.is_empty(), "{problems:?}");
@@ -660,7 +727,7 @@ exec = ["true"]
             Some("palette.toggle")
         );
 
-        let (registry, _) = Registry::build(&[], &late);
+        let (registry, _) = Registry::build(&[], &late, &[]);
         let (map, _) = Keymap::build(&registry, &RawKeys::default());
         assert_eq!(
             map.resolve(Context::Base, &palette).as_deref(),
@@ -683,6 +750,7 @@ label = "Late"
 exec = ["true"]
 "#,
             ),
+            &[],
         );
         assert!(registry.get("user.late").is_some());
         assert!(recents.command_bonus("user.late") > 0);

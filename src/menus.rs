@@ -86,12 +86,8 @@ impl Diffui {
             .registry
             .iter()
             .filter(|entry| {
-                entry.declared().is_some_and(|command| {
-                    wanted(&command.places)
-                        && command
-                            .when
-                            .as_ref()
-                            .is_none_or(|(_, when)| when.eval(&keys))
+                entry.declaration().is_some_and(|declared| {
+                    wanted(&declared.places) && declared.when.is_none_or(|when| when.eval(&keys))
                 })
             })
             .map(|entry| self.menu_item(&entry.id, arg.clone()))
@@ -569,7 +565,8 @@ impl Diffui {
             return;
         }
         if let Some(action) = command.build(self, arg) {
-            self.perform(action, cx)
+            self.perform(action, cx);
+            self.plugins_after_command(id);
         }
     }
 

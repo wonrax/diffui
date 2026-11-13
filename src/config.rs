@@ -7,7 +7,9 @@
 //!
 //! Both hold the settings below; `config.toml` wins per key, and a key it
 //! sets is locked in the dialog. `[keys]`, `[[revset_presets]]`,
-//! `[[commands]]`, `[editor]` and `[ai]` are read from `config.toml` only.
+//! `[[commands]]`, `[editor]`, `[ai]` and a plugin's `[plugins.<id>]` table
+//! are read from `config.toml` only. `settings.toml` also keeps what the user
+//! decided about each plugin (see [`crate::plugins::Record`]).
 //!
 //! Configurable fields:
 //!   ui_font              — family used for chrome, sidebar, file names, etc.
@@ -148,11 +150,14 @@ impl AppConfig {
                 )
             }
         };
-        let (stored, settings_error) = match read_settings_file(settings_path.as_deref()) {
-            Ok(read) => (read.unwrap_or_default(), None),
+        let (stored, plugins, settings_error) = match read_settings_file(settings_path.as_deref()) {
+            Ok(read) => {
+                let (stored, plugins) = read.unwrap_or_default();
+                (stored, plugins.plugins, None)
+            }
             Err(error) => {
                 tracing::warn!("ignoring settings file: {error}");
-                (Scalars::default(), Some(error))
+                (Scalars::default(), Default::default(), Some(error))
             }
         };
         let resolved = Self::resolve(&config, &stored);
@@ -165,6 +170,7 @@ impl AppConfig {
             config_path,
             settings_path,
             stored,
+            plugins,
             config_error,
             settings_error,
         };
@@ -360,6 +366,8 @@ pub struct ConfigFiles {
     pub settings_path: Option<PathBuf>,
     /// `settings.toml` as last read or written: what the next write keeps.
     stored: Scalars,
+    /// What the user decided about each plugin, by id.
+    pub(crate) plugins: PluginRecords,
     /// Why `config.toml` was ignored, as `path:line:col: message`.
     pub config_error: Option<String>,
     /// Why `settings.toml` was ignored.
@@ -395,14 +403,63 @@ impl ConfigFiles {
         };
         let mut next = self.stored.clone();
         setting.store(&mut next);
-        let body = toml::to_string(&next).map_err(|error| error.to_string())?;
-        let text = format!("{SETTINGS_HEADER}{body}");
-        write_atomic(path, text.as_bytes())
-            .map_err(|error| format!("{}: {error}", display_path(path)))?;
+        save_settings(path, &next, &self.plugins)?;
         self.stored = next;
         self.settings_error = None;
         Ok(())
     }
+
+    /// Save what the user decided about the plugin `id`, keeping every other
+    /// setting as it was.
+    pub(crate) fn write_plugin(
+        &mut self,
+        id: &str,
+        record: crate::plugins::Record,
+    ) -> Result<(), String> {
+        let mut next = self.plugins.clone();
+        next.insert(id.to_owned(), record);
+        if let Some(path) = &self.settings_path {
+            save_settings(path, &self.stored, &next)?;
+            self.settings_error = None;
+        }
+        self.plugins = next;
+        Ok(())
+    }
+}
+
+/// What `settings.toml` says about each plugin, by id.
+pub(crate) type PluginRecords = std::collections::BTreeMap<String, crate::plugins::Record>;
+
+/// What `settings.toml` says about each plugin, read on its own: for
+/// `diffui plugin list`, which has no app around it.
+pub(crate) fn plugin_records() -> PluginRecords {
+    read_settings_file(settings_path().as_deref())
+        .ok()
+        .flatten()
+        .map(|(_, stored)| stored.plugins)
+        .unwrap_or_default()
+}
+
+/// The `[plugins.<id>]` tables of `settings.toml`.
+#[derive(Default, Debug, Deserialize, Serialize)]
+struct StoredPlugins {
+    #[serde(default, skip_serializing_if = "PluginRecords::is_empty")]
+    plugins: PluginRecords,
+}
+
+/// Write `settings.toml` whole: the settings, then the plugin tables.
+fn save_settings(path: &Path, scalars: &Scalars, plugins: &PluginRecords) -> Result<(), String> {
+    let body = toml::to_string(scalars).map_err(|error| error.to_string())?;
+    let mut text = format!("{SETTINGS_HEADER}{body}");
+    if !plugins.is_empty() {
+        let tables = toml::to_string(&StoredPlugins {
+            plugins: plugins.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+        text.push('\n');
+        text.push_str(&tables);
+    }
+    write_atomic(path, text.as_bytes()).map_err(|error| format!("{}: {error}", display_path(path)))
 }
 
 const SETTINGS_HEADER: &str = "\
@@ -494,6 +551,9 @@ struct FileOnly {
     editor: Tool,
     #[serde(default)]
     ai: Tool,
+    /// `[plugins.<id>]`: each plugin's own settings, as written.
+    #[serde(default)]
+    plugins: std::collections::BTreeMap<String, toml::Table>,
 }
 
 /// `[editor]` / `[ai]`: the program a shipped command starts.
@@ -513,6 +573,8 @@ pub(crate) struct UserConfig {
     pub(crate) problems: Vec<String>,
     pub(crate) editor: Option<Vec<String>>,
     pub(crate) ai: Option<Vec<String>>,
+    /// Each plugin's `[plugins.<id>]` table.
+    pub(crate) plugins: std::collections::BTreeMap<String, toml::Table>,
 }
 
 impl UserConfig {
@@ -527,6 +589,7 @@ impl UserConfig {
             problems,
             editor: file_only.editor.command,
             ai: file_only.ai.command,
+            plugins: file_only.plugins,
         }
     }
 
@@ -591,11 +654,11 @@ fn read_config_file(path: Option<&Path>) -> Result<Option<(Scalars, FileOnly, St
 }
 
 /// `settings.toml`'s settings, as [`read_config_file`] reads its file.
-fn read_settings_file(path: Option<&Path>) -> Result<Option<Scalars>, String> {
+fn read_settings_file(path: Option<&Path>) -> Result<Option<(Scalars, StoredPlugins)>, String> {
     let Some((path, text)) = read_file(path)? else {
         return Ok(None);
     };
-    parse(path, &text).map(Some)
+    Ok(Some((parse(path, &text)?, parse(path, &text)?)))
 }
 
 fn read_file(path: Option<&Path>) -> Result<Option<(&Path, String)>, String> {
