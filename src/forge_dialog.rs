@@ -1177,18 +1177,20 @@ pub(crate) fn build_dialog(
                 look,
             )
         };
-        card =
-            card.child(
-                crate::ui::segmented(theme)
-                    .child(
-                        segment("pull-request-ready", "Ready for review", !draft).on_click(
-                            Diffui::on_action(Action::Forge(ForgeAction::Draft(false)), cx),
-                        ),
-                    )
-                    .child(segment("pull-request-draft", "Draft", draft).on_click(
-                        Diffui::on_action(Action::Forge(ForgeAction::Draft(true)), cx),
-                    )),
+        let toggle = crate::ui::segmented(theme)
+            .child(
+                segment("pull-request-ready", "Ready for review", !draft).on_click(
+                    Diffui::on_action(Action::Forge(ForgeAction::Draft(false)), cx),
+                ),
+            )
+            .child(
+                segment("pull-request-draft", "Draft", draft).on_click(Diffui::on_action(
+                    Action::Forge(ForgeAction::Draft(true)),
+                    cx,
+                )),
             );
+        // In a row of its own, so the well hugs its segments.
+        card = card.child(div().flex().flex_row().child(toggle));
     }
     if let Some(problem) = dialog.problem() {
         card = card.child(

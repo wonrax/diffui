@@ -498,6 +498,104 @@ fn all_revs(c: &mut Ctx) {
     c.act(Action::SetRevset("all()".to_owned()));
 }
 
+/// Pull requests on the fixture's bookmarks, as a refresh against a GitHub
+/// origin would have left them: one of each state, with and without checks.
+fn forge_badges(c: &mut Ctx) {
+    use diffui_core::forge::{CheckState, Checks, ForgeKind, ForgeRemote, PrState, PullRequest};
+    let remote = ForgeRemote::new(ForgeKind::GitHub, "github.com", "acme", "render-toolkit");
+    let badges = [
+        (
+            "feature/render-pipeline",
+            41,
+            PrState::Open,
+            Some(CheckState::Pending),
+            "Rework the render pipeline",
+        ),
+        (
+            "feature/auth",
+            38,
+            PrState::Draft,
+            Some(CheckState::Failure),
+            "Sign in with a device code",
+        ),
+        (
+            "fix/parser-crash",
+            35,
+            PrState::Merged,
+            None,
+            "Fix the parser crash on empty input",
+        ),
+        (
+            "fix/changelog-note",
+            42,
+            PrState::Open,
+            Some(CheckState::Success),
+            "Note the release in the changelog",
+        ),
+        (
+            "data/regenerate",
+            30,
+            PrState::Closed,
+            None,
+            "Regenerate the lookup tables",
+        ),
+    ];
+    c.h.act(|ui, _| {
+        let state = ui.active_mut();
+        let targets = crate::forge::bookmark_targets(&state.session.bookmarks);
+        state.forge.home = Some(("origin".to_owned(), remote.clone()));
+        for (name, number, pr_state, checks, title) in badges {
+            let Some(target) = targets.get(name) else {
+                continue;
+            };
+            state.forge.decorations.insert(
+                name.to_owned(),
+                crate::forge::Decoration {
+                    remote: remote.clone(),
+                    pr: PullRequest {
+                        number,
+                        url: format!("{}/pull/{number}", remote.web_url),
+                        title: title.to_owned(),
+                        head: name.to_owned(),
+                        base: "main".to_owned(),
+                        head_sha: target.clone(),
+                        state: pr_state,
+                        review: None,
+                    },
+                    checks: checks.map(|state| Checks {
+                        state,
+                        url: Some(format!("{}/commit/{target}", remote.web_url)),
+                    }),
+                    target: target.clone(),
+                },
+            );
+        }
+        state.session.repaint_version += 1;
+    });
+    c.settle();
+}
+
+/// The fake `glab`'s answers for `acme/render-toolkit!7` on gitlab.com.
+fn answer_merge_request() {
+    let project = "api --hostname gitlab.com projects/acme%2Frender-toolkit/merge_requests/7";
+    crate::harness::answer_forge(&[
+        (
+            &format!("{project}/commits*"),
+            r#"[{"id": "2222222222222222222222222222222222222222", "title": "Bind once per frame", "author_name": "Mika", "authored_date": "2026-03-12T09:30:00Z"},
+                {"id": "1111111111111111111111111111111111111111", "title": "Rework the render pipeline", "author_name": "Mika", "authored_date": "2026-03-10T10:00:00Z"}]"#,
+        ),
+        (
+            &format!("{project}/diffs*"),
+            r#"[{"old_path": "src/render.rs", "new_path": "src/render.rs", "diff": "@@ -1,4 +1,5 @@\n fn render(frame: &Frame) {\n-    draw(frame);\n+    let bindings = bind(frame);\n+    draw(frame, &bindings);\n }\n"},
+                {"old_path": "CHANGELOG.md", "new_path": "CHANGELOG.md", "new_file": true, "diff": "@@ -0,0 +1,2 @@\n+## Unreleased\n+- Bindings are cached per frame.\n"}]"#,
+        ),
+        (
+            project,
+            r#"{"iid": 7, "web_url": "https://gitlab.com/acme/render-toolkit/-/merge_requests/7", "title": "Cache the pipeline's bindings", "source_branch": "feature/render-pipeline", "target_branch": "main", "sha": "2222222222222222222222222222222222222222", "state": "opened", "source_project_id": 1, "target_project_id": 1, "author": {"username": "mika"}, "changes_count": "2"}"#,
+        ),
+    ]);
+}
+
 fn prompt(c: &mut Ctx, kind: PromptKind, text: &str, subject: Option<&str>, detail: Option<&str>) {
     let event = AskpassEvent::Prompt(PromptRequest {
         id: 1,
@@ -2526,6 +2624,66 @@ fn all() -> Vec<Scene> {
         )
         .dark(),
     );
+
+    t.group("Forges");
+    // A wide sidebar, so every badged chip has room beside its row's ids.
+    let badges = |c: &mut Ctx| {
+        all_revs(c);
+        c.h.act(|ui, _| ui.on_sidebar_width_changed(760.0));
+        forge_badges(c);
+    };
+    t.add(s(
+        "forge-badges",
+        "Bookmark chips wearing their pull request: open with checks running, draft with checks failing, merged, open and passing, closed.",
+        "Refresh pull requests against a GitHub origin.",
+        badges,
+    ));
+    t.add(
+        s(
+            "forge-badges-dark",
+            "The same badges in the dark theme.",
+            "Refresh pull requests against a GitHub origin.",
+            badges,
+        )
+        .dark(),
+    );
+    t.add(s(
+        "forge-commit-info",
+        "A revision whose bookmark has an open pull request: the commit info block's Pull request field, its state, and its checks.",
+        "Select feature/render-pipeline's revision.",
+        |c| {
+            forge_badges(c);
+            c.select("feature/render-pipeline");
+        },
+    ));
+    t.add(s(
+        "forge-create-dialog",
+        "The create pull request dialog for a bookmark: title and body from the description, base main, push first.",
+        "Create pull request on fix/changelog-note.",
+        |c| {
+            forge_badges(c);
+            c.h.act(|ui, _| {
+                ui.active_mut().forge.decorations.remove("fix/changelog-note");
+            });
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Open(
+                CommandArg::Bookmark {
+                    name: "fix/changelog-note".to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            )));
+        },
+    ));
+    t.add(s(
+        "forge-mr-tab",
+        "A GitLab merge request open as a tab: the tab reads render-toolkit!7, the header says Merge request.",
+        "Open acme/render-toolkit!7.",
+        |c| {
+            answer_merge_request();
+            c.act(Action::OpenRepo("acme/render-toolkit!7".to_owned()));
+            c.wait_for_load();
+        },
+    ));
 
     t.scenes
 }

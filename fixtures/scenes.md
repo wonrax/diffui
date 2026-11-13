@@ -1407,3 +1407,35 @@ scenes are new in the port; there is no iced capture for them.
 - Window: 1440x900, dark
 - State: commands-generate in dark.
 - Steps: d on a revision, theme Dark.
+
+## Forges
+
+### `forge-badges`
+
+- Window: 1440x900, light
+- State: Bookmark chips wearing their pull request: open with checks running, draft with checks failing, merged, open and passing, closed.
+- Steps: Refresh pull requests against a GitHub origin.
+
+### `forge-badges-dark`
+
+- Window: 1440x900, dark
+- State: The same badges in the dark theme.
+- Steps: Refresh pull requests against a GitHub origin.
+
+### `forge-commit-info`
+
+- Window: 1440x900, light
+- State: A revision whose bookmark has an open pull request: the commit info block's Pull request field, its state, and its checks.
+- Steps: Select feature/render-pipeline's revision.
+
+### `forge-create-dialog`
+
+- Window: 1440x900, light
+- State: The create pull request dialog for a bookmark: title and body from the description, base main, push first.
+- Steps: Create pull request on fix/changelog-note.
+
+### `forge-mr-tab`
+
+- Window: 1440x900, light
+- State: A GitLab merge request open as a tab: the tab reads render-toolkit!7, the header says Merge request.
+- Steps: Open acme/render-toolkit!7.

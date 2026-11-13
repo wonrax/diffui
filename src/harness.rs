@@ -91,12 +91,38 @@ pub(crate) fn scratch_home() -> &'static Path {
                 let path = std::env::var("PATH").unwrap_or_default();
                 std::env::set_var("PATH", format!("{}:{path}", dir.display()));
             }
+            // A test never reaches a forge: `gh` and `glab` are fakes that answer
+            // only what a test told them to (see [`answer_forge`]).
+            let forge_bin = home.join("forge-bin");
+            std::fs::create_dir_all(&forge_bin).expect("make the fake forge directory");
+            let fake =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("core/tests/fixtures/fake-forge-cli.sh");
+            for cli in ["gh", "glab"] {
+                std::fs::copy(&fake, forge_bin.join(cli)).expect("install a fake forge CLI");
+            }
+            std::fs::write(forge_bin.join("rules"), "").expect("write the fake forge rules");
+            let path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{path}", forge_bin.display()));
         }
         // `Diffui::new` opens the repository it's started in, and these tests start
         // inside a workspace: that must not become the repo under test.
         std::env::set_current_dir(&home).expect("enter the scratch home");
         home
     })
+}
+
+/// What the fake `gh` and `glab` on the harness's PATH answer: `(glob over
+/// the arguments, response)` pairs, the first match winning. Anything else
+/// fails, as a CLI that can't reach its forge would.
+pub(crate) fn answer_forge(rules: &[(&str, &str)]) {
+    let dir = scratch_home().join("forge-bin");
+    let mut table = String::new();
+    for (index, (pattern, response)) in rules.iter().enumerate() {
+        let file = format!("response-{index}");
+        std::fs::write(dir.join(&file), response).expect("write a fake forge response");
+        table.push_str(&format!("{pattern}\t{file}\t0\n"));
+    }
+    std::fs::write(dir.join("rules"), table).expect("write the fake forge rules");
 }
 
 /// The jj the fixture needs: `$JJ`, which the dev shell sets.
@@ -248,7 +274,7 @@ impl Harness {
         let home = scratch_home();
         for entry in std::fs::read_dir(home).expect("list the scratch home") {
             let path = entry.expect("a scratch home entry").path();
-            let keep = ["fixture", "repos", "jj-config.toml"]
+            let keep = ["fixture", "repos", "jj-config.toml", "forge-bin"]
                 .iter()
                 .any(|name| path.file_name().is_some_and(|file| file == *name));
             if !keep {
