@@ -230,14 +230,14 @@ impl Diffui {
         }
         // A PR or MR URL, `owner/repo#123` or `group/repo!7` opens a PR tab;
         // anything else is a path.
-        if let Some(spec) = forge::ForgePr::parse(trimmed) {
+        if let Some(spec) = diffui_core::forge::ForgePr::parse(trimmed) {
             // A bare `owner/repo#123` typed from a repository whose remote
             // lives on a company host means that host's PR.
             let remotes = self
                 .tabs
                 .get(self.active)
                 .and_then(|tab| tab.state.repository.as_ref())
-                .map(|repository| forge::remotes(&repository.root))
+                .map(|repository| diffui_core::forge::remotes(&repository.root))
                 .unwrap_or_default();
             let spec = spec.with_host_from_remotes(remotes.iter().map(|(_, url)| url.as_str()));
             return self.open_pull_request(spec, cx);
@@ -349,7 +349,7 @@ impl Diffui {
     /// diff streams from its forge; the tab has no local repository, so the
     /// graph/watcher/mutation machinery stays disabled (`repository`
     /// is `None`) and only the streamed document renders.
-    pub(crate) fn open_pull_request(&mut self, spec: forge::ForgePr, cx: &mut Cx) {
+    pub(crate) fn open_pull_request(&mut self, spec: diffui_core::forge::ForgePr, cx: &mut Cx) {
         self.pop_mode(ModeKind::OpenRepo);
         self.mark_geometry_dirty();
         let source = TabSource::ForgePr(spec.clone());
@@ -473,6 +473,7 @@ pub(crate) mod tests {
             palette_query: Default::default(),
             command_line_settle: Default::default(),
             panes: None,
+            forge: Default::default(),
             #[cfg(test)]
             renders: 0,
             modifiers: crate::keys::Modifiers::default(),

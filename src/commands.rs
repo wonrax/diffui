@@ -87,6 +87,8 @@ contexts! {
     Output = "output",
     /// The conflict marker editor.
     ConflictEdit = "conflict-edit",
+    /// The create / update pull request dialog.
+    PullRequest = "pull-request",
 }
 
 impl Context {
@@ -3119,6 +3121,109 @@ pub(crate) static REGISTRY: &[Command] = &[
         },
         build: |ui, _arg| Some(Action::ExpandFile(ui.active().selected_file)),
         palette: PaletteScope::Root,
+    },
+    // ── Pull requests ───────────────────────────────────────────────────
+    Command {
+        id: "forge.create",
+        label: "Create pull request",
+        hint: "Open a pull request for this bookmark or revision, pushing it first",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::has_forge(ui, arg)
+        },
+        build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.update",
+        label: "Update pull request",
+        hint: "Change the pull request's base, title or description, pushing first",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::has_open_pull_request(ui, arg)
+        },
+        build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.submit-stack",
+        label: "Submit stack",
+        hint: "Push the bookmarks from trunk to here and open or update a pull request for \
+               each, based on the one below",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::has_forge(ui, arg)
+        },
+        build: |_ui, arg| {
+            Some(Action::Forge(
+                crate::forge_dialog::ForgeAction::SubmitStack(arg),
+            ))
+        },
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.open",
+        label: "Open pull request",
+        hint: "Open the pull request in the browser",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_pull_request,
+        build: crate::forge::open_in_browser,
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.open-tab",
+        label: "Open pull request as tab",
+        hint: "Review the pull request in a tab of its own",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_pull_request,
+        build: crate::forge::open_as_tab,
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.copy-url",
+        label: "Copy pull request URL",
+        hint: "Copy the pull request's address",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_pull_request,
+        build: crate::forge::copy_url,
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.refresh",
+        label: "Refresh pull requests",
+        hint: "Ask the forge again for the bookmarks' pull requests and checks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_forge,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Refresh)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "forge.dialog-cancel",
+        label: "Cancel",
+        hint: "Close the pull request dialog",
+        contexts: &[Context::PullRequest],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Cancel)),
+        palette: PaletteScope::Hidden,
     },
 ];
 

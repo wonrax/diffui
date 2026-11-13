@@ -273,6 +273,68 @@ pub(crate) fn header_lines(
             chips,
         });
     }
+    if let Some(row) = row_of {
+        lines.extend(pull_request_fields(ui, row.bookmarks(), look));
+    }
+    lines
+}
+
+/// The pull requests of the revision's bookmarks: each a link to it with its
+/// state, then its checks with a link to them.
+fn pull_request_fields(ui: &Diffui, bookmarks: &[String], look: Look) -> Vec<HeaderLine> {
+    let Look { theme, .. } = look;
+    let forge = &ui.active().forge;
+    let mut shown: Vec<&str> = Vec::new();
+    let mut lines = Vec::new();
+    for decoration in bookmarks
+        .iter()
+        .filter_map(|label| crate::forge::local_name(label))
+        .filter_map(|name| forge.of(name))
+    {
+        if shown.contains(&decoration.pr.url.as_str()) {
+            continue;
+        }
+        shown.push(&decoration.pr.url);
+        let reference = decoration.reference();
+        let id_chars = reference.chars().count();
+        let mut field = HeaderField::new(
+            decoration.remote.kind.title_noun(),
+            format!("{reference}  {}", decoration.pr.title),
+        );
+        field.runs = vec![(0, theme.accent), (id_chars, theme.muted_text)];
+        field.link = Some((id_chars, HeaderAction::OpenUrl(decoration.pr.url.clone())));
+        let (glyph, color) = crate::forge::state_mark(decoration.pr.state, theme);
+        field.chips = vec![crate::chip::Chip {
+            label: decoration.pr.state.label().to_owned(),
+            font: look.mono,
+            background: crate::theme::chip_background(color),
+            text_color: color,
+            border_color: None,
+            border_dashed: false,
+            icon: Some(glyph),
+            icon_color: None,
+            suffix: None,
+            marks: Vec::new(),
+            tip: None,
+        }];
+        field.buttons = vec![(icons::COPY, HeaderAction::Copy(decoration.pr.url.clone()))];
+        lines.push(rich(field));
+        let Some(checks) = decoration
+            .checks
+            .as_ref()
+            .filter(|checks| checks.state != diffui_core::forge::CheckState::None)
+        else {
+            continue;
+        };
+        let mut field = HeaderField::new("Checks", checks.state.phrase());
+        if let Some((_, color)) = crate::forge::checks_mark(checks.state, theme) {
+            field.runs = vec![(0, color)];
+        }
+        if let Some(url) = &checks.url {
+            field.buttons = vec![(icons::EXTERNAL_LINK, HeaderAction::OpenUrl(url.clone()))];
+        }
+        lines.push(rich(field));
+    }
     lines
 }
 
@@ -283,6 +345,7 @@ pub(crate) fn header_action(action: HeaderAction) -> Action {
         HeaderAction::Open(commit_id) => {
             Action::History(crate::history_panel::HistoryAction::OpenRevision(commit_id))
         }
+        HeaderAction::OpenUrl(url) => Action::OpenUrl(url),
     }
 }
 

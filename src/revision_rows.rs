@@ -104,6 +104,12 @@ pub(crate) fn build_revision_list(
                 this.open_revision_menu(key.clone(), *rect, *point, cx);
             },
         ))
+        .on_chip_click(Diffui::listen(
+            cx,
+            |this, (key, index, rect): &(RowSelectionKey, usize, Rectangle), _, cx| {
+                this.on_badge_click(key, *index, *rect, cx);
+            },
+        ))
         .on_file_context_menu(Diffui::listen(
             cx,
             |this, (row, rect, point): &(usize, Rectangle, Point), _, cx| {
@@ -213,6 +219,7 @@ fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
     };
     let ghost = slot.preview.is_some_and(|row| row.role.is_ghost());
     let commit_id = slot.commit.commit_id();
+    let bookmarks = slot.commit.bookmarks();
     let mut view = build_revision_row(
         slot,
         look,
@@ -247,6 +254,10 @@ fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
                 },
             );
         }
+    }
+    // A bookmark's pull request rides on its chip.
+    if !ghost {
+        crate::forge::decorate_chips(&mut view.bookmark_chips, bookmarks, &tab.forge, theme);
     }
     // Tags trail the bookmarks, so the rail's `+N` overflow sheds them first.
     if !ghost && let Some(tags) = tab.session.bookmarks.tags.get(commit_id) {

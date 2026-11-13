@@ -26,6 +26,8 @@ mod diff_panel;
 mod empty_states;
 mod field;
 mod find;
+mod forge;
+mod forge_dialog;
 mod graph_preview;
 #[cfg(test)]
 mod harness;
@@ -84,7 +86,7 @@ mod window_state;
 // …) so those call sites stay unchanged.
 pub(crate) use action::Action;
 pub(crate) use diffui_core::{
-    FetchTarget, JobId, RepoHandle, forge, graph_layout, jj, mutations, repository,
+    FetchTarget, JobId, RepoHandle, graph_layout, jj, mutations, repository,
 };
 // The same for the widget layer in `diffui-widgets`: `crate::theme`,
 // `crate::ui`, `crate::diff_view` and the rest resolve as they did when they
@@ -442,6 +444,8 @@ pub(crate) struct Diffui {
     pub(crate) command_line_settle: spawn::Debounce,
     /// The window's regions as cached views, once it has a window.
     pub(crate) panes: Option<root::Panes>,
+    /// The forges, and when to ask them again.
+    pub(crate) forge: forge::ForgeUi,
     /// How many times the root has rendered.
     #[cfg(test)]
     pub(crate) renders: usize,
@@ -824,6 +828,8 @@ pub(crate) struct TabState {
     pub(crate) find_debounce: spawn::Debounce,
     /// The draft's simulation, waiting for candidate hops to pause.
     pub(crate) preview_debounce: spawn::Debounce,
+    /// This repository's pull requests.
+    pub(crate) forge: forge::TabForge,
 }
 
 impl TabState {
@@ -873,6 +879,7 @@ impl TabState {
             cmdline: Default::default(),
             find_debounce: Default::default(),
             preview_debounce: Default::default(),
+            forge: Default::default(),
         }
     }
 
@@ -978,7 +985,7 @@ pub(crate) enum TabSource {
         /// Repository root, used to de-duplicate opens and key the watcher.
         root: PathBuf,
     },
-    ForgePr(forge::ForgePr),
+    ForgePr(diffui_core::forge::ForgePr),
 }
 
 /// One open tab: its identity + display metadata, plus the per-tab state it
@@ -1063,6 +1070,8 @@ pub(crate) enum Pending {
     /// A `Copy → Author / Committer / Description` waiting on the revision
     /// header, with the in-memory value to copy if that never comes.
     DetailCopy(DetailField, String),
+    /// A pull-request dialog's or submission's question.
+    Forge(forge_dialog::ForgeQuery),
 }
 
 impl Pending {

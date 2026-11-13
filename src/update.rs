@@ -66,7 +66,7 @@ impl Diffui {
         // repository" error.
         enum BootTarget {
             Repo(Repository),
-            Pr(forge::ForgePr),
+            Pr(diffui_core::forge::ForgePr),
         }
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
@@ -86,7 +86,7 @@ impl Diffui {
         }
         if cli.requested_paths().next().is_some() {
             for path in cli.requested_paths() {
-                if let Some(spec) = forge::ForgePr::parse(&path.to_string_lossy()) {
+                if let Some(spec) = diffui_core::forge::ForgePr::parse(&path.to_string_lossy()) {
                     if !targets
                         .iter()
                         .any(|target| matches!(target, BootTarget::Pr(open) if *open == spec))
@@ -243,6 +243,7 @@ impl Diffui {
             palette_query: Default::default(),
             command_line_settle: Default::default(),
             panes: None,
+            forge: Default::default(),
             #[cfg(test)]
             renders: 0,
         };
@@ -553,6 +554,7 @@ impl Diffui {
             (Pending::DetailCopy(field, fallback), Payload::DetailsLoaded { details, .. }) => {
                 crate::write_clipboard(format_detail(&details, field).unwrap_or(fallback), cx)
             }
+            (Pending::Forge(query), payload) => self.forge_job_done(tab, query, payload),
             // A fetch or mutation reporting how far it got: the job runs on.
             (Pending::Fetch(activity, target), Payload::Progress { loaded, total, .. }) => {
                 if let Some(state) = self.tab_mut(tab) {
@@ -625,6 +627,7 @@ impl Diffui {
             }
             // Copy what the graph knows instead.
             Pending::DetailCopy(_, fallback) => crate::write_clipboard(fallback, cx),
+            Pending::Forge(query) => self.forge_job_failed(tab, query, error.to_string()),
         }
     }
 
@@ -646,7 +649,8 @@ impl Diffui {
             | Pending::CommandRevset(_)
             | Pending::LineRevset(..)
             | Pending::RevsetField(_)
-            | Pending::DetailCopy(..) => return,
+            | Pending::DetailCopy(..)
+            | Pending::Forge(_) => return,
         };
         if let Some(log) = self.activity_log_for(tab) {
             log.finish(
@@ -1180,6 +1184,7 @@ impl Diffui {
                 open_url(&url);
             }
             Action::Bookmark(action) => self.update_bookmark(action, cx),
+            Action::Forge(action) => self.update_forge(action, cx),
             Action::Revops(action) => self.perform_revops(action, cx),
             Action::Credential(action) => self.update_credential(action, cx),
             Action::CommandLine(action) => self.on_command_line_action(action, cx),
@@ -2850,6 +2855,7 @@ impl Diffui {
                 .collect::<Vec<_>>()
         });
         let ok = result.is_ok();
+        self.forge_after_fetch(tab, ok);
         self.finish_activity_row(tab, activity_id, result, summary);
         if ok {
             let effects = match self.tab_mut(tab) {
@@ -2871,6 +2877,7 @@ impl Diffui {
         pending: PendingMutation,
         result: Result<mutations::MutationOutcome, diffui_core::RepoError>,
     ) {
+        self.forge_after_mutation(tab, &pending, &result);
         let activity_id = pending.activity_id;
         let description_save = self.tab_mut(tab).is_some_and(|target| {
             target

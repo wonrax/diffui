@@ -358,6 +358,7 @@ impl Diffui {
             .collect();
         top.push(MenuEntry::Separator);
         top.extend(self.revision_bookmark_rows(selection));
+        top.extend(self.pull_request_rows(selection, None));
         top.push(if move_items.is_empty() {
             MenuEntry::Disabled {
                 label: "Move bookmark here".to_owned(),
@@ -408,6 +409,7 @@ impl Diffui {
                         ));
                     }
                     sub.extend(self.local_bookmark_rows(entry));
+                    sub.extend(self.pull_request_rows(selection, Some(&entry.name)));
                     let label = if entry.is_conflicted() {
                         format!("{}??", entry.name)
                     } else {
@@ -436,6 +438,55 @@ impl Diffui {
         }
 
         top
+    }
+
+    /// The pull-request rows: a bookmark's (its badge's menu, and its
+    /// submenu in the revision menu), or the revision's own. Worded for the
+    /// tab's forge (`merge request` on GitLab); nothing without one.
+    pub(crate) fn pull_request_rows(
+        &self,
+        selection: &RevisionSelection,
+        bookmark: Option<&str>,
+    ) -> Vec<menu::MenuEntry> {
+        if self.active().forge.home.is_none() {
+            return Vec::new();
+        }
+        let noun = crate::forge::noun(self);
+        let arg = match bookmark {
+            Some(name) => CommandArg::Bookmark {
+                name: name.to_owned(),
+                remote: None,
+                to: None,
+            },
+            None => CommandArg::Revision(selection.clone()),
+        };
+        let open = self
+            .decoration_for(&arg)
+            .filter(|decoration| decoration.pr.state.is_open())
+            .is_some();
+        let mut rows = vec![menu::MenuEntry::Separator];
+        if self.decoration_for(&arg).is_some() {
+            rows.push(self.menu_row(format!("Open {noun} in browser"), "forge.open", arg.clone()));
+            rows.push(self.menu_row(format!("Open {noun} as tab"), "forge.open-tab", arg.clone()));
+            rows.push(self.menu_row(format!("Copy {noun} URL"), "forge.copy-url", arg.clone()));
+        }
+        rows.push(if open {
+            self.menu_row(
+                format!("Update {noun}\u{2026}"),
+                "forge.update",
+                arg.clone(),
+            )
+        } else {
+            self.menu_row(
+                format!("Create {noun}\u{2026}"),
+                "forge.create",
+                arg.clone(),
+            )
+        });
+        if bookmark.is_none() {
+            rows.push(self.menu_item("forge.submit-stack", arg));
+        }
+        rows
     }
 
     /// The toolbar fetch menu's entries: "Fetch all remotes" + one row per known
@@ -530,13 +581,11 @@ impl Diffui {
         op: mutations::MutationOp,
         allow_backwards: bool,
         allow_immutable: bool,
-    ) {
+    ) -> Option<activity::ActivityId> {
         use mutations::MutationOp;
-        let Some(tab) = self.tab(tab_id) else {
-            return;
-        };
+        let tab = self.tab(tab_id)?;
         if !tab.session.capabilities.mutate {
-            return;
+            return None;
         }
         // Surface the mutation as an activity (push captures its remote output).
         let label: Prose = match &op {
@@ -655,13 +704,15 @@ impl Diffui {
             }
             let (name, to) = (name.clone(), to.clone());
             let Some(state) = self.tab_mut(tab_id) else {
-                return;
+                return Some(activity_id);
             };
             let (job, effects) = state.session.bookmark_check(name, to);
             state.jobs.issue(job, Pending::BookmarkCheck(pending));
-            return self.run_effects(tab_id, effects);
+            self.run_effects(tab_id, effects);
+            return Some(activity_id);
         }
-        self.run_mutation_checking_wc_push(pending)
+        self.run_mutation_checking_wc_push(pending);
+        Some(activity_id)
     }
 
     /// Raise a confirmation for `op` and run it on accept. Only abandon asks

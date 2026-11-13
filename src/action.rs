@@ -184,6 +184,8 @@ pub(crate) enum Action {
 
     /// Bookmark workflow and push — see [`crate::bookmarks`].
     Bookmark(crate::bookmarks::BookmarkAction),
+    /// The pull-request workflow (see [`crate::forge_dialog`]).
+    Forge(crate::forge_dialog::ForgeAction),
 
     /// Answer the credential prompt — see [`crate::credentials`].
     Credential(crate::credentials::CredentialAction),

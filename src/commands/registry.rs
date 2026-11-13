@@ -402,7 +402,7 @@ fn builtin_group(id: &str) -> &'static str {
     match id.split('.').next().unwrap_or(id) {
         "repo" | "tab" | "activity" | "palette" => "Repository",
         "revision" | "selection" | "range" | "diff" => "Revisions",
-        "bookmark" => "Bookmarks",
+        "bookmark" | "forge" => "Bookmarks",
         "changes" | "file" | "lines" => "Changes",
         "conflict" => "Conflicts",
         "compare" => "Compare",
@@ -451,6 +451,12 @@ fn builtin_icon(id: &str) -> &'static str {
         "lines.toggle" | "changes.toggle-file" | "selection.toggle" => icons::LIST_CHECKS,
         "range.edit" => icons::PENCIL,
         "tab.close" | "changes.clear" => icons::CLOSE,
+        "forge.create" | "forge.update" | "forge.submit-stack" | "forge.open-tab" => {
+            icons::PULL_REQUEST
+        }
+        "forge.open" => icons::EXTERNAL_LINK,
+        "forge.copy-url" => icons::COPY,
+        "forge.refresh" => icons::REFRESH,
         _ if id.starts_with("conflict.") => icons::ALERT_TRIANGLE,
         _ if id.starts_with("compare.") => icons::GIT_COMPARE,
         _ if id.starts_with("file.history") => icons::FILE_CLOCK,

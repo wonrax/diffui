@@ -296,6 +296,14 @@ impl ActivityLog {
         }
     }
 
+    /// Where an entry stands, while the log still has it.
+    pub fn status(&self, id: ActivityId) -> Option<ActivityStatus> {
+        self.activities
+            .iter()
+            .find(|activity| activity.id == id)
+            .map(|activity| activity.status)
+    }
+
     /// Flip an entry's status without recording a result — used to move a
     /// mutation between `Queued` and `Running` as the serial queue drains.
     pub fn set_status(&mut self, id: ActivityId, status: ActivityStatus) {

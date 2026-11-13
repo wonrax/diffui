@@ -105,6 +105,8 @@ modes! {
         ActivityPopover => ActivityPopover,
         /// The bookmark-name prompt (create / rename).
         NamePrompt(crate::bookmarks::NamePrompt) => Prompt,
+        /// The create / update pull request dialog.
+        PullRequest(crate::forge_dialog::PrDialog) => PullRequest,
         /// The keyboard-shortcut cheat sheet.
         Shortcuts => Shortcuts,
         /// The settings dialog.

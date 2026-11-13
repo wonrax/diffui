@@ -255,6 +255,8 @@ pub enum HeaderAction {
     Copy(String),
     /// Open the revision with this commit id.
     Open(String),
+    /// Open this address in the browser.
+    OpenUrl(String),
 }
 
 /// One field of the commit info grid (see [`HeaderLine::Rich`]). Its label
