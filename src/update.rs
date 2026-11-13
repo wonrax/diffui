@@ -483,7 +483,7 @@ impl Diffui {
         let handed_back = matches!(pending, Pending::Mutation(_)).then(|| event.clone());
         match event.payload {
             Payload::Failed { error, .. } => self.fail_own_job(tab, job, pending, error, cx),
-            Payload::Cancelled { .. } => self.cancel_own_job(tab, job, pending),
+            Payload::Cancelled { .. } => self.cancel_own_job(tab, job, pending, cx),
             payload => self.finish_own_job(tab, job, pending, payload, cx),
         }
         handed_back
@@ -634,12 +634,27 @@ impl Diffui {
     /// A job the tab issued was cancelled: resolve whatever row was showing
     /// it. A cancelled fetch or mutation left "Running" spins in the log
     /// forever, and calling it "Done" would claim work that never happened.
-    fn cancel_own_job(&mut self, tab: TabId, job: diffui_core::JobId, pending: Pending) {
+    fn cancel_own_job(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        pending: Pending,
+        cx: &mut Cx,
+    ) {
         let activity = match pending {
             Pending::Fetch(activity, _) => activity,
             Pending::Mutation(pending) | Pending::BookmarkCheck(pending) => pending.activity_id,
             Pending::Cli(activity) => {
                 return self.finish_cli_run(tab, job, activity, crate::cli_output::Exit::Cancelled);
+            }
+            // Settled, so a line run from `diffui ctl jj` answers and a
+            // submission doesn't wait on a read that won't come.
+            Pending::LineRevset(line, revset) => {
+                let refused = Err(diffui_core::RevsetError::new("Canceled".to_owned()));
+                return self.line_revset_resolved(tab, line, job, &revset, refused, cx);
+            }
+            Pending::Forge(query) => {
+                return self.forge_job_failed(tab, query, "canceled".to_owned());
             }
             Pending::Preview
             | Pending::FilePair(..)
@@ -647,10 +662,8 @@ impl Diffui {
             | Pending::Tree(_)
             | Pending::File(_)
             | Pending::CommandRevset(_)
-            | Pending::LineRevset(..)
             | Pending::RevsetField(_)
-            | Pending::DetailCopy(..)
-            | Pending::Forge(_) => return,
+            | Pending::DetailCopy(..) => return,
         };
         if let Some(log) = self.activity_log_for(tab) {
             log.finish(
@@ -4662,6 +4675,22 @@ mod tests {
     use crate::commands::Context;
     use crate::modes::{Mode, ModeKind};
     use crate::tabs::tests::{app, push_tab};
+
+    #[test]
+    fn a_cancelled_stack_read_ends_its_submission_row() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/forge-cancelled");
+            let (activity, _) = ui.begin_activity(tab, "Submit stack", false);
+            let job = ui.tab_mut(tab).unwrap().session.next_job();
+            let query = crate::forge_dialog::ForgeQuery::Stack(activity);
+            ui.cancel_own_job(tab, job, Pending::Forge(query), cx);
+            assert_eq!(
+                ui.tab(tab).unwrap().activities.status(activity),
+                Some(activity::ActivityStatus::Error)
+            );
+        });
+    }
 
     #[test]
     fn dragging_history_to_its_minimum_collapses_and_keeps_its_width() {
