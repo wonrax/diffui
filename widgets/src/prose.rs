@@ -30,12 +30,12 @@ enum Kind {
 /// Text with the names in it marked, built left to right:
 /// `Prose::text("Move ").bookmark("main").text(" backwards?")`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Prose {
+pub struct Prose {
     parts: Vec<(Kind, String)>,
 }
 
 impl Prose {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -51,37 +51,37 @@ impl Prose {
         self
     }
 
-    pub(crate) fn text(self, text: impl Into<String>) -> Self {
+    pub fn text(self, text: impl Into<String>) -> Self {
         self.push(Kind::Text, text)
     }
 
-    pub(crate) fn rev(self, id: impl Into<String>) -> Self {
+    pub fn rev(self, id: impl Into<String>) -> Self {
         self.push(Kind::Revision, id)
     }
 
-    pub(crate) fn bookmark(self, name: impl Into<String>) -> Self {
+    pub fn bookmark(self, name: impl Into<String>) -> Self {
         self.push(Kind::Bookmark, name)
     }
 
-    pub(crate) fn path(self, path: impl Into<String>) -> Self {
+    pub fn path(self, path: impl Into<String>) -> Self {
         self.push(Kind::Path, path)
     }
 
-    pub(crate) fn op(self, id: impl Into<String>) -> Self {
+    pub fn op(self, id: impl Into<String>) -> Self {
         self.push(Kind::Operation, id)
     }
 
-    pub(crate) fn remote(self, name: impl Into<String>) -> Self {
+    pub fn remote(self, name: impl Into<String>) -> Self {
         self.push(Kind::Remote, name)
     }
 
     /// Code that isn't one of the named kinds: a revset, a config key.
-    pub(crate) fn code(self, code: impl Into<String>) -> Self {
+    pub fn code(self, code: impl Into<String>) -> Self {
         self.push(Kind::Code, code)
     }
 
     /// `other` appended after this.
-    pub(crate) fn then(mut self, other: Prose) -> Self {
+    pub fn then(mut self, other: Prose) -> Self {
         for (kind, text) in other.parts {
             self = self.push(kind, text);
         }
@@ -90,7 +90,7 @@ impl Prose {
 
     /// Plain text where `` `quoted` `` runs are code, the way jj quotes names
     /// in its messages. An unpaired backtick stays as typed.
-    pub(crate) fn from_backticks(source: &str) -> Self {
+    pub fn from_backticks(source: &str) -> Self {
         let mut prose = Self::new();
         let mut rest = source;
         while let Some(open) = rest.find('`') {
@@ -110,8 +110,7 @@ impl Prose {
     }
 
     /// The revision ids named, in order.
-    #[cfg(test)]
-    pub(crate) fn revisions(&self) -> impl Iterator<Item = &str> {
+    pub fn revisions(&self) -> impl Iterator<Item = &str> {
         self.parts
             .iter()
             .filter(|(kind, _)| *kind == Kind::Revision)
@@ -119,21 +118,20 @@ impl Prose {
     }
 
     /// The bookmark names named, in order.
-    #[cfg(test)]
-    pub(crate) fn bookmarks(&self) -> impl Iterator<Item = &str> {
+    pub fn bookmarks(&self) -> impl Iterator<Item = &str> {
         self.parts
             .iter()
             .filter(|(kind, _)| *kind == Kind::Bookmark)
             .map(|(_, text)| text.as_str())
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
 
     /// Rich text in `font` and `color`, with the names in `mono` and their
     /// own colours. Size, wrapping and width are the caller's.
-    pub(crate) fn view<'a, Message: 'a>(
+    pub fn view<'a, Message: 'a>(
         &self,
         font: Font,
         mono: Font,
@@ -147,7 +145,7 @@ impl Prose {
 
     /// The same text as an [`ellipsis::Line`] at `size`: one line cut to
     /// fit, or wrapped in full.
-    pub(crate) fn line(
+    pub fn line(
         &self,
         font: Font,
         mono: Font,
@@ -177,7 +175,7 @@ impl Prose {
     /// to share a baseline with chips and glyphs (a rich text's runs aren't
     /// placed by [`crate::typography`], and drift off it). One line, no
     /// wrapping; the caller clips it.
-    pub(crate) fn runs<'a, Message: 'a>(
+    pub fn runs<'a, Message: 'a>(
         &self,
         font: Font,
         mono: Font,

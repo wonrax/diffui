@@ -1118,6 +1118,7 @@ pub fn build_confirm_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     ui::modal(
         ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
+        crate::toolbar::modal_top(),
         Message::Action(Action::ConfirmCancel),
         Message::Ui(UiEvent::ConfirmNoOp),
     )
@@ -1150,6 +1151,7 @@ pub fn build_open_repo_dialog(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Mess
 
     ui::modal(
         open_repo_card(ui, theme, dialog),
+        crate::toolbar::modal_top(),
         Message::Action(Action::CloseRepoDialog),
         Message::Ui(UiEvent::OpenRepoNoOp),
     )

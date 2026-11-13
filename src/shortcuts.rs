@@ -293,11 +293,12 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
             ..Padding::from(crate::ui::DIALOG_PADDING)
         })
         .height(Length::Fixed(
-            (ui.window_size.height - theme::modal_top() - theme::space::XXL)
+            (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
                 .clamp(240.0, CARD_MAX_HEIGHT),
         ));
     crate::ui::modal(
         card,
+        crate::toolbar::modal_top(),
         Message::Action(Action::CloseShortcuts),
         Message::Ui(UiEvent::ConfirmNoOp),
     )
@@ -440,11 +441,12 @@ pub(crate) fn welcome_hints(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     ]
     .spacing(theme::space::XL)
     .align_y(Alignment::Center);
-    let gestures =
-        text("Right-click a revision for its actions  \u{b7}  drag one onto another to rebase")
-            .size(text_size::UI)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font);
+    let gestures = text(
+        "Right-click a revision for its actions  \u{b7}  drag a revision or marked set onto another to rebase",
+    )
+    .size(text_size::UI)
+    .color(theme.subtle_text)
+    .font(ui.config.ui_font);
     let all = crate::ui::button(
         text("Keyboard shortcuts")
             .size(text_size::UI)

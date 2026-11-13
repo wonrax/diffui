@@ -38,7 +38,7 @@ const STOCK_PIXELS_PER_LINE: f32 = 4.0;
 /// own — action positions are editor-content-relative, and the wrapper can't
 /// read the child's padding back out of the `Element`. `line_height` is the
 /// editor's line box in pixels, for the scroll-speed correction.
-pub(crate) fn editor_drag_area<'a, Message>(
+pub fn editor_drag_area<'a, Message>(
     content: impl Into<Element<'a, Message, Theme>>,
     padding: impl Into<Padding>,
     line_height: f32,
@@ -52,7 +52,7 @@ pub(crate) fn editor_drag_area<'a, Message>(
     }
 }
 
-pub(crate) struct EditorDragArea<'a, Message> {
+pub struct EditorDragArea<'a, Message> {
     content: Element<'a, Message, Theme>,
     padding: Padding,
     line_height: f32,

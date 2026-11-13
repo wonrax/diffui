@@ -282,6 +282,33 @@ pub(crate) fn batch(ui: &Diffui, arg: &CommandArg) -> Vec<RevisionSelection> {
     }
 }
 
+/// The sources a drag that started on the commit-store row `index` moves.
+///
+/// Dragging a marked row carries the whole marked set, so a batch selection
+/// behaves the same whether it went through the context menu or the pointer.
+/// Dragging an unmarked row while other rows are marked stays a
+/// single-revision drag — Finder's rule: picking up something outside the
+/// selection doesn't silently drag things the user isn't holding.
+pub(crate) fn drag_sources(ui: &Diffui, index: usize) -> Vec<RevisionSelection> {
+    let Some(source) = ui.selection_at_index(index) else {
+        return Vec::new();
+    };
+    let Some(source_id) = ui.draft_source_for(&source).map(|source| source.commit_id) else {
+        return vec![source];
+    };
+    let marked = marked_selections(ui);
+    if marked.len() > 1
+        && marked.iter().any(|selection| {
+            ui.draft_source_for(selection)
+                .is_some_and(|source| source.commit_id == source_id)
+        })
+    {
+        marked
+    } else {
+        vec![source]
+    }
+}
+
 fn batch_enabled(ui: &Diffui, arg: &CommandArg, minimum: usize) -> Availability {
     let targets = batch(ui, arg);
     require(!targets.is_empty(), "No revisions marked")?;
@@ -412,6 +439,16 @@ impl Diffui {
                     self.menu_row(
                         "With descendants onto\u{2026}",
                         "selection.rebase.descendants.start",
+                        set(),
+                    ),
+                    self.menu_row(
+                        "Whole branches onto\u{2026}",
+                        "selection.rebase.branch.start",
+                        set(),
+                    ),
+                    self.menu_row(
+                        "Whole branches onto trunk",
+                        "selection.rebase.onto-trunk",
                         set(),
                     ),
                 ],
@@ -612,6 +649,19 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_marked_row_carries_the_whole_batch() {
+        let mut ui = loaded(graph());
+        let a = RevisionSelection::Commit("a".repeat(8));
+        let b = RevisionSelection::Commit("b".repeat(8));
+        let c = RevisionSelection::Commit("c".repeat(8));
+        ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "c".repeat(8)];
+
+        assert_eq!(drag_sources(&ui, 1), vec![a, c]);
+        // Picking up an unmarked row stays a single-revision drag.
+        assert_eq!(drag_sources(&ui, 2), vec![b]);
+    }
+
+    #[test]
     fn the_batch_menu_offers_set_verbs_by_size() {
         let ui = loaded(graph());
         let two = ui.batch_menu_tree(vec![
@@ -621,6 +671,8 @@ mod tests {
         let two = labels(&two);
         for expected in [
             "Rebase 2 revisions",
+            "Whole branches onto\u{2026}",
+            "Whole branches onto trunk",
             "Squash 2 revisions into\u{2026}",
             "Duplicate 2 revisions",
             "New change on all 2 (merge)",

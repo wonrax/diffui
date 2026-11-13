@@ -17,7 +17,7 @@ watcher = ["dep:notify"]
 fault-injection = []
 
 # Fetch and checksum the highlights module, then translate it to C and
-# compile it (see build.rs). ureq and sha2 match the app's build.rs.
+# compile it (see build.rs). ureq and sha2 match widgets/build.rs.
 [build-dependencies]
 cc = "1"
 sha2 = "0.11"

@@ -11,9 +11,7 @@ use iced::advanced::{
 };
 use iced::{Element, Event, Length, Rectangle, Size, Theme, Vector};
 
-pub(crate) fn suppress<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
+pub fn suppress<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Element::new(PointerSuppressed {
         content: content.into(),
     })

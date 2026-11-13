@@ -471,14 +471,6 @@ pub fn centered_control_content_fill<'a, Message: 'a>(
         .into()
 }
 
-/// Where every modal surface (command palette, open-repo and confirm
-/// dialogs) hangs from: a fixed distance under the window chrome rather than
-/// centered, so a card doesn't jump as its content grows and stacked
-/// takeovers line up with one another.
-pub fn modal_top() -> f32 {
-    crate::toolbar::chrome_bottom() + space::XXL * 2.0
-}
-
 /// Corner radii shared across the chrome. Chips keep their own tighter
 /// rounding ([`crate::chip::RADIUS`]).
 pub mod radius {
@@ -522,7 +514,7 @@ pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::S
 /// Blend `a` toward `b` by `t` (0..=1), ignoring alpha. Used to derive the
 /// raised buttons' bezel stops from surface tokens without growing the spec,
 /// and the sidebar's target-mode wash.
-pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
     Color {
         r: a.r + (b.r - a.r) * t,
         g: a.g + (b.g - a.g) * t,

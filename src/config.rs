@@ -62,33 +62,7 @@ use serde::Deserialize;
 
 use crate::keymap::RawKeys;
 use crate::theme::ThemePreference;
-
-/// Default row-height factor of the code grid — 1.85 × the font size gives
-/// the historical 22px rows at the default 12px code font.
-pub const DEFAULT_CODE_LINE_HEIGHT: f32 = 1.85;
-
-/// Typography of the code surfaces, resolved and clamped at load. One value
-/// object so the diff view's metrics take the whole set at once.
-#[derive(Debug, Clone, Copy)]
-pub struct CodeTypography {
-    /// Font size in px (`code_font_size`).
-    pub size: f32,
-    /// Row height as a multiple of `size` (`code_line_height`).
-    pub line_height: f32,
-    /// Vertical nudge of text within its row, px, positive = down
-    /// (`code_baseline_offset`).
-    pub baseline_offset: f32,
-}
-
-impl Default for CodeTypography {
-    fn default() -> Self {
-        Self {
-            size: 12.0,
-            line_height: DEFAULT_CODE_LINE_HEIGHT,
-            baseline_offset: 0.0,
-        }
-    }
-}
+use crate::typography::CodeTypography;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AppConfig {

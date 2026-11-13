@@ -5,7 +5,7 @@
 //! jj-lib's push shells out to `git push`, so every scenario here skips when
 //! the git CLI isn't on PATH, like the git suite does.
 
-mod harness;
+use crate::harness;
 
 use std::path::{Path, PathBuf};
 

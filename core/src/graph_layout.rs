@@ -17,7 +17,7 @@
 //! (see [`LaneFoldState`]), so reconstruction is lossless — the `reconstruct_*`
 //! tests assert byte-identical output against the reference fold.
 
-use jj_lib::graph::GraphEdgeType;
+pub use jj_lib::graph::GraphEdgeType;
 
 use crate::graph::LaneFrame;
 

@@ -463,6 +463,7 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
     );
     ui::modal(
         card,
+        crate::toolbar::modal_top(),
         send(OutputAction::Close),
         Message::Ui(UiEvent::ConfirmNoOp),
     )

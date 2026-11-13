@@ -6,13 +6,10 @@
 //! jj-lib-only fixture builder the scenarios construct their repos with (no
 //! `jj` CLI, so these run anywhere the crate builds).
 
-// Shared by both integration-test binaries; each uses a different subset.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
+use diffui_core::RevisionSelection;
 use diffui_core::repo::{self, Command, JobId, OpenSpec, Payload, RepoHandle, SettingsSource};
-use diffui_core::{Repository, RevisionSelection, Vcs};
 use futures::StreamExt;
 
 pub fn block_on<F: Future>(future: F) -> F::Output {
@@ -181,14 +178,6 @@ impl TestRepo {
             events,
             runtime,
             parked: Vec::new(),
-        }
-    }
-
-    pub fn repository(&self) -> Repository {
-        Repository {
-            root: self.root.clone(),
-            vcs: Vcs::Jj,
-            scope: PathBuf::new(),
         }
     }
 

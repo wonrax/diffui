@@ -1,0 +1,20 @@
+[package]
+name = "diffui-widgets"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+diffui-core = { path = "../core" }
+iced = { workspace = true }
+raw-window-handle = "0.6"
+
+# Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
+# rides on rustls so the download needs no system TLS libs on any platform.
+[build-dependencies]
+sha2 = "0.11"
+ureq = "3"
+
+# `chrome` moves the native traffic lights to the center of the tab strip.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["NSString", "NSGeometry"] }

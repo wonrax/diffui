@@ -1,7 +1,7 @@
 //! The history views against a live repository actor: op log, op show,
 //! restore/revert, evolog, interdiffs and annotate, on jj-lib-built fixtures.
 
-mod harness;
+use crate::harness;
 
 use diffui_core::history::{
     CommitChangeKind, EvologEntry, FileAnnotation, HistoryDiffTarget, HistoryRequest,

@@ -1233,7 +1233,7 @@ impl Diffui {
             Action::Revops(action) => self.perform_revops(action),
             Action::Credential(action) => self.update_credential(action),
             Action::CommandLine(action) => self.on_command_line_action(action),
-            Action::RebaseOntoTrunk(source) => self.rebase_onto_trunk(source),
+            Action::RebaseOntoTrunk(sources) => self.rebase_onto_trunk(sources),
             Action::Changes(message) => self.on_changes(message),
             Action::History(action) => self.perform_history(action),
             Action::RevealLogFile => {
@@ -2599,16 +2599,20 @@ impl Diffui {
         {
             return Task::none();
         }
-        let Some(source) = self.selection_at_index(index) else {
+        // A marked row drags the whole marked set; an unmarked one drags
+        // itself. `start_draft_with` filters rows that left the graph and
+        // clears the marks once the draft's source wash takes over.
+        let sources = crate::revops::drag_sources(self, index);
+        if sources.is_empty() {
             return Task::none();
-        };
+        }
         // ⌥ at drag start opts into moving the whole subtree.
         let mode = if self.modifiers.alt() {
             mutations::RebaseSourceMode::WithDescendants
         } else {
             mutations::RebaseSourceMode::Revisions
         };
-        self.start_draft(mutations::DraftKind::Rebase { mode }, source)
+        self.start_draft_with(mutations::DraftKind::Rebase { mode }, sources, None)
     }
 
     /// A drag released: execute the draft on the spot, or keep target mode.
@@ -5317,7 +5321,8 @@ mod tests {
     /// recompute them; they used to stay stale until the next keystroke.
     #[test]
     fn a_replaced_document_recomputes_find_matches() {
-        use crate::find::{FindMatch, FindState};
+        use crate::diff_view::FindMatch;
+        use crate::find::FindState;
         use crate::modes::TabMode;
         use diffui_core::{
             DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,

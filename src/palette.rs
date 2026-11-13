@@ -880,7 +880,12 @@ pub fn build_overlay<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Messag
             let target_x = baseline_x + anim_offset;
             // Anchored near the top (rather than centered), like VS Code /
             // Raycast, so the input keeps its Y as columns push/pop.
-            layers.push(pin(column_el).x(target_x).y(theme::modal_top()).into());
+            layers.push(
+                pin(column_el)
+                    .x(target_x)
+                    .y(crate::toolbar::modal_top())
+                    .into(),
+            );
         }
         stack(layers)
             .clip(true)

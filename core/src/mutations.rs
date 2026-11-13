@@ -15,7 +15,10 @@ pub enum RebaseSourceMode {
     /// Only the picked revisions (`jj rebase -r`) — their descendants stay
     /// behind, re-parented across the hole.
     Revisions,
-    /// The picked revisions and every descendant (`jj rebase -s`).
+    /// The picked revisions and every descendant (`jj rebase -s`). The moved
+    /// set is the union of the picked subtrees, so a picked revision whose
+    /// ancestor is also picked is already covered — it doesn't become a
+    /// second root on the destination.
     WithDescendants,
     /// The whole branch the picked revision sits on (`jj rebase -b`): every
     /// commit reachable from it but not from the destination, moved from its

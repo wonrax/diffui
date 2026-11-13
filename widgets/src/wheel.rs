@@ -25,7 +25,7 @@ use iced::{Element, Event, Length, Rectangle, Size, Theme, Vector};
 /// WebKit's and Chromium's per-line distance on macOS, about two diff rows
 /// (AppKit's own text views step 10pt, its tables one row). Elsewhere a notch
 /// is one unaccelerated line, and Chromium's 100 (three lines) applies.
-pub(crate) const POINTS_PER_LINE: f32 = if cfg!(target_os = "macos") {
+pub const POINTS_PER_LINE: f32 = if cfg!(target_os = "macos") {
     40.0
 } else {
     100.0
@@ -33,7 +33,7 @@ pub(crate) const POINTS_PER_LINE: f32 = if cfg!(target_os = "macos") {
 
 /// `delta` as logical points: pixel deltas divided by the window's scale
 /// factor, line deltas at [`POINTS_PER_LINE`] each.
-pub(crate) fn normalize(delta: mouse::ScrollDelta, scale_factor: f32) -> mouse::ScrollDelta {
+pub fn normalize(delta: mouse::ScrollDelta, scale_factor: f32) -> mouse::ScrollDelta {
     match delta {
         mouse::ScrollDelta::Pixels { x, y } => {
             let scale = if scale_factor > 0.0 {
@@ -55,7 +55,7 @@ pub(crate) fn normalize(delta: mouse::ScrollDelta, scale_factor: f32) -> mouse::
 
 /// How far content moves for a normalized `delta`, in points: the opposite
 /// of the gesture, as iced's `scrollable` does it.
-pub(crate) fn movement(delta: mouse::ScrollDelta) -> Vector {
+pub fn movement(delta: mouse::ScrollDelta) -> Vector {
     match normalize(delta, 1.0) {
         mouse::ScrollDelta::Pixels { x, y } | mouse::ScrollDelta::Lines { x, y } => {
             Vector::new(-x, -y)
@@ -65,7 +65,7 @@ pub(crate) fn movement(delta: mouse::ScrollDelta) -> Vector {
 
 /// Wrap the window's `content` so every wheel event it and its overlays see
 /// is normalized for `scale_factor`.
-pub(crate) fn normalized<'a, Message: 'a>(
+pub fn normalized<'a, Message: 'a>(
     content: impl Into<Element<'a, Message, Theme>>,
     scale_factor: f32,
 ) -> Element<'a, Message, Theme> {

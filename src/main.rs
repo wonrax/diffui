@@ -10,8 +10,6 @@ mod activity;
 mod app_menu;
 mod bookmarks;
 mod changes;
-mod chip;
-mod chrome;
 mod cli_output;
 mod cmdline;
 mod cmdline_view;
@@ -22,25 +20,17 @@ mod config;
 mod conflicts;
 mod credentials;
 mod diff_panel;
-mod diff_view;
-mod editor_drag;
-mod ellipsis;
 mod empty_states;
 mod field;
 mod find;
 mod graph_preview;
-mod graph_view;
 mod history_panel;
-mod hunk_actions;
-mod icons;
-mod input;
 mod jj_version;
 mod keymap;
 mod launch_env;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos_native;
-mod measure;
 mod media;
 mod menu;
 mod menus;
@@ -51,37 +41,34 @@ mod modes;
 mod palette;
 mod path_browse;
 mod plan;
-mod pointer;
-mod prose;
 mod range;
-mod resize_handle;
-mod revision_list;
 mod revops;
 mod revset_assist;
-mod scrollbar;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
 mod tab_bar;
 mod tabs;
-mod theme;
 mod toolbar;
 mod trunk;
-mod typography;
-mod ui;
 mod update;
-mod wheel;
-mod width_memo;
 mod window_state;
 
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the
-// modules the app still reaches into by path (`crate::graph`, `crate::jj`,
-// `crate::mutations`, …) so those call sites stay unchanged.
+// modules the app still reaches into by path (`crate::jj`, `crate::mutations`,
+// …) so those call sites stay unchanged.
 pub(crate) use action::Action;
 pub(crate) use diffui_core::{
-    FetchTarget, JobId, RepoHandle, github, graph, graph_layout, jj, mutations, repository,
+    FetchTarget, JobId, RepoHandle, github, graph_layout, jj, mutations, repository,
 };
 pub(crate) use message::{Message, UiEvent, WindowEvent};
+// The same for the widget layer in `diffui-widgets`: `crate::theme`,
+// `crate::ui`, `crate::diff_view` and the rest resolve as they did when they
+// were modules of this crate.
+pub(crate) use diffui_widgets::{
+    chip, chrome, diff_view, editor_drag, ellipsis, graph_view, hunk_actions, icons, input,
+    measure, pointer, prose, resize_handle, revision_list, scrollbar, theme, typography, ui, wheel,
+};
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
 /// forwards every request to the system allocator while tracking the live byte

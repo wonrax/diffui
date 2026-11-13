@@ -309,6 +309,7 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
 
     ui::modal(
         ui::dialog_card(body.width(Length::Fill), ui::DIALOG_WIDTH, theme),
+        crate::toolbar::modal_top(),
         // A stray click on the scrim must not cancel a push.
         Message::Ui(crate::UiEvent::ConfirmNoOp),
         Message::Ui(crate::UiEvent::ConfirmNoOp),

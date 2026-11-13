@@ -10,7 +10,7 @@
 //! Each test rebuilds its repo from scratch, so reruns are deterministic; the
 //! repos are left behind afterwards for inspection.
 
-mod harness;
+use crate::harness;
 
 use std::path::{Path, PathBuf};
 
@@ -966,6 +966,91 @@ fn rebase_revision_moves_a_leaf_onto_the_destination() {
     assert_eq!(commit_id(&root, &y_change), rewritten);
     assert!(!outcome.moved_working_copy);
     assert!(outcome.operation_id.is_some());
+}
+
+/// Non-contiguous `-r` sources: the picked revisions keep their order on the
+/// destination while the skipped revisions fill the holes they leave behind.
+/// This is what dragging a ⇧/⌘ selection onto a destination does, and it's
+/// well-defined even when the selection has gaps.
+#[test]
+fn rebase_non_contiguous_revisions_compacts_them_onto_the_destination() {
+    let root = scratch_repo("rebase-non-contiguous");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\na\n");
+    commit(&root, "a");
+    let a_change = change_id(&root, "description(exact:\"a\\n\")");
+    write(&root, "file.txt", "base\na\nb\n");
+    commit(&root, "b");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+    write(&root, "file.txt", "base\na\nb\nc\n");
+    commit(&root, "c");
+    let c_change = change_id(&root, "description(exact:\"c\\n\")");
+    // A destination off base; the chain's working copy stays where it is.
+    new_leaf(&root, std::slice::from_ref(&base), "dest");
+    let dest = commit_id(&root, "description(exact:\"dest\\n\")");
+
+    run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![
+                RevisionSelection::Commit(commit_id(&root, &a_change)),
+                RevisionSelection::Commit(commit_id(&root, &c_change)),
+            ],
+            destination: Destination::Onto(RevisionSelection::Commit(dest.clone())),
+        },
+    );
+
+    // `a` and `c` land together on the destination, in their original order.
+    assert_eq!(parent_ids(&root, &a_change), vec![dest]);
+    let a_new = commit_id(&root, &a_change);
+    assert_eq!(parent_ids(&root, &c_change), vec![a_new]);
+    // The skipped `b` fills the hole under `a` instead of following `c`.
+    assert_eq!(parent_ids(&root, &b_change), vec![base]);
+}
+
+/// Overlapping `-s` sources are a union of subtrees: picking a descendant
+/// alongside its ancestor must not tear it out of the subtree that already
+/// contains it.
+#[test]
+fn rebase_with_descendants_dedupes_overlapping_sources() {
+    let root = scratch_repo("rebase-descendants-overlap");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\na\n");
+    commit(&root, "a");
+    let a_change = change_id(&root, "description(exact:\"a\\n\")");
+    write(&root, "file.txt", "base\na\nb\n");
+    commit(&root, "b");
+    let b_change = change_id(&root, "description(exact:\"b\\n\")");
+    write(&root, "file.txt", "base\na\nb\nc\n");
+    commit(&root, "c");
+    let c_change = change_id(&root, "description(exact:\"c\\n\")");
+    new_leaf(&root, std::slice::from_ref(&base), "dest");
+    let dest = commit_id(&root, "description(exact:\"dest\\n\")");
+
+    run(
+        &root,
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::WithDescendants,
+            sources: vec![
+                RevisionSelection::Commit(commit_id(&root, &a_change)),
+                RevisionSelection::Commit(commit_id(&root, &c_change)),
+            ],
+            destination: Destination::Onto(RevisionSelection::Commit(dest.clone())),
+        },
+    );
+
+    // The whole subtree `a → b → c` moves; `c` stays under `b` instead of
+    // being promoted to a sibling of `a` on the destination.
+    assert_eq!(parent_ids(&root, &a_change), vec![dest]);
+    let a_new = commit_id(&root, &a_change);
+    let b_new = commit_id(&root, &b_change);
+    assert_eq!(parent_ids(&root, &b_change), vec![a_new]);
+    assert_eq!(parent_ids(&root, &c_change), vec![b_new]);
 }
 
 /// `jj rebase -A a -B b` (the gap-drop gesture): the moved leaf lands exactly

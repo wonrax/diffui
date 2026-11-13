@@ -7,7 +7,7 @@
 //! Needs the git CLI and a jj 0.45.1 binary: `$DIFFUI_PARITY_JJ`, else the UI
 //! kit's `/tmp/diffui-fix/uikit/jj`. A scenario without either skips.
 
-mod harness;
+use crate::harness;
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
