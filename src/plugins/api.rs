@@ -261,26 +261,28 @@ impl Diffui {
                 let (activity, _) = self.begin_activity(tab, Prose::from(label), false);
                 self.plugins.next_activity += 1;
                 let number = self.plugins.next_activity;
-                self.plugins.activities.insert(number, (tab, activity));
+                self.plugins
+                    .activities
+                    .insert(number, (id.to_owned(), tab, activity));
                 reply.ok(number)
             }
             UiCall::ActivityAppend { activity, text } => {
-                if let Some((tab, id)) = self.plugins.activities.get(&activity).copied()
+                if let Some((_, tab, row)) = self.plugins.activities.get(&activity).cloned()
                     && let Some(log) = self.activity_log_for(tab)
                 {
-                    log.extend_output(id, text.lines().map(str::to_owned));
+                    log.extend_output(row, text.lines().map(str::to_owned));
                 }
                 reply.ok(())
             }
             UiCall::ActivityFinish { activity, error } => {
-                if let Some((tab, id)) = self.plugins.activities.remove(&activity)
+                if let Some((_, tab, row)) = self.plugins.activities.remove(&activity)
                     && let Some(log) = self.activity_log_for(tab)
                 {
                     let status = match &error {
                         Some(_) => ActivityStatus::Error,
                         None => ActivityStatus::Done,
                     };
-                    log.finish(id, status, error);
+                    log.finish(row, status, error);
                 }
                 reply.ok(())
             }
@@ -352,6 +354,29 @@ impl Diffui {
                     }
                 }
                 reply.ok(())
+            }
+        }
+    }
+
+    /// The plugin `id` stopped, failed or was reloaded: the activity rows its
+    /// script left running end here, because nothing will finish them now.
+    pub(super) fn end_plugin_activities(&mut self, id: &str) {
+        let left: Vec<u64> = self
+            .plugins
+            .activities
+            .iter()
+            .filter(|(_, (plugin, ..))| plugin == id)
+            .map(|(number, _)| *number)
+            .collect();
+        for number in left {
+            if let Some((_, tab, row)) = self.plugins.activities.remove(&number)
+                && let Some(log) = self.activity_log_for(tab)
+            {
+                log.finish(
+                    row,
+                    ActivityStatus::Cancelled,
+                    Some("The plugin stopped".to_owned()),
+                );
             }
         }
     }

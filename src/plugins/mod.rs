@@ -265,8 +265,9 @@ pub(crate) struct Plugins {
     minted: Vec<(TabId, RepoId)>,
     /// What scripts were handed for forge calls: see [`forge::Handles`].
     forge_handles: forge::Handles,
-    /// The activity rows scripts started, by the number each was given.
-    activities: HashMap<u64, (TabId, crate::activity::ActivityId)>,
+    /// The activity rows scripts started and haven't finished, by the number
+    /// each was given: whose it is, and where it shows.
+    activities: HashMap<u64, (String, TabId, crate::activity::ActivityId)>,
     next_activity: u64,
     /// Each plugin's status-bar item, by id.
     status: BTreeMap<String, String>,
@@ -639,6 +640,7 @@ impl Diffui {
         found.running = None;
         found.state = state;
         self.plugins.status.remove(id);
+        self.end_plugin_activities(id);
         if was_forge {
             self.refresh_script_forges();
         }
@@ -648,6 +650,10 @@ impl Diffui {
     /// the allowed ones start afresh with the config as it is now. What
     /// "Reload keys and commands" and `diffui ctl reload` do for plugins.
     pub(crate) fn reload_plugins(&mut self) -> Vec<String> {
+        let running: Vec<String> = self.plugins.found.iter().map(|f| f.id.clone()).collect();
+        for id in running {
+            self.end_plugin_activities(&id);
+        }
         self.plugins.rescan(&self.config_files.plugins);
         self.refresh_script_forges();
         let problems = self.rederive_commands(None);
@@ -719,6 +725,8 @@ impl Diffui {
                     found.announce = true;
                     found.state = State::Loading;
                     running.plugin.reload();
+                    let id = found.id.clone();
+                    self.end_plugin_activities(&id);
                 }
                 continue;
             }
@@ -822,6 +830,7 @@ impl Diffui {
                     .map_or(why.clone(), str::to_owned);
                 found.state = State::Failed(why.clone());
                 self.plugins.status.remove(id);
+                self.end_plugin_activities(id);
                 self.push_error_toast(format!("{name} failed"), &why);
             }
         }

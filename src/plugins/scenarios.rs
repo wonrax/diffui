@@ -392,7 +392,7 @@ fn a_crashing_plugin_fails_alone() {
         "spin",
         "",
         &["forever"],
-        "import { commands } from \"diffui\";\ncommands.register(\"spin.forever\", () => { for (;;) {} });\n",
+        "import { commands, ui } from \"diffui\";\ncommands.register(\"spin.forever\", async () => { await ui.activity(\"Spinning\"); for (;;) {} });\n",
     );
     let broken = PluginDir::new("broken", "", &[], "import { nothing } from \"node:fs\";\n");
     let steady = PluginDir::new(
@@ -428,6 +428,14 @@ fn a_crashing_plugin_fails_alone() {
     h.read(|ui| {
         assert!(toasts(ui).iter().any(|(title, ..)| title == "Spin failed"));
         assert!(matches!(state(ui, "steady"), State::Running(_)));
+        // The row its script left running doesn't spin on.
+        let row = ui
+            .active()
+            .activities
+            .recent(10)
+            .find(|activity| activity.label.to_string() == "Spinning")
+            .expect("the activity row");
+        assert_eq!(row.status, crate::activity::ActivityStatus::Cancelled);
     });
     assert_eq!(
         run_and_read(&mut h, "steady", "steady.ping", |_| true),
