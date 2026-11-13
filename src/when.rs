@@ -91,10 +91,11 @@ pub(crate) static KEYS: &[KeyDef] = &[
         read: |ui, _| ui.active().session.capabilities.mutate.into(),
     },
     KeyDef {
-        // "github" or "gitlab": the forge that claims a remote
+        // "github", "gitlab" or a forge plugin's id: the forge that claims a
+        // remote
         name: "repo.forge",
         read: |ui, _| match ui.active().forge.kind() {
-            Some(kind) => Value::Text(kind.name().to_lowercase()),
+            Some(kind) => Value::Text(kind.id().to_owned()),
             None => Value::Missing,
         },
     },

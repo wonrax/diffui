@@ -21,7 +21,9 @@ impl Cli {
     /// The program, pointed at `host` through its host variable.
     pub fn command(&self, host: &str) -> Command {
         let mut command = Command::new(&self.program);
-        command.env(self.kind.host_env(), host);
+        if let Some(var) = self.kind.host_env() {
+            command.env(var, host);
+        }
         command
     }
 
@@ -160,6 +162,7 @@ pub(super) fn configured_hosts(kind: ForgeKind) -> Vec<String> {
             config_dir("GLAB_CONFIG_DIR", "glab-cli").map(|dir| dir.join("config.yml")),
             false,
         ),
+        ForgeKind::Script(_) => return Vec::new(),
     };
     file.and_then(|file| std::fs::read_to_string(file).ok())
         .map(|text| yaml_hosts(&text, top_level))

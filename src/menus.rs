@@ -14,6 +14,7 @@ use super::*;
 use crate::Cx;
 use crate::commands::CommandId;
 use crate::prose::Prose;
+use diffui_core::forge::ForgeAbility;
 
 impl Diffui {
     /// A menu row for `command`, labelled and chord-hinted from the registry.
@@ -464,27 +465,38 @@ impl Diffui {
             .decoration_for(&arg)
             .filter(|decoration| decoration.pr.state.is_open())
             .is_some();
+        // A plugin's forge offers what its script implements.
+        let can = |ability| crate::forge::can(self, ability);
         let mut rows = vec![menu::MenuEntry::Separator];
         if self.decoration_for(&arg).is_some() {
             rows.push(self.menu_row(format!("Open {noun} in browser"), "forge.open", arg.clone()));
-            rows.push(self.menu_row(format!("Open {noun} as tab"), "forge.open-tab", arg.clone()));
+            if can(ForgeAbility::Tab) {
+                rows.push(self.menu_row(
+                    format!("Open {noun} as tab"),
+                    "forge.open-tab",
+                    arg.clone(),
+                ));
+            }
             rows.push(self.menu_row(format!("Copy {noun} URL"), "forge.copy-url", arg.clone()));
         }
-        rows.push(if open {
-            self.menu_row(
+        if open && can(ForgeAbility::Update) {
+            rows.push(self.menu_row(
                 format!("Update {noun}\u{2026}"),
                 "forge.update",
                 arg.clone(),
-            )
-        } else {
-            self.menu_row(
+            ));
+        } else if !open && can(ForgeAbility::Create) {
+            rows.push(self.menu_row(
                 format!("Create {noun}\u{2026}"),
                 "forge.create",
                 arg.clone(),
-            )
-        });
-        if bookmark.is_none() {
+            ));
+        }
+        if bookmark.is_none() && can(ForgeAbility::Create) && can(ForgeAbility::Update) {
             rows.push(self.menu_item("forge.submit-stack", arg));
+        }
+        if rows.len() == 1 {
+            rows.clear();
         }
         rows
     }

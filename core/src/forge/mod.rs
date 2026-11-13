@@ -41,6 +41,45 @@ use crate::repo::CancelFlag;
 pub enum ForgeKind {
     GitHub,
     GitLab,
+    /// A forge a plugin provides.
+    Script(ScriptForge),
+}
+
+/// A plugin's forge: who it is and how it words things. `Copy` like the
+/// built-in kinds, so its strings are interned for the life of the process
+/// (one small allocation per distinct plugin id and name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScriptForge {
+    /// The plugin's id.
+    pub id: &'static str,
+    /// The plugin's name, for messages.
+    pub name: &'static str,
+    /// It says "merge request" rather than "pull request".
+    pub merge_requests: bool,
+}
+
+impl ScriptForge {
+    pub fn new(id: &str, name: &str, merge_requests: bool) -> Self {
+        Self {
+            id: intern(id),
+            name: intern(name),
+            merge_requests,
+        }
+    }
+}
+
+/// `text` for the life of the process, the same allocation for the same text.
+fn intern(text: &str) -> &'static str {
+    static INTERNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut interned = INTERNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(known) = interned.iter().find(|known| **known == text) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
+    interned.push(leaked);
+    leaked
 }
 
 impl ForgeKind {
@@ -49,70 +88,89 @@ impl ForgeKind {
         match self {
             Self::GitHub => "GitHub",
             Self::GitLab => "GitLab",
+            Self::Script(script) => script.name,
+        }
+    }
+
+    /// What a when-clause's `repo.forge` reads: `github`, `gitlab`, or a
+    /// plugin's id.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::GitLab => "gitlab",
+            Self::Script(script) => script.id,
+        }
+    }
+
+    /// Whether the forge says "merge request" for a pull request.
+    pub fn merge_requests(self) -> bool {
+        match self {
+            Self::GitHub => false,
+            Self::GitLab => true,
+            Self::Script(script) => script.merge_requests,
         }
     }
 
     /// What the forge calls a pull request, lowercase.
     pub fn noun(self) -> &'static str {
-        match self {
-            Self::GitHub => "pull request",
-            Self::GitLab => "merge request",
+        if self.merge_requests() {
+            "merge request"
+        } else {
+            "pull request"
         }
     }
 
     /// [`Self::noun`], sentence case.
     pub fn title_noun(self) -> &'static str {
-        match self {
-            Self::GitHub => "Pull request",
-            Self::GitLab => "Merge request",
+        if self.merge_requests() {
+            "Merge request"
+        } else {
+            "Pull request"
         }
     }
 
     /// The abbreviation: `PR`, `MR`.
     pub fn short(self) -> &'static str {
-        match self {
-            Self::GitHub => "PR",
-            Self::GitLab => "MR",
-        }
+        if self.merge_requests() { "MR" } else { "PR" }
     }
 
     /// What prefixes a number in the forge's own references: `#12`, `!12`.
     pub fn sigil(self) -> char {
-        match self {
-            Self::GitHub => '#',
-            Self::GitLab => '!',
-        }
+        if self.merge_requests() { '!' } else { '#' }
     }
 
-    /// The CLI the built-in provider drives.
+    /// The CLI the built-in provider drives. A plugin's forge has none.
     pub fn cli(self) -> &'static str {
         match self {
             Self::GitHub => "gh",
             Self::GitLab => "glab",
+            Self::Script(_) => "",
         }
     }
 
-    /// The host a reference without one means.
+    /// The host a reference without one means. A plugin's forge has none.
     pub fn default_host(self) -> &'static str {
         match self {
             Self::GitHub => "github.com",
             Self::GitLab => "gitlab.com",
+            Self::Script(_) => "",
         }
     }
 
     /// The environment variable that points the CLI at a host.
-    fn host_env(self) -> &'static str {
+    fn host_env(self) -> Option<&'static str> {
         match self {
-            Self::GitHub => "GH_HOST",
-            Self::GitLab => "GITLAB_HOST",
+            Self::GitHub => Some("GH_HOST"),
+            Self::GitLab => Some("GITLAB_HOST"),
+            Self::Script(_) => None,
         }
     }
 
     /// The host a reference without one resolves to: the CLI's environment
     /// override, else the forge's public host.
     pub fn implied_host(self) -> String {
-        std::env::var(self.host_env())
-            .ok()
+        self.host_env()
+            .and_then(|var| std::env::var(var).ok())
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| self.default_host().to_owned())
     }
@@ -383,9 +441,27 @@ pub type ForgeFuture<'a, T> = Pin<Box<dyn Future<Output = ForgeResult<T>> + Send
 /// Called once per file as a pull request's diff streams in.
 pub type OnFile<'a> = Box<dyn FnMut(DiffFile) + Send + 'a>;
 
+/// Something a provider may not be able to do. The built-in forges do all of
+/// it; a plugin's forge does what its script implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeAbility {
+    /// [`ForgeProvider::create_pull_request`].
+    Create,
+    /// [`ForgeProvider::update_pull_request`].
+    Update,
+    /// A pull request in a tab of its own: `view`, `commits` and the diffs.
+    Tab,
+}
+
 /// A forge, as diffui talks to it. See the module docs.
 pub trait ForgeProvider: Send + Sync {
     fn kind(&self) -> ForgeKind;
+
+    /// Whether this provider can do `ability`, so the app offers only what
+    /// would work.
+    fn can(&self, _ability: ForgeAbility) -> bool {
+        true
+    }
 
     /// The project `remote_url` names, if this forge hosts it.
     fn claims(&self, remote_url: &str) -> Option<ForgeRemote>;
@@ -490,6 +566,26 @@ impl Forges {
             .iter()
             .find(|provider| provider.kind() == kind)
             .cloned()
+    }
+
+    /// These forges with `scripts` as the plugins' forges, after the built-in
+    /// ones: a plugin's forge answers for hosts no built-in claims, and never
+    /// takes one over.
+    pub fn with_scripts(&self, scripts: Vec<Arc<dyn ForgeProvider>>) -> Self {
+        let mut providers: Vec<Arc<dyn ForgeProvider>> = self
+            .providers
+            .iter()
+            .filter(|provider| !matches!(provider.kind(), ForgeKind::Script(_)))
+            .cloned()
+            .collect();
+        providers.extend(scripts);
+        Self { providers }
+    }
+
+    /// Whether `kind`'s provider can do `ability`.
+    pub fn can(&self, kind: ForgeKind, ability: ForgeAbility) -> bool {
+        self.provider(kind)
+            .is_some_and(|provider| provider.can(ability))
     }
 
     /// The first provider that claims `url`, and what it made of it.

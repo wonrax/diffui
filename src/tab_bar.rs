@@ -854,9 +854,7 @@ fn tab_badge(source: &crate::TabSource, active: bool, look: Look) -> Div {
     let label = match source {
         crate::TabSource::Repo { vcs: Vcs::Jj, .. } => "jj",
         crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
-        crate::TabSource::ForgePr(spec) if spec.kind == diffui_core::forge::ForgeKind::GitLab => {
-            "mr"
-        }
+        crate::TabSource::ForgePr(spec) if spec.kind.merge_requests() => "mr",
         crate::TabSource::ForgePr(_) => "pr",
     };
     let ink = if active {
@@ -1454,9 +1452,10 @@ fn pull_request_card(look: Look, spec: &diffui_core::forge::ForgePr) -> Div {
         "Opens as its own tab, diffing the {noun}'s head against its base."
     ));
     if spec.host.is_none() {
-        let example = match spec.kind {
-            diffui_core::forge::ForgeKind::GitHub => "owner/repo#123",
-            diffui_core::forge::ForgeKind::GitLab => "group/repo!123",
+        let example = if spec.kind.merge_requests() {
+            "group/repo!123"
+        } else {
+            "owner/repo#123"
         };
         words = words
             .text(" A bare ")

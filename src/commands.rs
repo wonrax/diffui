@@ -3132,7 +3132,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: |ui, arg| {
             can_mutate(ui, arg)?;
-            crate::forge::has_forge(ui, arg)
+            crate::forge::can_create(ui, arg)
         },
         build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
         palette: PaletteScope::RevisionVerb,
@@ -3146,7 +3146,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: |ui, arg| {
             can_mutate(ui, arg)?;
-            crate::forge::has_open_pull_request(ui, arg)
+            crate::forge::can_update(ui, arg)
         },
         build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
         palette: PaletteScope::RevisionVerb,
@@ -3161,7 +3161,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: |ui, arg| {
             can_mutate(ui, arg)?;
-            crate::forge::has_forge(ui, arg)
+            crate::forge::can_submit_stack(ui, arg)
         },
         build: |_ui, arg| {
             Some(Action::Forge(
@@ -3188,7 +3188,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
-        enabled: crate::forge::has_pull_request,
+        enabled: crate::forge::can_open_tab,
         build: crate::forge::open_as_tab,
         palette: PaletteScope::Hidden,
     },

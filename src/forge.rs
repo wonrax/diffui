@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diffui_core::forge::{
-    CheckState, Checks, ForgeError, ForgeKind, ForgeProvider, ForgeRemote, Forges, PrState,
-    PullRequest,
+    CheckState, Checks, ForgeAbility, ForgeError, ForgeKind, ForgeProvider, ForgeRemote, Forges,
+    PrState, PullRequest,
 };
 use diffui_core::repo::CancelFlag;
 use diffui_core::{BookmarksInfo, JobId, RepoId, RevisionSelection, Vcs};
@@ -601,7 +601,7 @@ pub(crate) fn has_forge(ui: &Diffui, _arg: &CommandArg) -> Availability {
 pub(crate) fn has_pull_request(ui: &Diffui, arg: &CommandArg) -> Availability {
     has_forge(ui, arg)?;
     let none = match ui.active().forge.kind() {
-        Some(ForgeKind::GitLab) => "No merge request",
+        Some(kind) if kind.merge_requests() => "No merge request",
         _ => "No pull request",
     };
     require(ui.decoration_for(arg).is_some(), none)
@@ -611,7 +611,7 @@ pub(crate) fn has_pull_request(ui: &Diffui, arg: &CommandArg) -> Availability {
 pub(crate) fn has_open_pull_request(ui: &Diffui, arg: &CommandArg) -> Availability {
     has_pull_request(ui, arg)?;
     let closed = match ui.active().forge.kind() {
-        Some(ForgeKind::GitLab) => "Merge request is closed",
+        Some(kind) if kind.merge_requests() => "Merge request is closed",
         _ => "Pull request is closed",
     };
     require(
@@ -619,6 +619,42 @@ pub(crate) fn has_open_pull_request(ui: &Diffui, arg: &CommandArg) -> Availabili
             .is_some_and(|decoration| decoration.pr.state.is_open()),
         closed,
     )
+}
+
+/// The active tab's forge can do `ability`. A plugin's forge does what its
+/// script implements.
+pub(crate) fn can(ui: &Diffui, ability: ForgeAbility) -> bool {
+    ui.active()
+        .forge
+        .kind()
+        .is_some_and(|kind| ui.forge.forges.can(kind, ability))
+}
+
+/// What a forge command says when the tab's forge can't do it.
+const UNSUPPORTED: &str = "This forge's plugin can't do that";
+
+/// A pull request can be opened here.
+pub(crate) fn can_create(ui: &Diffui, arg: &CommandArg) -> Availability {
+    has_forge(ui, arg)?;
+    require(can(ui, ForgeAbility::Create), UNSUPPORTED)
+}
+
+/// The bookmark's (or the revision's) open pull request can be changed.
+pub(crate) fn can_update(ui: &Diffui, arg: &CommandArg) -> Availability {
+    has_open_pull_request(ui, arg)?;
+    require(can(ui, ForgeAbility::Update), UNSUPPORTED)
+}
+
+/// A stack can be submitted: its pull requests opened, and rebased on a rerun.
+pub(crate) fn can_submit_stack(ui: &Diffui, arg: &CommandArg) -> Availability {
+    can_create(ui, arg)?;
+    require(can(ui, ForgeAbility::Update), UNSUPPORTED)
+}
+
+/// The bookmark's (or the revision's) pull request opens in a tab.
+pub(crate) fn can_open_tab(ui: &Diffui, arg: &CommandArg) -> Availability {
+    has_pull_request(ui, arg)?;
+    require(can(ui, ForgeAbility::Tab), UNSUPPORTED)
 }
 
 /// The pull request's page.
@@ -648,7 +684,7 @@ pub(crate) fn noun(ui: &Diffui) -> &'static str {
 /// request` says `Create merge request` on GitLab.
 pub(crate) fn relabel(ui: &Diffui, label: &str) -> String {
     match ui.active().forge.kind() {
-        Some(ForgeKind::GitLab) => label
+        Some(kind) if kind.merge_requests() => label
             .replace("pull request", "merge request")
             .replace("Pull request", "Merge request"),
         _ => label.to_owned(),
