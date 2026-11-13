@@ -1,0 +1,14 @@
+[package]
+name = "diffui-plugins"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# QuickJS-NG and its bindings. Plain runtime only: no `futures`, no `macro`.
+rquickjs = { version = "0.14", default-features = false, features = ["std", "loader"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+tracing = "0.1"
+# Already built for the build scripts of core and widgets.
+ureq = "3"
