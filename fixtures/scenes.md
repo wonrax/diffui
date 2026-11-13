@@ -1422,6 +1422,12 @@ scenes are new in the port; there is no iced capture for them.
 - State: The same badges in the dark theme.
 - Steps: Refresh pull requests against a GitHub origin.
 
+### `forge-badges-narrow`
+
+- Window: 1440x900, light
+- State: A narrow sidebar with every revision: badged chips fold into +N, and on deep rows the change id ellipsises rather than running under a chip.
+- Steps: Refresh pull requests against a GitHub origin, then drag the sidebar to its narrowest.
+
 ### `forge-commit-info`
 
 - Window: 1440x900, light

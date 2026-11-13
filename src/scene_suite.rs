@@ -2648,6 +2648,16 @@ fn all() -> Vec<Scene> {
         .dark(),
     );
     t.add(s(
+        "forge-badges-narrow",
+        "A narrow sidebar with every revision: badged chips fold into +N, and on deep rows the change id ellipsises rather than running under a chip.",
+        "Refresh pull requests against a GitHub origin, then drag the sidebar to its narrowest.",
+        |c| {
+            all_revs(c);
+            c.h.act(|ui, _| ui.on_sidebar_width_changed(ui.sidebar_min_width + 1.0));
+            forge_badges(c);
+        },
+    ));
+    t.add(s(
         "forge-commit-info",
         "A revision whose bookmark has an open pull request: the commit info block's Pull request field, its state, and its checks.",
         "Select feature/render-pipeline's revision.",

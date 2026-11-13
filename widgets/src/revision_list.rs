@@ -17,6 +17,7 @@
 //! computed by the caller and passed in per row, so this module stays decoupled
 //! from the rest of the app's theming logic.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -2227,6 +2228,8 @@ impl RevisionList {
             RailInput {
                 total_width,
                 mandatory_left: label_w + label_gap + prefix_w + suffix_w,
+                id_prefix_w: prefix_w,
+                id_suffix_w: suffix_w,
                 status_total,
                 has_status: !status_widths.is_empty(),
                 commit_w,
@@ -2278,8 +2281,24 @@ impl RevisionList {
             );
             x_cursor += label_w + label_gap;
         }
+        // A row too narrow for its change id beside the chips cuts the gray
+        // tail first, keeping the unique prefix whole while it can.
+        let (prefix, suffix) = match layout.change_id_room {
+            None => (
+                Cow::Borrowed(rev.change_id_prefix.as_str()),
+                Cow::Borrowed(rev.change_id_suffix.as_str()),
+            ),
+            Some(room) if room >= prefix_w + ellipsis_w => (
+                Cow::Borrowed(rev.change_id_prefix.as_str()),
+                ellipsis::cut_end(&rev.change_id_suffix, room - prefix_w, id_size, mono),
+            ),
+            Some(room) => (
+                ellipsis::cut_end(&rev.change_id_prefix, room, id_size, mono),
+                Cow::Borrowed(""),
+            ),
+        };
         paint_centered(
-            &rev.change_id_prefix,
+            &prefix,
             x_cursor,
             title_mid_y,
             id_size,
@@ -2290,7 +2309,7 @@ impl RevisionList {
         );
         x_cursor += prefix_w;
         paint_centered(
-            &rev.change_id_suffix,
+            &suffix,
             x_cursor,
             title_mid_y,
             id_size,
@@ -2758,6 +2777,9 @@ struct RailInput {
     total_width: f32,
     /// The working-copy label, its gap and the change id.
     mandatory_left: f32,
+    /// The change id's two parts, which give way last.
+    id_prefix_w: f32,
+    id_suffix_w: f32,
     status_total: f32,
     has_status: bool,
     commit_w: f32,
@@ -2779,6 +2801,9 @@ struct RailLayout {
     /// How wide the author draws, 0 when it's dropped.
     author_width: f32,
     need_ellipsis: bool,
+    /// The width the change id is cut to, when even it doesn't fit beside
+    /// the chips.
+    change_id_room: Option<f32>,
     chip_gap: f32,
 }
 
@@ -2805,8 +2830,10 @@ impl RailLayout {
 }
 
 /// Priority when the row is short of room: commit id, then bookmark chips (with
-/// a `+N` chip for the rest), then the author. Status chips and the change id
-/// are load-bearing and never compress.
+/// a `+N` chip for the rest), then the author. Status chips never compress.
+/// When even the change id doesn't fit beside them, its tail ellipsises, then
+/// a lone `+N` goes, then its unique prefix is cut: text never runs under a
+/// chip.
 fn rail_layout(
     input: RailInput,
     bookmarks: &[f32],
@@ -2815,6 +2842,8 @@ fn rail_layout(
     let RailInput {
         total_width,
         mandatory_left,
+        id_prefix_w,
+        id_suffix_w,
         status_total,
         has_status,
         commit_w,
@@ -2827,7 +2856,8 @@ fn rail_layout(
     } = input;
     // Always-shown widths consume from the budget first.
     let mandatory = mandatory_left + status_total + if has_status { chip_gap } else { 0.0 };
-    let mut budget = (total_width - mandatory).max(0.0);
+    // Negative when the change id and the status chips alone don't fit.
+    let mut budget = total_width - mandatory;
 
     // 1. commit_id (with leading id_gap).
     let mut show_commit_id = has_commit_id && commit_w + id_gap <= budget;
@@ -2838,6 +2868,7 @@ fn rail_layout(
     // 2. Bookmarks: fit greedily, reserving space for a `+N` overflow chip
     //    when not all fit. The chip rail's leading gap separates it from the
     //    left-side text.
+    let mut freed = 0.0;
     let mut visible_bookmarks = 0;
     let mut overflow_count = 0;
     let mut overflow_w = 0.0;
@@ -2869,10 +2900,12 @@ fn rail_layout(
                 overflow_count = bookmarks.len() - visible_bookmarks;
                 overflow_w = overflow_width(overflow_count);
             }
-            acc + if overflow_count > 0 {
-                chip_gap + overflow_w
-            } else {
-                0.0
+            // The `+N` takes a gap only after a bookmark: alone, it leads
+            // the rail.
+            acc + match (overflow_count, visible_bookmarks) {
+                (0, _) => 0.0,
+                (_, 0) => overflow_w,
+                _ => chip_gap + overflow_w,
             }
         };
         // Subtract the chip rail's leading gap once, plus the block.
@@ -2881,8 +2914,22 @@ fn rail_layout(
         // refs exist; the id gives way rather than running under it.
         if budget < 0.0 && show_commit_id {
             show_commit_id = false;
+            freed = commit_w + id_gap;
         }
     }
+    // What's left of the line once everything shown has its room.
+    let slack = budget + freed;
+
+    // 4. Still short: the change id's tail ellipsises; when that isn't
+    //    enough, a lone `+N` goes; what's still missing comes off the id.
+    let mut deficit = -slack;
+    let tail = (id_suffix_w - ellipsis_w).max(0.0);
+    if deficit > tail && visible_bookmarks == 0 && overflow_count > 0 {
+        deficit -= chip_gap + overflow_w;
+        overflow_count = 0;
+        overflow_w = 0.0;
+    }
+    let change_id_room = (deficit > 0.0).then(|| (id_prefix_w + id_suffix_w - deficit).max(0.0));
 
     // 3. Author squeezes into whatever's left (with a leading id_gap).
     let author_max_w = (budget - id_gap).max(0.0);
@@ -2898,8 +2945,11 @@ fn rail_layout(
         overflow_count,
         overflow_width: overflow_w,
         author_width,
-        // Ellipsis indicator when commit_id or author got dropped entirely.
-        need_ellipsis: (has_commit_id && !show_commit_id) || (author_width == 0.0 && has_author),
+        // Ellipsis indicator when commit_id or author got dropped entirely,
+        // where it has room of its own.
+        need_ellipsis: ((has_commit_id && !show_commit_id) || (author_width == 0.0 && has_author))
+            && slack >= id_gap + ellipsis_w,
+        change_id_room,
         chip_gap,
     }
 }
@@ -3619,6 +3669,8 @@ mod tests {
             RailInput {
                 total_width,
                 mandatory_left: 60.0,
+                id_prefix_w: 24.0,
+                id_suffix_w: 36.0,
                 status_total: 40.0,
                 has_status: true,
                 commit_w: 50.0,
@@ -3654,7 +3706,8 @@ mod tests {
         assert_eq!(overflowed.visible_bookmarks, 1);
         assert_eq!(overflowed.overflow_count, 1);
         assert_eq!(overflowed.author_width, 0.0);
-        assert!(overflowed.need_ellipsis);
+        // Its `…` would run under the bookmark chip, so it isn't drawn.
+        assert!(!overflowed.need_ellipsis);
 
         // The commit id goes last, and status chips never do.
         let tight = rail(120.0, &[50.0, 50.0]);
@@ -3675,6 +3728,47 @@ mod tests {
             "the author is lower priority still"
         );
         assert!(layout.need_ellipsis);
+    }
+
+    #[test]
+    fn a_change_id_short_of_room_ellipsises_before_the_lone_overflow_chip_goes() {
+        // The `+1` leaves the id 22 short: its tail gives that up.
+        let cut = rail(110.0, &[50.0]);
+        assert_eq!(cut.overflow_count, 1);
+        assert_eq!(cut.change_id_room, Some(38.0));
+        // The tail alone can't make room, so the `+1` goes and the id is cut
+        // to what's left.
+        let gone = rail(90.0, &[50.0]);
+        assert_eq!(gone.overflow_count, 0);
+        assert_eq!(gone.change_id_room, Some(44.0));
+        assert!(!gone.need_ellipsis, "no room for the signal either");
+    }
+
+    /// Whatever the width, the left-side text ends before the chip rail
+    /// starts (once the status chips, which never give way, fit at all).
+    #[test]
+    fn the_meta_line_never_runs_under_its_chips() {
+        let (gap, id_gap, ellipsis, commit) = (6.0, 8.0, 8.0, 50.0);
+        for bookmarks in [&[][..], &[50.0], &[50.0, 50.0], &[120.0, 50.0, 50.0]] {
+            for width in 46..420 {
+                let width = width as f32;
+                let layout = rail(width, bookmarks);
+                let mut left = layout.change_id_room.unwrap_or(60.0);
+                if layout.show_commit_id {
+                    left += id_gap + commit;
+                }
+                if layout.author_width > 0.0 {
+                    left += id_gap + layout.author_width;
+                } else if layout.need_ellipsis {
+                    left += id_gap + ellipsis;
+                }
+                let rail_w = layout.rail_width(bookmarks, 40.0);
+                assert!(
+                    left + gap + rail_w <= width + 0.01,
+                    "{bookmarks:?} at {width}: {left} + {gap} + {rail_w}, {layout:?}"
+                );
+            }
+        }
     }
 
     #[test]
