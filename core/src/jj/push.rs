@@ -98,6 +98,8 @@ pub(super) struct PushOutcome {
     /// transaction must still be committed (the remote did change), and the
     /// caller reports this as the failure it is afterwards.
     pub partial_failure: Option<String>,
+    /// The bookmarks the request named (see [`PlannedPush`]).
+    pub bookmarks: Vec<String>,
 }
 
 /// One bookmark the request names, with the CLI's per-flag allowances.
@@ -120,6 +122,8 @@ pub(super) struct PlannedPush {
     /// place, and what signing did.
     pub notes: Vec<String>,
     plan: Vec<String>,
+    /// Every bookmark the request named, generated names included.
+    named: Vec<String>,
 }
 
 /// Plan `request` inside `repo` (a transaction's mutable repo): apply its
@@ -215,6 +219,10 @@ pub(super) async fn plan_push(
         }
     }
 
+    let named_list: Vec<String> = named
+        .iter()
+        .map(|item| item.name.as_str().to_owned())
+        .collect();
     // Classify. An explicitly named bookmark that can't be pushed fails the
     // whole push, as it does in the CLI.
     let mut updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)> = Vec::new();
@@ -296,6 +304,7 @@ pub(super) async fn plan_push(
             tags,
             notes,
             plan: Vec::new(),
+            named: named_list,
         });
     }
 
@@ -325,6 +334,7 @@ pub(super) async fn plan_push(
         tags,
         notes,
         plan,
+        named: named_list,
     })
 }
 
@@ -341,6 +351,7 @@ pub(super) fn send_push(
         tags,
         mut notes,
         plan,
+        named,
     } = planned;
     if updates.is_empty() && tags.is_empty() {
         notes.push("Nothing changed.".to_owned());
@@ -348,6 +359,7 @@ pub(super) fn send_push(
             message: format!("Nothing to push to {remote_name}"),
             output: notes,
             partial_failure: None,
+            bookmarks: named,
         });
     }
     let remote = RemoteName::new(&remote_name);
@@ -387,6 +399,7 @@ pub(super) fn send_push(
             message,
             output,
             partial_failure: None,
+            bookmarks: named,
         });
     }
     let mut problems = Vec::new();
@@ -409,6 +422,7 @@ pub(super) fn send_push(
         message,
         output,
         partial_failure: Some(failure),
+        bookmarks: named,
     })
 }
 

@@ -224,6 +224,7 @@ async fn apply_view_only(
         let (moved, planned) = stage_view_only(&push_context, tx.repo_mut(), op).await?;
         let mut output: Vec<String> = Vec::new();
         let mut partial_failure: Option<String> = None;
+        let mut bookmarks: Vec<String> = Vec::new();
         let message = match planned {
             Some(mut planned) => {
                 let signing = sign_plan(&push_context, tx.repo(), &planned).await?;
@@ -258,6 +259,7 @@ async fn apply_view_only(
                 planned.notes.extend(signing.skipped_note);
                 let pushed = send_push(&push_context, tx.repo_mut(), planned, progress)?;
                 output = pushed.output;
+                bookmarks = pushed.bookmarks;
                 partial_failure = pushed.partial_failure;
                 match moved {
                     Some(moved) => format!("{moved} \u{b7} {}", pushed.message),
@@ -299,6 +301,7 @@ async fn apply_view_only(
             rewritten_commit: None,
             output,
             operation_id: Some(new_repo.op_id().hex()),
+            bookmarks,
         };
         return Ok((outcome, new_repo));
     }
@@ -1505,6 +1508,7 @@ fn mutation_outcome(
         rewritten_commit,
         output,
         operation_id: Some(operation_id.hex()),
+        bookmarks: Vec::new(),
     }
 }
 

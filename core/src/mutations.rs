@@ -275,6 +275,9 @@ pub struct MutationOutcome {
     /// activity row's per-op "Undo" uses to revert exactly this mutation
     /// (not just the latest op).
     pub operation_id: Option<String>,
+    /// The bookmarks a push named, in order, the ones it generated for
+    /// `--change` included. Empty for anything but a push.
+    pub bookmarks: Vec<String>,
 }
 
 /// What a draft simulation produced — the op bar renders the kind-specific

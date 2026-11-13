@@ -370,6 +370,7 @@ fn push_change_creates_the_generated_bookmark() {
         "{}",
         again.message
     );
+    assert_eq!(again.bookmarks, [name], "named even when nothing moved");
 }
 
 /// `templates.git_push_bookmark` renders through jj-cli's template engine, so
@@ -390,6 +391,8 @@ fn push_change_renders_the_bookmark_template_like_jj() {
     let name = format!("me/{}-first", &change[..8]);
     assert_eq!(outcome.message, format!("Pushed {name} to origin"));
     assert_eq!(remote_ref(&remote, &name), Some(first));
+    // The generated name comes back, for what opens its pull request next.
+    assert_eq!(outcome.bookmarks, [name]);
 }
 
 #[test]
