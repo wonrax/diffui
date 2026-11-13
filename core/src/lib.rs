@@ -22,7 +22,7 @@ pub mod mutations;
 pub mod partial;
 pub mod plan;
 pub mod preview_graph;
-mod process;
+pub mod process;
 pub mod push;
 pub mod repo;
 pub mod repository;
