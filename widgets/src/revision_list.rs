@@ -394,6 +394,10 @@ pub struct RevisionListProps {
     /// row's selection key, its card's rectangle in window coordinates (what
     /// anchors a native highlight) and the cursor.
     on_context_menu: Option<Callback<(RowSelectionKey, Rectangle, Point)>>,
+    /// A click on a bookmark chip that has a tip: the row's key, the chip's
+    /// index in its row's `bookmark_chips` and its rectangle in window
+    /// coordinates (what a menu anchors to).
+    on_chip_click: Option<Callback<(RowSelectionKey, usize, Rectangle)>>,
     /// Right-click on a file row: the row's *display* index into the file tree
     /// (like `on_select_file`), its rect, and the cursor.
     on_file_context_menu: Option<Callback<(usize, Rectangle, Point)>>,
@@ -464,6 +468,7 @@ impl RevisionListProps {
             on_select_revision: None,
             on_select_file: None,
             on_context_menu: None,
+            on_chip_click: None,
             on_file_context_menu: None,
             on_file_check: None,
             on_scroll: None,
@@ -587,6 +592,16 @@ impl RevisionListProps {
         callback: impl Fn(&(RowSelectionKey, Rectangle, Point), &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_context_menu = Some(Rc::new(callback));
+        self
+    }
+
+    /// Register a click handler for the bookmark chips that have a tip (see
+    /// [`Chip::tip`]). Such a click doesn't select the row.
+    pub fn on_chip_click(
+        mut self,
+        callback: impl Fn(&(RowSelectionKey, usize, Rectangle), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_chip_click = Some(Rc::new(callback));
         self
     }
 
@@ -998,6 +1013,11 @@ pub struct RevisionList {
     /// labels at that row. Drives the branch-name tooltip on the graph
     /// gutter.
     hovered_lane: Option<(usize, usize, LaneHalf)>,
+    /// The bookmark chips with a tip that the last paint drew, where it drew
+    /// them: their hover tooltip and click targets.
+    painted_chips: RefCell<Vec<PaintedChip>>,
+    /// Index into `painted_chips` of the chip under the cursor.
+    hovered_chip: Option<usize>,
     /// Last cursor position observed inside the list's bounds. Anchors the
     /// tooltip.
     cursor_position: Option<Point>,
@@ -1037,6 +1057,15 @@ pub struct RevisionList {
     /// File names cut to their column, kept across frames: see [`NameCuts`].
     name_cuts: NameCuts,
     _escape: Subscription,
+}
+
+/// A chip with a tip, as the last paint placed it.
+struct PaintedChip {
+    key: RowSelectionKey,
+    /// Its index in the row's `bookmark_chips`.
+    chip: usize,
+    bounds: Rectangle,
+    tip: String,
 }
 
 /// File names cut in the middle to fit their column, one entry per name. A cut
@@ -1120,6 +1149,8 @@ impl RevisionList {
             hovered_file_item: None,
             hovered_revision_item: None,
             hovered_lane: None,
+            painted_chips: RefCell::default(),
+            hovered_chip: None,
             cursor_position: None,
             over_scrollbar: false,
             bar: scrollbar::Shared::default(),
@@ -1286,18 +1317,21 @@ impl RevisionList {
         self.hovered_file_item.take().is_some()
             | self.hovered_revision_item.take().is_some()
             | self.hovered_lane.take().is_some()
+            | self.hovered_chip.take().is_some()
     }
 
     fn recompute_hover(&mut self, cx: &App) {
         self.hovered_file_item = None;
         self.hovered_revision_item = None;
         self.hovered_lane = None;
+        self.hovered_chip = None;
         let Some(pos) = self.cursor_position else {
             return;
         };
         if !self.bounds.contains(pos) {
             return;
         }
+        self.hovered_chip = self.chip_at(pos);
         let local_x = pos.x - self.bounds.x;
         let local_y = f64::from(pos.y - self.bounds.y) + self.vertical_offset;
         let props = self.props.clone();
@@ -1435,6 +1469,7 @@ impl RevisionList {
             self.hovered_file_item,
             self.hovered_revision_item,
             self.hovered_lane,
+            self.hovered_chip,
         );
         self.recompute_hover(cx);
         // The cursor shape is set at paint, so crossing onto the bar repaints.
@@ -1445,6 +1480,7 @@ impl RevisionList {
                 self.hovered_file_item,
                 self.hovered_revision_item,
                 self.hovered_lane,
+                self.hovered_chip,
             )
             || over_scrollbar != self.over_scrollbar
         {
@@ -1495,6 +1531,17 @@ impl RevisionList {
         {
             self.pending_reveal_row = props.working_copy_flat;
             cx.notify();
+            return true;
+        }
+        if let Some(on_chip_click) = &props.on_chip_click
+            && let Some(index) = self.chip_at(cursor)
+        {
+            let chips = self.painted_chips.borrow();
+            let chip = &chips[index];
+            effects.push(call(
+                on_chip_click,
+                (chip.key.clone(), chip.chip, chip.bounds),
+            ));
             return true;
         }
         let local_y = f64::from(cursor.y - bounds.y) + self.vertical_offset;
@@ -1629,7 +1676,16 @@ impl RevisionList {
         self.bounds.y + (self.props.row_top(flat) - self.vertical_offset) as f32
     }
 
-    /// The hover tooltip due this frame, if any: a lane's labels, or the full
+    /// The painted chip with a tip under `point`.
+    fn chip_at(&self, point: Point) -> Option<usize> {
+        self.painted_chips
+            .borrow()
+            .iter()
+            .position(|chip| chip.bounds.contains(point))
+    }
+
+    /// The hover tooltip due this frame, if any: a chip's tip, a lane's
+    /// labels, or the full
     /// path of a file row whose name is ellipsized. Text, the row's box in the
     /// window and where to put it relative to that.
     fn tooltip(&self, window: &Window, cx: &App) -> Option<Floating> {
@@ -1637,6 +1693,13 @@ impl RevisionList {
         let props = &self.props;
         let style = &props.style;
         let bounds = self.bounds;
+        let look = crate::ui::Look::new(style.floating, style.primary_font, style.mono_font);
+        if let Some(index) = self.hovered_chip
+            && let Some(chip) = self.painted_chips.borrow().get(index)
+        {
+            let (card, at) = crate::ui::placed_tooltip(chip.tip.clone(), chip.bounds, look, window);
+            return Some((card.into_any_element(), at));
+        }
 
         // Lane tooltip wins over the file path tooltip when both could fire at
         // the same time: the cursor is in the gutter, which is mutually
@@ -1691,7 +1754,6 @@ impl RevisionList {
             )
         };
 
-        let look = crate::ui::Look::new(style.floating, style.primary_font, style.mono_font);
         let (card, at) = crate::ui::placed_tooltip(text, target, look, window);
         Some((card.into_any_element(), at))
     }
@@ -1744,6 +1806,7 @@ impl RevisionList {
 
     fn paint(&self, window: &mut Window, cx: &mut Context<Self>) {
         PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.painted_chips.borrow_mut().clear();
         let bounds = self.bounds;
         let props = self.props.clone();
         let style = &props.style;
@@ -2287,14 +2350,31 @@ impl RevisionList {
         // bookmarks, then the `+N` overflow chip (if any), then status
         // chips. The leading edge is computed from the cumulative width.
         let mut chip_x = content_right - layout.rail_width(&bm_widths, status_total);
-        for (c, width) in rev
+        for (index, (c, width)) in rev
             .bookmark_chips
             .iter()
             .zip(&bm_widths)
             .take(layout.visible_bookmarks)
+            .enumerate()
         {
             let center = chip::center_for_baseline(c, meta_baseline);
             chip::paint(c, widths, chip_x, center, window, cx);
+            if let Some(tip) = &c.tip
+                && !rev.inert
+            {
+                let height = chip::height();
+                self.painted_chips.borrow_mut().push(PaintedChip {
+                    key: rev.selection_key.clone(),
+                    chip: index,
+                    bounds: Rectangle {
+                        x: chip_x,
+                        y: (center - height / 2.0).round(),
+                        width: *width,
+                        height,
+                    },
+                    tip: tip.clone(),
+                });
+            }
             chip_x += width + chip_gap;
         }
         if layout.overflow_count > 0 {
@@ -2308,6 +2388,8 @@ impl RevisionList {
                 icon: None,
                 icon_color: None,
                 suffix: None,
+                marks: Vec::new(),
+                tip: None,
             };
             let center = chip::center_for_baseline(&overflow_chip, meta_baseline);
             chip::paint(&overflow_chip, widths, chip_x, center, window, cx);

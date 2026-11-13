@@ -810,6 +810,8 @@ mod scenes {
                 icon: Some(icons::GIT_BRANCH),
                 icon_color: None,
                 suffix: None,
+                marks: Vec::new(),
+                tip: None,
             };
             let dashed = chip::Chip {
                 label: "empty".to_owned(),
@@ -820,6 +822,8 @@ mod scenes {
                 icon: None,
                 icon_color: None,
                 suffix: None,
+                marks: Vec::new(),
+                tip: None,
                 ..chip.clone()
             };
             let prose = Prose::from("Move ")

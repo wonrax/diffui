@@ -61,6 +61,13 @@ pub struct Chip {
     /// bookmark's `@origin`, or the `*` of a bookmark that differs from its
     /// remote.
     pub suffix: Option<(String, Color)>,
+    /// Glyphs after the label and suffix, each in its own colour: a
+    /// bookmark's pull-request state and checks.
+    pub marks: Vec<(&'static str, Color)>,
+    /// What hovering the chip says. A list that takes chip clicks (see
+    /// `RevisionListProps::on_chip_click`) reports a click on a chip with a
+    /// tip instead of selecting its row.
+    pub tip: Option<String>,
 }
 
 /// Full chip width (icon + label + horizontal padding) for the given label,
@@ -80,7 +87,15 @@ pub fn chip_width(memo: &WidthMemo, chip: &Chip) -> f32 {
         + chip.suffix.as_ref().map_or(0.0, |(suffix, _)| {
             memo.width(suffix, text_size(chip.font), chip.font)
         })
+        + chip
+            .marks
+            .iter()
+            .map(|(glyph, _)| MARK_GAP + memo.width(glyph, ICON_SIZE, icons::ICON_FONT))
+            .sum::<f32>()
 }
+
+/// Between a chip's text and each of its trailing marks.
+const MARK_GAP: f32 = 4.0;
 
 /// [`width`], shaping through `memo`.
 ///
@@ -172,10 +187,11 @@ pub fn paint(
         window,
         cx,
     );
+    text_x += memo.width(&chip.label, label_size, chip.font);
     if let Some((suffix, color)) = &chip.suffix {
         crate::typography::paint_line(
             suffix,
-            text_x + memo.width(&chip.label, label_size, chip.font),
+            text_x,
             top + shift,
             label_size,
             chip_h,
@@ -185,6 +201,23 @@ pub fn paint(
             window,
             cx,
         );
+        text_x += memo.width(suffix, label_size, chip.font);
+    }
+    for (glyph, color) in &chip.marks {
+        text_x += MARK_GAP;
+        crate::typography::paint_line(
+            glyph,
+            text_x,
+            top + (chip_h - ICON_SIZE) / 2.0,
+            ICON_SIZE,
+            ICON_SIZE,
+            icons::ICON_FONT,
+            *color,
+            TextAlign::Left,
+            window,
+            cx,
+        );
+        text_x += memo.width(glyph, ICON_SIZE, icons::ICON_FONT);
     }
 }
 
@@ -240,6 +273,13 @@ pub fn view(chip: &Chip) -> Div {
     if let Some((suffix, color)) = &chip.suffix {
         // Flush against the label: the row's gap is for the icon.
         element = element.child(text(suffix.clone(), *color).ml(px(-ICON_GAP)));
+    }
+    for (glyph, color) in &chip.marks {
+        element = element.child(
+            div()
+                .ml(px(MARK_GAP - ICON_GAP))
+                .child(icons::icon(glyph, ICON_SIZE, *color)),
+        );
     }
     element
 }

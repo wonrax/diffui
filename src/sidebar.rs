@@ -194,6 +194,8 @@ pub(crate) fn bookmark_chips_for(bookmarks: &[String], lane_color: Color, look: 
                 }),
                 icon_color: Some(lane_color),
                 suffix,
+                marks: Vec::new(),
+                tip: None,
             }
         })
         .collect()
@@ -221,6 +223,8 @@ pub(crate) fn tag_chips_for(tags: &[String], look: Look) -> Vec<Chip> {
             icon: Some(icons::TAG),
             icon_color: None,
             suffix: None,
+            marks: Vec::new(),
+            tip: None,
         })
         .collect()
 }
@@ -241,6 +245,8 @@ pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
             icon: None,
             icon_color: None,
             suffix: None,
+            marks: Vec::new(),
+            tip: None,
         });
     }
     if commit.has_conflict() {
@@ -254,6 +260,8 @@ pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
             icon: None,
             icon_color: None,
             suffix: None,
+            marks: Vec::new(),
+            tip: None,
         });
     }
     if commit.is_hidden() {
@@ -270,6 +278,8 @@ pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
             icon: None,
             icon_color: None,
             suffix: None,
+            marks: Vec::new(),
+            tip: None,
         });
     } else if commit.is_divergent() {
         // jj log flags these with a change-offset suffix: the change id maps
@@ -285,6 +295,8 @@ pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
             icon: None,
             icon_color: None,
             suffix: None,
+            marks: Vec::new(),
+            tip: None,
         });
     }
     status_chips

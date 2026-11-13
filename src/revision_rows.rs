@@ -242,6 +242,8 @@ fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
                     icon: None,
                     icon_color: None,
                     suffix: None,
+                    marks: Vec::new(),
+                    tip: None,
                 },
             );
         }
@@ -430,6 +432,8 @@ fn build_revision_row(
                     icon: Some(icons::ARROW_UP),
                     icon_color: None,
                     suffix: None,
+                    marks: Vec::new(),
+                    tip: None,
                 },
             );
         } else {
@@ -486,6 +490,8 @@ fn build_revision_row(
                         icon: Some(icons::ARROW_DOWN),
                         icon_color: None,
                         suffix: None,
+                        marks: Vec::new(),
+                        tip: None,
                     },
                 );
             }
@@ -512,6 +518,8 @@ fn build_revision_row(
                 icon: None,
                 icon_color: None,
                 suffix: None,
+                marks: Vec::new(),
+                tip: None,
             },
         );
     }
