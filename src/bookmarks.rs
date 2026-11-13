@@ -184,7 +184,8 @@ impl Diffui {
     }
 
     /// `jj git push` without `--remote` falls back to `origin`; with several
-    /// remotes, none called that, and no `git.push`, there's nothing to guess.
+    /// remotes, none called that, and no `git.push` naming just one, there's
+    /// nothing to guess.
     fn no_push_remote(&mut self) {
         let remotes = &self.active().session.bookmarks.remotes;
         let body = if remotes.is_empty() {
@@ -192,8 +193,8 @@ impl Diffui {
         } else {
             let remotes: Vec<String> = remotes.iter().map(|remote| format!("`{remote}`")).collect();
             format!(
-                "Several remotes ({}) and no `git.push`. Pick one from the revision's menu, \
-                 or set `git.push`.",
+                "Several remotes ({}) and `git.push` doesn't pick one. Pick one from the \
+                 revision's menu, or set `git.push` to one remote.",
                 remotes.join(", ")
             )
         };

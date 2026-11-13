@@ -569,7 +569,9 @@ fn push_button(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
     );
 
     let tip = match (remote, candidates.as_slice()) {
-        (None, _) => "Push needs a remote: several are set up, and no git.push".to_owned(),
+        (None, _) => {
+            "Push needs a remote: several are set up, and git.push doesn't pick one".to_owned()
+        }
         (Some(remote), []) => format!("Nothing to push to {remote}"),
         (Some(remote), [one]) => format!(
             "Push {} to {remote}: {} {} ahead",
