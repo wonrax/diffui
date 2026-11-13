@@ -20,7 +20,7 @@ bring it forward; otherwise the active tab).
 | Verb | Does |
 |---|---|
 | `diffui ctl state` | Open repositories (tab, root, kind `jj`/`git`/`pr`, which is active), the selected revision (change id, commit id, first line, bookmarks, whether it's `@`), the log's revset, and the active tab's ten latest activity rows (label, status, result, equivalent command). |
-| `diffui ctl open <path>` | Open a repository (or a GitHub PR reference) as a tab. Answers with `state`. |
+| `diffui ctl open <path>` | Open a repository, or a pull request (`https://github.com/o/r/pull/12`, `o/r#12`, a GitLab `https://host/group/name/-/merge_requests/7` or `group/name!7`), as a tab. Answers with `state`. |
 | `diffui ctl select <revset>` | Show the revision `<revset>` names, as `jj show` would. |
 | `diffui ctl commands` | Every command id, its label, whether it was declared in config (`declared`), and whether it can run now (`available`, with `reason` when not). |
 | `diffui ctl run <id>` | Run a command by id, as its key would. Fails with the reason when it can't run now. |
@@ -30,6 +30,27 @@ bring it forward; otherwise the active tab).
 
 Prefer `diffui ctl jj …` over running `jj` yourself when the user is
 watching the app: the change shows in its activity and can be undone there.
+
+## Pull requests
+
+When a remote is on GitHub or GitLab, diffui shows each bookmark's pull
+request (merge request on GitLab) and its checks, and can open and update
+them through the `gh` or `glab` CLI the user is signed in to. These are
+ordinary commands, so `diffui ctl run <id>` runs them on the selected
+revision (select one first with `diffui ctl select`):
+
+| Id | Does |
+|---|---|
+| `forge.create` | Open the create dialog for the revision's bookmark (or a generated one), pushing first. |
+| `forge.update` | Open the dialog to change an open pull request's base, title or description. |
+| `forge.submit-stack` | Push every bookmark from trunk to the revision and open or update a pull request for each, each based on the one below. |
+| `forge.open` | Open the pull request in the browser. |
+| `forge.open-tab` | Open the pull request as a tab. |
+| `forge.copy-url` | Copy the pull request's URL. |
+| `forge.refresh` | Ask the forge again for every bookmark's pull request and checks. |
+
+The dialog waits for the user; `forge.submit-stack` doesn't. Watch `state`'s
+activity for the outcome.
 
 ## Declaring commands
 
