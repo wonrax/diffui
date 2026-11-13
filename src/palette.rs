@@ -1372,9 +1372,9 @@ fn build_input(
 ) -> AnyElement {
     let Look { theme, .. } = look;
     let placeholder = match &column.source {
-        ColumnSource::Root => "Run a command, or find a file, bookmark or revision",
-        ColumnSource::Actions(_) => "Filter actions\u{2026}",
-        ColumnSource::Choose { .. } => "Filter\u{2026}",
+        ColumnSource::Root => "Run a command, or find a file, bookmark or revision".to_owned(),
+        ColumnSource::Actions(_) => "Filter actions\u{2026}".to_owned(),
+        ColumnSource::Choose { title, .. } => format!("{title}\u{2026}"),
     };
     let font = look.font;
     let band = div()
@@ -1398,7 +1398,7 @@ fn build_input(
         // Older (left-of-center) columns are read-only previews. Only the rightmost
         // holds the input: a field's state is keyed by its id.
         let (text, color) = if column.query.is_empty() {
-            (placeholder.to_owned(), theme.subtle_text)
+            (placeholder, theme.subtle_text)
         } else {
             (column.query.clone(), theme.text)
         };
@@ -1421,7 +1421,7 @@ fn build_input(
     });
     let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_submit(cx));
     let spec = input::FieldSpec::new(PALETTE_INPUT_ID, &column.query)
-        .placeholder(placeholder)
+        .placeholder(&placeholder)
         .on_input(move |query, window, cx| on_input(&query, window, cx))
         .on_submit(move |window, cx| on_submit(&(), window, cx));
     band.child(

@@ -2479,8 +2479,86 @@ fn all() -> Vec<Scene> {
         },
     ));
 
+    t.group("Declared commands");
+    t.add(
+        s(
+            "commands-palette",
+            "Declared commands under their own heading: one runs, one that needs a bookmark is greyed with why, one whose when-clause doesn't hold says so.",
+            "Declare them in config.toml, select a revision without a bookmark, cmd+K, type >staging.",
+            |c| {
+                c.select("no-description");
+                c.key("cmd+k");
+                c.typed(">staging");
+            },
+        )
+        .config(DECLARED),
+    );
+    t.add(
+        s(
+            "commands-choose",
+            "A declared command's choose prompt: its choices in a palette column, the prompt's label in the footer.",
+            "Run a declared command whose prompt is a choose.",
+            |c| {
+                c.select("no-description");
+                c.cmd("user.rebase-staging");
+            },
+        )
+        .config(DECLARED),
+    );
+    t.add(s(
+        "commands-generate",
+        "The description editor with Generate beside Cancel and Save.",
+        "d on a revision.",
+        |c| {
+            c.select("no-description");
+            c.key("d");
+        },
+    ));
+    t.add(
+        s(
+            "commands-generate-dark",
+            "commands-generate in dark.",
+            "d on a revision, theme Dark.",
+            |c| {
+                c.select("no-description");
+                c.key("d");
+            },
+        )
+        .dark(),
+    );
+
     t.scenes
 }
+
+/// The `config.toml` the declared-command scenes run with.
+const DECLARED: &str = r#"
+[[commands]]
+id = "user.deploy-staging"
+label = "Deploy to staging"
+exec = ["true"]
+
+[[commands]]
+id = "user.push-staging"
+label = "Push bookmark to staging"
+run = "jj git push -b {bookmark} --remote staging"
+
+[[commands]]
+id = "user.open-staging-pr"
+label = "Open staging PR"
+when = "bookmark.has_remote"
+exec = ["gh", "pr", "view", "--web", "{bookmark}"]
+
+[[commands]]
+id = "user.rebase-staging"
+label = "Rebase onto a staging branch"
+run = "jj rebase -r {change_id} -o {prompt.target}"
+
+[[commands.prompts]]
+name = "target"
+kind = "choose"
+label = "Rebase onto"
+choices = ["staging", "staging-next", "release/1.0"]
+"#;
 
 /// The ids of `fixtures/scenes.md`, in order.
 fn baseline_ids() -> Vec<String> {

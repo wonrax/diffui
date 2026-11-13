@@ -1379,3 +1379,31 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: History view's segment selected via the switcher.
 - Steps: Click the History segment.
 
+## Declared commands
+
+`[[commands]]` rows from `config.toml` (see `assets/agent/SKILL.md`). These
+scenes are new in the port; there is no iced capture for them.
+
+### `commands-palette`
+
+- Window: 1440x900, light
+- State: Declared commands under their own heading: one runs, one that needs a bookmark is greyed with why, one whose when-clause doesn't hold says so.
+- Steps: Declare them in config.toml, select a revision without a bookmark, cmd+K, type >staging.
+
+### `commands-choose`
+
+- Window: 1440x900, light
+- State: A declared command's choose prompt: its choices in a palette column, the prompt's label in the footer.
+- Steps: Run a declared command whose prompt is a choose.
+
+### `commands-generate`
+
+- Window: 1440x900, light
+- State: The description editor with Generate beside Cancel and Save.
+- Steps: d on a revision.
+
+### `commands-generate-dark`
+
+- Window: 1440x900, dark
+- State: commands-generate in dark.
+- Steps: d on a revision, theme Dark.
