@@ -1225,9 +1225,63 @@ pub(crate) fn build_dialog(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use diffui_core::{BookmarkEntry, RemoteBookmarkRef};
+    use std::path::{Path, PathBuf};
+
+    /// A fake `gh` / `glab` (`core/tests/fixtures/fake-forge-cli.sh`) in a
+    /// directory of its own: rules in, recorded calls out. Never reaches a
+    /// forge.
+    pub(crate) struct FakeCli {
+        dir: PathBuf,
+    }
+
+    impl FakeCli {
+        pub(crate) fn new(name: &str, rules: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("diffui-app-forge-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("core/tests/fixtures/fake-forge-cli.sh");
+            std::fs::copy(script, dir.join("cli")).unwrap();
+            let fake = Self { dir };
+            fake.answer(rules);
+            fake
+        }
+
+        /// Replace the rules, and forget the calls so far.
+        pub(crate) fn answer(&self, rules: &[(&str, &str)]) {
+            let mut table = String::new();
+            for (index, (pattern, response)) in rules.iter().enumerate() {
+                let file = format!("response-{index}");
+                std::fs::write(self.dir.join(&file), response).unwrap();
+                table.push_str(&format!("{pattern}\t{file}\t0\n"));
+            }
+            std::fs::write(self.dir.join("rules"), table).unwrap();
+            let _ = std::fs::remove_file(self.dir.join("calls"));
+        }
+
+        pub(crate) fn program(&self) -> PathBuf {
+            self.dir.join("cli")
+        }
+
+        /// Each call's arguments, `HOST=…` first.
+        pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+            std::fs::read_to_string(self.dir.join("calls"))
+                .unwrap_or_default()
+                .split("\u{1}\n")
+                .filter(|call| !call.is_empty())
+                .map(|call| {
+                    call.split('\0')
+                        .filter(|arg| !arg.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect()
+        }
+    }
 
     fn entry(name: &str, target: &str, remote: Option<&str>) -> BookmarkEntry {
         BookmarkEntry {
@@ -1348,5 +1402,272 @@ mod tests {
             Some("main"),
             "trunk's branch when nothing below has an open pull request"
         );
+    }
+
+    fn rest_pr(number: u64, head: &str, base: &str) -> String {
+        format!(
+            r#"{{"number": {number}, "html_url": "https://github.invalid/team/app/pull/{number}",
+            "title": "t", "state": "open", "draft": false, "merged_at": null,
+            "head": {{"ref": "{head}", "sha": "s{number}"}}, "base": {{"ref": "{base}", "sha": "b"}}}}"#
+        )
+    }
+
+    fn listed(prs: &[(u64, &str, &str)]) -> String {
+        let rows: Vec<String> = prs
+            .iter()
+            .map(|(number, head, base)| {
+                format!(
+                    r#"{{"number": {number}, "url": "https://github.invalid/team/app/pull/{number}",
+                    "title": "t", "headRefName": "{head}", "baseRefName": "{base}",
+                    "headRefOid": "s{number}", "state": "OPEN", "isDraft": false,
+                    "reviewDecision": "", "isCrossRepository": false}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn has(call: &[String], args: &[&str]) -> bool {
+        call.windows(args.len())
+            .any(|window| window.iter().zip(args).all(|(a, b)| a == b))
+    }
+
+    /// The fixture with a two-commit stack on `main` (`stack-1`, `stack-2`,
+    /// and an empty `@` on top), opened, its `origin` looking like a GitHub
+    /// project that git sends to the fixture's bare remote, and the app's
+    /// GitHub going through `fake`. `.invalid` never resolves, whatever
+    /// happens. Returns the harness and `stack-2`'s commit.
+    fn stacked_repo(fake: &FakeCli) -> (crate::harness::Harness, String) {
+        use crate::harness::{Harness, fixture_jj, fixture_repo};
+        let repo = fixture_repo();
+        let jj = |args: &[&str]| {
+            let output = std::process::Command::new(fixture_jj())
+                .arg("-R")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("run jj");
+            assert!(
+                output.status.success(),
+                "jj {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        jj(&["new", "main", "-m", "Stack one\n\nThe first body."]);
+        std::fs::write(repo.join("stack-one.txt"), "one\n").unwrap();
+        jj(&["bookmark", "create", "stack-1", "-r", "@"]);
+        jj(&["new", "-m", "Stack two"]);
+        std::fs::write(repo.join("stack-two.txt"), "two\n").unwrap();
+        jj(&["bookmark", "create", "stack-2", "-r", "@"]);
+        jj(&["new"]);
+        let top = jj(&["log", "--no-graph", "-r", "stack-2", "-T", "commit_id"]);
+
+        let mut h = Harness::open(Some(&repo));
+        h.wait_for_graph();
+        h.act(|ui, _| {
+            ui.forge.forges = diffui_core::forge::Forges::with_programs(
+                fake.program(),
+                "/nonexistent/diffui-test/glab".into(),
+            )
+        });
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(repo.join(".git"))
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        let url = "https://github.invalid/team/app.git";
+        let bare = repo.join(".jj/fixture-remote.git");
+        git(&["config", "remote.origin.url", url]);
+        git(&["config", &format!("url.{}.insteadOf", bare.display()), url]);
+        h.act(|ui, cx| {
+            let tab = ui.active_tab_id().expect("a tab");
+            ui.refresh_pull_requests(tab, true, cx);
+        });
+        h.settle();
+        assert!(
+            h.read(|ui| ui.active().forge.home.is_some()),
+            "origin is on a forge"
+        );
+        (h, top.trim().to_owned())
+    }
+
+    /// Waits for the activity row `activity` to finish, and says how.
+    fn finished(h: &mut crate::harness::Harness, activity: ActivityId) -> Option<ActivityStatus> {
+        h.wait_until("the submission", |ui| {
+            !matches!(
+                ui.active().activities.status(activity),
+                Some(ActivityStatus::Running | ActivityStatus::Queued)
+            )
+        });
+        h.settle();
+        h.read(|ui| ui.active().activities.status(activity))
+    }
+
+    /// Submit stack against a fake `gh`: the first run pushes both bookmarks
+    /// in one push and opens a pull request for each, the second based on
+    /// the first; a rerun changes nothing; a base moved on the forge is moved
+    /// back.
+    #[test]
+    fn submit_stack_chains_bases_and_is_idempotent() {
+        use crate::harness::Harness;
+        let fake = FakeCli::new(
+            "submit-stack",
+            &[
+                ("pr list *", "[]"),
+                (
+                    "api -X POST repos/team/app/pulls *head=stack-1 *",
+                    &rest_pr(1, "stack-1", "main"),
+                ),
+                (
+                    "api -X POST repos/team/app/pulls *head=stack-2 *",
+                    &rest_pr(2, "stack-2", "stack-1"),
+                ),
+                ("api graphql *", "SUCCESS\n"),
+            ],
+        );
+        let (mut h, top) = stacked_repo(&fake);
+        let submit = |h: &mut Harness| {
+            h.perform(Action::Forge(ForgeAction::SubmitStack(
+                CommandArg::Revision(RevisionSelection::Commit(top.clone())),
+            )));
+            let activity = h
+                .read(|ui| ui.active().forge.submission.as_ref().map(|s| s.activity))
+                .expect("a submission");
+            finished(h, activity)
+        };
+
+        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
+        let calls = fake.calls();
+        let posts: Vec<&Vec<String>> = calls.iter().filter(|call| has(call, &["POST"])).collect();
+        assert_eq!(posts.len(), 2, "{calls:?}");
+        assert!(has(posts[0], &["-f", "head=stack-1"]) && has(posts[0], &["-f", "base=main"]));
+        assert!(has(posts[0], &["-f", "title=Stack one"]));
+        assert!(has(posts[0], &["-f", "body=The first body."]));
+        assert!(has(posts[1], &["-f", "head=stack-2"]) && has(posts[1], &["-f", "base=stack-1"]));
+        h.read(|ui| {
+            let info = &ui.active().session.bookmarks;
+            assert!(in_sync(info, "stack-1", "origin") && in_sync(info, "stack-2", "origin"));
+        });
+
+        // Again, with both open as asked: nothing to push, nothing to change.
+        fake.answer(&[
+            (
+                "pr list *",
+                &listed(&[(1, "stack-1", "main"), (2, "stack-2", "stack-1")]),
+            ),
+            ("api graphql *", "SUCCESS\n"),
+        ]);
+        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
+        let calls = fake.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| has(call, &["POST"]) || has(call, &["PATCH"])),
+            "{calls:?}"
+        );
+
+        // Someone retargeted the second onto main: only its base moves back.
+        fake.answer(&[
+            (
+                "pr list *",
+                &listed(&[(1, "stack-1", "main"), (2, "stack-2", "main")]),
+            ),
+            (
+                "api -X PATCH repos/team/app/pulls/2 *",
+                &rest_pr(2, "stack-2", "stack-1"),
+            ),
+            ("api graphql *", "SUCCESS\n"),
+        ]);
+        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
+        let patches: Vec<Vec<String>> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| has(call, &["PATCH"]))
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert!(has(&patches[0], &["-f", "base=stack-1"]));
+        assert!(
+            !patches[0]
+                .iter()
+                .any(|arg| arg.starts_with("body=") || arg.starts_with("title=")),
+            "a resubmission leaves the text alone"
+        );
+    }
+
+    /// The dialog on a revision without a bookmark: its title and body come
+    /// from the description, its base from the stack under it, and it
+    /// pushes the revision under a generated bookmark before asking the
+    /// forge for a draft.
+    #[test]
+    fn the_dialog_pushes_a_bare_revision_under_a_generated_bookmark() {
+        let fake = FakeCli::new(
+            "dialog",
+            &[
+                ("pr list *", &listed(&[(1, "stack-1", "main")])),
+                (
+                    "api -X POST repos/team/app/pulls *",
+                    &rest_pr(3, "push-generated", "stack-1"),
+                ),
+                ("api graphql *", "PENDING\n"),
+            ],
+        );
+        let (mut h, _) = stacked_repo(&fake);
+        h.wait_until("the badge", |ui| ui.active().forge.of("stack-1").is_some());
+        // `@`, the empty change on stack-2, has no bookmark; describe it.
+        let commit = h.read(|ui| {
+            ui.active()
+                .session
+                .commits
+                .working_copy()
+                .map(|row| row.commit_id().to_owned())
+                .expect("a working copy")
+        });
+        h.perform(Action::Forge(ForgeAction::Open(CommandArg::Revision(
+            RevisionSelection::Commit(commit),
+        ))));
+        h.settle();
+        let dialog = h
+            .read(|ui| ui.pull_request_dialog().cloned())
+            .expect("the dialog");
+        assert!(matches!(dialog.head, Head::Generated(_)));
+        assert_eq!(
+            dialog.base, "stack-1",
+            "stacked on the nearest open pull request"
+        );
+        h.perform(Action::Forge(ForgeAction::Title(
+            "Top of the stack".to_owned(),
+        )));
+        h.perform(Action::Forge(ForgeAction::Draft(true)));
+        h.perform(Action::Forge(ForgeAction::Submit));
+        let activity = h
+            .read(|ui| ui.active().forge.submission.as_ref().map(|s| s.activity))
+            .expect("a submission");
+        // The push asks first, as any push of an undescribed working copy
+        // does; the submission waits on the answer.
+        h.wait_until("the push's question", |ui| ui.confirm().is_some());
+        while h.read(|ui| ui.confirm().is_some()) {
+            h.perform(Action::ConfirmAccept);
+            h.settle();
+        }
+        assert_eq!(finished(&mut h, activity), Some(ActivityStatus::Done));
+        let calls = fake.calls();
+        let post = calls
+            .iter()
+            .find(|call| has(call, &["POST"]))
+            .expect("a create");
+        let head = post
+            .iter()
+            .find_map(|arg| arg.strip_prefix("head="))
+            .expect("a head");
+        assert!(head.starts_with("push-"), "{head}");
+        assert!(has(post, &["-f", "base=stack-1"]));
+        assert!(has(post, &["-f", "title=Top of the stack"]));
+        assert!(has(post, &["-F", "draft=true"]));
+        h.read(|ui| assert!(in_sync(&ui.active().session.bookmarks, head, "origin")));
     }
 }

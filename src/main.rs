@@ -1080,7 +1080,11 @@ impl Pending {
     fn is_slot(&self) -> bool {
         !matches!(
             self,
-            Self::FilePair(..) | Self::CommandRevset(_) | Self::LineRevset(..) | Self::Cli(_)
+            Self::FilePair(..)
+                | Self::CommandRevset(_)
+                | Self::LineRevset(..)
+                | Self::Cli(_)
+                | Self::Forge(_)
         )
     }
 }
