@@ -131,6 +131,30 @@ pub(crate) struct Step {
     commit: Option<String>,
 }
 
+/// Give each generated step the branch the push made for it: the bookmarks
+/// the push named that aren't a step's own, in the order they were asked
+/// for. A step already in sync wasn't pushed, so it isn't among them.
+/// `false` when the push named too few.
+fn name_generated(steps: &mut [Step], pushed: &[String]) -> bool {
+    let own: Vec<String> = steps
+        .iter()
+        .filter_map(|step| match &step.head {
+            Head::Bookmark(name) => Some(name.clone()),
+            Head::Generated(_) => None,
+        })
+        .collect();
+    let mut made = pushed.iter().filter(|name| !own.contains(name));
+    for step in steps {
+        if matches!(step.head, Head::Generated(_)) {
+            let Some(name) = made.next() else {
+                return false;
+            };
+            step.head = Head::Bookmark(name.clone());
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Reading the stack's descriptions.
@@ -596,27 +620,12 @@ impl Diffui {
         let activity = submission.activity;
         match result {
             Ok(outcome) => {
-                // The push named the generated branches in the order it was
-                // asked for them.
-                let mut named = outcome.bookmarks.iter();
-                for step in &mut submission.steps {
-                    let generated = matches!(step.head, Head::Generated(_));
-                    let name = match &step.head {
-                        Head::Bookmark(name) => named.find(|pushed| *pushed == name).cloned(),
-                        Head::Generated(_) => named.next().cloned(),
-                    };
-                    if generated {
-                        match name {
-                            Some(name) => step.head = Head::Bookmark(name),
-                            None => {
-                                return self.fail_submission(
-                                    tab,
-                                    activity,
-                                    "The push didn't say which branch it made.".to_owned(),
-                                );
-                            }
-                        }
-                    }
+                if !name_generated(&mut submission.steps, &outcome.bookmarks) {
+                    return self.fail_submission(
+                        tab,
+                        activity,
+                        "The push didn't say which branch it made.".to_owned(),
+                    );
                 }
                 submission.phase = Phase::Talking;
             }
@@ -1232,6 +1241,31 @@ pub(crate) mod tests {
     use super::*;
     use diffui_core::{BookmarkEntry, RemoteBookmarkRef};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn generated_branches_skip_the_steps_that_were_already_in_sync() {
+        let step = |head| Step {
+            head,
+            base: "main".to_owned(),
+            title: String::new(),
+            body: String::new(),
+            draft: false,
+            commit: None,
+        };
+        let generated = || Head::Generated(RevisionSelection::Commit("abc".to_owned()));
+        // `ready` was in sync, so the push named only the branch it made.
+        let mut steps = vec![step(Head::Bookmark("ready".to_owned())), step(generated())];
+        assert!(name_generated(&mut steps, &["push-abc".to_owned()]));
+        assert_eq!(steps[1].head, Head::Bookmark("push-abc".to_owned()));
+        // A pushed bookmark and a generated one, in the order asked.
+        let mut steps = vec![step(generated()), step(Head::Bookmark("ready".to_owned()))];
+        assert!(name_generated(
+            &mut steps,
+            &["push-abc".to_owned(), "ready".to_owned()]
+        ));
+        assert_eq!(steps[0].head, Head::Bookmark("push-abc".to_owned()));
+        assert!(!name_generated(&mut [step(generated())], &[]));
+    }
 
     /// A fake `gh` / `glab` (`core/tests/fixtures/fake-forge-cli.sh`) in a
     /// directory of its own: rules in, recorded calls out. Never reaches a
