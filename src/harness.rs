@@ -39,6 +39,9 @@ use crate::theme::ThemeSpec;
 use crate::window_state::WindowState;
 use crate::{Action, Cli, Cx, Diffui};
 
+/// What [`crate::open_url`] was asked to open, instead of opening it.
+pub(crate) static OPENED_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// A view to show instead of the app: see [`Harness::show`].
 pub(crate) type Scene = Rc<dyn Fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement>;
 
@@ -268,6 +271,19 @@ impl Harness {
         config: &str,
         settings: &str,
     ) -> Self {
+        Self::open_prepared(repo, size, config, settings, |_| {})
+    }
+
+    /// [`Self::open_fresh`], with `prepare` run on the home once it is
+    /// cleared and its two files are written: for what else the launch
+    /// should find there (a plugin's folder).
+    pub(crate) fn open_prepared(
+        repo: Option<&Path>,
+        size: (f32, f32),
+        config: &str,
+        settings: &str,
+        prepare: impl FnOnce(&Path),
+    ) -> Self {
         let turn = turn();
         let home = scratch_home();
         for entry in std::fs::read_dir(home).expect("list the scratch home") {
@@ -288,6 +304,7 @@ impl Harness {
         std::fs::create_dir_all(&dir).expect("make the config directory");
         std::fs::write(dir.join("config.toml"), config).expect("write the config");
         std::fs::write(dir.join("settings.toml"), settings).expect("write the settings");
+        prepare(home);
         Self::start(turn, repo, size)
     }
 

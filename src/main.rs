@@ -1353,6 +1353,15 @@ pub(crate) fn expand_user_path(input: &str) -> PathBuf {
 /// "create a pull request" URL). Fire-and-forget — a failure to launch is
 /// non-fatal and silently ignored.
 pub(crate) fn open_url(url: &str) {
+    // A test opens nothing: it reads what would have been opened.
+    #[cfg(test)]
+    if true {
+        harness::OPENED_URLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(url.to_owned());
+        return;
+    }
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");
