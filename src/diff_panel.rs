@@ -1,4 +1,5 @@
 use crate::changes::ChangesMsg;
+use crate::commands::CommandArg;
 use crate::diff_view::{
     self, DiffFileView, DiffHunkView, DiffProps, DocSource, HeaderAction, HeaderLine, Slice,
 };
@@ -910,6 +911,9 @@ fn diff_props(
     props
 }
 
+/// The command the description editor's Generate button runs.
+const GENERATE: &str = "ai.describe";
+
 fn build_description_editor(
     ui: &Diffui,
     look: Look,
@@ -925,16 +929,21 @@ fn build_description_editor(
         return div().into_any_element();
     };
     let saving = editor.saving_activity.is_some();
+    let generating = editor
+        .generating
+        .as_ref()
+        .is_some_and(|generation| generation.running);
     let content = editor.text();
-    let mut spec = crate::input::FieldSpec::new(DESCRIPTION_EDITOR_ID, &content).placeholder(
-        if editor.commit {
+    let mut spec = crate::input::FieldSpec::new(DESCRIPTION_EDITOR_ID, &content)
+        .placeholder(if editor.commit {
             "Describe the change you are committing\u{2026}"
         } else {
             "Describe this revision\u{2026}"
-        },
-    );
-    // Read-only while saving.
-    if !saving {
+        })
+        // What a program wrote can be undone like typing.
+        .undoable(editor.generating.is_some());
+    // Read-only while saving, or while a program writes it.
+    if !saving && !generating {
         let on_edit = Diffui::listen(cx, |this, text: &String, _, _| {
             this.on_description_edited(text.clone());
         });
@@ -959,8 +968,31 @@ fn build_description_editor(
         .disabled(saving)
         .on_click(Diffui::on_action(Action::CancelDescription, cx));
 
+    // The agent CLI writes one, where the shipped command (or a user's
+    // override of it) can run here.
+    let generate = ui.registry.get(GENERATE).map(|command| {
+        let target = CommandArg::Revision(editor.target.clone());
+        let (label, action) = if generating {
+            ("Stop", Some(Action::StopGenerating))
+        } else {
+            let runs = command.enabled(ui, &target).is_ok();
+            (
+                "Generate",
+                runs.then(|| command.build(ui, target)).flatten(),
+            )
+        };
+        let button = look
+            .button("description-generate", label)
+            .compact()
+            .disabled(saving || action.is_none());
+        match action {
+            Some(action) => button.on_click(Diffui::on_action(action, cx)),
+            None => button,
+        }
+    });
+
     // A commit may keep the description as it stands.
-    let save_enabled = !saving && (editor.is_dirty() || editor.commit);
+    let save_enabled = !saving && !generating && (editor.is_dirty() || editor.commit);
     let save_label = match (saving, editor.commit) {
         (true, true) => "Committing\u{2026}",
         (true, false) => "Saving\u{2026}",
@@ -1008,7 +1040,10 @@ fn build_description_editor(
         crate::overlay_kit::Density::Well,
         crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
         hints,
-        [cancel.into_any_element(), save.into_any_element()],
+        generate
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .chain([cancel.into_any_element(), save.into_any_element()]),
         theme,
     );
     div()

@@ -189,6 +189,9 @@ pub struct FieldSpec<'a> {
     pub placeholder: &'a str,
     /// Echo the text as dots (credential prompts).
     pub masked: bool,
+    /// A new `value` from outside (a program writing into the field) goes on
+    /// the undo stack like an edit, rather than replacing the history.
+    pub undoable: bool,
     pub on_input: Option<OnInput>,
     pub on_edit: Option<OnEdit>,
     pub on_submit: Option<OnSubmit>,
@@ -201,6 +204,7 @@ impl<'a> FieldSpec<'a> {
             value,
             placeholder: "",
             masked: false,
+            undoable: false,
             on_input: None,
             on_edit: None,
             on_submit: None,
@@ -214,6 +218,11 @@ impl<'a> FieldSpec<'a> {
 
     pub fn masked(mut self, masked: bool) -> Self {
         self.masked = masked;
+        self
+    }
+
+    pub fn undoable(mut self, undoable: bool) -> Self {
+        self.undoable = undoable;
         self
     }
 
@@ -478,11 +487,16 @@ pub fn multi_line_with_focus(
         }
         moved.then(|| spec.value.to_owned())
     };
+    let undoable = spec.undoable;
     state.update(cx, |state, cx| {
         if let Some(value) = value
             && state.value().as_ref() != value
         {
-            state.set_value(value, window, cx);
+            if undoable {
+                state.replace_all(value, window, cx);
+            } else {
+                state.set_value(value, window, cx);
+            }
         }
         if let Some(placeholder) = replace_placeholder {
             state.set_placeholder(placeholder, window, cx);
