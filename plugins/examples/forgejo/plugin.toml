@@ -1,0 +1,24 @@
+# Forgejo and Gitea pull requests for diffui: badges on bookmarks, checks,
+# create and update. The reference plugin; copy it to
+# ~/.config/diffui/plugins/forgejo to use it.
+#
+# For a self-hosted instance, add its host to both lists below. The token
+# comes from `git credential fill`, or from `token_cmd` under
+# [plugins.forgejo] in config.toml.
+id = "forgejo"
+name = "Forgejo"
+version = "0.1.0"
+api = 0
+main = "main.js"
+
+[permissions]
+http = ["codeberg.org"]
+
+[provides]
+forge = { hosts = ["codeberg.org"] }
+
+[[commands]]
+id = "forgejo.open-in-browser"
+label = "Open pull request in browser"
+when = "bookmark.pr"
+menu = ["bookmark", "palette"]
