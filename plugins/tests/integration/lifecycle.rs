@@ -625,3 +625,23 @@ fn typescript_that_needs_a_compiler_fails_the_load_with_its_place() {
         "main.ts did not load: SyntaxError: Could not find export 'Repo' in module 'diffui'"
     );
 }
+
+#[test]
+fn a_panic_on_the_plugins_thread_fails_that_plugin_only() {
+    let plugin = probe(
+        "",
+        "toast: (repo) => ui.toast(\"panic\"),\n  ok: () => \"fine\",",
+    )
+    .spawn();
+    plugin.loaded();
+    let why = "the plugin host panicked: the app broke";
+    assert_eq!(
+        plugin.case("toast").unwrap_err(),
+        PluginError::Failed(why.into())
+    );
+    assert_eq!(plugin.failed(), why);
+    // The thread survived its panic and still takes orders.
+    plugin.plugin.reload();
+    plugin.loaded();
+    assert_eq!(plugin.case("ok").unwrap(), json!("fine"));
+}

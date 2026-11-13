@@ -78,6 +78,7 @@ impl Host for FakeHost {
             },
             HostCall::Ui(ui) => match ui {
                 UiCall::ActivityStart { .. } => reply.ok(7),
+                UiCall::Toast { message, .. } if message == "panic" => panic!("the app broke"),
                 UiCall::PromptInput { label, .. } if label == "hold" => {
                     self.held.lock().unwrap().push(reply)
                 }
