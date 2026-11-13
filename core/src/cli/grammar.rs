@@ -11,7 +11,7 @@ use clap::{Arg, ArgAction, Command};
 
 use crate::completion::ValueKind;
 
-/// jj-cli 0.45.1's `jj` command tree, built once (global flags propagated
+/// jj-cli 0.47.1's `jj` command tree, built once (global flags propagated
 /// into every subcommand, positional indices assigned).
 pub(crate) fn app() -> &'static Command {
     static APP: LazyLock<Command> = LazyLock::new(|| {
@@ -384,7 +384,7 @@ mod tests {
         let push = find_subcommand(find_subcommand(app(), "git").unwrap(), "push").unwrap();
         let remote = push
             .get_arguments()
-            .find(|a| a.get_id() == "remote")
+            .find(|a| a.get_id() == "remotes")
             .unwrap();
         assert_eq!(value_kind(push, remote), ValueKind::Remote);
     }

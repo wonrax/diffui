@@ -1,11 +1,11 @@
 //! From a typed line to a [`ParsedCommand`]: tokenise, expand aliases and
-//! the default command the way jj-cli 0.45.1 does, validate with jj's own
+//! the default command the way jj-cli 0.47.1 does, validate with jj's own
 //! clap tree, then classify.
 //!
-//! Ported from jj-cli 0.45.1, because jj-cli's version runs inside
+//! Ported from jj-cli 0.47.1, because jj-cli's version runs inside
 //! `CliRunner`. Check against its source on a jj bump:
-//! - The alias and default-command expansion: `resolve_aliases` and
-//!   `resolve_default_command` (`cli/src/cli_util.rs`).
+//! - The alias and default-command expansion: `load_aliases`, `resolve_aliases`
+//!   and `resolve_default_command` (`cli/src/cli_args.rs`).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -77,6 +77,14 @@ impl CliConfig {
         for name in config.table_keys("aliases") {
             // A real command can't be shadowed; jj warns and drops it.
             if grammar::find_subcommand(grammar::app(), name).is_some() {
+                continue;
+            }
+            // jj 0.46: `enabled = false` turns an alias off, a shipped one too.
+            if config
+                .get::<bool>(["aliases", name, "enabled"])
+                .is_ok_and(|enabled| !enabled)
+            {
+                self.aliases.remove(name);
                 continue;
             }
             let definition = config
@@ -945,23 +953,33 @@ fn classify(view: &ArgsView) -> CliCommand {
                 _ => MutationCommand::BookmarkUntrack { name, remote },
             }))
         }
+        // Since jj 0.46 `--remote` takes patterns and repeats, pushing to
+        // every remote they match; the native push goes to one, so only a
+        // single plain name lowers.
         ["git", "push"]
             if view.only(&[
-                "remote",
+                "remotes",
                 "bookmark",
                 "change",
                 "allow_empty_description",
                 "allow_private",
                 "allow_conflicts",
-            ]) =>
+            ]) && view.count("remotes") <= 1 =>
         {
             let bookmarks: Option<Vec<Spanned<String>>> = view
                 .values("bookmark")
                 .into_iter()
                 .map(plain_name)
                 .collect();
+            let remote = match view.value("remotes") {
+                Some(remote) => match plain_name(remote) {
+                    Some(remote) => Some(remote.value),
+                    None => return CliCommand::Passthrough,
+                },
+                None => None,
+            };
             native(bookmarks.map(|bookmarks| MutationCommand::Push {
-                remote: view.value("remote").map(|r| r.value),
+                remote,
                 bookmarks,
                 changes: view.revsets("change"),
                 allow: PushAllow {
@@ -1323,6 +1341,22 @@ mod tests {
         }
         assert_eq!(command("jj git push --dry-run"), CliCommand::Passthrough);
         assert_eq!(command("jj git push --all"), CliCommand::Passthrough);
+        // jj 0.46's `--remote` repeats and takes patterns; the native push
+        // goes to one remote, so only a single plain name lowers.
+        match mutation("jj git push --remote upstream -b main") {
+            MutationCommand::Push { remote, .. } => {
+                assert_eq!(remote.as_deref(), Some("upstream"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            command("jj git push --remote origin --remote upstream"),
+            CliCommand::Passthrough
+        );
+        assert_eq!(
+            command("jj git push --remote 'glob:up*'"),
+            CliCommand::Passthrough
+        );
         assert_eq!(
             mutation("jj git fetch --all-remotes"),
             MutationCommand::FetchAll
@@ -1389,6 +1423,17 @@ mod tests {
         assert_eq!(command("jj fix -s @"), CliCommand::Passthrough);
         assert_eq!(command("jj rebase --help"), CliCommand::Passthrough);
         assert_eq!(command("jj -R ../other new"), CliCommand::Passthrough);
+        // Commands jj 0.46 and 0.47 added, with no native op behind them.
+        for line in [
+            "jj converge",
+            "jj file edit -r @- a.txt",
+            "jj file delete -r @- a.txt",
+            "jj workspace remove other",
+            "jj undo --allow-cross-workspace",
+            "jj redo --allow-cross-workspace",
+        ] {
+            assert_eq!(command(line), CliCommand::Passthrough, "{line}");
+        }
         // The leading `jj` is optional.
         assert_eq!(parse_ok("new").path, ["new"]);
     }
@@ -1482,5 +1527,22 @@ mod tests {
         assert_eq!(config.aliases["b"], ["bookmark"]);
         assert_eq!(config.aliases["ci"], ["commit"]);
         assert_eq!(config.default_command, ["log"]);
+    }
+
+    /// jj 0.46 lets `enabled = false` switch an alias off, a shipped one too.
+    #[test]
+    fn a_disabled_alias_is_gone() {
+        let mut config = CliConfig::builtin();
+        let mut user = StackedConfig::empty();
+        user.add_layer(
+            jj_lib::config::ConfigLayer::parse(
+                jj_lib::config::ConfigSource::User,
+                "[aliases.ci]\nenabled = false\n[aliases.mine]\ndefinition = ['log', '-r', 'mine()']\nenabled = true\n",
+            )
+            .expect("parse the user config"),
+        );
+        config.overlay(&user);
+        assert!(!config.aliases.contains_key("ci"));
+        assert_eq!(config.aliases["mine"], ["log", "-r", "mine()"]);
     }
 }

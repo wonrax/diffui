@@ -59,7 +59,8 @@ pub(crate) fn shipped_settings() -> &'static UserSettings {
     static SHIPPED: LazyLock<UserSettings> = LazyLock::new(|| {
         let mut config = jj_lib::config::StackedConfig::with_defaults();
         config.extend_layers(default_config_layers());
-        UserSettings::from_config(config).expect("jj-cli's shipped config builds settings")
+        UserSettings::from_config_and_home_dir(config, None)
+            .expect("jj-cli's shipped config builds settings")
     });
     &SHIPPED
 }
@@ -103,7 +104,8 @@ pub(crate) fn jj_settings(repo_root: &Path) -> Result<UserSettings> {
     jj_lib::config::migrate(&mut config, &default_config_migrations())
         .context("failed to migrate deprecated jj config")?;
 
-    UserSettings::from_config(config).context("failed to build jj settings")
+    UserSettings::from_config_and_home_dir(config, env.home_dir().map(ToOwned::to_owned))
+        .context("failed to build jj settings")
 }
 
 /// Every config file jj-cli would read for the workspace at `repo_root`,
@@ -349,7 +351,10 @@ fn git_excludes_file(work_dir: &Path, git_dir: Option<&Path>) -> Option<PathBuf>
     match configured {
         Some(value) => {
             let path = std::str::from_utf8(&value).ok()?;
-            Some(work_dir.join(jj_lib::file_util::expand_home_path(path)))
+            Some(work_dir.join(jj_lib::file_util::expand_home_path(
+                path,
+                env::home_dir().as_deref(),
+            )))
         }
         None => xdg_config_home().map(|dir| dir.join("git").join("ignore")),
     }
@@ -523,6 +528,29 @@ mod config_layering_tests {
             settings.get("user.email"),
             "home@example.com",
             "~/.jjconfig.toml still supplies what no higher layer sets"
+        );
+    }
+
+    /// jj 0.47 renamed `git.sign-on-push = true` to a revset; the settings
+    /// carry the CLI's migration, so an old config still signs what it did.
+    #[test]
+    fn old_sign_on_push_migrates_to_the_revset() {
+        let root = scratch_dir("sign-on-push-migration");
+        let home = root.join("home");
+        write_file(
+            home.join(".config").join("jj").join("config.toml"),
+            "[git]\nsign-on-push = true\n",
+        );
+
+        let settings = probe(
+            &root,
+            &[("HOME", utf8(&home))],
+            &["revsets.git-sign-on-push"],
+        );
+
+        assert_eq!(
+            settings.get("revsets.git-sign-on-push"),
+            "~signed() & mine()"
         );
     }
 
@@ -750,7 +778,7 @@ mod config_layering_tests {
                 )
                 .expect("parse"),
             );
-            UserSettings::from_config(config).expect("settings")
+            UserSettings::from_config_and_home_dir(config, None).expect("settings")
         };
         assert_eq!(
             snapshot_max_new_file_size(&settings("0")).unwrap(),

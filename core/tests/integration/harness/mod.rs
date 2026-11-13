@@ -29,9 +29,14 @@ pub fn scratch_repo(test: &str) -> PathBuf {
     let settings = test_settings();
     block_on(async {
         // The default object hash is SHA-1, what every real repo uses.
-        jj_lib::workspace::Workspace::init_internal_git(&settings, &root, Default::default())
-            .await
-            .expect("init jj workspace");
+        jj_lib::workspace::Workspace::init_internal_git(
+            &settings,
+            &root,
+            jj_lib::ref_name::WorkspaceName::DEFAULT,
+            Default::default(),
+        )
+        .await
+        .expect("init jj workspace");
     });
     root
 }
@@ -44,9 +49,14 @@ pub fn scratch_colocated_repo(test: &str) -> PathBuf {
     std::fs::create_dir_all(&root).expect("create scratch dir");
     let settings = test_settings();
     block_on(async {
-        jj_lib::workspace::Workspace::init_colocated_git(&settings, &root, Default::default())
-            .await
-            .expect("init colocated jj workspace");
+        jj_lib::workspace::Workspace::init_colocated_git(
+            &settings,
+            &root,
+            jj_lib::ref_name::WorkspaceName::DEFAULT,
+            Default::default(),
+        )
+        .await
+        .expect("init colocated jj workspace");
     });
     root
 }
@@ -63,13 +73,15 @@ pub fn test_settings_for(root: &Path) -> jj_lib::settings::UserSettings {
             .expect("parse the scratch repo's config");
         config.add_layer(layer);
     }
-    jj_lib::settings::UserSettings::from_config(config).expect("build test settings")
+    jj_lib::settings::UserSettings::from_config_and_home_dir(config, None)
+        .expect("build test settings")
 }
 
 /// jj-cli's defaults plus an identity and signing off, so a commit written
 /// here never reaches for the user's real config or a signing agent.
 pub fn test_settings() -> jj_lib::settings::UserSettings {
-    jj_lib::settings::UserSettings::from_config(test_config()).expect("build test settings")
+    jj_lib::settings::UserSettings::from_config_and_home_dir(test_config(), None)
+        .expect("build test settings")
 }
 
 fn test_config() -> jj_lib::config::StackedConfig {
@@ -106,18 +118,8 @@ pub fn write(dir: &Path, name: &str, contents: &str) {
 pub fn commit_ids(root: &Path) -> Vec<String> {
     let settings = test_settings_for(root);
     block_on(async {
-        let workspace = jj_lib::workspace::Workspace::load(
-            &settings,
-            root,
-            &jj_lib::default_backend_factories::default_backend_factories(),
-            &jj_lib::default_backend_factories::default_working_copy_factories(),
-        )
-        .expect("load workspace");
-        let repo = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo at head");
+        let workspace = load_workspace_with(&settings, root);
+        let repo = workspace.load_at_head().await.expect("load repo at head");
         let expr = jj_lib::revset::RevsetExpression::all();
         let resolver = jj_lib::revset::SymbolResolver::new(
             repo.as_ref(),
@@ -127,7 +129,7 @@ pub fn commit_ids(root: &Path) -> Vec<String> {
             .resolve_user_expression(repo.as_ref(), &resolver)
             .expect("resolve all()");
         resolved
-            .evaluate(repo.as_ref())
+            .evaluate()
             .expect("evaluate all()")
             .stream()
             .map(|entry| {
@@ -331,13 +333,24 @@ impl TestRepo {
 /// Load the workspace at `root` through jj-lib directly, for the fixtures that
 /// have to reach past the protocol to set something up.
 pub fn load_workspace(root: &Path) -> jj_lib::workspace::Workspace {
-    jj_lib::workspace::Workspace::load(
-        &test_settings_for(root),
-        root,
-        &jj_lib::default_backend_factories::default_backend_factories(),
-        &jj_lib::default_backend_factories::default_working_copy_factories(),
-    )
-    .expect("load workspace")
+    load_workspace_with(&test_settings_for(root), root)
+}
+
+fn load_workspace_with(
+    settings: &jj_lib::settings::UserSettings,
+    root: &Path,
+) -> jj_lib::workspace::Workspace {
+    use jj_lib::workspace::WorkspaceLoaderFactory as _;
+    jj_lib::workspace::DefaultWorkspaceLoaderFactory
+        .create(root)
+        .and_then(|loader| {
+            loader.load(
+                settings,
+                &jj_lib::default_backend_factories::default_backend_factories(),
+                &jj_lib::default_backend_factories::default_working_copy_factories(),
+            )
+        })
+        .expect("load workspace")
 }
 
 /// Write two operations from the same base so the op log has a genuine merge
@@ -355,7 +368,10 @@ pub fn write_merge_operation(root: &Path) -> String {
     block_on(async {
         let workspace = load_workspace(root);
         let loader = workspace.repo_loader().clone();
-        let base = loader.load_at_head().await.expect("load repo at head");
+        let base = loader
+            .load_at_head(Some(workspace.workspace_name()))
+            .await
+            .expect("load repo at head");
 
         // Two transactions from the same base commit into divergent op heads;
         // reloading then merges them, and that merge is what we hand to undo.
@@ -373,7 +389,7 @@ pub fn write_merge_operation(root: &Path) -> String {
                 .expect("commit concurrent op");
         }
         let merged = loader
-            .load_at_head()
+            .load_at_head(Some(workspace.workspace_name()))
             .await
             .expect("reload after divergence");
         assert_eq!(
@@ -406,11 +422,7 @@ pub fn add_workspace(root: &Path, name: &str) -> PathBuf {
     std::fs::create_dir_all(&side).expect("create the second workspace dir");
     block_on(async {
         let workspace = load_workspace(root);
-        let repo = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo at head");
+        let repo = workspace.load_at_head().await.expect("load repo at head");
         let factories = jj_lib::default_backend_factories::default_working_copy_factories();
         let factory = factories
             .get(jj_lib::working_copy::WorkingCopy::name(
@@ -423,6 +435,7 @@ pub fn add_workspace(root: &Path, name: &str) -> PathBuf {
             &repo,
             factory.as_ref(),
             jj_lib::ref_name::WorkspaceNameBuf::from(name),
+            Some(workspace.workspace_name()),
         )
         .await
         .expect("add the second workspace");
@@ -468,7 +481,10 @@ fn at_head<T>(
     block_on(async {
         let workspace = load_workspace(root);
         let loader = workspace.repo_loader().clone();
-        let repo = loader.load_at_head().await.expect("load repo at head");
+        let repo = loader
+            .load_at_head(Some(workspace.workspace_name()))
+            .await
+            .expect("load repo at head");
         body(loader, repo).await
     })
 }

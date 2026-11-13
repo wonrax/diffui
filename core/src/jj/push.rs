@@ -1,7 +1,7 @@
 //! `jj git push`, with the CLI's safety checks, plus the bookmark bookkeeping
 //! (`create` / `rename` / `forget` / `untrack`) the push workflow needs.
 //!
-//! Mirrors jj-cli 0.45.1 `cli/src/commands/git/push.rs`: the ref-level
+//! Mirrors jj-cli 0.47.1 `cli/src/commands/git/push.rs`: the ref-level
 //! classification (conflicted bookmark, untracked remote bookmark in the way,
 //! refusing to create or delete a remote bookmark the user didn't name) and
 //! the per-commit checks over everything the push would make newly reachable
@@ -12,13 +12,13 @@
 //! Everything here runs inside the caller's transaction, so a refused push
 //! commits nothing — not even the bookmark a `--change` push would create.
 //!
-//! `git.sign-on-push` is the CLI's `sign_commits_before_push`: the commits
-//! about to be pushed that aren't signed yet are signed (immutable ones are
+//! `revsets.git-sign-on-push` is the CLI's `sign_commits_before_push`: the
+//! commits about to be pushed that it picks are signed (immutable ones are
 //! skipped with a warning) and their descendants rebased. The caller runs that
 //! in a transaction of its own under the working-copy lock, so a failed push
 //! keeps the signatures.
 //!
-//! Ported from jj-cli 0.45.1, whose versions take its `Ui` and command helper.
+//! Ported from jj-cli 0.47.1, whose versions take its `Ui` and command helper.
 //! Check each against its source on a jj bump:
 //! - `plan_push`, `classify`, `default_push_range`, `describe_updates` and
 //!   `ensure_new_bookmark_name`: `cmd_git_push`, `classify_bookmark_update`,
@@ -39,11 +39,10 @@ use futures::{StreamExt, TryStreamExt};
 use jj_cli::{
     cli_util::{has_tracked_remote_bookmarks, load_template_aliases, short_commit_hash},
     commit_templater::{CommitTemplateLanguage, CommitTemplateLanguageExtension},
-    revset_util::parse_immutable_heads_expression,
     template_builder,
-    template_parser::TemplateDiagnostics,
     ui::Ui,
 };
+use jj_frontend::revset_util::parse_immutable_heads_expression;
 use jj_lib::{
     backend::{BackendError, CommitId},
     commit::Commit,
@@ -61,9 +60,10 @@ use jj_lib::{
     refs::{LocalAndRemoteRef, RefPushAction, classify_ref_push_action},
     repo::{MutableRepo, Repo},
     revset::{ResolvedRevsetExpression, RevsetDiagnostics, RevsetExpression, SymbolResolver},
-    settings::UserSettings,
-    signing::{SignBehavior, SignError},
+    settings::{SignBehavior, UserSettings},
+    signing::SignError,
     ssh_signing::SshError,
+    template_parser::TemplateDiagnostics,
 };
 
 use super::mutate::{resolve_mutation_target, short_change_id};
@@ -236,9 +236,16 @@ pub(super) async fn plan_push(
     }
     if tracked_mode {
         // `jj git push` with no target flags: tracked bookmarks pointing into
-        // `remote_bookmarks(remote=<remote>)..@`. Ones that can't be pushed are
+        // `revsets.git-push`. Ones that can't be pushed are
         // skipped with a note rather than failing the rest.
-        let in_range = default_push_range(repo, remote, &context.targets.wc_id).await?;
+        let in_range = git_push_range(
+            context.repo_root,
+            context.settings,
+            context.workspace_name,
+            repo,
+            remote,
+        )
+        .await?;
         let candidates: Vec<RefNameBuf> = repo
             .view()
             .local_remote_bookmarks(remote)
@@ -246,7 +253,7 @@ pub(super) async fn plan_push(
             .filter(|(_, targets)| {
                 targets
                     .local_target
-                    .added_ids()
+                    .present_adds()
                     .any(|id| in_range.contains(id))
             })
             .map(|(name, _)| name.to_owned())
@@ -261,7 +268,7 @@ pub(super) async fn plan_push(
                 Err(error) => notes.push(format!("skipped: {error}")),
             }
         }
-        // And the tracked tags pointing there, as jj 0.45 pushes them.
+        // And the tracked tags pointing there, as jj pushes them.
         let tag_candidates: Vec<RefNameBuf> = repo
             .view()
             .local_remote_tags(remote)
@@ -269,7 +276,7 @@ pub(super) async fn plan_push(
             .filter(|(_, targets)| {
                 targets
                     .local_target
-                    .added_ids()
+                    .present_adds()
                     .any(|id| in_range.contains(id))
             })
             .map(|(name, _)| name.to_owned())
@@ -394,11 +401,8 @@ pub(super) fn send_push(
         let reason = reason.as_deref().unwrap_or("rejected by the remote");
         problems.push(format!("{}: {reason}", git_ref.as_str()));
     }
-    for (symbol, reason) in &stats.unexported_bookmarks {
-        problems.push(format!("{symbol}: couldn't export to git ({reason})"));
-    }
     let failure = format!("push rejected: {}", problems.join("; "));
-    if !stats.some_exported() {
+    if stats.pushed.is_empty() {
         return Err(PushFailed(failure).into());
     }
     Ok(PushOutcome {
@@ -422,7 +426,7 @@ impl std::fmt::Display for PushFailed {
 
 impl std::error::Error for PushFailed {}
 
-/// What `git.sign-on-push` asks of a planned push.
+/// What `revsets.git-sign-on-push` asks of a planned push.
 #[derive(Default)]
 pub(super) struct SignPlan {
     /// Mutable commits to sign before the push goes out.
@@ -432,81 +436,76 @@ pub(super) struct SignPlan {
 }
 
 /// jj-cli's `sign_commits_before_push` selection: the commits in
-/// `remote_bookmarks(remote)..new_heads` that aren't signed yet and that
-/// `signing.behavior = "own"` would sign. Immutable ones are left alone and
-/// named in the warning instead. Empty when `git.sign-on-push` is off.
+/// `remote_bookmarks(remote)..new_heads` that `revsets.git-sign-on-push`
+/// picks (jj 0.47; a `git.sign-on-push = true` from before migrates to
+/// `~signed() & mine()`). Immutable ones are left alone and named in the
+/// warning instead. Empty when the revset is jj's default `none()`.
 pub(super) async fn sign_plan(
     context: &PushContext<'_>,
     repo: &MutableRepo,
     planned: &PlannedPush,
 ) -> Result<SignPlan> {
-    let sign_on_push = context
-        .settings
-        .get_bool("git.sign-on-push")
-        .context("failed to read git.sign-on-push")?;
     let new_heads: Vec<CommitId> = planned
         .updates
         .iter()
         .filter_map(|(_, update)| update.after.clone())
         .collect();
-    if !sign_on_push || new_heads.is_empty() {
+    if new_heads.is_empty() {
         return Ok(SignPlan::default());
     }
+    let sign_on_push = context
+        .settings
+        .get_string("revsets.git-sign-on-push")
+        .context("failed to read revsets.git-sign-on-push")?;
     let old_heads: Vec<CommitId> = repo
         .view()
         .remote_bookmarks(RemoteName::new(&planned.remote))
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
         .cloned()
         .collect();
-    let to_push = RevsetExpression::commits(old_heads).range(&RevsetExpression::commits(new_heads));
+    let user_revset = |text: &str| {
+        parse_user_revset(
+            context.repo_root,
+            context.settings,
+            context.workspace_name,
+            text,
+        )
+    };
+    let needs_signing = RevsetExpression::commits(old_heads)
+        .range(&RevsetExpression::commits(new_heads))
+        .intersection(&user_revset(&sign_on_push).context("invalid revsets.git-sign-on-push")?);
+    let immutable = user_revset("immutable()")?;
     let symbol_resolver = SymbolResolver::new(
         repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
     );
-    let immutable = parse_user_revset(
-        context.repo_root,
-        context.settings,
-        context.workspace_name,
-        "immutable()",
-    )?
-    .resolve_user_expression(repo, &symbol_resolver)
-    .context("failed to resolve immutable()")?;
-
-    let mut sign_settings = context.settings.sign_settings();
-    sign_settings.behavior = SignBehavior::Own;
-    let needs_signing =
-        |commit: &Commit| !commit.is_signed() && sign_settings.should_sign(commit.store_commit());
+    let evaluate = |expression: Arc<jj_lib::revset::UserRevsetExpression>| {
+        expression
+            .resolve_user_expression(repo, &symbol_resolver)
+            .context("failed to resolve the commits to sign")?
+            .evaluate()
+            .context("failed to evaluate the commits to sign")
+    };
 
     // Like the CLI, name up to ten and say "10+" past that.
     let mut skipped = Vec::new();
-    let mut stream = to_push
-        .intersection(&immutable)
-        .evaluate(repo)
-        .context("failed to evaluate the commits to sign")?
-        .stream();
+    let mut stream = evaluate(needs_signing.intersection(&immutable))?.stream();
     while let Some(id) = stream.next().await {
         let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
-        if needs_signing(&commit) {
-            skipped.push(short_change_id(&commit));
-            if skipped.len() > 10 {
-                break;
-            }
+        skipped.push(short_change_id(&commit));
+        if skipped.len() > 10 {
+            break;
         }
     }
-    let mut to_sign = Vec::new();
-    let mut stream = to_push
-        .minus(&immutable)
-        .evaluate(repo)
-        .context("failed to evaluate the commits to sign")?
-        .stream();
-    while let Some(id) = stream.next().await {
-        let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
-        if needs_signing(&commit) {
-            to_sign.push(commit.id().clone());
-        }
-    }
+    let to_sign: Vec<CommitId> = evaluate(needs_signing.minus(&immutable))?
+        .stream()
+        .map(|id| id.context("failed to walk the commits to sign"))
+        .try_collect()
+        .await?;
     if !to_sign.is_empty() && !repo.store().signer().can_sign() {
-        bail!("git.sign-on-push is set, but no signing.backend is configured");
+        bail!(
+            "revsets.git-sign-on-push picks commits to sign, but no signing.backend is configured"
+        );
     }
 
     let skipped_note = (!skipped.is_empty()).then(|| {
@@ -567,7 +566,7 @@ pub(super) async fn sign_commits(repo: &mut MutableRepo, ids: &[CommitId]) -> Re
         if wanted.contains(rewriter.old_commit().id()) {
             rewriter
                 .reparent()
-                .set_sign_behavior(SignBehavior::Own)
+                .set_sign_behavior(SignBehavior::Force)
                 .write()
                 .await?;
             stats.signed += 1;
@@ -704,7 +703,8 @@ async fn check_commits(
     let known_heads: Vec<CommitId> = repo
         .view()
         .remote_bookmarks(remote)
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .chain(repo.view().remote_tags(remote))
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
         .cloned()
         .collect();
     let symbol_resolver = SymbolResolver::new(
@@ -718,7 +718,9 @@ async fn check_commits(
         "immutable_heads()",
     )?
     .resolve_user_expression(repo, &symbol_resolver)
-    .context("failed to resolve immutable_heads()")?;
+    .context("failed to resolve immutable_heads()")?
+    .into_inner()
+    .0;
 
     let private_revset = if allow.private {
         None
@@ -740,7 +742,7 @@ async fn check_commits(
             .context("failed to parse git.private-commits")?
             .resolve_user_expression(repo, &symbol_resolver)
             .context("failed to resolve git.private-commits")?
-            .evaluate(repo)
+            .evaluate()
             .context("failed to evaluate git.private-commits")?,
         ),
         None => None,
@@ -815,25 +817,41 @@ fn rejected_commit(commit: &Commit, reasons: Vec<PushCheck>, wc: &CommitId) -> R
     }
 }
 
-/// Commits in `remote_bookmarks(remote=<remote>)..@` — the default push range.
-async fn default_push_range(
-    repo: &MutableRepo,
+/// The default push range: `revsets.git-push` (jj's default is
+/// `remote_bookmarks(remote=exact:remote)..@`) with `remote` bound to the
+/// remote being pushed to, as jj-cli's `find_default_target_revisions` does.
+/// The toolbar's push summary reads the same range.
+pub(super) async fn git_push_range(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    repo: &dyn Repo,
     remote: &RemoteName,
-    wc_commit_id: &CommitId,
 ) -> Result<HashSet<CommitId>> {
-    let remote_heads: Vec<CommitId> = repo
-        .view()
-        .remote_bookmarks(remote)
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
-        .cloned()
-        .collect();
-    let range: std::sync::Arc<ResolvedRevsetExpression> = RevsetExpression::commits(remote_heads)
-        .range(&RevsetExpression::commits(vec![wc_commit_id.clone()]));
-    range
-        .evaluate(repo)
-        .context("failed to evaluate the default push range")?
+    let text = settings
+        .get_string("revsets.git-push")
+        .context("failed to read revsets.git-push")?;
+    let expression =
+        with_revset_parse_context(repo_root, settings, workspace_name, |revset_context, _| {
+            let revset_context = jj_lib::revset::RevsetParseContext {
+                local_variables: [("remote", jj_lib::revset::new_string_node(remote.as_str()))]
+                    .into(),
+                ..revset_context
+            };
+            jj_lib::revset::parse(&mut RevsetDiagnostics::new(), &text, &revset_context)
+        })?
+        .with_context(|| format!("invalid revsets.git-push {text:?}"))?;
+    let symbol_resolver = SymbolResolver::new(
+        repo,
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+    expression
+        .resolve_user_expression(repo, &symbol_resolver)
+        .context("failed to resolve revsets.git-push")?
+        .evaluate()
+        .context("failed to evaluate revsets.git-push")?
         .stream()
-        .map(|entry| entry.context("failed to walk the default push range"))
+        .map(|entry| entry.context("failed to walk revsets.git-push"))
         .try_collect()
         .await
 }
@@ -851,7 +869,7 @@ async fn describe_updates(
     let known_heads: Vec<CommitId> = repo
         .view()
         .remote_bookmarks(remote)
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
         .cloned()
         .collect();
     let mut moves = Vec::new();

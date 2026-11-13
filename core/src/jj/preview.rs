@@ -22,7 +22,7 @@ use jj_lib::{
 
 use super::mutate::*;
 use super::walk::{describe_resolution_error, parse_user_revset, ref_labels};
-use super::workspace::{Place, TargetContext};
+use super::workspace::{Place, TargetContext, start_transaction};
 use crate::model::{CommitSummary, RevisionSelection};
 use crate::mutations::{
     Destination, DraftSimulation, InsertPreview, MergePreview, MutationOp, RebasePreview,
@@ -85,7 +85,7 @@ pub(crate) async fn preview(
             workspace_name: scope.workspace_name,
             workspace_root: &scope.repository.root,
         });
-    let mut tx = scope.repo.start_transaction();
+    let mut tx = start_transaction(scope.repo, scope.workspace_name);
     let simulated = match request {
         PreviewRequest::Rebase {
             mode,
@@ -195,7 +195,8 @@ async fn simulate_merge(
         .context("failed to merge parent trees")?;
     let mut conflicts: Vec<String> = Vec::new();
     let mut truncated = false;
-    for (path, _value) in tree.conflicts() {
+    let mut tree_conflicts = tree.conflicts();
+    while let Some((path, _value)) = tree_conflicts.next().await {
         if conflicts.len() == CONFLICT_LIST_CAP {
             truncated = true;
             break;
@@ -607,7 +608,7 @@ async fn post_op_graph(
     let name = scope.workspace_name;
     let root = &scope.repository.root;
     let expression = parse_user_revset(root, base.settings(), name, revset)?;
-    let resolve = |repo: &dyn Repo| {
+    let evaluate = |repo: &dyn Repo| {
         let resolver = SymbolResolver::new(
             repo,
             &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -615,17 +616,15 @@ async fn post_op_graph(
         expression
             .resolve_user_expression(repo, &resolver)
             .map_err(describe_resolution_error)
-            .context("failed to resolve jj revset")
+            .context("failed to resolve jj revset")?
+            .evaluate()
+            .context("failed to evaluate jj revset")
     };
     // What the loaded graph shows: rows it has need no data shipped back.
-    let base_set = resolve(base.as_ref())?
-        .evaluate(base.as_ref())
-        .context("failed to evaluate jj revset")?;
+    let base_set = evaluate(base.as_ref())?;
     let shown_before = base_set.containing_fn();
-    let post_set = resolve(repo)?
-        .evaluate(repo)
-        .context("failed to evaluate jj revset")?;
-    if let Ok((lower, _)) = post_set.count_estimate()
+    let post_set = evaluate(repo)?;
+    if let Ok((lower, _)) = post_set.count_estimate().await
         && lower > GRAPH_CAP
     {
         return Ok(None);
@@ -676,7 +675,7 @@ async fn post_op_graph(
         })
         .and_then(|resolved| {
             resolved
-                .evaluate(repo)
+                .evaluate()
                 .context("failed to evaluate immutable()")
         })
         .ok();

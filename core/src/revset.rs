@@ -208,7 +208,7 @@ const ONE_REVSET: &[Arg] = &[Arg::Revset];
 const ONE_FREE: &[Arg] = &[Arg::Free];
 const NONE: &[Arg] = &[];
 
-/// jj-lib 0.45.1's built-in revset functions (`BUILTIN_FUNCTION_MAP`), with
+/// jj-lib 0.47.1's built-in revset functions (`BUILTIN_FUNCTION_MAP`), with
 /// the one-line gist of jj's docs. Keep in sync when bumping jj-lib.
 const FUNCTIONS: &[Function] = &[
     f("parents", "x, [depth]", "Parents of x", REVSET_DEPTH),

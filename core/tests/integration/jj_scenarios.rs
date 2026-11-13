@@ -2508,6 +2508,42 @@ fn wc_description(root: &Path) -> String {
 
 const UNDO: MutationOp = MutationOp::Undo { operation_id: None };
 
+/// jj 0.46+ attributes each operation to the workspace that wrote it and
+/// refuses to undo or redo another workspace's: `jj undo` there would take
+/// back work the user can't see from here. The workspace that wrote it can.
+#[test]
+fn undo_and_redo_refuse_another_workspaces_operation() {
+    let root = scratch_repo("undo-cross-workspace");
+    write(&root, "file.txt", "one\n");
+    commit(&root, "base");
+    let side = harness::add_workspace(&root, "side");
+    run(
+        &side,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "side work\n".to_owned(),
+        },
+    );
+
+    let refused = |result: Result<mutations::MutationOutcome, RepoError>, verb: &str| {
+        let error = result.expect_err("another workspace's operation is refused");
+        assert!(
+            matches!(&error, RepoError::Other(message)
+                if message.contains(&format!("refusing to {verb} operation"))
+                    && message.contains("performed in workspace side")),
+            "{error:?}"
+        );
+    };
+    refused(try_run(&root, UNDO), "undo");
+    assert_eq!(wc_description(&side), "side work\n", "nothing was undone");
+
+    run(&side, UNDO);
+    assert_eq!(wc_description(&side), "", "its own workspace undoes it");
+    refused(try_run(&root, MutationOp::Redo), "redo");
+    run(&side, MutationOp::Redo);
+    assert_eq!(wc_description(&side), "side work\n");
+}
+
 /// jj 0.45's undo walks back one operation per press and redo walks forward
 /// again, and both write jj's own descriptions, so the CLI continues the same
 /// stack. diffui's undo used to undo the undo instead (a redo), nesting

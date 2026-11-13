@@ -11,6 +11,7 @@ use jj_lib::{
     conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialize_tree_value},
     diff_presentation::unified::git_diff_part,
     files::FileMergeHunkLevel,
+    files::MergeOptions,
     gitignore::GitIgnoreFile,
     matchers::EverythingMatcher,
     merge::SameChange,
@@ -18,7 +19,6 @@ use jj_lib::{
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
     repo_path::{RepoPath, RepoPathBuf},
-    tree_merge::MergeOptions,
 };
 
 use super::settings::*;
@@ -108,7 +108,8 @@ pub(crate) async fn list_jj_source_tree(
     let tree = commit.tree();
 
     let mut tracked: Vec<String> = Vec::new();
-    for (path, _value) in tree.entries() {
+    let mut entries = tree.entries();
+    while let Some((path, _value)) = entries.next().await {
         tracked.push(path.as_internal_file_string().to_owned());
     }
 
@@ -167,12 +168,12 @@ pub(super) async fn jj_change_statuses(
 ) -> Result<HashMap<String, DiffFileStatus>> {
     let new_tree = commit.tree();
     let old_tree = commit
-        .parent_tree(repo)
+        .parent_tree(repo.index())
         .await
         .with_context(|| format!("failed to load jj parent tree for {}", commit.id().hex()))?;
 
     let mut changes = HashMap::new();
-    let mut stream = old_tree.diff_stream(&new_tree, &EverythingMatcher);
+    let mut stream = old_tree.diff(&new_tree, &EverythingMatcher);
     while let Some(entry) = stream.next().await {
         let Ok(values) = entry.values else {
             continue;

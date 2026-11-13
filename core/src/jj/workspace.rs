@@ -21,8 +21,11 @@ use jj_lib::{
     revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver, SymbolResolverExtension},
     rewrite::RebaseOptions,
     settings::{HumanByteSize, UserSettings},
+    transaction::Transaction,
     working_copy::{SnapshotOptions, SnapshotStats, UntrackedReason, WorkingCopyFreshness},
-    workspace::{LockedWorkspace, Workspace},
+    workspace::{
+        DefaultWorkspaceLoaderFactory, LockedWorkspace, Workspace, WorkspaceLoaderFactory,
+    },
 };
 
 use super::settings::*;
@@ -208,7 +211,7 @@ pub(crate) async fn lock_working_copy<'a>(
     let base_repo = match context.head.take() {
         Some(repo) if read_op_heads(repo_loader).await.ok() == Some(repo.op_id().hex()) => repo,
         _ => repo_loader
-            .load_at_head()
+            .load_at_head(Some(workspace_name))
             .await
             .context("failed to load jj repo")?,
     };
@@ -366,7 +369,7 @@ pub(crate) async fn lock_working_copy<'a>(
                     workspace_name,
                     workspace_root: &workspace_root,
                 };
-                let mut tx = old_repo.start_transaction();
+                let mut tx = start_transaction(&old_repo, workspace_name);
                 tx.set_is_snapshot(true);
                 fold_into_working_copy(&place, tx.repo_mut(), &old_wc_commit, disk_tree)
                     .await
@@ -381,7 +384,7 @@ pub(crate) async fn lock_working_copy<'a>(
             }
 
             let merged_repo = repo_loader
-                .load_at_head()
+                .load_at_head(Some(workspace_name))
                 .await
                 .context("failed to reload jj repo after stale-workspace recovery")?;
             let desired_id = merged_repo
@@ -442,7 +445,7 @@ async fn fresh_working_copy(
     workspace_name: &WorkspaceName,
 ) -> Result<Option<(Arc<ReadonlyRepo>, Commit)>> {
     let repo = repo_loader
-        .load_at_head()
+        .load_at_head(Some(workspace_name))
         .await
         .context("failed to load jj repo")?;
     let Some(wc_id) = repo.view().get_wc_commit_id(workspace_name).cloned() else {
@@ -477,7 +480,7 @@ async fn import_git_head(
     else {
         return Ok(());
     };
-    let mut tx = repo.start_transaction();
+    let mut tx = start_transaction(&repo, place.workspace_name);
     import_head(tx.repo_mut(), place.workspace_name, place.workspace_root)
         .await
         .context("failed to import the colocated git HEAD")?;
@@ -556,7 +559,7 @@ async fn import_git_refs(
     };
     // A dry run first: almost always git moved nothing, and then neither the
     // disk nor the op log is touched.
-    let mut probe = repo.start_transaction();
+    let mut probe = start_transaction(&repo, place.workspace_name);
     import_refs(probe.repo_mut(), &import_options)
         .await
         .context("failed to import git refs")?;
@@ -570,7 +573,7 @@ async fn import_git_refs(
         .snapshot(snapshot_options)
         .await
         .context("failed to snapshot jj working copy")?;
-    let mut tx = repo.start_transaction();
+    let mut tx = start_transaction(&repo, place.workspace_name);
     if tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
         fold_into_working_copy(place, tx.repo_mut(), &wc_commit, tree).await?;
         tx.repo_mut()
@@ -667,15 +670,17 @@ impl Place<'_> {
             repo,
             &SymbolResolver::new(repo, &[] as &[Box<dyn SymbolResolverExtension>]),
         )
+        .map(|resolved| resolved.into_inner().0)
         .context("failed to resolve immutable()")
     }
 
-    fn is_immutable(&self, repo: &dyn Repo, id: &CommitId) -> Result<bool> {
+    async fn is_immutable(&self, repo: &dyn Repo, id: &CommitId) -> Result<bool> {
         self.immutable(repo)?
             .intersection(&RevsetExpression::commit(id.clone()))
             .evaluate(repo)
             .context("failed to check whether the working-copy commit is immutable")?
             .is_empty()
+            .await
             .map(|empty| !empty)
             .context("failed to check whether the working-copy commit is immutable")
     }
@@ -699,7 +704,7 @@ pub(crate) async fn fold_into_working_copy(
     wc_commit: &Commit,
     tree: MergedTree,
 ) -> Result<FoldedWorkingCopy> {
-    let on_top = place.is_immutable(repo, wc_commit.id())?;
+    let on_top = place.is_immutable(repo, wc_commit.id()).await?;
     let commit = if on_top {
         repo.new_commit(vec![wc_commit.id().clone()], tree)
             .write()
@@ -724,7 +729,7 @@ pub(crate) async fn renew_immutable_working_copy(
     let Some(wc_id) = repo.view().get_wc_commit_id(place.workspace_name).cloned() else {
         return Ok(false);
     };
-    if !place.is_immutable(repo, &wc_id)? {
+    if !place.is_immutable(repo, &wc_id).await? {
         return Ok(false);
     }
     let wc_commit = repo
@@ -850,7 +855,7 @@ impl TargetContext {
                 &SymbolResolver::new(repo, &[] as &[Box<dyn SymbolResolverExtension>]),
             )
             .context("failed to resolve trunk()")?
-            .evaluate(repo)
+            .evaluate()
             .context("failed to evaluate trunk()")?
             .stream()
             .next()
@@ -1007,16 +1012,32 @@ impl SnapshotContext {
     }
 }
 
+/// `repo.start_transaction()` with the operation attributed to
+/// `workspace_name`, as jj-cli's `RunnerOptions::start_transaction` does: jj
+/// 0.46+ refuses to `jj undo` an operation another workspace wrote, and reads
+/// which one from here.
+pub(crate) fn start_transaction(
+    repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+) -> Transaction {
+    let mut tx = repo.start_transaction();
+    tx.set_workspace_name(workspace_name);
+    tx
+}
+
 /// Open the workspace at `root`. The actor calls this once and keeps the
 /// result for the repository's whole life; nothing else should.
 pub(crate) fn load_workspace(settings: &UserSettings, root: &Path) -> Result<Workspace> {
-    Workspace::load(
-        settings,
-        root,
-        &default_backend_factories(),
-        &default_working_copy_factories(),
-    )
-    .context("failed to load jj workspace")
+    DefaultWorkspaceLoaderFactory
+        .create(root)
+        .and_then(|loader| {
+            loader.load(
+                settings,
+                &default_backend_factories(),
+                &default_working_copy_factories(),
+            )
+        })
+        .context("failed to load jj workspace")
 }
 
 /// What a snapshot (or a check) produced.
@@ -1074,7 +1095,7 @@ pub(crate) async fn snapshot_working_copy(
             // the files on disk stay as they are until the user updates them.
             Ok(stale) => {
                 let repo = repo_loader
-                    .load_at_head()
+                    .load_at_head(Some(&workspace_name))
                     .await
                     .context("failed to load jj repo")?;
                 let wc_commit = match repo.view().get_wc_commit_id(&workspace_name) {
@@ -1086,7 +1107,7 @@ pub(crate) async fn snapshot_working_copy(
                     None => None,
                 };
                 let working_copy_empty = match &wc_commit {
-                    Some(commit) => commit.is_empty(repo.as_ref()).await.ok(),
+                    Some(commit) => commit.is_empty(repo.as_ref().index()).await.ok(),
                     None => None,
                 };
                 return Ok(SnapshotOutcome {
@@ -1116,7 +1137,7 @@ pub(crate) async fn snapshot_working_copy(
         LockOutcome::Recovered {
             repo, wc_commit, ..
         } => {
-            let working_copy_empty = wc_commit.is_empty(repo.as_ref()).await.ok();
+            let working_copy_empty = wc_commit.is_empty(repo.as_ref().index()).await.ok();
             let snapshot = RepositorySnapshot {
                 fingerprint: repo.op_id().hex(),
                 working_copy_empty,
@@ -1174,7 +1195,7 @@ async fn unchanged_snapshot(
     disk: DiskState,
 ) -> Result<SnapshotOutcome> {
     let repo = locked.repo.clone();
-    let working_copy_empty = locked.wc_commit.is_empty(repo.as_ref()).await.ok();
+    let working_copy_empty = locked.wc_commit.is_empty(repo.as_ref().index()).await.ok();
     if locked.locked_ws.is_some() {
         locked.finish(repo.op_id().clone()).await?;
     }
@@ -1220,7 +1241,7 @@ async fn absorb_snapshot(
         workspace_name,
         workspace_root,
     };
-    let mut tx = base_repo.start_transaction();
+    let mut tx = start_transaction(&base_repo, workspace_name);
     tx.set_is_snapshot(true);
     let folded = fold_into_working_copy(
         &place,
@@ -1243,19 +1264,12 @@ async fn absorb_snapshot(
     // holding git's index lock for a moment must not make the save fail to
     // land. The next mutation resets the index anyway. A new `@` on top
     // moves git's `HEAD` as well, as the CLI's snapshot does then.
-    let synced = if folded.on_top {
+    if folded.on_top {
         warnings.push(WC_IMMUTABLE_NOTE.to_owned());
+    }
+    let synced =
         super::colocate::sync_git_after_transaction(tx.repo_mut(), workspace_name, workspace_root)
-            .await
-    } else {
-        super::colocate::sync_git_after_snapshot(
-            tx.repo_mut(),
-            workspace_root,
-            &locked.wc_commit.tree(),
-            &locked.tree,
-        )
-        .await
-    };
+            .await;
     if let Err(error) = synced {
         tracing::warn!(
             error = format!("{error:#}"),
@@ -1269,7 +1283,7 @@ async fn absorb_snapshot(
     let new_op_id = new_repo.op_id().clone();
     locked.finish(new_op_id.clone()).await?;
 
-    let working_copy_empty = new_commit.is_empty(new_repo.as_ref()).await.ok();
+    let working_copy_empty = new_commit.is_empty(new_repo.index()).await.ok();
     Ok(SnapshotOutcome {
         snapshot: RepositorySnapshot {
             fingerprint: new_op_id.hex(),

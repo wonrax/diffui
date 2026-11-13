@@ -34,7 +34,10 @@ anyhow = "1.0"
 bstr = "1.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
-jj-lib = "0.45.1"
+# Already in the tree through jj-lib: its revset parser takes the current time
+# as a `jiff::Zoned`.
+jiff = "0.2"
+jj-lib = "0.47"
 # Both already in the tree transitively via jj-lib; used by the GitHub
 # files-API fallback (per-file JSON entries with embedded patches).
 serde = { version = "1.0", features = ["derive"] }
@@ -47,10 +50,13 @@ notify = { version = "8", optional = true }
 # Unicode identifier classes for the highlighter's ECMAScript lexers (see
 # `highlights`). Already in the tree through proc-macro2.
 unicode-ident = "1"
-jj-cli = { version = "0.45.1", default-features = false, features = ["git"] }
+jj-cli = { version = "0.47", default-features = false, features = ["git"] }
+# Already in the tree through jj-cli, which moved its revset helpers
+# (`parse_immutable_heads_expression`) here in 0.47.
+jj-frontend = "0.47"
 # Already in the tree through jj-lib, same version and features: reads git's
 # config for `core.excludesFile` the way jj-cli does.
-gix = { version = "0.87.1", default-features = false }
+gix = { version = "0.90.0", default-features = false }
 clap = "4.5"
 # Image and SVG previews in diffs (`media`). Codecs are limited to the formats a
 # repo commonly holds.

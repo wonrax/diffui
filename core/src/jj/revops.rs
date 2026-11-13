@@ -3,7 +3,7 @@
 //! resolution and `jj metaedit`'s author updates.
 //!
 //! Each runs inside the transaction [`super::mutate`] opened under the
-//! working-copy lock, after the on-disk fold, and mirrors the jj CLI v0.45.1
+//! working-copy lock, after the on-disk fold, and mirrors the jj CLI v0.47.1
 //! command of the same name. They return the activity message; the caller
 //! commits the transaction and checks the result out.
 

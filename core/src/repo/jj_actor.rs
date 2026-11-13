@@ -355,15 +355,14 @@ impl Actor {
         {
             return Ok(repo);
         }
-        let repo = match &self.repo {
+        let repo = match self.repo.clone() {
             Some(repo) => repo
-                .reload_at_head()
+                .reload_at_head(Some(self.slot(repository)?.workspace.workspace_name()))
                 .await
                 .context("failed to reload the jj repo at head")?,
             None => self
                 .slot(repository)?
                 .workspace
-                .repo_loader()
                 .load_at_head()
                 .await
                 .context("failed to load the jj repo")?,

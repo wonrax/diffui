@@ -36,7 +36,7 @@ use super::walk::*;
 use super::workspace::{
     LockOutcome, LockedWorkingCopy, Place, SnapshotContext, TargetContext,
     WC_BECAME_IMMUTABLE_NOTE, fold_into_working_copy, follow_rewritten, lock_working_copy,
-    renew_immutable_working_copy,
+    renew_immutable_working_copy, start_transaction,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
@@ -87,7 +87,7 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// pushing one — never touch the disk, so they never take the working-copy
 /// lock. A push in particular must not: it talks to a network, and holding
 /// jj's working-copy lock across that stalls every snapshot for as long as the
-/// remote takes to answer. (Signing commits for `git.sign-on-push` does take
+/// remote takes to answer. (Signing commits for `revsets.git-sign-on-push` does take
 /// it, briefly and before the network: see [`apply_view_only`].)
 ///
 /// Everything else runs one locked working-copy session, mirroring what `jj`
@@ -178,7 +178,7 @@ fn is_view_only(op: &MutationOp) -> bool {
 /// halves in one transaction, so a failed push still rolls the move back and
 /// the action never half-lands — the whole thing simply runs outside the lock.
 ///
-/// The exception is `git.sign-on-push` with commits still to sign: those are
+/// The exception is `revsets.git-sign-on-push` with commits still to sign: those are
 /// signed first, in an operation of their own under the working-copy lock
 /// ([`sign_before_push`]), and the push is then planned again over the signed
 /// commits. A push that fails after that keeps the signatures, as in the CLI.
@@ -199,7 +199,7 @@ async fn apply_view_only(
     loop {
         let base_repo = workspace
             .repo_loader()
-            .load_at_head()
+            .load_at_head(Some(&workspace_name))
             .await
             .context("failed to load jj repo")?;
         let wc_commit_id = base_repo
@@ -208,7 +208,7 @@ async fn apply_view_only(
             .context("jj workspace has no working-copy commit")?
             .clone();
 
-        let mut tx = base_repo.start_transaction();
+        let mut tx = start_transaction(&base_repo, &workspace_name);
         tx.set_attribute(
             "args".to_owned(),
             super::op_args::op_args(base_repo.as_ref(), op, false).await,
@@ -479,7 +479,7 @@ async fn sign_locked(
         workspace_name,
         workspace_root: repo_root,
     };
-    let mut tx = base_repo.start_transaction();
+    let mut tx = start_transaction(&base_repo, workspace_name);
     fold_working_copy(&mut tx, locked, &place).await?;
     let wc_commit_id = tx
         .repo()
@@ -665,9 +665,11 @@ async fn mutate_locked(
             Some(super::undo::plan_revert(repo_loader, &base_repo, hex).await?)
         }
         MutationOp::Undo { operation_id: None } => {
-            Some(super::undo::plan_undo(repo_loader, base_repo.operation()).await?)
+            Some(super::undo::plan_undo(repo_loader, base_repo.operation(), &workspace_name).await?)
         }
-        MutationOp::Redo => Some(super::undo::plan_redo(repo_loader, base_repo.operation()).await?),
+        MutationOp::Redo => {
+            Some(super::undo::plan_redo(repo_loader, base_repo.operation(), &workspace_name).await?)
+        }
         _ => None,
     };
     // jj-cli only warns after the fact that undoing a push "often leads to
@@ -693,7 +695,7 @@ async fn mutate_locked(
         workspace_name: &workspace_name,
         workspace_root: &repository.root,
     };
-    let mut tx = base_repo.start_transaction();
+    let mut tx = start_transaction(&base_repo, &workspace_name);
 
     // Fold any uncommitted on-disk changes into `@` first so moving off it
     // doesn't lose them. The fold normally rides inside the mutation's own
@@ -711,7 +713,7 @@ async fn mutate_locked(
             .commit("snapshot working copy")
             .await
             .context("failed to commit pre-undo snapshot")?;
-        tx = snapped.start_transaction();
+        tx = start_transaction(&snapped, &workspace_name);
     }
 
     // The post-fold `@`, used to resolve a `WorkingCopy` target after the fold
@@ -1070,7 +1072,9 @@ async fn mutate_locked(
                 );
                 let mutable = mutable
                     .resolve_user_expression(tx.repo(), &symbol_resolver)
-                    .context("failed to resolve mutable()")?;
+                    .context("failed to resolve mutable()")?
+                    .into_inner()
+                    .0;
                 RevsetExpression::commits(source.parent_ids().to_vec())
                     .ancestors()
                     .intersection(&mutable)
@@ -1690,9 +1694,10 @@ pub(super) async fn ensure_rewritable(
         repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
     );
-    let resolved = expr
+    let (resolved, _) = expr
         .resolve_user_expression(repo, &symbol_resolver)
-        .context("failed to resolve immutable()")?;
+        .context("failed to resolve immutable()")?
+        .into_inner();
     let check = resolved.intersection(&RevsetExpression::commits(ids.to_vec()));
     let first = check
         .evaluate(repo)
@@ -1782,7 +1787,7 @@ pub(super) async fn squash_whole(
         selections.push(CommitWithSelection {
             selected_tree: source.tree(),
             parent_tree: source
-                .parent_tree(repo)
+                .parent_tree(repo.index())
                 .await
                 .context("failed to load squash source parent tree")?,
             commit: source,

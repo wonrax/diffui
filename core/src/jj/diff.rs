@@ -10,6 +10,7 @@ use jj_lib::{
     copies::CopyRecords,
     diff_presentation::unified::{DiffLineType, GitDiffPart, git_diff_part},
     files::FileMergeHunkLevel,
+    files::MergeOptions,
     matchers::{EverythingMatcher, FilesMatcher, Matcher, PrefixMatcher},
     merge::{Diff, SameChange},
     merged_tree::MergedTree,
@@ -18,7 +19,6 @@ use jj_lib::{
     repo::{ReadonlyRepo, Repo},
     repo_path::{RepoPath, RepoPathBuf},
     rewrite::rebase_to_dest_parent,
-    tree_merge::MergeOptions,
 };
 
 use super::large_diff::{self, DiffLimits, RowBudget};
@@ -81,13 +81,13 @@ async fn base_tree(
 ) -> Result<MergedTree> {
     match base {
         ResolvedBase::Parents => commit
-            .parent_tree(repo)
+            .parent_tree(repo.index())
             .await
             .with_context(|| format!("failed to load jj parent tree for {}", commit.id().hex())),
         ResolvedBase::Tree(from) => Ok(load_commit(repo, from).await?.tree()),
         ResolvedBase::Interdiff(from) => {
             let from = load_commit(repo, from).await?;
-            rebase_to_dest_parent(repo, std::slice::from_ref(&from), commit)
+            rebase_to_dest_parent(repo.index(), std::slice::from_ref(&from), commit)
                 .await
                 .with_context(|| {
                     format!(
@@ -301,7 +301,7 @@ pub(crate) async fn diff_trees_with_copies(
     cancel: &CancelFlag,
 ) -> Result<DiffDocument> {
     let mut budget = RowBudget::new(options.limits);
-    let tree_diff = old_tree.diff_stream_with_copies(new_tree, matcher, copy_records);
+    let tree_diff = old_tree.diff_with_copies(new_tree, matcher, copy_records);
     let labels = Diff::new(old_tree.labels(), new_tree.labels());
     let mut stream = materialized_diff_stream(repo.store(), tree_diff, labels);
     let materialize_options = ConflictMaterializeOptions {
@@ -549,7 +549,8 @@ pub(crate) async fn diff_trees_with_copies(
         let covered: std::collections::HashSet<&str> =
             files.iter().map(|file| file.path.as_str()).collect();
         let mut conflict_files = Vec::new();
-        for (repo_path, value) in new_tree.conflicts_matching(matcher) {
+        let mut conflicts = new_tree.conflicts_matching(matcher);
+        while let Some((repo_path, value)) = conflicts.next().await {
             let path = repo_path_label(&repo_path);
             if covered.contains(path.as_str()) {
                 continue;

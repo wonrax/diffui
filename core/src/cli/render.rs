@@ -109,7 +109,7 @@ impl fmt::Display for CliEquivalent {
     }
 }
 
-/// `args` as jj-cli 0.45.1 writes an operation's `args` tag: `jj`, then each
+/// `args` as jj-cli 0.47.1 writes an operation's `args` tag: `jj`, then each
 /// argument bare or in single quotes with `'` escaped as `\'`. A port of the
 /// private `command_args_to_transaction_attribute` (`cli/src/cli_util.rs`);
 /// a transaction that should carry the tag can come from jj-cli's public

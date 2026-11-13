@@ -1,7 +1,7 @@
 //! Running the real jj CLI for the commands diffui doesn't run itself.
 //!
 //! The CLI is diffui's own binary: started with `argv[0]` = `jj` it runs
-//! jj-cli 0.45.1's `CliRunner` (see [`jj_main`]), which links the same jj-lib
+//! jj-cli 0.47.1's `CliRunner` (see [`jj_main`]), which links the same jj-lib
 //! diffui embeds. So the CLI always matches the repo format diffui writes,
 //! whatever `jj` is on the user's `PATH`, and it reads the user's jj config
 //! the way the real CLI does. Core can't know the app's executable, so the
@@ -19,7 +19,7 @@ use crate::repo::cancel::CancelFlag;
 use crate::repo::{JobId, Payload};
 
 /// The jj-cli version linked in, which `jj version` reports.
-pub const JJ_VERSION: &str = "0.45.1";
+pub const JJ_VERSION: &str = "0.47.1";
 
 /// Set in a passthrough child's environment: the CLI then writes plain text
 /// (no colour, no pager) whatever the user's `ui.color` says.

@@ -13,7 +13,6 @@ use jj_lib::{
     commit::Commit,
     copies::CopyRecords,
     matchers::EverythingMatcher,
-    merge::Merge,
     merged_tree::MergedTree,
     merged_tree_builder::MergedTreeBuilder,
     repo::{MutableRepo, Repo},
@@ -109,7 +108,9 @@ pub(super) async fn tree_with_selection(
                     .path_value(&path)
                     .await
                     .with_context(|| format!("failed to read {}", file.path))?;
-                builder.set_or_remove(path, value);
+                builder
+                    .set_or_remove_merge(path, value)
+                    .with_context(|| format!("failed to take {}", file.path))?;
                 // A rename's old path goes (or comes back) with it; a copy's
                 // source is a file of its own.
                 if let Some(old) = copied_from {
@@ -124,7 +125,9 @@ pub(super) async fn tree_with_selection(
                         let value = source.path_value(&old).await.with_context(|| {
                             format!("failed to read {}", old.as_internal_file_string())
                         })?;
-                        builder.set_or_remove(old, value);
+                        builder
+                            .set_or_remove_merge(old, value)
+                            .with_context(|| format!("failed to take {}", file.path))?;
                     }
                 }
                 continue;
@@ -171,7 +174,9 @@ pub(super) async fn tree_with_selection(
                 .path_value(&path)
                 .await
                 .with_context(|| format!("failed to read {}", file.path))?;
-            builder.set_or_remove(path, value);
+            builder
+                .set_or_remove_merge(path, value)
+                .with_context(|| format!("failed to take {}", file.path))?;
             continue;
         }
         let content = apply_lines(&before_content, &after_content, &hunks, |index, line| {
@@ -187,7 +192,7 @@ pub(super) async fn tree_with_selection(
             .unwrap_or_else(CopyId::placeholder);
         builder.set_or_remove(
             path,
-            Merge::normal(TreeValue::File {
+            Some(TreeValue::File {
                 id,
                 executable,
                 copy_id,
@@ -219,7 +224,7 @@ pub(super) async fn split(
     second_description: &str,
 ) -> Result<(Commit, Commit)> {
     let parent_tree = commit
-        .parent_tree(repo)
+        .parent_tree(repo.index())
         .await
         .context("failed to load the split revision's parent tree")?;
     let copies = commit_copies(repo, commit).await?;
@@ -298,7 +303,7 @@ pub(super) async fn squash_selection(
     selection: &DiffSelection,
 ) -> Result<PartialSquash> {
     let parent_tree = source
-        .parent_tree(repo)
+        .parent_tree(repo.index())
         .await
         .context("failed to load the squash source's parent tree")?;
     let copies = commit_copies(repo, source).await?;
@@ -356,7 +361,7 @@ pub(super) async fn restore_selection(
     selection: &DiffSelection,
 ) -> Result<Commit> {
     let parent_tree = commit
-        .parent_tree(repo)
+        .parent_tree(repo.index())
         .await
         .context("failed to load the parent tree")?;
     let tree = commit.tree();

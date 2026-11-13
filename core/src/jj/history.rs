@@ -3,7 +3,7 @@
 //! against a repo the actor already holds; the op restore/revert mutations
 //! live with the other mutations in [`super::mutate`].
 //!
-//! Ported from jj-cli 0.45.1, where these live in private command modules.
+//! Ported from jj-cli 0.47.1, where these live in private command modules.
 //! Check each against its source on a jj bump:
 //! - `changed_commits`: `compute_operation_commits_diff`
 //!   (`cli/src/commands/operation/diff.rs`).
@@ -114,15 +114,18 @@ pub(crate) async fn load_operation(loader: &RepoLoader, hex: &str) -> Result<Ope
 
 async fn brief(repo: &ReadonlyRepo, commit: &Commit) -> Result<CommitBrief> {
     let mut brief = brief_without_emptiness(repo, commit).await?;
-    brief.empty = commit.is_empty(repo).await.unwrap_or(false);
+    brief.empty = commit.is_empty(repo.index()).await.unwrap_or(false);
     Ok(brief)
 }
 
 async fn brief_without_emptiness(repo: &ReadonlyRepo, commit: &Commit) -> Result<CommitBrief> {
-    let visible = !commit
-        .is_hidden(repo)
+    // jj-lib 0.47 dropped `Commit::is_hidden`; this is its body, as jj-cli's
+    // `hidden` template keyword still runs it.
+    let visible = repo
+        .resolve_change_id(commit.change_id())
         .await
-        .context("failed to check commit visibility")?;
+        .context("failed to check commit visibility")?
+        .is_some_and(|targets| targets.has_visible(commit.id()));
     Ok(CommitBrief {
         commit_id: commit.id().hex(),
         change_id: commit.change_id().to_string(),
@@ -147,7 +150,7 @@ async fn brief_by_id(repo: &ReadonlyRepo, id: &CommitId) -> Result<CommitBrief> 
 
 async fn ref_side(repo: &ReadonlyRepo, target: &RefTarget) -> Result<Vec<CommitBrief>> {
     let mut out = Vec::new();
-    for id in target.added_ids() {
+    for id in target.present_adds() {
         out.push(brief_by_id(repo, id).await?);
     }
     Ok(out)
@@ -433,7 +436,7 @@ pub(crate) async fn history_diff(
         HistoryDiffTarget::Commit { commit_id } => {
             let commit = load_commit(repo, commit_id).await?;
             let old_tree = commit
-                .parent_tree(repo)
+                .parent_tree(repo.index())
                 .await
                 .context("failed to load the parent tree")?;
             let document = diff_trees(
@@ -457,7 +460,7 @@ pub(crate) async fn history_diff(
             if sources.is_empty() {
                 bail!("an interdiff needs at least one predecessor");
             }
-            let old_tree = rebase_to_dest_parent(repo, &sources, &to)
+            let old_tree = rebase_to_dest_parent(repo.index(), &sources, &to)
                 .await
                 .context("failed to rebase the predecessors onto the new parents")?;
             let document = diff_trees(
@@ -518,23 +521,22 @@ pub(crate) async fn annotate(
     // Lines whose origin lies outside the searched domain point at the commit
     // the search stopped at, which is what the CLI prints too.
     for (origin, _line) in annotation.lines() {
-        let id = match origin {
-            Ok(id) | Err(id) => id,
+        let commit = match origin {
+            Ok(commit) | Err(commit) => commit,
         };
-        let index = match index_of.get(id) {
+        let index = match index_of.get(commit.id()) {
             Some(index) => *index,
             None => {
                 let index = origins.len() as u32;
                 // No emptiness check: a commit a line came from is never
                 // empty, and the check costs a tree diff per origin.
-                let commit = load_commit_id(repo, id).await?;
-                origins.push(brief_without_emptiness(repo, &commit).await?);
+                origins.push(brief_without_emptiness(repo, commit).await?);
                 unique_prefix_lens.push(
                     repo.shortest_unique_change_id_prefix_len(commit.change_id())
                         .await
                         .unwrap_or(0),
                 );
-                index_of.insert(id.clone(), index);
+                index_of.insert(commit.id().clone(), index);
                 index
             }
         };

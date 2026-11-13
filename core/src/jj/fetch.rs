@@ -1,11 +1,11 @@
-//! `jj git fetch`, as jj-cli 0.45.1 runs it: which remotes, which bookmarks
+//! `jj git fetch`, as jj-cli 0.47.1 runs it: which remotes, which bookmarks
 //! and tags from each, the import (auto-tracking, abandoning what the remote
 //! dropped), and the transaction tail (rebasing mutable descendants, a fresh
 //! `@` when the old one became immutable, the colocated git sync). It runs
 //! under the same locked prologue as a mutation, with git's progress and the
 //! credential prompt wired in.
 //!
-//! Ported from jj-cli 0.45.1, where the command is private. Check each against
+//! Ported from jj-cli 0.47.1, where the command is private. Check each against
 //! its source on a jj bump:
 //! - `fetch_locked`: `cmd_git_fetch` (`cli/src/commands/git/fetch.rs`).
 //! - `default_fetch_remotes`: `get_default_fetch_remotes` (same file) and
@@ -32,7 +32,7 @@ use jj_lib::{
     config::ConfigGetResultExt as _,
     git::{
         GitFetch, GitFetchRefExpression, GitImportStats, GitSettings, IgnoredRefspecs,
-        expand_fetch_refspecs, get_all_remote_names, get_git_backend, load_default_fetch_bookmarks,
+        get_all_remote_names, get_git_backend, load_default_fetch_bookmarks,
     },
     object_id::ObjectId,
     op_store::RemoteRefState,
@@ -49,7 +49,7 @@ use super::remote::CollectingCallback;
 use super::settings::cli_error;
 use super::workspace::{
     LockOutcome, LockedWorkingCopy, Place, SnapshotContext, WC_BECAME_IMMUTABLE_NOTE,
-    fold_into_working_copy, lock_working_copy, renew_immutable_working_copy,
+    fold_into_working_copy, lock_working_copy, renew_immutable_working_copy, start_transaction,
 };
 use crate::model::LoadProgress;
 use crate::repository::{FetchOutcome, FetchTarget};
@@ -159,7 +159,7 @@ async fn fetch_locked(
         .map(|remote| remote.as_str().to_owned())
         .collect();
 
-    let mut tx = repo.start_transaction();
+    let mut tx = start_transaction(&repo, place.workspace_name);
     tx.set_attribute(
         "args".to_owned(),
         crate::plan::args_tag(&crate::plan::fetch_command(target)),
@@ -188,7 +188,7 @@ async fn fetch_locked(
         ),
         FetchTarget::Default | FetchTarget::AllRemotes => (None, None),
     };
-    let mut expansions = Vec::with_capacity(matching_remotes.len());
+    let mut remote_ref_exprs = Vec::with_capacity(matching_remotes.len());
     {
         let git_repo = get_git_backend(tx.repo().store())
             .context("fetching needs a git-backed repo")?
@@ -220,11 +220,7 @@ async fn fetch_locked(
             } else {
                 StringExpression::all()
             };
-            let expanded = expand_fetch_refspecs(remote, GitFetchRefExpression { bookmark, tag })
-                .with_context(|| {
-                format!("invalid fetch patterns for {}", remote.as_symbol())
-            })?;
-            expansions.push((remote, expanded));
+            remote_ref_exprs.push((remote, GitFetchRefExpression { bookmark, tag }));
         }
     }
 
@@ -245,9 +241,9 @@ async fn fetch_locked(
         let mut fetcher = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)
             .context("failed to start git fetch")?;
         let mut callback = CollectingCallback::new(progress.clone());
-        for (remote, expanded) in expansions {
+        for (remote, ref_expr) in &remote_ref_exprs {
             fetcher
-                .fetch(remote, expanded, &mut callback, None)
+                .fetch(remote, ref_expr, &mut callback, None)
                 .map_err(|error| askpass.explain(error.into()))
                 .with_context(|| format!("failed to fetch from {}", remote.as_symbol()))?;
         }
@@ -308,7 +304,7 @@ async fn fetch_locked(
         .iter()
         .map(|remote| remote.as_symbol().to_string())
         .collect::<Vec<_>>()
-        .join(",");
+        .join(", ");
     let new_repo = tx
         .commit(format!("diffui: fetch from git remote(s) {remotes}"))
         .await

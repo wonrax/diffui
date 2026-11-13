@@ -606,6 +606,39 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
     assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
+/// The range a plain push draws from is `revsets.git-push` since jj 0.46,
+/// with `remote` bound to the remote pushed to: one that stops short of the
+/// moved bookmark sends nothing, in the push and in the toolbar's summary.
+#[test]
+fn tracked_push_draws_from_revsets_git_push() {
+    let config = "[revsets]\ngit-push = \"remote_bookmarks(remote=exact:remote)..@--\"\n";
+    let Some((mut repo, remote)) = setup_with_config("push-git-push-revset", Some(config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    let second = commit(&mut repo, "b.txt", "second");
+    repo.mutate(MutationOp::MoveBookmark {
+        name: "main".to_owned(),
+        to: at(&second),
+        push_remote: None,
+    })
+    .expect("move");
+
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Tracked]))
+        .expect("plain push");
+    assert_eq!(outcome.message, "Nothing to push to origin");
+    assert_eq!(remote_ref(&remote, "main"), Some(first));
+}
+
 /// `jj git push` with no targets carries tracked tags pointing into the
 /// default range along with the bookmarks; an untracked tag stays home.
 #[test]
@@ -624,11 +657,7 @@ fn tracked_push_sends_tracked_tags_too() {
     let second = commit(&mut repo, "b.txt", "second");
     harness::block_on(async {
         let workspace = harness::load_workspace(&repo.root);
-        let base = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo");
+        let base = workspace.load_at_head().await.expect("load repo");
         let mut tx = base.start_transaction();
         let id = jj_lib::backend::CommitId::try_from_hex(&second).expect("commit id");
         for (name, tracked) in [("v1", true), ("v2", false)] {
@@ -686,11 +715,7 @@ fn tags_reach_the_graph_as_read_only_labels() {
     let first = commit(&mut repo, "a.txt", "first");
     harness::block_on(async {
         let workspace = harness::load_workspace(&repo.root);
-        let base = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo");
+        let base = workspace.load_at_head().await.expect("load repo");
         let mut tx = base.start_transaction();
         let id = jj_lib::backend::CommitId::try_from_hex(&first).expect("commit id");
         tx.repo_mut().set_local_tag_target(
@@ -768,7 +793,7 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
     assert_eq!(remote_ref(&remote, "main"), Some(second));
 }
 
-// ── git.sign-on-push ────────────────────────────────────────────────────────
+// ── revsets.git-sign-on-push ─────────────────────────────────────────────────
 
 /// A stand-in for `ssh-keygen -Y sign` (or 1Password's `op-ssh-sign`) that
 /// logs each call and prints a signature-shaped blob, or fails like a
@@ -798,7 +823,7 @@ fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (Strin
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
         .expect("make signer executable");
     let config = format!(
-        "[git]\nsign-on-push = true\n\
+        "[revsets]\ngit-sign-on-push = \"~signed() & mine()\"\n\
          [signing]\nbehavior = \"{behavior}\"\nbackend = \"ssh\"\nkey = \"ssh-ed25519 AAAAtest\"\n\
          [signing.backends.ssh]\nprogram = \"{}\"\n{extra}",
         program.display()
@@ -814,11 +839,7 @@ fn sign_calls(log: &Path) -> usize {
 fn is_signed(root: &Path, commit_id: &str) -> bool {
     harness::block_on(async {
         let workspace = harness::load_workspace(root);
-        let repo = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo at head");
+        let repo = workspace.load_at_head().await.expect("load repo at head");
         let id = jj_lib::backend::CommitId::try_from_hex(commit_id).expect("commit id");
         jj_lib::repo::Repo::store(repo.as_ref())
             .get_commit_async(&id)

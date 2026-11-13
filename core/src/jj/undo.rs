@@ -1,4 +1,4 @@
-//! `jj undo`, `jj redo` and `jj op revert`, as jj 0.45 runs them, adapted to a
+//! `jj undo`, `jj redo` and `jj op revert`, as jj 0.47 runs them, adapted to a
 //! working copy that is snapshotted on every file save.
 //!
 //! Undo and redo walk the CLI's own stacks: an undo writes an operation
@@ -17,7 +17,7 @@
 //! something else. When no snapshot came in between, the result is exactly
 //! the view `jj undo` / `jj redo` would have restored.
 //!
-//! Ported from jj-cli 0.45.1, where these live in private command modules.
+//! Ported from jj-cli 0.47.1, where these live in private command modules.
 //! Check each against its source on a jj bump:
 //! - `UNDO_OP_DESC_PREFIX` and `REDO_OP_DESC_PREFIX`: `cli/src/commands/undo.rs`
 //!   and `cli/src/commands/redo.rs`.
@@ -26,6 +26,7 @@
 //! - The restore itself is [`super::history::restored_view`].
 
 use anyhow::{Context, Result, bail};
+use jj_cli::cli_util::short_operation_hash;
 use jj_lib::{
     backend::CommitId,
     merge::Merge,
@@ -77,7 +78,11 @@ enum PlanKind {
 
 /// `jj undo`: the latest real operation (snapshots skipped), or — when that is
 /// itself an undo — the operation it restored to, one step further back.
-pub(crate) async fn plan_undo(loader: &RepoLoader, head: &Operation) -> Result<OpRestorePlan> {
+pub(crate) async fn plan_undo(
+    loader: &RepoLoader,
+    head: &Operation,
+    workspace_name: &WorkspaceName,
+) -> Result<OpRestorePlan> {
     let latest_real = skip_snapshots(head.clone()).await?;
     let mut target = latest_real.clone();
     if let Some(restored) = pointer(&target, UNDO_OP_DESC_PREFIX, loader).await? {
@@ -85,6 +90,7 @@ pub(crate) async fn plan_undo(loader: &RepoLoader, head: &Operation) -> Result<O
         // the stack points at is a file save; step past it as well.
         target = skip_snapshots(restored).await?;
     }
+    refuse_cross_workspace("undo", &target, workspace_name)?;
     let mut parent = match target.parents().await?.as_slice() {
         [] => bail!("nothing to undo: this is the repository's first operation"),
         [parent] => parent.clone(),
@@ -108,7 +114,11 @@ pub(crate) async fn plan_undo(loader: &RepoLoader, head: &Operation) -> Result<O
 
 /// `jj redo`: re-apply what the latest undo took back, walking forward
 /// through earlier redos the same way undo walks back.
-pub(crate) async fn plan_redo(loader: &RepoLoader, head: &Operation) -> Result<OpRestorePlan> {
+pub(crate) async fn plan_redo(
+    loader: &RepoLoader,
+    head: &Operation,
+    workspace_name: &WorkspaceName,
+) -> Result<OpRestorePlan> {
     let latest_real = skip_snapshots(head.clone()).await?;
     let mut target = latest_real.clone();
     if let Some(redone) = pointer(&target, REDO_OP_DESC_PREFIX, loader).await? {
@@ -121,6 +131,7 @@ pub(crate) async fn plan_redo(loader: &RepoLoader, head: &Operation) -> Result<O
     {
         bail!("nothing to redo");
     }
+    refuse_cross_workspace("redo", &target, workspace_name)?;
     let mut parent = match target.parents().await?.as_slice() {
         [parent] => parent.clone(),
         _ => bail!("the undo operation to redo has no single parent"),
@@ -139,6 +150,27 @@ pub(crate) async fn plan_redo(loader: &RepoLoader, head: &Operation) -> Result<O
             latest_real,
         },
     })
+}
+
+/// jj 0.46+ refuses to undo or redo an operation another workspace wrote
+/// (`--allow-cross-workspace` overrides it there; here the operation's own
+/// Revert does). Operations from before 0.46 name no workspace and pass.
+fn refuse_cross_workspace(
+    verb: &str,
+    target: &Operation,
+    workspace_name: &WorkspaceName,
+) -> Result<()> {
+    if let Some(op_workspace) = &target.metadata().workspace_name
+        && op_workspace != workspace_name
+    {
+        bail!(
+            "refusing to {verb} operation {} because it was performed in workspace {}; revert \
+             that operation instead",
+            short_operation_hash(target.id()),
+            op_workspace.as_symbol()
+        );
+    }
+    Ok(())
 }
 
 /// `jj op revert <op>`: undo exactly that operation, keeping everything done

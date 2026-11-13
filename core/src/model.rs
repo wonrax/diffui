@@ -1162,8 +1162,9 @@ pub struct BookmarksInfo {
     pub working_copy_commit: Option<String>,
     /// Every configured git remote, sorted — where a new bookmark can go.
     pub remotes: Vec<String>,
-    /// The `git.push` setting, when configured.
-    pub git_push: Option<String>,
+    /// The remotes the `git.push` setting matches, when it's configured. Since
+    /// jj 0.46 it holds name patterns and may pick several.
+    pub git_push: Option<Vec<String>>,
     /// Tag labels by commit id (hex), in jj's `tags` template form (`v1`,
     /// `v1@origin` for a remote tag elsewhere, `v1??` when conflicted). Read
     /// only: the graph shows them, nothing acts on them.
@@ -1188,10 +1189,14 @@ pub struct PushCandidate {
 impl BookmarksInfo {
     /// The remote `jj git push` picks without `--remote`: `git.push`, else the
     /// only remote, else `origin` — `None` when that names no real remote
-    /// (several remotes, none of them `origin`), and the caller has to ask.
+    /// (several remotes, none of them `origin`) or `git.push` matches several,
+    /// which jj pushes to in turn and diffui doesn't, and the caller has to ask.
     pub fn default_push_remote(&self) -> Option<&str> {
         let pick = match (&self.git_push, self.remotes.as_slice()) {
-            (Some(configured), _) => configured.as_str(),
+            (Some(configured), _) => match configured.as_slice() {
+                [one] => one.as_str(),
+                _ => return None,
+            },
             (None, [only]) => only.as_str(),
             (None, _) => "origin",
         };

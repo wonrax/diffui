@@ -1,33 +1,29 @@
 //! Keeping a colocated git checkout in step with jj, the way jj-cli does at
-//! the end of every transaction (`finish_transaction`) and snapshot
-//! (`export_working_copy_changes_to_git`).
+//! the end of every transaction and snapshot (`finish_transaction` and
+//! `snapshot_working_copy`), which since jj 0.47 run the same git tail.
 //!
 //! Exporting the bookmarks alone left git's `HEAD` and index wherever the last
 //! jj CLI command put them, so after a diffui `new`/`edit`/squash `git status`
 //! and IDE git views described a commit `@` had long left.
 //!
-//! Ported from jj-cli 0.45.1. Check each against its source on a jj bump:
-//! - `is_colocated`: `git_util::is_colocated_git_workspace`
-//!   (`cli/src/git_util.rs`), which takes a `Workspace` the transaction tail
-//!   doesn't hold.
+//! Ported from jj-cli 0.47.1. Check each against its source on a jj bump:
+//! - `is_colocated`: `git_util::is_colocated_git_workspace` (jj-frontend's
+//!   `src/git_util.rs` since 0.47), which takes a `Workspace` the transaction
+//!   tail doesn't hold.
 //! - `sync_git_after_transaction`: the git tail of
-//!   `WorkspaceCommandHelper::finish_transaction` and `try_reset_git_head`
-//!   (`cli/src/cli_util.rs`).
+//!   `WorkspaceCommandHelper::finish_transaction`, `snapshot_working_copy` and
+//!   `try_reset_git_head` (`cli/src/cli_util.rs`).
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use jj_cli::{cli_util::export_working_copy_changes_to_git, ui::Ui};
 use jj_lib::{
     git::{GitResetHeadError, export_refs, get_git_backend, reset_head},
     git_backend::GitRepoAtWorkdirError,
-    merged_tree::MergedTree,
     ref_name::WorkspaceName,
     repo::{MutableRepo, Repo},
     store::Store,
 };
-
-use super::settings::cli_error;
 
 /// Whether `workspace_root` is a git worktree of the repo jj stores into —
 /// jj-cli's `is_colocated_git_workspace`. Each git worktree has its own `HEAD`,
@@ -45,9 +41,10 @@ pub(crate) fn is_colocated(store: &Store, workspace_root: &Path) -> Result<bool>
     }
 }
 
-/// The tail of a mutating transaction, before it commits: in a colocated
-/// workspace point this worktree's git `HEAD` at `@`'s first parent, reset
-/// the index to match, and export the bookmarks. Elsewhere nothing runs, as
+/// The tail of a mutating transaction or snapshot, before it commits: in a
+/// colocated workspace point this worktree's git `HEAD` at `@`'s first parent,
+/// reset the index to match when `@` moved (otherwise only mark new files
+/// intent-to-add), and export the bookmarks. Elsewhere nothing runs, as
 /// in jj-cli: a backing git repo that isn't this working copy (`jj git init
 /// --git-repo=<clone>`) keeps its branches until a push or `jj git export`.
 ///
@@ -67,7 +64,21 @@ pub(crate) async fn sync_git_after_transaction(
             .get_commit_async(&wc_id)
             .await
             .context("failed to load the working-copy commit for git HEAD")?;
-        match reset_head(mut_repo, workspace_name, workspace_root, &wc_commit).await {
+        // The `@` the transaction started from: with the same change and
+        // parents, jj 0.47 leaves git's index (what the user staged) alone and
+        // only marks new files intent-to-add.
+        let old_wc_commit = match mut_repo.base_repo().view().get_wc_commit_id(workspace_name) {
+            Some(id) => Some(
+                mut_repo
+                    .store()
+                    .get_commit_async(id)
+                    .await
+                    .context("failed to load the previous working-copy commit")?,
+            ),
+            None => None,
+        };
+        let diff_wc_commit = (old_wc_commit.as_ref(), &wc_commit);
+        match reset_head(mut_repo, workspace_name, workspace_root, diff_wc_commit).await {
             Ok(()) => {}
             Err(error @ GitResetHeadError::UpdateHeadRef(_)) => {
                 tracing::warn!(%error, "git HEAD moved concurrently; leaving it for the next import");
@@ -81,24 +92,4 @@ pub(crate) async fn sync_git_after_transaction(
     // propagated.
     export_refs(mut_repo).context("failed to export bookmarks to the git backend")?;
     Ok(())
-}
-
-/// A snapshot in a colocated workspace: mark newly tracked files
-/// intent-to-add in git's index (so `git diff` shows them) and export the
-/// bookmarks the snapshot's descendant rebase may have moved. That's jj-cli's
-/// `export_working_copy_changes_to_git`, which the CLI also runs only when
-/// colocated.
-pub(crate) async fn sync_git_after_snapshot(
-    mut_repo: &mut MutableRepo,
-    workspace_root: &Path,
-    old_tree: &MergedTree,
-    new_tree: &MergedTree,
-) -> Result<()> {
-    if !is_colocated(mut_repo.store(), workspace_root)? {
-        return Ok(());
-    }
-    export_working_copy_changes_to_git(&Ui::null(), mut_repo, workspace_root, old_tree, new_tree)
-        .await
-        .map_err(cli_error)
-        .context("failed to update the colocated git index")
 }
