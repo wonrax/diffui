@@ -598,16 +598,24 @@ pub(crate) fn has_forge(ui: &Diffui, _arg: &CommandArg) -> Availability {
 /// The bookmark (or the revision's) has a pull request.
 pub(crate) fn has_pull_request(ui: &Diffui, arg: &CommandArg) -> Availability {
     has_forge(ui, arg)?;
-    require(ui.decoration_for(arg).is_some(), "No pull request")
+    let none = match ui.active().forge.kind() {
+        Some(ForgeKind::GitLab) => "No merge request",
+        _ => "No pull request",
+    };
+    require(ui.decoration_for(arg).is_some(), none)
 }
 
 /// The bookmark (or the revision's) has a pull request that's still open.
 pub(crate) fn has_open_pull_request(ui: &Diffui, arg: &CommandArg) -> Availability {
     has_pull_request(ui, arg)?;
+    let closed = match ui.active().forge.kind() {
+        Some(ForgeKind::GitLab) => "Merge request is closed",
+        _ => "Pull request is closed",
+    };
     require(
         ui.decoration_for(arg)
             .is_some_and(|decoration| decoration.pr.state.is_open()),
-        "Pull request is closed",
+        closed,
     )
 }
 
@@ -632,6 +640,17 @@ pub(crate) fn copy_url(ui: &Diffui, arg: CommandArg) -> Option<Action> {
 /// `merge request` on GitLab.
 pub(crate) fn noun(ui: &Diffui) -> &'static str {
     ui.active().forge.kind().unwrap_or(ForgeKind::GitHub).noun()
+}
+
+/// A forge command's label as the active tab's forge words it: `Create pull
+/// request` says `Create merge request` on GitLab.
+pub(crate) fn relabel(ui: &Diffui, label: &str) -> String {
+    match ui.active().forge.kind() {
+        Some(ForgeKind::GitLab) => label
+            .replace("pull request", "merge request")
+            .replace("Pull request", "Merge request"),
+        _ => label.to_owned(),
+    }
 }
 
 impl Diffui {
@@ -902,6 +921,36 @@ mod tests {
         assert!(holds(&ui, "bookmark.pr == 'draft'", "feature"));
         assert!(holds(&ui, "bookmark.pr", "feature"));
         assert!(!holds(&ui, "bookmark.pr", "other"), "no pull request");
+    }
+
+    #[test]
+    fn forge_commands_say_merge_request_on_gitlab() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/forge-noun");
+        ui.active = ui.tabs.iter().position(|state| state.id == tab).unwrap();
+        let label = |ui: &Diffui, id: &str| {
+            ui.registry
+                .get(id)
+                .expect("registered")
+                .palette_label_for(ui)
+                .into_owned()
+        };
+        ui.tab_mut(tab).unwrap().forge.home = Some(("origin".to_owned(), remote()));
+        assert_eq!(label(&ui, "forge.create"), "Create pull request");
+        ui.tab_mut(tab).unwrap().forge.home = Some((
+            "origin".to_owned(),
+            ForgeRemote::new(ForgeKind::GitLab, "gitlab.com", "team", "app"),
+        ));
+        assert_eq!(label(&ui, "forge.create"), "Create merge request");
+        assert_eq!(label(&ui, "forge.refresh"), "Refresh merge requests");
+        assert_eq!(label(&ui, "forge.copy-url"), "Copy merge request URL");
+        assert_eq!(
+            ui.registry
+                .get("forge.open")
+                .unwrap()
+                .enabled(&ui, &CommandArg::None),
+            Err("No merge request".into())
+        );
     }
 
     #[test]

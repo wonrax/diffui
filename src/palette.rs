@@ -919,7 +919,7 @@ fn push_command_candidates(
     for (command, availability) in ui.registry.palette_commands(ui, scope, arg) {
         out.push(Candidate {
             item: ResultRef::Command(command.id.clone()),
-            haystack: format!("{} {}", command.palette_label, command.hint),
+            haystack: format!("{} {}", command.palette_label_for(ui), command.hint),
             disabled: availability.err(),
         });
     }
@@ -968,7 +968,7 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
 fn command_label(ui: &Diffui, id: &str) -> String {
     ui.registry
         .get(id)
-        .map(|command| command.palette_label.to_string())
+        .map(|command| command.palette_label_for(ui).into_owned())
         .unwrap_or_default()
 }
 

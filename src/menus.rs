@@ -26,12 +26,12 @@ impl Diffui {
         };
         if let Err(reason) = entry.enabled(self, &arg) {
             return menu::MenuEntry::Disabled {
-                label: entry.label.to_string(),
+                label: entry.label_for(self).into_owned(),
                 reason: Some(reason.into_owned()),
             };
         }
         menu::MenuEntry::Item {
-            label: entry.label.to_string(),
+            label: entry.label_for(self).into_owned(),
             detail: self
                 .keymap
                 .chord_for(Context::Base, command)

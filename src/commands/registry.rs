@@ -118,6 +118,9 @@ pub(crate) struct Entry {
     pub(crate) palette: PaletteScope,
     /// Ids an older build persisted for this command.
     pub(crate) aliases: &'static [&'static str],
+    /// Rewords a label for the active tab, for a built-in whose wording
+    /// depends on it (a forge's noun).
+    relabel: Option<fn(&Diffui, &str) -> String>,
     pub(crate) handler: Handler,
 }
 
@@ -138,6 +141,7 @@ impl Entry {
                 .collect(),
             palette: command.palette,
             aliases: builtin_aliases(command.id),
+            relabel: builtin_relabel(command.id),
             handler: Handler::Builtin {
                 enabled: command.enabled,
                 build: command.build,
@@ -158,7 +162,24 @@ impl Entry {
             // Declared commands say where they go with `places`.
             palette: PaletteScope::Hidden,
             aliases: &[],
+            relabel: None,
             handler: Handler::User(command),
+        }
+    }
+
+    /// What a menu row says on the active tab.
+    pub(crate) fn label_for(&self, ui: &Diffui) -> Cow<'_, str> {
+        match self.relabel {
+            Some(relabel) => Cow::Owned(relabel(ui, &self.label)),
+            None => Cow::Borrowed(&self.label),
+        }
+    }
+
+    /// What a palette row says on the active tab.
+    pub(crate) fn palette_label_for(&self, ui: &Diffui) -> Cow<'_, str> {
+        match self.relabel {
+            Some(relabel) => Cow::Owned(relabel(ui, &self.palette_label)),
+            None => Cow::Borrowed(&self.palette_label),
         }
     }
 
@@ -484,6 +505,12 @@ fn builtin_icon(id: &str) -> &'static str {
             _ => icons::CHEVRON_RIGHT,
         },
     }
+}
+
+/// A built-in whose labels change with the active tab.
+fn builtin_relabel(id: &str) -> Option<fn(&Diffui, &str) -> String> {
+    id.starts_with("forge.")
+        .then_some(crate::forge::relabel as fn(&Diffui, &str) -> String)
 }
 
 /// The ids a pre-registry recents file called a built-in.

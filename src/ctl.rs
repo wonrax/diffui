@@ -305,7 +305,7 @@ impl Diffui {
                 let verdict = command.enabled(self, &CommandArg::None);
                 json!({
                     "id": command.id.as_str(),
-                    "label": command.palette_label,
+                    "label": command.palette_label_for(self),
                     "declared": command.declared().is_some(),
                     "available": verdict.is_ok(),
                     "reason": verdict.err(),
