@@ -41,8 +41,8 @@ pub use host::{
 };
 pub use js::JsError;
 pub use manifest::{
-    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, HostPattern,
-    JjAccess, MANIFEST_FILE, Manifest, MenuPlace, Permissions,
+    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, ForgeTerm,
+    HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, Permissions,
 };
 use protocol::PluginCall;
 

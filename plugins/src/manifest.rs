@@ -174,6 +174,16 @@ impl From<HostPattern> for String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeClaim {
     pub hosts: Vec<HostPattern>,
+    /// What the forge calls a pull request: `term = "merge request"` makes
+    /// the app say that in its menus, dialogs and badges.
+    pub term: ForgeTerm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForgeTerm {
+    #[default]
+    PullRequest,
+    MergeRequest,
 }
 
 /// A `[[commands]]` row: the shape of a command declared in config.toml,
@@ -278,6 +288,7 @@ struct RawProvides {
 #[serde(deny_unknown_fields)]
 struct RawForge {
     hosts: Spanned<Vec<Spanned<String>>>,
+    term: Option<Spanned<String>>,
 }
 
 #[derive(Deserialize)]
@@ -438,8 +449,22 @@ impl Manifest {
                     "forge.hosts is empty: name the hosts this plugin answers for",
                 );
             }
+            let term = match forge.term.as_ref().map(|term| (term, term.get_ref().as_str())) {
+                None | Some((_, "pull request")) => ForgeTerm::PullRequest,
+                Some((_, "merge request")) => ForgeTerm::MergeRequest,
+                Some((term, other)) => {
+                    report.at(
+                        term.span(),
+                        format!(
+                            "forge.term {other:?} is not known: write \"pull request\" or \"merge request\""
+                        ),
+                    );
+                    ForgeTerm::PullRequest
+                }
+            };
             ForgeClaim {
                 hosts: hosts(forge.hosts.get_ref(), &mut report),
+                term,
             }
         });
         for argv in &raw.permissions.exec {
@@ -807,6 +832,14 @@ limit = { type = "number", default = 50 }
         );
         let problems = parse(&with("hosts = [\"codeberg.org\"]", "hosts = []")).unwrap_err();
         assert!(problems[0].contains("forge.hosts is empty"), "{problems:?}");
+        let hosts = "hosts = [\"codeberg.org\"]";
+        let merge = parse(&with(hosts, &format!("{hosts}, term = \"merge request\""))).unwrap();
+        assert_eq!(merge.forge.unwrap().term, ForgeTerm::MergeRequest);
+        let problems = parse(&with(hosts, &format!("{hosts}, term = \"patch\""))).unwrap_err();
+        assert!(
+            problems[0].contains("forge.term \"patch\" is not known"),
+            "{problems:?}"
+        );
         let problems = parse(&with("\"localhost:3000\"", "\"*\"")).unwrap_err();
         assert!(problems[0].contains("\"*\" is not a host"), "{problems:?}");
     }

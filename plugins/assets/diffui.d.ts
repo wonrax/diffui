@@ -21,7 +21,8 @@
  *     jj = "read"                      # "read": repo reads and repo.jj.query. "write": also repo.jj.run
  *
  *     [provides]
- *     forge = { hosts = ["codeberg.org"] }   # then main.js must call forge.register
+ *     forge = { hosts = ["codeberg.org"] }   # then main.js must call forge.register;
+ *                                            # add term = "merge request" if that is what the forge calls them
  *
  *     [[commands]]                     # then main.js must call commands.register with this id
  *     id = "forgejo.open-in-browser"   # always "<plugin id>.<name>"
