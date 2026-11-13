@@ -2064,9 +2064,10 @@ mod tests {
             assert_eq!(context, Context::Split);
             let resolve = |chord: &str| {
                 ui.resolve_chord(context, &Chord::parse(chord).expect("a chord"), false)
+                    .map(|id| id.to_string())
             };
-            assert_eq!(resolve("esc"), Some("split.cancel"));
-            assert_eq!(resolve("cmd+enter"), Some("split.confirm"));
+            assert_eq!(resolve("esc").as_deref(), Some("split.cancel"));
+            assert_eq!(resolve("cmd+enter").as_deref(), Some("split.confirm"));
             assert_eq!(resolve("j"), None);
         });
     }

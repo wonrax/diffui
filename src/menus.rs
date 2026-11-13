@@ -12,27 +12,32 @@
 
 use super::*;
 use crate::Cx;
-use crate::commands::{self, CommandId};
+use crate::commands::CommandId;
 use crate::prose::Prose;
 
 impl Diffui {
     /// A menu row for `command`, labelled and chord-hinted from the registry.
-    pub(crate) fn menu_item(&self, command: CommandId, arg: CommandArg) -> menu::MenuEntry {
-        let entry = commands::command(command);
-        if let Some(Err(reason)) = entry.map(|entry| (entry.enabled)(self, &arg)) {
+    pub(crate) fn menu_item(&self, command: &str, arg: CommandArg) -> menu::MenuEntry {
+        let Some(entry) = self.registry.get(command) else {
             return menu::MenuEntry::Disabled {
-                label: entry.map(|c| c.label.to_owned()).unwrap_or_default(),
-                reason: Some(reason.to_owned()),
+                label: command.to_owned(),
+                reason: None,
+            };
+        };
+        if let Err(reason) = entry.enabled(self, &arg) {
+            return menu::MenuEntry::Disabled {
+                label: entry.label.to_string(),
+                reason: Some(reason.into_owned()),
             };
         }
         menu::MenuEntry::Item {
-            label: entry.map(|c| c.label.to_owned()).unwrap_or_default(),
+            label: entry.label.to_string(),
             detail: self
                 .keymap
                 .chord_for(Context::Base, command)
                 .map(Chord::display),
             emphasized: false,
-            command,
+            command: entry.id.clone(),
             arg,
         }
     }
@@ -42,22 +47,24 @@ impl Diffui {
     pub(crate) fn menu_row(
         &self,
         label: impl Into<String>,
-        command: CommandId,
+        command: &str,
         arg: CommandArg,
     ) -> menu::MenuEntry {
-        if let Some(Err(reason)) =
-            commands::command(command).map(|entry| (entry.enabled)(self, &arg))
+        if let Some(Err(reason)) = self
+            .registry
+            .get(command)
+            .map(|entry| entry.enabled(self, &arg))
         {
             return menu::MenuEntry::Disabled {
                 label: label.into(),
-                reason: Some(reason.to_owned()),
+                reason: Some(reason.into_owned()),
             };
         }
         menu::MenuEntry::Item {
             label: label.into(),
             detail: None,
             emphasized: false,
-            command,
+            command: command.into(),
             arg,
         }
     }
@@ -289,7 +296,7 @@ impl Diffui {
                         remote.clone()
                     }),
                     emphasized: false,
-                    command: "bookmark.move",
+                    command: "bookmark.move".into(),
                     arg: CommandArg::Bookmark {
                         name: name.clone(),
                         remote: Some(remote),
@@ -392,14 +399,14 @@ impl Diffui {
                 label: "Fetch".to_owned(),
                 detail: None,
                 emphasized: true,
-                command: "repo.fetch",
+                command: "repo.fetch".into(),
                 arg: CommandArg::Fetch(FetchTarget::Default),
             },
             MenuEntry::Item {
                 label: "Fetch all remotes".to_owned(),
                 detail: None,
                 emphasized: false,
-                command: "repo.fetch",
+                command: "repo.fetch".into(),
                 arg: CommandArg::Fetch(FetchTarget::AllRemotes),
             },
         ];
@@ -428,7 +435,7 @@ impl Diffui {
                 label,
                 detail: Some(expr.clone()),
                 emphasized: false,
-                command: "repo.set-revset",
+                command: "repo.set-revset".into(),
                 arg: CommandArg::Revset(expr),
             })
             .collect()
@@ -439,14 +446,15 @@ impl Diffui {
     /// The single funnel every non-keyboard producer goes through. `enabled` is
     /// evaluated *here*, not when the surface was built, so a menu that has been
     /// open across a graph reload can no longer act on a row that reload hid.
-    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg, cx: &mut Cx) {
-        let Some(command) = commands::command(id) else {
+    pub(crate) fn run_command(&mut self, id: &str, arg: CommandArg, cx: &mut Cx) {
+        let registry = self.registry.clone();
+        let Some(command) = registry.get(id) else {
             return;
         };
-        if (command.enabled)(self, &arg).is_err() {
+        if command.enabled(self, &arg).is_err() {
             return;
         }
-        if let Some(action) = (command.build)(self, arg) {
+        if let Some(action) = command.build(self, arg) {
             self.perform(action, cx)
         }
     }
@@ -821,7 +829,7 @@ impl Diffui {
         let items = lower_menu_to_native(tree, &mut picks);
         Self::popup(items, glow, cx, move |this, chosen, cx| {
             if let Some((command, arg)) = picks.get(chosen as usize).cloned() {
-                this.run_command(command, arg, cx);
+                this.run_command(&command, arg, cx);
             }
         });
     }

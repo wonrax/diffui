@@ -109,7 +109,7 @@ impl Diffui {
             label,
             detail: None,
             emphasized: current.family == family,
-            command,
+            command: command.into(),
             arg: CommandArg::Text(family.to_owned()),
         };
         let mut tree = vec![

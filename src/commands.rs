@@ -29,9 +29,8 @@ use crate::revops::{self, RevopsAction};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
-/// A command's stable identity. A string so it survives in a config file and
-/// in the persisted palette recents without a hand-written mapping table.
-pub(crate) type CommandId = &'static str;
+mod registry;
+pub(crate) use registry::{CommandId, Disabled, Entry, Registry};
 
 /// Declares [`Context`] once: each variant with the name it goes by in
 /// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
@@ -192,9 +191,9 @@ pub(crate) fn require(condition: bool, reason: Reason) -> Availability {
     if condition { Ok(()) } else { Err(reason) }
 }
 
-/// One registry row.
+/// One built-in row. [`Registry`] makes an [`Entry`] of each.
 pub(crate) struct Command {
-    pub(crate) id: CommandId,
+    pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) hint: &'static str,
     pub(crate) contexts: &'static [Context],
@@ -226,53 +225,6 @@ impl Command {
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Command").field("id", &self.id).finish()
-    }
-}
-
-/// Look a command up by id. `None` for an id that no longer exists — a stale
-/// keymap entry or a persisted palette recent, both of which are ignored
-/// rather than fatal.
-pub(crate) fn command(id: &str) -> Option<&'static Command> {
-    REGISTRY.iter().find(|command| command.id == id)
-}
-
-/// The commands the palette offers in `scope`, in registry order, each with
-/// its `enabled` verdict against the arg it would run with.
-pub(crate) fn palette_commands(
-    ui: &Diffui,
-    scope: PaletteScope,
-    arg: &CommandArg,
-) -> Vec<(&'static Command, Availability)> {
-    REGISTRY
-        .iter()
-        .filter(|command| {
-            command.palette == scope
-                || (command.palette == PaletteScope::RevisionVerb
-                    && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
-        })
-        .map(|command| (command, (command.enabled)(ui, arg)))
-        .collect()
-}
-
-impl Command {
-    /// The label a palette row shows. Most commands use their menu label;
-    /// the revision verbs are spelled for a menu that already says what they
-    /// are (`Rebase ▸ Onto…`), which reads as nothing on its own in a list.
-    pub(crate) fn palette_label(&self) -> &'static str {
-        match self.id {
-            "revision.edit" => "Edit revision",
-            "revision.rebase.start" => "Rebase onto\u{2026}",
-            "revision.rebase.descendants.start" => "Rebase with descendants onto\u{2026}",
-            "revision.rebase.branch.start" => "Rebase whole branch onto\u{2026}",
-            "revision.rebase.onto-trunk" => "Rebase onto trunk",
-            "revision.squash.start" => "Squash into\u{2026}",
-            "revision.squash-into-parent" => "Squash into parent",
-            "revision.abandon" => "Abandon\u{2026}",
-            "repo.fetch" => "Fetch all remotes",
-            "bookmark.track" => "Track remote bookmark",
-            "bookmark.delete" => "Delete bookmark",
-            _ => self.label,
-        }
     }
 }
 
@@ -3216,7 +3168,7 @@ mod tests {
 
     #[test]
     fn revision_verbs_have_jj_style_keys() {
-        let map = crate::keymap::Keymap::build(&Default::default()).0;
+        let map = crate::keymap::Keymap::build(&Registry::builtin(), &Default::default()).0;
         for (key, id) in [
             ("n", "revision.new-child"),
             ("e", "revision.edit"),
@@ -3226,7 +3178,11 @@ mod tests {
             ("S", "revision.squash-into-parent"),
         ] {
             let chord = crate::keymap::Chord::parse(key).expect("a parsable chord");
-            assert_eq!(map.resolve(Context::Base, &chord), Some(id), "{key}");
+            assert_eq!(
+                map.resolve(Context::Base, &chord).as_deref(),
+                Some(id),
+                "{key}"
+            );
         }
     }
 
@@ -3236,13 +3192,14 @@ mod tests {
     fn only_an_unaimed_abandon_asks_first() {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
-        let abandon = command("revision.abandon").expect("registered");
+        let registry = Registry::builtin();
+        let abandon = registry.get("revision.abandon").expect("registered");
         assert!(matches!(
-            (abandon.build)(&ui, CommandArg::None),
+            abandon.build(&ui, CommandArg::None),
             Some(Action::ConfirmMutation(_))
         ));
         assert!(matches!(
-            (abandon.build)(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
+            abandon.build(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
             Some(Action::Mutate(_))
         ));
     }
@@ -3255,19 +3212,26 @@ mod tests {
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
         ui.tabs[0].state.session.capabilities.mutate = true;
         for scope in [PaletteScope::Root, PaletteScope::Revision] {
-            let ids: Vec<CommandId> = palette_commands(&ui, scope, &CommandArg::None)
+            let ids: Vec<CommandId> = ui
+                .registry
+                .palette_commands(&ui, scope, &CommandArg::None)
                 .iter()
-                .map(|(command, _)| command.id)
+                .map(|(command, _)| command.id.clone())
                 .collect();
             for id in ["revision.new-child", "revision.edit", "revision.abandon"] {
-                assert!(ids.contains(&id), "{id} missing from {scope:?}");
+                assert!(
+                    ids.iter().any(|known| *known == id),
+                    "{id} missing from {scope:?}"
+                );
             }
         }
-        let files: Vec<CommandId> = palette_commands(&ui, PaletteScope::File, &CommandArg::None)
+        let files: Vec<CommandId> = ui
+            .registry
+            .palette_commands(&ui, PaletteScope::File, &CommandArg::None)
             .iter()
-            .map(|(command, _)| command.id)
+            .map(|(command, _)| command.id.clone())
             .collect();
-        assert!(!files.contains(&"revision.abandon"));
+        assert!(!files.iter().any(|id| *id == "revision.abandon"));
     }
 
     /// A command that can't run stays in the palette with why.
@@ -3275,27 +3239,31 @@ mod tests {
     fn unavailable_commands_carry_their_reason() {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
-        let verdict = |ui: &Diffui, id: CommandId| {
-            palette_commands(ui, PaletteScope::Root, &CommandArg::None)
+        let verdict = |ui: &Diffui, id: &str| {
+            ui.registry
+                .palette_commands(ui, PaletteScope::Root, &CommandArg::None)
                 .into_iter()
                 .find(|(command, _)| command.id == id)
                 .map(|(_, availability)| availability)
         };
-        assert_eq!(verdict(&ui, "revision.edit"), Some(Err(reason::NOT_JJ)));
+        assert_eq!(
+            verdict(&ui, "revision.edit"),
+            Some(Err(reason::NOT_JJ.into()))
+        );
         assert_eq!(
             verdict(&ui, "compare.exit"),
-            Some(Err(reason::NOT_COMPARING))
+            Some(Err(reason::NOT_COMPARING.into()))
         );
         assert_eq!(verdict(&ui, "theme.dark"), Some(Ok(())));
 
         ui.tabs[0].state.session.capabilities.mutate = true;
         assert_eq!(verdict(&ui, "revision.edit"), Some(Ok(())));
         assert_eq!(
-            (command("revision.edit").unwrap().enabled)(
+            ui.registry.get("revision.edit").unwrap().enabled(
                 &ui,
                 &CommandArg::Revision(RevisionSelection::Commit("gone".to_owned()))
             ),
-            Err(reason::GONE)
+            Err(reason::GONE.into())
         );
     }
 
@@ -3304,7 +3272,7 @@ mod tests {
     #[test]
     fn default_chords_do_not_collide_within_a_context() {
         for context in Context::ALL {
-            let mut seen: Vec<(crate::keymap::Chord, CommandId)> = Vec::new();
+            let mut seen: Vec<(crate::keymap::Chord, &str)> = Vec::new();
             for command in REGISTRY {
                 if !command.contexts.contains(context) {
                     continue;

@@ -17,7 +17,8 @@ impl Diffui {
         crate::typography::set_ui_font(config.ui_font);
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
-        let (keymap, problems) = Keymap::build(&raw_keys);
+        let registry = std::rc::Rc::new(commands::Registry::builtin());
+        let (keymap, problems) = Keymap::build(&registry, &raw_keys);
         for problem in &problems {
             tracing::warn!("config: {problem}");
         }
@@ -215,10 +216,11 @@ impl Diffui {
             geometry_dirty_since: None,
             config,
             config_files,
+            recents: Recents::load(&registry),
+            registry,
             keymap,
             modes: Vec::new(),
             focus_before_modes: None,
-            recents: Recents::load(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,
             document_version: 0,
@@ -1646,12 +1648,14 @@ impl Diffui {
         // A key a focused field also edits with (Backspace) stays the field's
         // when the command bound to it has nothing to do right now.
         if consumed
-            && commands::command(id)
-                .is_some_and(|command| (command.build)(self, CommandArg::None).is_none())
+            && self
+                .registry
+                .get(&id)
+                .is_some_and(|command| command.build(self, CommandArg::None).is_none())
         {
             return false;
         }
-        self.run_command(id, CommandArg::None, cx);
+        self.run_command(&id, CommandArg::None, cx);
         true
     }
 
@@ -1879,9 +1883,9 @@ impl Diffui {
         if !open.opening_release(button)
             && let Some(menu::MenuEntry::Item { command, arg, .. }) = open.entry_at(&path)
         {
-            let (command, arg) = (*command, arg.clone());
+            let (command, arg) = (command.clone(), arg.clone());
             self.pop_mode(ModeKind::Menu);
-            self.run_command(command, arg, cx);
+            self.run_command(&command, arg, cx);
         }
     }
 
@@ -3539,11 +3543,11 @@ impl Diffui {
             // Top-level: command rows run directly; revision/file rows
             // primary-action without going through the Actions column.
             (None, ResultRef::Command(id)) => {
-                let id = *id;
-                self.recents.push_command(id);
+                let id = id.clone();
+                self.recents.push_command(id.clone());
                 self.recents.save();
                 self.pop_mode(ModeKind::Palette);
-                self.run_command(id, CommandArg::None, cx)
+                self.run_command(&id, CommandArg::None, cx)
             }
             (None, ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Bookmark(_)) => {
                 self.pop_mode(ModeKind::Palette);
@@ -3557,11 +3561,11 @@ impl Diffui {
             // Actions column: the row is always a Command — run it against
             // the column's target.
             (Some(target), ResultRef::Command(id)) => {
-                let id = *id;
-                self.recents.push_command(id);
+                let id = id.clone();
+                self.recents.push_command(id.clone());
                 self.recents.save();
                 self.pop_mode(ModeKind::Palette);
-                self.run_command(id, CommandArg::Result(target), cx)
+                self.run_command(&id, CommandArg::Result(target), cx)
             }
             _ => {}
         }
@@ -4635,7 +4639,7 @@ mod tests {
         let id = ui
             .resolve_chord(ui.key_context(), &chord, false)
             .unwrap_or_else(|| panic!("{chord:?} is bound to nothing"));
-        ui.run_command(id, CommandArg::None, cx);
+        ui.run_command(&id, CommandArg::None, cx);
     }
 
     /// Matching is debounced, so between a keystroke and its recompute the
@@ -4969,7 +4973,7 @@ mod tests {
         }
         let esc = Chord::parse("esc").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(context, &esc, false),
+            ui.resolve_chord(context, &esc, false).as_deref(),
             Some("confirm.cancel")
         );
     }
@@ -4997,10 +5001,10 @@ mod tests {
             }));
             let enter = Chord::parse("enter").expect("a parsable chord");
             let id = ui.resolve_chord(Context::Confirm, &enter, false);
-            assert_eq!(id, Some("confirm.accept"));
-            let command = commands::command("confirm.accept").expect("a command");
+            assert_eq!(id.as_deref(), Some("confirm.accept"));
+            let command = ui.registry.get("confirm.accept").expect("a command");
             assert_eq!(
-                (command.enabled)(&ui, &CommandArg::None).is_ok(),
+                command.enabled(&ui, &CommandArg::None).is_ok(),
                 routine,
                 "routine: {routine}"
             );
@@ -5015,13 +5019,13 @@ mod tests {
         let ui = app();
         let plain = Chord::parse("j").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(Context::Base, &plain, false),
+            ui.resolve_chord(Context::Base, &plain, false).as_deref(),
             Some("file.next")
         );
         assert_eq!(ui.resolve_chord(Context::Base, &plain, true), None);
         let combo = Chord::parse("cmd+k").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(Context::Base, &combo, true),
+            ui.resolve_chord(Context::Base, &combo, true).as_deref(),
             Some("palette.toggle")
         );
     }
@@ -5033,18 +5037,18 @@ mod tests {
         let ui = app();
         let j = Chord::parse("j").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(Context::Draft, &j, false),
+            ui.resolve_chord(Context::Draft, &j, false).as_deref(),
             Some("draft.candidate.next")
         );
         let combo = Chord::parse("cmd+k").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(Context::Draft, &combo, false),
+            ui.resolve_chord(Context::Draft, &combo, false).as_deref(),
             Some("palette.toggle")
         );
         // Nothing in target mode binds ⌘W, so the base context answers it.
         let close = Chord::parse("cmd+w").expect("a parsable chord");
         assert_eq!(
-            ui.resolve_chord(Context::Draft, &close, false),
+            ui.resolve_chord(Context::Draft, &close, false).as_deref(),
             Some("tab.close")
         );
     }

@@ -108,7 +108,7 @@ pub(crate) fn key_hint(keys: &[&str], label: impl Into<SharedString>, look: Look
 pub(crate) fn bound_hint(
     ui: &crate::Diffui,
     context: crate::commands::Context,
-    commands: &[crate::commands::CommandId],
+    commands: &[&str],
     label: impl Into<SharedString>,
     look: Look,
 ) -> Option<Div> {
@@ -125,7 +125,7 @@ pub(crate) fn bound_hint(
 pub(crate) fn bound_keys(
     ui: &crate::Diffui,
     context: crate::commands::Context,
-    commands: &[crate::commands::CommandId],
+    commands: &[&str],
 ) -> Vec<String> {
     commands
         .iter()
@@ -359,7 +359,7 @@ impl Dialog {
         mut self,
         ui: &crate::Diffui,
         context: crate::commands::Context,
-        commands: &[crate::commands::CommandId],
+        commands: &[&str],
         label: impl Into<SharedString>,
     ) -> Self {
         self.hints.extend(

@@ -156,20 +156,30 @@ impl Ctx {
     }
 
     fn cmd_arg(&mut self, id: &'static str, arg: CommandArg) {
-        let command = crate::commands::command(id).unwrap_or_else(|| panic!("no command {id}"));
         let action = self.h.act(|ui, _| {
-            if let Err(reason) = (command.enabled)(ui, &arg) {
+            let registry = ui.registry.clone();
+            let command = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("no command {id}"));
+            if let Err(reason) = command.enabled(ui, &arg) {
                 panic!("command {id} is disabled: {reason:?}");
             }
-            (command.build)(ui, arg).unwrap_or_else(|| panic!("command {id} built nothing"))
+            command
+                .build(ui, arg)
+                .unwrap_or_else(|| panic!("command {id} built nothing"))
         });
         self.act(action);
     }
 
     /// `cmd`, but a disabled command is only logged: the shot shows why.
     fn try_cmd(&mut self, id: &'static str) {
-        let command = crate::commands::command(id).unwrap_or_else(|| panic!("no command {id}"));
-        match self.h.read(|ui| (command.enabled)(ui, &CommandArg::None)) {
+        let verdict = self.h.read(|ui| {
+            ui.registry
+                .get(id)
+                .unwrap_or_else(|| panic!("no command {id}"))
+                .enabled(ui, &CommandArg::None)
+        });
+        match verdict {
             Ok(()) => self.cmd(id),
             Err(reason) => eprintln!("{id}: disabled: {reason:?}"),
         }

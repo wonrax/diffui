@@ -1547,7 +1547,7 @@ fn open_repo_footer(
             .gap(px(theme::space::SM))
     };
     let strip = footer(Density::Strip, MODAL_FOOT, theme);
-    let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
+    let bound = |commands: &[&str], label: &'static str| {
         crate::overlay_kit::bound_hint(
             ui,
             crate::commands::Context::OpenRepo,

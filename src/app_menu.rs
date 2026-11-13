@@ -8,13 +8,13 @@
 
 use crate::Cx;
 use crate::Diffui;
-use crate::commands::{CommandArg, CommandId, REGISTRY};
+use crate::commands::{CommandArg, CommandId};
 
 impl Diffui {
-    /// A menu-bar pick: `tag` is the command's position in the registry.
+    /// A menu-bar pick: `tag` names the command through [`tag_of`].
     pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
-        if let Some(command) = REGISTRY.get(tag as usize) {
-            self.run_command(command.id, CommandArg::None, cx)
+        if let Some(id) = command_of(tag) {
+            self.run_command(&id, CommandArg::None, cx)
         }
     }
 }
@@ -65,9 +65,11 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
             .iter()
             .copied()
             .filter(|tag| {
-                REGISTRY
-                    .get(*tag as usize)
-                    .is_some_and(|command| (command.enabled)(ui, &CommandArg::None).is_err())
+                command_of(*tag).is_none_or(|id| {
+                    ui.registry
+                        .get(&id)
+                        .is_none_or(|command| command.enabled(ui, &CommandArg::None).is_err())
+                })
             })
             .collect();
         crate::macos_native::set_unavailable_bar_commands(unavailable);
@@ -76,13 +78,33 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
     let _ = ui;
 }
 
-/// The registry position of `id`, which is what a menu item's tag carries.
+/// Every id a menu item's tag has stood for, the tag being the position.
+/// Handed out on first use and never reused, so a tag the bar was built with
+/// still names its command after the registry is rebuilt.
+static TAG_IDS: std::sync::Mutex<Vec<CommandId>> = std::sync::Mutex::new(Vec::new());
+
+/// The tag a menu item for `id` carries.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn tag_of(id: CommandId) -> Option<u32> {
-    REGISTRY
-        .iter()
-        .position(|command| command.id == id)
-        .map(|index| index as u32)
+fn tag_of(id: &str) -> u32 {
+    let mut tags = TAG_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = match tags.iter().position(|tagged| *tagged == id) {
+        Some(index) => index,
+        None => {
+            tags.push(id.into());
+            tags.len() - 1
+        }
+    };
+    index as u32
+}
+
+/// The command `tag` stands for.
+fn command_of(tag: u32) -> Option<CommandId> {
+    let tags = TAG_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tags.get(tag as usize).cloned()
 }
 
 #[cfg(target_os = "macos")]
@@ -93,13 +115,13 @@ mod mac {
 
     use super::tag_of;
     use crate::Diffui;
-    use crate::commands::{self, CommandId, Context};
+    use crate::commands::Context;
     use crate::keymap::{Chord, ChordKey};
     use crate::macos_native::{BarItem, BarMenu, BarRole, KeyEquivalent};
 
     /// The chord the keymap binds `id` to in the base context, as an AppKit
     /// key equivalent, when AppKit can spell it.
-    fn key_for(ui: &Diffui, id: CommandId) -> Option<KeyEquivalent> {
+    fn key_for(ui: &Diffui, id: &str) -> Option<KeyEquivalent> {
         let chord = ui.keymap.chord_for(Context::Base, id)?;
         key_equivalent(chord)
     }
@@ -128,20 +150,21 @@ mod mac {
         })
     }
 
-    fn command(ui: &Diffui, title: &str, id: CommandId) -> BarItem {
+    fn command(ui: &Diffui, title: &str, id: &str) -> BarItem {
         BarItem::Command {
             title: title.to_owned(),
-            tag: tag_of(id).unwrap_or(u32::MAX),
+            tag: tag_of(id),
             key: key_for(ui, id),
         }
     }
 
     /// A command under its registry (palette) label.
-    fn registered(ui: &Diffui, id: CommandId) -> BarItem {
-        let title = commands::command(id)
-            .map(|command| command.palette_label())
-            .unwrap_or(id);
-        command(ui, title, id)
+    fn registered(ui: &Diffui, id: &str) -> BarItem {
+        let title = ui.registry.get(id).map_or_else(
+            || id.to_owned(),
+            |command| command.palette_label.to_string(),
+        );
+        command(ui, &title, id)
     }
 
     fn standard(title: &str, action: objc2::runtime::Sel, key: Option<(&str, bool)>) -> BarItem {
@@ -356,7 +379,9 @@ mod tests {
             walk(&menu.items, &mut tags);
         }
         assert!(tags.len() > 20);
-        assert!(tags.iter().all(|tag| REGISTRY.get(*tag as usize).is_some()));
+        assert!(tags.iter().all(|tag| {
+            super::command_of(*tag).is_some_and(|id| ui.registry.get(&id).is_some())
+        }));
     }
 
     #[test]

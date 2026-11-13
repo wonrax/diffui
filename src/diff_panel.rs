@@ -975,7 +975,7 @@ fn build_description_editor(
         .on_click(Diffui::on_action(Action::SaveDescription, cx));
 
     let font = look.font;
-    let bound = |command: crate::commands::CommandId, label: &'static str| {
+    let bound = |command: &str, label: &'static str| {
         crate::overlay_kit::bound_hint(
             ui,
             crate::commands::Context::Description,

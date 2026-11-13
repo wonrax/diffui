@@ -12,7 +12,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::Diffui;
-use crate::commands::{CommandId, Context};
+use crate::commands::Context;
 use crate::theme::{self, text_size};
 use crate::ui::Look;
 
@@ -20,11 +20,11 @@ use crate::ui::Look;
 /// and what pressing them does. No commands: a pointer gesture, shown as
 /// text alone.
 struct Hint {
-    commands: &'static [CommandId],
+    commands: &'static [&'static str],
     what: &'static str,
 }
 
-const fn hint(commands: &'static [CommandId], what: &'static str) -> Hint {
+const fn hint(commands: &'static [&'static str], what: &'static str) -> Hint {
     Hint { commands, what }
 }
 
@@ -130,7 +130,7 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
 }
 
 /// The first live key of each of `commands`, deduplicated.
-fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
+fn keys(ui: &Diffui, context: Context, commands: &[&str]) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for id in commands {
         if let Some(chord) = ui.keymap.live_chords(context, id).first() {
@@ -242,7 +242,7 @@ mod tests {
             "#,
         )
         .expect("valid keys");
-        ui.keymap = crate::keymap::Keymap::build(&fixture.keys).0;
+        ui.keymap = crate::keymap::Keymap::build(&ui.registry, &fixture.keys).0;
         assert_eq!(
             keys(&ui, Context::Lines, &["lines.next", "lines.previous"]),
             vec!["n".to_owned(), "k".to_owned()]

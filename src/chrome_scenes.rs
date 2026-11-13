@@ -118,7 +118,7 @@ fn confirm_scene(h: &mut Harness, scene: &str) {
     h.perform(Action::ConfirmCancel);
 }
 
-fn run(h: &mut Harness, command: crate::commands::CommandId, arg: CommandArg) {
+fn run(h: &mut Harness, command: &str, arg: CommandArg) {
     h.act(|ui, cx| ui.run_command(command, arg, cx));
 }
 
@@ -585,7 +585,7 @@ fn one_row_menu(h: &mut Harness, opened_by: Option<gpui_kit::MouseButton>) {
         label: "Wrap".to_owned(),
         detail: None,
         emphasized: false,
-        command: "view.toggle-wrap",
+        command: "view.toggle-wrap".into(),
         arg: CommandArg::None,
     }];
     h.act(|ui, _| {

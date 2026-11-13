@@ -248,7 +248,7 @@ pub struct PaletteMatch {
     pub score: u32,
     /// Why a command row can't run: it lists greyed, below the rows that
     /// can, with this beside it.
-    pub disabled: Option<commands::Reason>,
+    pub disabled: Option<commands::Disabled>,
     /// nucleo's match positions in the row's label, by char, for the row to
     /// pick out what was typed. Empty when the label isn't what was matched.
     pub indices: Vec<u32>,
@@ -308,7 +308,7 @@ impl Recents {
             .unwrap_or(0)
     }
 
-    pub fn command_bonus(&self, command: CommandId) -> u32 {
+    pub fn command_bonus(&self, command: &str) -> u32 {
         self.commands
             .iter()
             .take(RECENCY_TOP_N)
@@ -320,11 +320,11 @@ impl Recents {
     /// Load persisted recents from the XDG data dir. Missing files /
     /// unparseable contents both yield `Recents::default()` — recents are
     /// best-effort convenience state, never load-bearing.
-    pub fn load() -> Self {
+    pub(crate) fn load(registry: &commands::Registry) -> Self {
         recents_path()
             .and_then(|path| std::fs::read_to_string(&path).ok())
             .and_then(|raw| toml::from_str::<PersistedRecents>(&raw).ok())
-            .map(Self::from_persisted)
+            .map(|persisted| Self::from_persisted(persisted, registry))
             .unwrap_or_default()
     }
 
@@ -338,16 +338,18 @@ impl Recents {
         }
     }
 
-    fn from_persisted(p: PersistedRecents) -> Self {
+    fn from_persisted(p: PersistedRecents, registry: &commands::Registry) -> Self {
         let mut revisions: VecDeque<String> = p.revisions.into_iter().collect();
-        // A recents file written by another build can name a command this one
-        // no longer has; drop those rather than carrying dead ids around.
+        // An id an older build persisted is read as the command that now
+        // answers to it. One the registry doesn't know is kept: config may
+        // declare it on the next reload, and the palette only lists what the
+        // registry has.
         let mut commands: VecDeque<CommandId> = p
             .commands
             .into_iter()
-            .filter_map(|name| {
-                let name = renamed_command(&name).unwrap_or(&name);
-                commands::command(name).map(|command| command.id)
+            .map(|name| match registry.resolve_alias(&name) {
+                Some(id) => id.clone(),
+                None => CommandId::from(name),
             })
             .collect();
         if revisions.len() > RECENTS_CAPACITY {
@@ -378,35 +380,6 @@ fn push_text(list: &mut VecDeque<String>, entry: String) {
     list.truncate(TEXT_RECENTS_CAPACITY);
 }
 
-/// The id a pre-registry recents file called this command, when it called it
-/// something else.
-///
-/// Command ids used to be a `CommandId` enum with its own kebab-case persist
-/// names; the registry replaced them with dotted ids. Left alone, every user's
-/// most-recent commands are silently dropped the first time the new build
-/// reads the file — the palette forgets what they use, once, for no reason
-/// they can see.
-fn renamed_command(persisted: &str) -> Option<&'static str> {
-    Some(match persisted {
-        "refresh-repository" => "repo.refresh",
-        "select-next-file" => "file.next",
-        "select-previous-file" => "file.previous",
-        "theme-system" => "theme.system",
-        "theme-light" => "theme.light",
-        "theme-dark" => "theme.dark",
-        "theme-high-contrast" => "theme.contrast",
-        "copy-file-diff" => "file.copy-diff",
-        "open-find" => "find.open",
-        "jump-to-revision" => "revision.select",
-        "copy-change-id" => "revision.copy-change-id",
-        "copy-commit-message" => "revision.copy-commit-message",
-        "copy-author" => "revision.copy-author",
-        "open-file" => "file.open",
-        "copy-file-path" => "file.copy-path",
-        _ => return None,
-    })
-}
-
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedRecents {
     #[serde(default)]
@@ -423,7 +396,7 @@ impl From<&Recents> for PersistedRecents {
     fn from(r: &Recents) -> Self {
         Self {
             revisions: r.revisions.iter().cloned().collect(),
-            commands: r.commands.iter().map(|id| (*id).to_owned()).collect(),
+            commands: r.commands.iter().map(|id| id.to_string()).collect(),
             cli: r.cli.iter().cloned().collect(),
             revsets: r.revsets.iter().cloned().collect(),
         }
@@ -725,7 +698,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         }
     }
     let mut matches: Vec<PaletteMatch> = matches.into_iter().map(|(entry, _)| entry).collect();
-    group_rows(&mut matches);
+    group_rows(&ui.registry, &mut matches);
 
     if root {
         counts.revisions = (mode == Mode::Revisions && search_revisions).then_some(matches.len());
@@ -757,43 +730,28 @@ fn label_leads_haystack(item: &ResultRef) -> bool {
 }
 
 /// The heading a result lists under.
-pub(crate) fn group_of(item: &ResultRef) -> &'static str {
+pub(crate) fn group_of(registry: &commands::Registry, item: &ResultRef) -> &'static str {
     match item {
         ResultRef::WorkingCopy | ResultRef::Commit { .. } => "Revisions",
         ResultRef::Bookmark(_) => "Bookmarks",
         ResultRef::File(_) => "Files",
-        ResultRef::Command(id) => command_group(id),
-    }
-}
-
-/// A command's group, from its id's namespace.
-fn command_group(id: CommandId) -> &'static str {
-    match id.split('.').next().unwrap_or(id) {
-        "repo" | "tab" | "activity" | "palette" => "Repository",
-        "revision" | "selection" | "range" | "diff" => "Revisions",
-        "bookmark" => "Bookmarks",
-        "changes" | "file" | "lines" => "Changes",
-        "conflict" => "Conflicts",
-        "compare" => "Compare",
-        "view" | "find" | "source" | "history" => "View",
-        "theme" => "Appearance",
-        _ => "App",
+        ResultRef::Command(id) => registry.get(id).map_or("Commands", |command| command.group),
     }
 }
 
 /// Gathers each group's rows together, the groups in the order their best
 /// row ranked and the rows keeping their rank inside a group, so the best
 /// match still leads the list.
-fn group_rows(matches: &mut [PaletteMatch]) {
+fn group_rows(registry: &commands::Registry, matches: &mut [PaletteMatch]) {
     let mut order: Vec<&'static str> = Vec::new();
     for entry in matches.iter() {
-        let group = group_of(&entry.item);
+        let group = group_of(registry, &entry.item);
         if !order.contains(&group) {
             order.push(group);
         }
     }
     matches.sort_by_key(|entry| {
-        let group = group_of(&entry.item);
+        let group = group_of(registry, &entry.item);
         order.iter().position(|seen| *seen == group)
     });
 }
@@ -829,7 +787,7 @@ struct Candidate {
     /// identifiers for the row, so a query like "abc def" matches across
     /// change-id + description + author.
     haystack: String,
-    disabled: Option<commands::Reason>,
+    disabled: Option<commands::Disabled>,
 }
 
 /// What a commit is searched by: its ids, description, author and
@@ -908,10 +866,10 @@ fn push_command_candidates(
     scope: PaletteScope,
     arg: &CommandArg,
 ) {
-    for (command, availability) in commands::palette_commands(ui, scope, arg) {
+    for (command, availability) in ui.registry.palette_commands(ui, scope, arg) {
         out.push(Candidate {
-            item: ResultRef::Command(command.id),
-            haystack: format!("{} {}", command.palette_label(), command.hint),
+            item: ResultRef::Command(command.id.clone()),
+            haystack: format!("{} {}", command.palette_label, command.hint),
             disabled: availability.err(),
         });
     }
@@ -931,8 +889,10 @@ fn push_action_candidates(out: &mut Vec<Candidate>, ui: &Diffui, target: &Result
     push_command_candidates(out, ui, scope, &CommandArg::Result(target.clone()));
 }
 
-fn is_revision_verb(id: CommandId) -> bool {
-    commands::command(id).is_some_and(|command| command.palette == PaletteScope::RevisionVerb)
+fn is_revision_verb(ui: &Diffui, id: &str) -> bool {
+    ui.registry
+        .get(id)
+        .is_some_and(|command| command.palette == PaletteScope::RevisionVerb)
 }
 
 fn target_label(target: &ResultRef, ui: &Diffui) -> String {
@@ -948,15 +908,16 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
         ),
         ResultRef::Bookmark(name) => name.clone(),
         ResultRef::File(path) => path.clone(),
-        ResultRef::Command(id) => command_label(id),
+        ResultRef::Command(id) => command_label(ui, id),
     }
 }
 
 /// A registry command's label for a palette row. A row can only exist for a
 /// command that is in the registry, so the fallback never renders.
-fn command_label(id: CommandId) -> String {
-    commands::command(id)
-        .map(|command| command.palette_label().to_owned())
+fn command_label(ui: &Diffui, id: &str) -> String {
+    ui.registry
+        .get(id)
+        .map(|command| command.palette_label.to_string())
         .unwrap_or_default()
 }
 
@@ -1263,7 +1224,7 @@ fn column_footer(ui: &Diffui, look: Look, column: &PaletteColumn) -> AnyElement 
     let Look { theme, .. } = look;
     let font = look.font;
     let hint = |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, look);
-    let bound = |commands: &[crate::commands::CommandId], label: &'static str| {
+    let bound = |commands: &[&str], label: &'static str| {
         crate::overlay_kit::bound_hint(ui, crate::commands::Context::Palette, commands, label, look)
     };
     let strip = crate::overlay_kit::footer(
@@ -1466,7 +1427,10 @@ fn build_results(
         Some(column.selected),
         |row| {
             let (top, bottom) = row_span(
-                column.matches.iter().map(|entry| group_of(&entry.item)),
+                column
+                    .matches
+                    .iter()
+                    .map(|entry| group_of(&ui.registry, &entry.item)),
                 row,
             );
             (top, bottom + 2.0 * RESULTS_INSET)
@@ -1476,7 +1440,10 @@ fn build_results(
     );
     let viewport = ui::scroll_viewport(&handle, window);
     let items = visible_results(
-        column.matches.iter().map(|row| Some(group_of(&row.item))),
+        column
+            .matches
+            .iter()
+            .map(|row| Some(group_of(&ui.registry, &row.item))),
         &handle,
         viewport,
         ROW_HEIGHT,
@@ -1731,18 +1698,18 @@ fn result_row_body(
                 Vec::new(),
             ),
             // A command that can't run: greyed, with the reason as its hint.
-            ResultRef::Command(id) if let Some(reason) = row.disabled => (
-                glyph_icon(command_icon(id), muted, window, cx),
-                highlighted(&command_label(id), indices, muted, look),
-                hint(reason.to_owned()),
+            ResultRef::Command(id) if let Some(reason) = &row.disabled => (
+                glyph_icon(command_icon(ui, id), muted, window, cx),
+                highlighted(&command_label(ui, id), indices, muted, look),
+                hint(reason.to_string()),
                 Vec::new(),
             ),
             ResultRef::Command(id) => (
-                glyph_icon(command_icon(id), ink, window, cx),
-                if root && is_revision_verb(id) {
+                glyph_icon(command_icon(ui, id), ink, window, cx),
+                if root && is_revision_verb(ui, id) {
                     verb_label(ui, look, id, indices)
                 } else {
-                    highlighted(&command_label(id), indices, primary, look)
+                    highlighted(&command_label(ui, id), indices, primary, look)
                 },
                 None,
                 // The shortcut, where there is one: what the palette teaches.
@@ -1842,75 +1809,16 @@ fn span(text: String, matched: bool, strong: Font, look: Look) -> crate::ellipsi
     }
 }
 
-/// A command's glyph, from what it does.
-fn command_icon(id: CommandId) -> &'static str {
-    use crate::overlay_kit::glyph;
-    let verb = id.rsplit('.').find(|part| *part != "start").unwrap_or(id);
-    match id {
-        "repo.refresh" => icons::REFRESH,
-        "repo.undo" | "history.revert-operation" => icons::UNDO,
-        "repo.redo" => icons::REDO,
-        "repo.fetch" => icons::FETCH,
-        "repo.push" | "revision.push-change" | "bookmark.push-to" => icons::UPLOAD,
-        "repo.open-dialog" => icons::FOLDER_OPEN,
-        "palette.command-line" => icons::TERMINAL,
-        "activity.toggle" => icons::LIST_CHECKS,
-        "theme.light" => glyph::SUN,
-        "theme.dark" => glyph::MOON,
-        "theme.system" => glyph::MONITOR,
-        "theme.contrast" => glyph::EYE,
-        "app.settings" => glyph::SETTINGS,
-        "app.reveal-config" => glyph::FILE_TEXT,
-        "app.reveal-log" => glyph::FILE_TEXT,
-        "help.shortcuts" => glyph::KEYBOARD,
-        "find.open" => icons::SEARCH,
-        "view.diff" | "diff.since-trunk" => icons::FILE_DIFF,
-        "view.source" | "revision.browse-source" | "file.open" => icons::FILE_CODE,
-        "view.toggle-split" => icons::SPLIT,
-        "view.toggle-wrap" => icons::WRAP,
-        "view.toggle-svg-markup" => icons::CODE_XML,
-        "view.toggle-commit-details" => icons::SCROLL_TEXT,
-        "source.toggle-annotate" => icons::USER,
-        "history.op-log" | "history.evolog" => icons::HISTORY,
-        "history.restore-operation" => icons::ROTATE_CCW,
-        "file.next" => icons::ARROW_DOWN,
-        "file.previous" => icons::ARROW_UP,
-        "file.expand-diff" => icons::UNFOLD_VERTICAL,
-        "lines.toggle" | "changes.toggle-file" | "selection.toggle" => icons::LIST_CHECKS,
-        "range.edit" => icons::PENCIL,
-        "tab.close" | "changes.clear" => icons::CLOSE,
-        _ if id.starts_with("conflict.") => icons::ALERT_TRIANGLE,
-        _ if id.starts_with("compare.") => icons::GIT_COMPARE,
-        _ if id.starts_with("file.history") => icons::FILE_CLOCK,
-        _ if id.starts_with("bookmark.") => glyph::BOOKMARK,
-        _ => match verb {
-            "rebase" | "branch" | "descendants" | "onto-trunk" => icons::GIT_BRANCH,
-            "squash" | "squash-into-parent" | "absorb" | "merge" | "new-merge" => icons::GIT_MERGE,
-            "new" | "new-child" | "new-after" | "new-before" => icons::SQUARE_PLUS,
-            "duplicate"
-            | "copy-change-id"
-            | "copy-commit-message"
-            | "copy-author"
-            | "copy-path"
-            | "copy-diff" => icons::COPY,
-            "edit" | "edit-description" => icons::PENCIL,
-            "commit" => glyph::GIT_COMMIT,
-            "split" => icons::SPLIT,
-            "parallelize" => icons::COLUMNS_3,
-            "restore" | "discard" => icons::ROTATE_CCW,
-            "move-into" => icons::ARROW_RIGHT,
-            "reset-author" | "update-author-timestamp" => icons::USER,
-            "abandon" => icons::CLOSE,
-            "keep" => icons::GIT_FORK,
-            "select" => icons::CIRCLE,
-            _ => icons::CHEVRON_RIGHT,
-        },
-    }
+/// A command's glyph.
+fn command_icon(ui: &Diffui, id: &str) -> &'static str {
+    ui.registry
+        .get(id)
+        .map_or(icons::CHEVRON_RIGHT, |command| command.icon)
 }
 
 /// A top-level revision verb's label: the verb, then the revision it will act
 /// on (the selected one) so a pick never lands somewhere unexpected.
-fn verb_label(ui: &Diffui, look: Look, id: CommandId, indices: &[u32]) -> Aligned {
+fn verb_label(ui: &Diffui, look: Look, id: &str, indices: &[u32]) -> Aligned {
     let Look { theme, .. } = look;
     let selection = &ui.active().session.selected_revision;
     let commits = &ui.active().session.commits;
@@ -1930,7 +1838,7 @@ fn verb_label(ui: &Diffui, look: Look, id: CommandId, indices: &[u32]) -> Aligne
     let mono = look.mono;
     typography::group(
         [
-            highlighted(&command_label(id), indices, theme.text, look),
+            highlighted(&command_label(ui, id), indices, theme.text, look),
             Aligned::text(
                 typography::line(target, mono, text_size::BODY, theme.accent),
                 mono,
@@ -2100,11 +2008,20 @@ mod tests {
                 "a-command-no-build-ever-had".to_owned(),
             ],
         };
-        let recents = Recents::from_persisted(persisted);
+        let recents = Recents::from_persisted(persisted, &commands::Registry::builtin());
         assert_eq!(
-            recents.commands.iter().copied().collect::<Vec<_>>(),
-            vec!["repo.refresh", "revision.copy-change-id", "theme.contrast"],
-            "known names map, the unknown one is dropped"
+            recents
+                .commands
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "repo.refresh",
+                "revision.copy-change-id",
+                "theme.contrast",
+                "a-command-no-build-ever-had"
+            ],
+            "known names map; the unknown one waits for a command to claim it"
         );
     }
 
@@ -2130,11 +2047,11 @@ mod tests {
             "open-file",
             "copy-file-path",
         ] {
-            let id = renamed_command(persisted)
-                .unwrap_or_else(|| panic!("{persisted} should map to a current id"));
             assert!(
-                commands::command(id).is_some(),
-                "{persisted} maps to {id}, which no longer exists"
+                commands::Registry::builtin()
+                    .resolve_alias(persisted)
+                    .is_some(),
+                "{persisted} should map to a current id"
             );
         }
     }
@@ -2166,17 +2083,21 @@ mod tests {
             indices: Vec::new(),
         };
         let mut rows = vec![
-            row(ResultRef::Command("theme.dark"), 9),
+            row(ResultRef::Command("theme.dark".into()), 9),
             row(ResultRef::File("a.rs".to_owned()), 8),
-            row(ResultRef::Command("theme.light"), 7),
+            row(ResultRef::Command("theme.light".into()), 7),
             row(ResultRef::File("b.rs".to_owned()), 6),
         ];
-        group_rows(&mut rows);
+        let registry = commands::Registry::builtin();
+        group_rows(&registry, &mut rows);
         let order: Vec<u32> = rows.iter().map(|row| row.score).collect();
         assert_eq!(order, [9, 7, 8, 6]);
         // A heading opens each group: the first row of the second group starts
         // under two headings and the two rows above it, its heading included.
-        let groups: Vec<&str> = rows.iter().map(|row| group_of(&row.item)).collect();
+        let groups: Vec<&str> = rows
+            .iter()
+            .map(|row| group_of(&registry, &row.item))
+            .collect();
         let heading = crate::overlay_kit::GROUP_HEIGHT;
         assert_eq!(
             row_span(groups.iter().copied(), 2),

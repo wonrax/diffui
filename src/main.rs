@@ -330,6 +330,9 @@ pub(crate) struct Diffui {
     pub(crate) config: AppConfig,
     /// Where `config` came from, and the one way to save a setting.
     pub(crate) config_files: config::ConfigFiles,
+    /// Every command: the built-ins plus what config declares. Rebuilt on
+    /// reload; the keymap, the menu bar and the palette are derived from it.
+    pub(crate) registry: std::rc::Rc<commands::Registry>,
     /// Chord → command id per context, built from the registry's defaults
     /// with the `[keys]` section of `config.toml` layered on top.
     pub(crate) keymap: Keymap,
@@ -1192,7 +1195,7 @@ fn lower_menu_to_native(
                 ..
             } => {
                 let id = picks.len() as u32;
-                picks.push((*command, arg.clone()));
+                picks.push((command.clone(), arg.clone()));
                 let label = match detail {
                     Some(detail) => format!("{label}  ·  {detail}"),
                     None => label.clone(),

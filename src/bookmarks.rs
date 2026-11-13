@@ -427,7 +427,7 @@ impl Diffui {
                 label: "Push as new bookmark".to_owned(),
                 detail: Some(remote.to_owned()),
                 emphasized: false,
-                command: "revision.push-change",
+                command: "revision.push-change".into(),
                 arg: push_change(remote),
             }),
             None if !info.remotes.is_empty() => rows.push(MenuEntry::Submenu {

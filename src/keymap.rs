@@ -1,10 +1,12 @@
 //! Chords, and the table that maps one to a command id per context.
 //!
-//! Defaults come from the registry ([`crate::commands::REGISTRY`]); the
+//! Defaults come from the registry ([`crate::commands::Registry`]); the
 //! `[keys]` section of `config.toml` overrides them. Nothing here is fatal: an
-//! unparsable chord or an unknown command id is collected as a diagnostic,
-//! reported once at startup, and skipped, so a config written against a newer
-//! build still opens the app.
+//! unparsable chord is collected as a diagnostic, reported once, and skipped,
+//! so a config written against a newer build still opens the app. An override
+//! naming a command the registry doesn't have (yet) is reported and kept: the
+//! map is rebuilt with the registry, and a command that arrives later picks
+//! its keys up then.
 //!
 //! ## Chord syntax
 //!
@@ -26,7 +28,7 @@ use crate::keys::{self as keyboard, Named};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-use crate::commands::{CommandId, Context, REGISTRY, command};
+use crate::commands::{CommandId, Context, Registry};
 
 /// The modifier state a chord requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -322,52 +324,52 @@ pub(crate) struct Keymap {
 }
 
 impl Keymap {
-    /// The registry's defaults for the running platform, with `overrides`
+    /// `registry`'s defaults for the running platform, with `overrides`
     /// applied on top. Diagnostics name what was skipped and why.
-    pub(crate) fn build(overrides: &RawKeys) -> (Self, Vec<String>) {
+    pub(crate) fn build(registry: &Registry, overrides: &RawKeys) -> (Self, Vec<String>) {
         let mut map = Keymap::default();
         let mut problems = Vec::new();
-        for command in REGISTRY {
-            for raw in command.default_chords() {
+        for command in registry.iter() {
+            for raw in &command.chords {
                 let Some(chord) = Chord::parse(raw) else {
-                    // Guarded by a unit test, so reaching this means the
-                    // registry and the parser disagree — say so rather than
-                    // dropping the binding silently.
-                    problems.push(format!(
-                        "built-in chord {raw:?} for {} does not parse",
-                        command.id
-                    ));
+                    // A built-in's are guarded by a unit test; a declared
+                    // command's come from config.
+                    problems.push(format!("{}: {raw:?} is not a chord", command.id));
                     continue;
                 };
                 for context in command.contexts {
-                    map.bindings.push((*context, chord.clone(), command.id));
+                    map.bindings
+                        .push((*context, chord.clone(), command.id.clone()));
                 }
             }
         }
-        map.apply(overrides, &mut problems);
+        map.apply(registry, overrides, &mut problems);
         (map, problems)
     }
 
-    fn apply(&mut self, overrides: &RawKeys, problems: &mut Vec<String>) {
+    fn apply(&mut self, registry: &Registry, overrides: &RawKeys, problems: &mut Vec<String>) {
         for (key, entry) in &overrides.0 {
             match entry {
-                RawKeyEntry::Chords(spec) => match command(key) {
+                RawKeyEntry::Chords(spec) => match registry.get(key) {
                     Some(command) => {
                         for context in command.contexts {
-                            self.rebind(*context, command.id, spec, problems);
+                            self.rebind(*context, &command.id, spec, problems);
                         }
                     }
-                    None => problems.push(format!("[keys] {key:?}: unknown command")),
+                    None => problems.push(format!(
+                        "[keys] {key:?}: no such command; kept for when one loads"
+                    )),
                 },
                 RawKeyEntry::Table(table) => match Context::parse(key) {
                     Some(context) => {
                         for (id, spec) in table {
-                            match command(id) {
-                                Some(command) => self.rebind(context, command.id, spec, problems),
-                                None => {
-                                    problems.push(format!("[keys.{key}] {id:?}: unknown command"))
-                                }
+                            if registry.get(id).is_none() {
+                                problems.push(format!(
+                                    "[keys.{key}] {id:?}: no such command; kept for when one loads"
+                                ));
+                                continue;
                             }
+                            self.rebind(context, &CommandId::from(id.as_str()), spec, problems);
                         }
                     }
                     None => problems.push(format!("[keys.{key}]: unknown context")),
@@ -382,19 +384,19 @@ impl Keymap {
     fn rebind(
         &mut self,
         context: Context,
-        id: CommandId,
+        id: &CommandId,
         spec: &ChordSpec,
         problems: &mut Vec<String>,
     ) {
         self.bindings
-            .retain(|(bound, _, bound_id)| *bound != context || *bound_id != id);
+            .retain(|(bound, _, bound_id)| *bound != context || bound_id != id);
         let mut added = Vec::new();
         for raw in spec.chords() {
             if raw.trim().eq_ignore_ascii_case("none") {
                 continue;
             }
             match Chord::parse(raw) {
-                Some(chord) => added.push((context, chord, id)),
+                Some(chord) => added.push((context, chord, id.clone())),
                 None => problems.push(format!(
                     "[keys.{}] {id:?}: {raw:?} is not a chord",
                     context.name()
@@ -417,20 +419,28 @@ impl Keymap {
     }
 
     fn lookup(&self, context: Context, chord: &Chord) -> Option<CommandId> {
+        self.lookup_ref(context, chord).cloned()
+    }
+
+    fn lookup_ref(&self, context: Context, chord: &Chord) -> Option<&CommandId> {
         self.bindings
             .iter()
             .find(|(bound, bound_chord, _)| *bound == context && bound_chord == chord)
-            .map(|(_, _, id)| *id)
+            .map(|(_, _, id)| id)
     }
 
     /// The chords that actually run `id` in `context`, in binding order. A
     /// chord an earlier binding shadows is left out, so a list built from
     /// this never advertises a key that does something else.
-    pub(crate) fn live_chords(&self, context: Context, id: CommandId) -> Vec<&Chord> {
+    pub(crate) fn live_chords(&self, context: Context, id: &str) -> Vec<&Chord> {
         self.bindings
             .iter()
             .filter(|(bound, chord, bound_id)| {
-                *bound == context && *bound_id == id && self.lookup(context, chord) == Some(id)
+                *bound == context
+                    && *bound_id == id
+                    && self
+                        .lookup_ref(context, chord)
+                        .is_some_and(|live| *live == id)
             })
             .map(|(_, chord, _)| chord)
             .collect()
@@ -438,7 +448,7 @@ impl Keymap {
 
     /// The first chord bound to `id` in `context` — what a menu row shows as
     /// its hint.
-    pub(crate) fn chord_for(&self, context: Context, id: CommandId) -> Option<&Chord> {
+    pub(crate) fn chord_for(&self, context: Context, id: &str) -> Option<&Chord> {
         self.bindings
             .iter()
             .find(|(bound, _, bound_id)| *bound == context && *bound_id == id)
@@ -590,7 +600,7 @@ mod tests {
 
     #[test]
     fn a_character_chord_ignores_shift_but_not_the_others() {
-        let map = Keymap::build(&RawKeys::default()).0;
+        let map = Keymap::build(&Registry::builtin(), &RawKeys::default()).0;
         let k = keyboard::Key::Character("k".into());
         let event = |modifiers| Chord::from_event(&k, modifiers).expect("a bindable key");
         // ⌘⇧K is still ⌘K: shift lives in the character, not the modifier set.
@@ -598,7 +608,8 @@ mod tests {
             map.resolve(
                 Context::Base,
                 &event(keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT)
-            ),
+            )
+            .as_deref(),
             Some("palette.toggle")
         );
         // ⌥ is not shift — it makes a different chord, bound to nothing.
@@ -606,7 +617,8 @@ mod tests {
             map.resolve(
                 Context::Base,
                 &event(keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT)
-            ),
+            )
+            .as_deref(),
             None
         );
     }
@@ -615,132 +627,159 @@ mod tests {
     /// not fall back to ⌘Z's undo.
     #[test]
     fn a_shifted_letter_resolves_as_its_capital() {
-        let map = Keymap::build(&RawKeys::default()).0;
+        let map = Keymap::build(&Registry::builtin(), &RawKeys::default()).0;
         let z = keyboard::Key::Character("z".into());
         let resolve = |modifiers| {
             map.resolve(
                 Context::Base,
                 &Chord::from_event(&z, modifiers).expect("a bindable key"),
             )
+            .map(|id| id.to_string())
         };
-        assert_eq!(resolve(keyboard::Modifiers::COMMAND), Some("repo.undo"));
         assert_eq!(
-            resolve(keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT),
+            resolve(keyboard::Modifiers::COMMAND).as_deref(),
+            Some("repo.undo")
+        );
+        assert_eq!(
+            resolve(keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT).as_deref(),
             Some("repo.redo")
         );
     }
 
     #[test]
     fn shift_does_distinguish_a_named_key() {
-        let map = Keymap::build(&RawKeys::default()).0;
+        let map = Keymap::build(&Registry::builtin(), &RawKeys::default()).0;
         assert_eq!(
-            map.resolve(Context::Find, &chord("enter")),
+            map.resolve(Context::Find, &chord("enter")).as_deref(),
             Some("find.next")
         );
         assert_eq!(
-            map.resolve(Context::Find, &chord("shift+enter")),
+            map.resolve(Context::Find, &chord("shift+enter")).as_deref(),
             Some("find.previous")
         );
     }
 
     #[test]
     fn defaults_resolve_per_context() {
-        let (map, problems) = Keymap::build(&RawKeys::default());
+        let (map, problems) = Keymap::build(&Registry::builtin(), &RawKeys::default());
         assert!(problems.is_empty(), "{problems:?}");
         // The same physical key means different things in different contexts.
-        assert_eq!(map.resolve(Context::Base, &chord("j")), Some("file.next"));
         assert_eq!(
-            map.resolve(Context::Draft, &chord("j")),
+            map.resolve(Context::Base, &chord("j")).as_deref(),
+            Some("file.next")
+        );
+        assert_eq!(
+            map.resolve(Context::Draft, &chord("j")).as_deref(),
             Some("draft.candidate.next")
         );
         assert_eq!(
-            map.resolve(Context::Base, &chord("esc")),
+            map.resolve(Context::Base, &chord("esc")).as_deref(),
             Some("selection.clear")
         );
         assert_eq!(
-            map.resolve(Context::Confirm, &chord("esc")),
+            map.resolve(Context::Confirm, &chord("esc")).as_deref(),
             Some("confirm.cancel")
         );
         // A context a command doesn't list never resolves it.
-        assert_eq!(map.resolve(Context::Confirm, &chord("j")), None);
-        assert_eq!(map.resolve(Context::Base, &chord("tab")), None);
+        assert_eq!(map.resolve(Context::Confirm, &chord("j")).as_deref(), None);
+        assert_eq!(map.resolve(Context::Base, &chord("tab")).as_deref(), None);
     }
 
     #[test]
     fn an_uppercase_character_is_its_own_chord() {
-        let map = Keymap::build(&RawKeys::default()).0;
+        let map = Keymap::build(&Registry::builtin(), &RawKeys::default()).0;
         assert_eq!(
-            map.resolve(Context::Base, &chord("r")),
+            map.resolve(Context::Base, &chord("r")).as_deref(),
             Some("revision.rebase.start")
         );
         assert_eq!(
-            map.resolve(Context::Base, &chord("R")),
+            map.resolve(Context::Base, &chord("R")).as_deref(),
             Some("revision.rebase.descendants.start")
         );
         // A lowercase binding still catches the shifted key when nothing
         // claims the uppercase form — that is how ⌘⇧K stays ⌘K.
         assert_eq!(
-            map.resolve(Context::Base, &chord("cmd+K")),
+            map.resolve(Context::Base, &chord("cmd+K")).as_deref(),
             Some("palette.toggle")
         );
     }
 
     #[test]
     fn a_context_table_overrides_only_that_context() {
-        let (map, problems) = Keymap::build(&keys(
-            r#"
+        let (map, problems) = Keymap::build(
+            &Registry::builtin(),
+            &keys(
+                r#"
             [keys.base]
             "file.next" = "n"
             "#,
-        ));
+            ),
+        );
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(map.resolve(Context::Base, &chord("n")), Some("file.next"));
+        assert_eq!(
+            map.resolve(Context::Base, &chord("n")).as_deref(),
+            Some("file.next")
+        );
         // The override replaces the defaults rather than piling on.
-        assert_eq!(map.resolve(Context::Base, &chord("j")), None);
+        assert_eq!(map.resolve(Context::Base, &chord("j")).as_deref(), None);
         // Target mode's own `j` is untouched.
         assert_eq!(
-            map.resolve(Context::Draft, &chord("j")),
+            map.resolve(Context::Draft, &chord("j")).as_deref(),
             Some("draft.candidate.next")
         );
     }
 
     #[test]
     fn a_bare_command_id_rebinds_every_context_it_is_valid_in() {
-        let (map, problems) = Keymap::build(&keys(
-            r#"
+        let (map, problems) = Keymap::build(
+            &Registry::builtin(),
+            &keys(
+                r#"
             [keys]
             "palette.toggle" = ["cmd+p", "f1"]
             "#,
-        ));
+            ),
+        );
         assert!(problems.is_empty(), "{problems:?}");
         for context in [Context::Base, Context::Palette, Context::Find] {
             assert_eq!(
-                map.resolve(context, &chord("cmd+p")),
+                map.resolve(context, &chord("cmd+p")).as_deref(),
                 Some("palette.toggle")
             );
-            assert_eq!(map.resolve(context, &chord("f1")), Some("palette.toggle"));
-            assert_eq!(map.resolve(context, &chord("cmd+k")), None);
+            assert_eq!(
+                map.resolve(context, &chord("f1")).as_deref(),
+                Some("palette.toggle")
+            );
+            assert_eq!(map.resolve(context, &chord("cmd+k")).as_deref(), None);
         }
     }
 
     #[test]
     fn none_unbinds() {
-        let (map, problems) = Keymap::build(&keys(
-            r#"
+        let (map, problems) = Keymap::build(
+            &Registry::builtin(),
+            &keys(
+                r#"
             [keys.base]
             "selection.clear" = "none"
             "#,
-        ));
+            ),
+        );
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(map.resolve(Context::Base, &chord("esc")), None);
+        assert_eq!(map.resolve(Context::Base, &chord("esc")).as_deref(), None);
         // Everything else in the context is left alone.
-        assert_eq!(map.resolve(Context::Base, &chord("j")), Some("file.next"));
+        assert_eq!(
+            map.resolve(Context::Base, &chord("j")).as_deref(),
+            Some("file.next")
+        );
     }
 
     #[test]
     fn a_bad_entry_is_reported_and_skipped() {
-        let (map, problems) = Keymap::build(&keys(
-            r#"
+        let (map, problems) = Keymap::build(
+            &Registry::builtin(),
+            &keys(
+                r#"
             [keys]
             "no.such.command" = "cmd+q"
 
@@ -750,7 +789,8 @@ mod tests {
             [keys.nowhere]
             "file.next" = "n"
             "#,
-        ));
+            ),
+        );
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("no.such.command")));
         assert!(problems.iter().any(|p| p.contains("not a chord")));
@@ -758,10 +798,10 @@ mod tests {
         // The bad chord still cleared the default it was replacing — the user
         // asked for `file.next` to move, and half-applying would be worse than
         // either outcome.
-        assert_eq!(map.resolve(Context::Base, &chord("j")), None);
+        assert_eq!(map.resolve(Context::Base, &chord("j")).as_deref(), None);
         // Unrelated bindings survive a bad file.
         assert_eq!(
-            map.resolve(Context::Base, &chord("cmd+k")),
+            map.resolve(Context::Base, &chord("cmd+k")).as_deref(),
             Some("palette.toggle")
         );
     }

@@ -9,7 +9,7 @@
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
-use crate::commands::{self, CommandArg, CommandId, Context, REGISTRY};
+use crate::commands::{self, CommandArg, CommandId, Context};
 use crate::modes::{Mode, ModeKind};
 use crate::theme::{self, Weight, emphasis_font, text_size};
 use crate::typography::{self, Aligned};
@@ -63,7 +63,7 @@ const BASE_GROUPS: &[(&str, &[&str])] = &[
 ];
 
 /// Which base group `id` is listed under.
-fn base_group(id: CommandId) -> &'static str {
+fn base_group(id: &str) -> &'static str {
     BASE_GROUPS
         .iter()
         .find(|(_, prefixes)| prefixes.iter().any(|prefix| id.starts_with(prefix)))
@@ -92,7 +92,7 @@ pub(crate) struct Entry {
     pub(crate) keys: Vec<String>,
     /// Why the command can't run right now (base context only: the other
     /// contexts' keys only exist inside their mode).
-    pub(crate) disabled: Option<commands::Reason>,
+    pub(crate) disabled: Option<commands::Disabled>,
 }
 
 /// The live bindings of `context`, in registry order. The nine `⌘N` tab
@@ -100,13 +100,13 @@ pub(crate) struct Entry {
 pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     let mut tab_jumps: Vec<String> = Vec::new();
-    for command in REGISTRY {
+    for command in ui.registry.iter() {
         if !command.contexts.contains(&context) {
             continue;
         }
         let keys: Vec<String> = ui
             .keymap
-            .live_chords(context, command.id)
+            .live_chords(context, &command.id)
             .into_iter()
             // macOS reports ⌥Z as the `Ω` it composes to, so the registry
             // binds both; only the key the user presses is worth listing.
@@ -121,11 +121,11 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             continue;
         }
         let disabled = (context == Context::Base)
-            .then(|| (command.enabled)(ui, &CommandArg::None).err())
+            .then(|| command.enabled(ui, &CommandArg::None).err())
             .flatten();
         out.push(Entry {
-            id: command.id,
-            label: label(command.id),
+            id: command.id.clone(),
+            label: label(command),
             keys,
             disabled,
         });
@@ -137,7 +137,7 @@ pub(crate) fn entries(ui: &Diffui, context: Context) -> Vec<Entry> {
             vec![first.clone()]
         };
         out.push(Entry {
-            id: "tab.select",
+            id: "tab.select".into(),
             label: "Go to tab 1\u{2013}9".to_owned(),
             keys,
             disabled: None,
@@ -152,15 +152,11 @@ fn is_composed(chord: &crate::keymap::Chord) -> bool {
     chord.mods.alt && matches!(&chord.key, crate::keymap::ChordKey::Char(c) if !c.is_ascii())
 }
 
-fn label(id: CommandId) -> String {
-    commands::command(id)
-        .map(|command| {
-            command
-                .palette_label()
-                .trim_end_matches('\u{2026}')
-                .to_owned()
-        })
-        .unwrap_or_default()
+fn label(command: &commands::Entry) -> String {
+    command
+        .palette_label
+        .trim_end_matches('\u{2026}')
+        .to_owned()
 }
 
 impl Diffui {
@@ -213,7 +209,7 @@ pub(crate) fn build_overlay(
     ] {
         let rows: Vec<Entry> = base
             .iter()
-            .filter(|entry| base_group(entry.id) == title)
+            .filter(|entry| base_group(&entry.id) == title)
             .cloned()
             .collect();
         if rows.is_empty() {
@@ -314,7 +310,7 @@ fn binding_row(
     look: Look,
     label: String,
     keys: Vec<String>,
-    disabled: Option<commands::Reason>,
+    disabled: Option<commands::Disabled>,
     _window: &mut Window,
     _cx: &mut Cx,
 ) -> AnyElement {
@@ -381,7 +377,7 @@ pub(crate) fn welcome_hints(
 ) -> AnyElement {
     let Look { theme, .. } = look;
     let font = look.font;
-    let chord = |id: CommandId| {
+    let chord = |id: &str| {
         ui.keymap
             .chord_for(Context::Base, id)
             .map(|chord| chord.display())
@@ -473,7 +469,7 @@ mod tests {
         let mut ui = crate::tabs::tests::app();
         let raw: crate::keymap::RawKeys =
             toml::from_str("[base]\n\"file.next\" = \"n\"").expect("parses");
-        ui.keymap = crate::keymap::Keymap::build(&raw).0;
+        ui.keymap = crate::keymap::Keymap::build(&ui.registry, &raw).0;
         let base = entries(&ui, Context::Base);
         let keys_of = |label: &str| {
             base.iter()
