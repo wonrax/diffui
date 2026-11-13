@@ -5,10 +5,16 @@ edition = "2024"
 
 [dependencies]
 # QuickJS-NG and its bindings. Plain runtime only: no `futures`, no `macro`.
+# About 1.1 MB of a stripped release binary.
 rquickjs = { version = "0.14", default-features = false, features = ["std", "loader"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# TypeScript plugins: swc's fixed-width type stripper, which blanks types out
+# in place so positions survive. About 0.6 MB of a stripped release binary;
+# a transformer (oxc) measured 2.5 MB and a hundred more crates.
+swc_next_type_strip = "0.6"
 toml = "1.1"
 tracing = "0.1"
-# Already built for the build scripts of core and widgets.
+# The build scripts of core and widgets already use it; here it is linked in,
+# with rustls, for about 1.7 MB of a stripped release binary.
 ureq = "3"

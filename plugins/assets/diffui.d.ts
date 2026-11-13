@@ -1,10 +1,10 @@
 /**
  * The diffui plugin API, version 0 (unstable through alpha).
  *
- * A plugin is a directory with a `plugin.toml` and an ES module:
+ * A plugin is a directory with a `plugin.toml` and an ES module, JavaScript or TypeScript:
  *
  *     ~/.config/diffui/plugins/<id>/plugin.toml
- *     ~/.config/diffui/plugins/<id>/main.js
+ *     ~/.config/diffui/plugins/<id>/main.js      (or main.ts)
  *
  * `plugin.toml` says what the plugin is, what it may do and what it adds.
  * Registration lives there, never in script:
@@ -38,7 +38,12 @@
  * - Import from "diffui" and from relative files ("./util.js"). Nothing else resolves: no npm, no `require`,
  *   no `fs`, no `process`. There is no global `fetch`; use `http.fetch`.
  * - The only globals beyond the language are the ones declared at the bottom of this file. Type-check with
- *   `"lib": ["ES2023"]` (no "DOM"), `"checkJs": true`, and `// @ts-check` at the top of each file.
+ *   `"lib": ["ES2023"]` (no "DOM") so that nothing else looks available. In JavaScript, put `// @ts-check` at
+ *   the top of each file and set `"checkJs": true`.
+ * - A `.ts` module is not compiled: diffui erases its types and runs the rest as written, so line numbers in
+ *   errors are the file's. That is TypeScript's `"erasableSyntaxOnly": true` with `"verbatimModuleSyntax": true`:
+ *   no `enum`, `namespace` or constructor parameter properties, and types are imported with `import type` or
+ *   `import { type Repo }`. Import your own files by their real name ("./util.ts").
  * - Plugins never draw. They answer questions (a forge provider), run commands and fill the slots in `ui`.
  * - Call `commands.register`, `forge.register` and `events.on` while the main module loads (top-level `await`
  *   is fine). Loading fails if a declared command or forge has no handler, or if anything throws.

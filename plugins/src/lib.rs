@@ -1,7 +1,8 @@
 //! Script plugins for diffui: everything about running one except app state.
 //!
 //! A plugin is a directory with a `plugin.toml` ([`Manifest`]) and an ES
-//! module. [`Plugin::spawn`] gives it a thread of its own with a QuickJS
+//! module, JavaScript or TypeScript (types are erased in place, nothing is
+//! compiled). [`Plugin::spawn`] gives it a thread of its own with a QuickJS
 //! context that has no ambient authority: the script reaches the world only
 //! through the `"diffui"` module, and each function there is checked against
 //! the manifest's permissions.
@@ -25,6 +26,7 @@ mod js;
 mod manifest;
 mod memory;
 pub mod protocol;
+mod typescript;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};

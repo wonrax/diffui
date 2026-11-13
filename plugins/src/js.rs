@@ -25,6 +25,7 @@ use crate::host::Registration;
 use crate::manifest::Manifest;
 use crate::memory::Capped;
 use crate::protocol::{EVENT_NAMES, FORGE_METHODS};
+use crate::typescript;
 
 /// The module a plugin imports, and the name its frames carry in a stack.
 const HOST_MODULE: &str = "diffui";
@@ -234,10 +235,7 @@ impl Js {
                 Module::evaluate(ctx.clone(), HOST_MODULE, HOST_SOURCE)?.finish::<()>()?;
                 let dispatch: Function = boot.get("dispatch")?;
                 let finish_load: Function = boot.get("finishLoad")?;
-                let source = read_module(&manifest.dir, &manifest.main)
-                    .map_err(|why| Exception::throw_message(&ctx, &why))?;
-                let (_, main) =
-                    Module::declare(ctx.clone(), manifest.main.as_str(), source)?.eval()?;
+                let (_, main) = declare(&ctx, &manifest.dir, &manifest.main)?.eval()?;
                 Ok((
                     Persistent::save(&ctx, dispatch),
                     Persistent::save(&ctx, finish_load),
@@ -509,7 +507,14 @@ impl Resolver for PluginResolver {
                 part => parts.push(part),
             }
         }
-        let resolved = parts.join("/");
+        let mut resolved = parts.join("/");
+        // TypeScript's habit of importing "./util.js" for a util.ts.
+        if !self.dir.join(&resolved).is_file()
+            && let Some(stem) = resolved.strip_suffix(".js")
+            && self.dir.join(format!("{stem}.ts")).is_file()
+        {
+            resolved = format!("{stem}.ts");
+        }
         if !self.dir.join(&resolved).is_file() {
             return Err(Exception::throw_reference(
                 ctx,
@@ -534,32 +539,52 @@ impl Loader for PluginLoader {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
-        let source =
-            read_module(&self.dir, name).map_err(|why| Exception::throw_reference(ctx, &why))?;
-        Module::declare(ctx.clone(), name, source)
+        declare(ctx, &self.dir, name)
     }
 }
 
-/// Read a module by its path relative to the plugin directory.
-fn read_module(dir: &Path, name: &str) -> Result<String, String> {
+/// Read and compile the module at `name`, a path relative to the plugin
+/// directory. A TypeScript module has its types erased first.
+fn declare<'js>(ctx: &Ctx<'js>, dir: &Path, name: &str) -> rquickjs::Result<Module<'js, Declared>> {
     let inside = Path::new(name)
         .components()
         .all(|part| matches!(part, Component::Normal(_)));
     if !inside {
-        return Err(format!("\"{name}\" is outside the plugin's directory"));
+        let why = format!("\"{name}\" is outside the plugin's directory");
+        return Err(Exception::throw_reference(ctx, &why));
     }
-    std::fs::read_to_string(dir.join(name)).map_err(|error| format!("Cannot read {name}: {error}"))
+    let mut source = std::fs::read_to_string(dir.join(name)).map_err(|error| {
+        Exception::throw_reference(ctx, &format!("Cannot read {name}: {error}"))
+    })?;
+    if typescript::is_typescript(name) {
+        source = typescript::erase_types(&source).map_err(|problem| {
+            // Thrown from here the error has no script frame; give it the
+            // one a syntax error from the engine would have.
+            let _ = Exception::throw_syntax(ctx, &problem.message);
+            let error = ctx.catch();
+            if let Some(error) = error.as_object() {
+                let place = format!("    at {name}:{}:{}\n", problem.line, problem.col);
+                let _ = error.set("stack", place);
+            }
+            ctx.throw(error)
+        })?;
+    }
+    Module::declare(ctx.clone(), name, source)
 }
 
-/// The JavaScript files at the top of a plugin's directory, for the message
-/// about one that isn't there.
+/// The modules at the top of a plugin's directory, for the message about one
+/// that isn't there.
 fn modules_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".js") || name.ends_with(".mjs"))
+        .filter(|name| {
+            [".js", ".mjs", ".ts", ".mts"]
+                .iter()
+                .any(|ext| name.ends_with(ext))
+        })
         .collect();
     names.sort();
     names

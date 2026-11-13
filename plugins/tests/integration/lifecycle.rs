@@ -545,3 +545,83 @@ fn a_floating_rejection_is_logged_with_its_place() {
         plugin.log_text()
     );
 }
+
+#[test]
+fn a_typescript_plugin_runs_with_its_types_erased_in_place() {
+    let plugin = Setup::typescript(
+        "",
+        r#"import { commands, forge, type Checks, type Repo } from "diffui";
+import type { PullRequest } from "diffui";
+import { describe } from "./lib/describe.js";
+
+interface Counted<T> {
+  items: T[];
+  count: number;
+}
+
+function counted<T>(items: T[]): Counted<T> {
+  return { items, count: items.length };
+}
+
+commands.register("t.run", async ({ repo }: { repo: Repo }): Promise<void> => {
+  const nothing = undefined as unknown as { field: { deep: string } };
+  console.log(nothing.field.deep);
+});
+
+forge.register({
+  async pullRequests(repo: Repo, { branches }: { branches: string[] }): Promise<PullRequest[]> {
+    return [];
+  },
+  async checks(repo: Repo, sha: string): Promise<Checks> {
+    return { state: "success", url: describe(counted([sha, repo.root])) } satisfies Checks;
+  },
+});
+"#,
+    )
+    .file(
+        "lib/describe.ts",
+        "export const describe = (list: { count: number; items: string[] }): string =>\n  `${list.count}: ${list.items.join(\",\")}`;\n",
+    )
+    .spawn();
+    plugin.loaded();
+    assert_eq!(
+        plugin.case("abc").unwrap(),
+        json!({ "state": "success", "url": "2: abc,/work/app" })
+    );
+    // The stack points into the file as written, types and all.
+    let error = threw(plugin.run_command());
+    assert_eq!(error.location(), Some("main.ts:16:15"));
+    assert_eq!(
+        error.to_string(),
+        "main.ts:16:15: TypeError: cannot read property 'field' of undefined"
+    );
+}
+
+#[test]
+fn typescript_that_needs_a_compiler_fails_the_load_with_its_place() {
+    let plugin =
+        Setup::typescript("", "const fine: number = 1;\nenum Colour { Red, Green }\n").spawn();
+    assert_eq!(
+        plugin.failed(),
+        "main.ts did not load: main.ts:2:1: SyntaxError: enum, namespace, parameter properties, `import =` and `<T>value` casts are not supported: diffui erases types and runs the rest as written"
+    );
+
+    let imported = Setup::new("", "import \"./broken.ts\";\n")
+        .file("broken.ts", "export const x: number = ;\n")
+        .spawn();
+    assert_eq!(
+        imported.failed(),
+        "main.js did not load: broken.ts:1:26: SyntaxError: Unexpected token ';' (Expected an expression)"
+    );
+
+    // A type imported as a value survives erasure and the engine says so.
+    let value_import = Setup::typescript(
+        "",
+        "import { Repo } from \"diffui\";\nconst repo: Repo | null = null;\n",
+    )
+    .spawn();
+    assert_eq!(
+        value_import.failed(),
+        "main.ts did not load: SyntaxError: Could not find export 'Repo' in module 'diffui'"
+    );
+}

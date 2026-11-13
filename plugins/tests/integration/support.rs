@@ -153,6 +153,14 @@ impl<'a> Setup<'a> {
         Self::with_manifest(format!("{MANIFEST}\n{extra}\n"), main)
     }
 
+    /// The same with a TypeScript main module.
+    pub fn typescript(extra: &str, main: &str) -> Self {
+        let manifest = MANIFEST.replace("main.js", "main.ts");
+        let mut setup = Self::with_manifest(format!("{manifest}\n{extra}\n"), "");
+        setup.files = vec![("main.ts", main.to_string())];
+        setup
+    }
+
     pub fn with_manifest(manifest: String, main: &str) -> Self {
         Setup {
             manifest,

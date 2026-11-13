@@ -615,22 +615,19 @@ impl Manifest {
     }
 }
 
-/// `main` names a JavaScript module inside the plugin directory.
+/// `main` names a JavaScript or TypeScript module inside the plugin
+/// directory.
 fn check_main(main: &str) -> Result<(), &'static str> {
     let path = Path::new(main);
-    if main.is_empty()
-        || !path
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-    {
+    let inside = path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)));
+    if main.is_empty() || !inside {
         return Err("must be a path inside the plugin directory");
     }
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("js" | "mjs") => Ok(()),
-        Some("ts" | "mts") => Err(
-            "plugins are JavaScript modules; keep the types with // @ts-check and JSDoc against diffui.d.ts",
-        ),
-        _ => Err("must be a .js or .mjs module"),
+        Some("js" | "mjs" | "ts" | "mts") => Ok(()),
+        _ => Err("must be a .js, .mjs, .ts or .mts module"),
     }
 }
 
@@ -749,21 +746,22 @@ limit = { type = "number", default = 50 }
     }
 
     #[test]
-    fn main_stays_inside_the_directory_and_is_javascript() {
+    fn main_stays_inside_the_directory_and_is_a_script() {
         for (main, why) in [
             ("../evil.js", "must be a path inside the plugin directory"),
             (
                 "/etc/passwd.js",
                 "must be a path inside the plugin directory",
             ),
-            ("main.ts", "plugins are JavaScript modules"),
-            ("main.py", "must be a .js or .mjs module"),
+            ("main.tsx", "must be a .js, .mjs, .ts or .mts module"),
+            ("main.py", "must be a .js, .mjs, .ts or .mts module"),
         ] {
             let problems =
                 parse(&with("main = \"main.js\"", &format!("main = \"{main}\""))).unwrap_err();
             assert!(problems[0].contains(why), "{main}: {problems:?}");
         }
         assert!(parse(&with("main = \"main.js\"", "main = \"src/main.mjs\"")).is_ok());
+        assert!(parse(&with("main = \"main.js\"", "main = \"main.ts\"")).is_ok());
     }
 
     #[test]
