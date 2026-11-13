@@ -48,6 +48,8 @@ use futures::channel::mpsc;
 pub(crate) use cli::client_main;
 pub(crate) use events::TabPlugins;
 #[cfg(test)]
+pub(crate) use query::READ_ONLY;
+#[cfg(test)]
 pub(crate) use scenarios::PluginDir;
 pub(crate) use trust::Record;
 pub(crate) use view::{PermissionDialog, build_permission_dialog, settings_group, status_items};

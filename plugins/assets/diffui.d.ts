@@ -82,7 +82,7 @@ declare module "diffui" {
     readonly bookmark: string | null;
     /** The file in context, relative to `repo.root`. */
     readonly path: string | null;
-    /** The 1-based line in `path`, when a diff line is in context. */
+    /** A 1-based line in `path`: line-select mode's cursor when it is in that file, else its first changed line. */
     readonly line: number | null;
   }
 
@@ -160,13 +160,13 @@ declare module "diffui" {
 
   /** Each event's payload. All carry the repository it happened in. */
   export interface EventMap {
-    /** A repository tab finished opening. */
+    /** A repository tab finished opening. Also sent, once the plugin has loaded, for each one already open. */
     repoOpened: { readonly repo: Repo };
     /** Bookmarks or remote refs moved. */
     refsChanged: { readonly repo: Repo };
-    /** The selected revision changed. Read it with `repo.selection()`. */
+    /** The selected revisions or the selected file changed, and stayed put for a moment. Read them with `repo.selection()`. */
     selectionChanged: { readonly repo: Repo };
-    /** A fetch finished. */
+    /** A fetch finished, and the log shows what it brought. */
     fetched: { readonly repo: Repo };
     /** A push finished; `bookmarks` are the ones it sent. */
     pushed: { readonly repo: Repo; readonly bookmarks: string[] };
@@ -178,9 +178,11 @@ declare module "diffui" {
 
   /**
    * One repository as it was when the handle was made. diffui passes one to every handler; there is no
-   * "current repository". The handle is pinned to the operation that was on screen: after the repository
-   * moves on (a commit, a fetch, an undo), its methods reject with an `Error` named "StaleError", so a slow
-   * plugin can't act on something the user no longer sees. Don't keep handles; use the one you are given.
+   * "current repository". The handle is pinned to the tab and the operation that were on screen: after the
+   * repository moves on (a commit, a fetch, an undo), or while another tab is in front, its methods reject
+   * with an `Error` named "StaleError", so a slow plugin can't act on something the user no longer sees.
+   * Don't keep handles; use the one you are given. (`root` and `forgeRemote` are plain values and stay
+   * readable.)
    *
    * `root` and `forgeRemote` need no permission. Every method needs `jj = "read"` in the manifest, and
    * `jj.run` needs `jj = "write"`.
@@ -213,7 +215,11 @@ declare module "diffui" {
      *
      *     const ids = await repo.jj.query(["log", "--no-graph", "-r", "trunk()..@", "-T", 'change_id ++ "\n"']);
      *
-     * Rejects with jj's stderr when the command fails or isn't read-only.
+     * The argv must start with one of: `log`, `show`, `diff`, `interdiff`, `evolog`, `status`, `file show`,
+     * `file list`, `file annotate`, `bookmark list`, `tag list`, `op log`, `op show`, `config get`,
+     * `git remote list`, `workspace list`. It may not carry `-R`, `--at-op`, `--ignore-working-copy`
+     * (diffui sets them), `--tool` or `--config*`. Rejects with why when the line is refused, and with
+     * jj's stderr when the command fails.
      */
     query(args: string[]): Promise<string>;
     /**
@@ -222,6 +228,10 @@ declare module "diffui" {
      * Needs `jj = "write"`.
      *
      *     await repo.jj.run(["bookmark", "set", "wip", "-r", "@"]);
+     *
+     * It resolves once diffui has accepted the command, not when it has finished, and rejects with why
+     * when the line is refused. Once the command has changed the repository this handle is stale: do the
+     * work in one command (`jj new -m …`, not `new` then `describe`), or carry on from the next event.
      */
     run(args: string[]): Promise<JjRun>;
   }
@@ -422,7 +432,8 @@ declare module "diffui" {
     /** A short message that goes away by itself. Sentence case, no trailing period. */
     toast(message: string, options?: { tone?: "info" | "error" }): Promise<void>;
     /**
-     * A row in the activity log for work that takes a while. Finish every activity you start.
+     * A row in the activity log (of the tab in front when it starts) for work that takes a while. Finish
+     * every activity you start.
      *
      *     const activity = await ui.activity("Syncing labels");
      *     try { await sync(activity); await activity.finish(); }

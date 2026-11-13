@@ -59,8 +59,12 @@ pub(crate) enum Request {
     },
     /// Show a toast.
     Toast { text: String },
-    /// Read config.toml's keys and commands again.
+    /// Read config.toml's keys and commands again, and start the plugins
+    /// afresh.
     Reload,
+    /// Every plugin found, with its state, what it registered and the end
+    /// of its log.
+    Plugins,
 }
 
 /// Where an answer goes.
@@ -200,6 +204,7 @@ impl Diffui {
             Request::Reload => self
                 .reload_commands()
                 .map(|problems| json!({ "problems": problems })),
+            Request::Plugins => Ok(self.ctl_plugins()),
             Request::Commands { repo } => self
                 .ctl_tab(repo.as_deref(), cx)
                 .map(|_| self.ctl_commands()),
@@ -295,6 +300,45 @@ impl Diffui {
             "revset": session.revset,
             "activity": activity,
         })
+    }
+
+    fn ctl_plugins(&self) -> Value {
+        use crate::plugins::State;
+        let plugins: Vec<Value> = self
+            .plugins
+            .found
+            .iter()
+            .map(|found| {
+                let (state, error) = match &found.state {
+                    State::Running(_) => ("running", None),
+                    State::Loading => ("loading", None),
+                    State::NotAllowed => ("not-allowed", None),
+                    State::Disabled => ("off", None),
+                    State::Failed(why) => ("failed", Some(why.clone())),
+                };
+                let registration = match &found.state {
+                    State::Running(registration) => Some(registration),
+                    _ => None,
+                };
+                let log = found.log();
+                json!({
+                    "id": found.id,
+                    "name": found.name,
+                    "version": found.version,
+                    "dir": found.dir.display().to_string(),
+                    "state": state,
+                    "error": error,
+                    "commands": registration.map(|registration| registration.commands.clone()),
+                    "forge": registration.and_then(|registration| registration.forge.clone()),
+                    "events": registration.map(|registration| registration.events.clone()),
+                    "log": log[log.len().saturating_sub(20)..]
+                        .iter()
+                        .map(|line| line.message.clone())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        json!({ "plugins": plugins })
     }
 
     fn ctl_commands(&self) -> Value {
@@ -413,8 +457,10 @@ enum Verb {
     },
     /// Show a toast.
     Toast { text: String },
-    /// Read config.toml's keys and commands again.
+    /// Read config.toml's keys and commands again, and reload the plugins.
     Reload,
+    /// Every plugin, its state and why it failed if it did.
+    Plugins,
 }
 
 fn ctl_main() -> i32 {
@@ -440,6 +486,7 @@ fn ctl_main() -> i32 {
         Verb::Jj { args } => Request::Jj { args, repo },
         Verb::Toast { text } => Request::Toast { text },
         Verb::Reload => Request::Reload,
+        Verb::Plugins => Request::Plugins,
     };
     let response = socket_file()
         .ok_or_else(|| "no home directory".to_owned())
@@ -542,6 +589,15 @@ fn print_human(request: &Request, response: &Value) {
                 println!("{}", problem.as_str().unwrap_or(""));
             }
         }
+        Request::Plugins => {
+            for plugin in response["plugins"].as_array().into_iter().flatten() {
+                let text = |key: &str| plugin[key].as_str().unwrap_or("");
+                match plugin["error"].as_str() {
+                    Some(error) => println!("{}\t{}: {error}", text("id"), text("state")),
+                    None => println!("{}\t{}", text("id"), text("state")),
+                }
+            }
+        }
         Request::Run { .. } | Request::Toast { .. } => {}
     }
 }
@@ -582,9 +638,61 @@ mod tests {
             assert!(SKILL.contains(&format!("`{{{name}}}`")), "{name}");
         }
         for verb in [
-            "state", "open", "select", "commands", "run", "jj", "toast", "reload",
+            "state", "open", "select", "commands", "run", "jj", "toast", "reload", "plugins",
         ] {
             assert!(SKILL.contains(&format!("`diffui ctl {verb}")), "{verb}");
+        }
+    }
+
+    /// The guide's plugin section names what a plugin author can reach: the
+    /// CLI's verbs, every import, event, forge method and read-only jj
+    /// command, and the reference plugin as it is shipped.
+    #[test]
+    fn the_skill_names_the_whole_plugin_surface() {
+        use diffui_plugins::protocol::{EVENT_NAMES, FORGE_METHODS};
+        for verb in ["init", "check", "list"] {
+            assert!(SKILL.contains(&format!("`diffui plugin {verb}")), "{verb}");
+        }
+        for import in [
+            "commands", "forge", "events", "http", "exec", "auth", "kv", "config", "ui",
+        ] {
+            assert!(SKILL.contains(&format!("| `{import}` |")), "{import}");
+            assert!(
+                diffui_plugins::TYPES.contains(&format!("export const {import}:"))
+                    || diffui_plugins::TYPES.contains(&format!("export function {import}(")),
+                "{import} isn't in diffui.d.ts"
+            );
+        }
+        for name in EVENT_NAMES.iter().chain(&FORGE_METHODS) {
+            assert!(SKILL.contains(&format!("`{name}`")), "{name}");
+        }
+        for command in crate::plugins::READ_ONLY {
+            let command = format!("`{}`", command.join(" "));
+            assert!(SKILL.contains(&command), "{command}");
+            assert!(
+                diffui_plugins::TYPES.contains(&command),
+                "{command} in diffui.d.ts"
+            );
+        }
+        for slot in [
+            "ui.toast",
+            "ui.activity",
+            "ui.prompt.input",
+            "ui.openUrl",
+            "ui.clipboard.write",
+            "ui.status.set",
+        ] {
+            assert!(SKILL.contains(slot), "{slot}");
+        }
+        for file in ["plugin.toml", "main.js"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/examples/forgejo")
+                .join(file);
+            let text = std::fs::read_to_string(&path).expect("the reference plugin");
+            assert!(
+                SKILL.contains(text.trim_end()),
+                "{file} isn't in the guide as shipped"
+            );
         }
     }
 

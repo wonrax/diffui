@@ -1,13 +1,14 @@
 ---
 name: diffui
-description: Drive the diffui app (a GUI for jj and git) from the terminal with `diffui ctl`, and add commands to it with `[[commands]]` rows in its config.toml. Use when the user runs diffui and wants you to show them something in it, run a jj command where they can watch it, or teach it a new command or shortcut.
+description: Drive the diffui app (a GUI for jj and git) from the terminal with `diffui ctl`, add commands to it with `[[commands]]` rows in its config.toml, and write plugins for it with `diffui plugin`. Use when the user runs diffui and wants you to show them something in it, run a jj command where they can watch it, teach it a new command or shortcut, or support a forge it doesn't know.
 ---
 
 # diffui
 
 diffui is a desktop app for reviewing and rewriting history in jj (and git)
-repositories. You can drive the running app with `diffui ctl`, and add
-commands to it by writing `[[commands]]` rows in its `config.toml`.
+repositories. You can drive the running app with `diffui ctl`, add commands
+to it by writing `[[commands]]` rows in its `config.toml`, and give it code
+of your own as a plugin (see "Writing a plugin").
 
 ## `diffui ctl`
 
@@ -26,7 +27,8 @@ bring it forward; otherwise the active tab).
 | `diffui ctl run <id>` | Run a command by id, as its key would. Fails with the reason when it can't run now. |
 | `diffui ctl jj <args…>` | Run a jj command line in the app, exactly as typing it in the palette would, except that a rebase or squash runs as written instead of waiting for a pick. A mutation gets the app's activity row, its queue and its confirm for immutable revisions; a view (`log`, `diff`, `show`, `evolog`, `op log`, `file annotate`) opens it; `describe`, `commit`, `split` and `resolve` open their editor; anything else runs as a jj subprocess whose output streams to an activity row. Answers once the line has planned, with what it does (`did`), or why it won't run. Watch `state`'s activity for the outcome. |
 | `diffui ctl toast <text>` | Show a toast. |
-| `diffui ctl reload` | Read `config.toml`'s `[keys]` and `[[commands]]` again. Answers with what was wrong (`problems`, as `path:line:col: message`). |
+| `diffui ctl reload` | Read `config.toml`'s `[keys]` and `[[commands]]` and the plugins folder again, and start every plugin afresh. Answers with what was wrong (`problems`, as `path:line:col: message`). |
+| `diffui ctl plugins` | Every plugin found: its id, folder, state (`running`, `loading`, `not-allowed`, `off`, `failed` with the `error`), what it registered and the end of its log. |
 
 Prefer `diffui ctl jj …` over running `jj` yourself when the user is
 watching the app: the change shows in its activity and can be undone there.
@@ -165,7 +167,7 @@ a key that doesn't exist reads as false and `reload` reports it.
 |---|---|
 | `repo.kind` | `"jj"`, `"git"` or `"pr"` (a pull-request tab) |
 | `repo.mutate` | the repository can be rewritten (jj) |
-| `repo.forge` | `"github"` or `"gitlab"`: the forge one of the repository's remotes is on |
+| `repo.forge` | `"github"`, `"gitlab"` or a forge plugin's id: the forge one of the repository's remotes is on |
 | `revision.selected` | a revision is in context and in the log |
 | `revision.mutable` | the revision in context isn't immutable |
 | `revision.is_working_copy` | the revision in context is `@` |
@@ -224,6 +226,282 @@ command = ["claude", "-p"]   # the agent CLI; the prompt is added last
 [editor]
 command = ["zed"]            # the path and line are added the way it takes them
 ```
+
+## Writing a plugin
+
+A plugin is a folder, `~/.config/diffui/plugins/<id>/`, with a `plugin.toml`
+and a JavaScript or TypeScript module that diffui runs in a sandbox of its
+own (QuickJS, not Node).
+
+Use a `[[commands]]` row when the job is "run this program, or this jj
+line, with these values filled in": it needs no code and nothing has to be
+allowed. Write a plugin when the job needs logic: several steps with
+decisions between them, HTTP, reading the repository, reacting to what
+happens in the app, a status-bar item, or a forge (pull-request badges and
+dialogs for a host diffui doesn't know).
+
+### The loop
+
+1. `diffui plugin init <id>` writes `plugin.toml`, `main.js`, `diffui.d.ts`
+   and `jsconfig.json` into `~/.config/diffui/plugins/<id>`. `--ts` writes
+   `main.ts` and `tsconfig.json` instead, `--forge <host>` adds a forge
+   provider for that host, `--dir <dir>` writes somewhere else. What it
+   writes loads as it is.
+2. Edit `plugin.toml` and the module. `diffui.d.ts` beside them is the whole
+   API with its types and what each function does; read it before you write.
+3. `diffui plugin check <dir>` loads the plugin without the app and prints
+   its permissions, the commands, forge methods and events it registered,
+   and what it logged. Every problem is one line with its `file:line:col`
+   (a manifest field, a when-clause, a syntax error, a handler the manifest
+   declares and the script doesn't register), and the exit status is
+   non-zero. Nothing answers repository or `ui` calls there, so handlers
+   aren't run: `check` proves the plugin loads, not that it works.
+4. In the running app, `diffui ctl reload` reads the plugins folder again.
+   The first time a plugin is seen, and whenever its manifest asks for more
+   than before, diffui asks the user whether it may run: you can't answer
+   for them, so tell them to look at the app. After that, saving a file in
+   the plugin's folder reloads it.
+5. `diffui ctl plugins` shows each plugin's state (`running`, `loading`,
+   `not-allowed`, `off`, `failed` with the error and its `file:line:col`),
+   what it registered and the end of its log (`--json` for all of it).
+   `diffui ctl run <id>` runs one of its commands. `diffui plugin list`
+   lists the folder without the app.
+
+### `plugin.toml`
+
+```toml
+id = "labels"                    # lowercase letters, digits, dashes; the folder's name
+name = "Labels"                  # shown in Settings and as the palette heading
+version = "0.1.0"
+api = 0                          # the plugin API version; 0 through alpha
+main = "main.js"                 # or main.ts
+
+[permissions]                    # all optional; see below
+http = ["codeberg.org"]
+exec = [["git", "config"]]
+jj = "read"
+
+[provides]                       # optional: this plugin is a forge
+forge = { hosts = ["codeberg.org"], term = "pull request" }
+
+[[commands]]                     # the script must register a handler for each
+id = "labels.sync"               # always "<plugin id>.<name>"
+label = "Sync labels"
+hint = "Fetch the labels again"  # optional
+when = "repo.kind == 'jj'"       # optional; the same when-clauses as above
+menu = ["palette", "revision"]   # palette | revision | bookmark | file; default palette
+keys = ["cmd+shift+l"]           # optional
+
+[config.schema]                  # optional: defaults for `config`
+team = { type = "string", default = "core", label = "Team" }
+```
+
+Unlike a `[[commands]]` row in config.toml, a plugin's row has no `exec`,
+`run`, `stdin`, `output`, `confirm` or prompts: the handler does all of
+that in code. `term` is `"pull request"` (the default) or `"merge request"`,
+whichever the forge says. The user sets a plugin's config under
+`[plugins.<id>]` in config.toml; `token_cmd` there is an argv that prints
+the token `auth.token` returns.
+
+### Permissions
+
+A plugin can do nothing outside its sandbox that its manifest doesn't ask
+for, and the user sees the list before it runs:
+
+| Manifest | Lets the script |
+|---|---|
+| `http = ["host", "*.example.com", "localhost:3000"]` | `http.fetch` those hosts, and ask `auth.token` for their git credentials |
+| `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes |
+| `jj = "read"` | read the repository: `repo.bookmarks`, `remotes`, `selection`, `rows`, `diff`, `readFile`, `repo.jj.query` |
+| `jj = "write"` | all of that, and `repo.jj.run` |
+
+`repo.root`, `repo.forgeRemote`, `kv`, `config`, `console` and `ui` need no
+permission. Ask for the least that works: every addition makes diffui ask
+the user again. A plugin that isn't allowed doesn't run, and its commands
+are listed greyed with "Not allowed".
+
+### The API
+
+Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
+
+| Import | For |
+|---|---|
+| `commands` | `commands.register(id, handler)`: the handler gets `{ repo, changeId, commitId, bookmark, path, line }` |
+| `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`; only `pullRequests` is required, and diffui hides what a missing method would serve |
+| `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
+| `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
+| `exec` | `exec(argv, options)`: no shell, an allowed argv prefix |
+| `auth` | `auth.token(host)`: the user's `token_cmd`, else `git credential fill`; never prompts |
+| `kv` | a small JSON store that survives restarts |
+| `config` | the plugin's settings |
+| `ui` | `ui.toast`, `ui.activity`, `ui.prompt.input` / `confirm` / `choose`, `ui.openUrl`, `ui.clipboard.write`, `ui.status.set` |
+
+Every handler is handed a `repo`. It is pinned to the tab and the jj
+operation that were on screen when the handler was called: once the
+repository has moved on, or while another tab is in front, its methods
+reject with an error named `StaleError`. Catch it and stop; the next event
+brings a fresh handle.
+
+`repo.jj.query(argv)` runs a read-only jj command at that operation and
+resolves with its stdout. The argv starts with one of `log`, `show`,
+`diff`, `interdiff`, `evolog`, `status`, `file show`, `file list`,
+`file annotate`, `bookmark list`, `tag list`, `op log`, `op show`,
+`config get`, `git remote list`, `workspace list`, and can't carry `-R`,
+`--at-op`, `--ignore-working-copy`, `--tool` or `--config`.
+`repo.jj.run(argv)` runs any jj command the way `diffui ctl jj` does.
+
+### The Forgejo plugin, in full
+
+The reference plugin: Forgejo and Gitea pull requests. `plugin.toml`:
+
+```toml
+# Forgejo and Gitea pull requests for diffui: badges on bookmarks, checks,
+# create and update. The reference plugin; copy it to
+# ~/.config/diffui/plugins/forgejo to use it.
+#
+# For a self-hosted instance, add its host to both lists below. The token
+# comes from `git credential fill`, or from `token_cmd` under
+# [plugins.forgejo] in config.toml.
+id = "forgejo"
+name = "Forgejo"
+version = "0.1.0"
+api = 0
+main = "main.js"
+
+[permissions]
+http = ["codeberg.org"]
+
+[provides]
+forge = { hosts = ["codeberg.org"] }
+
+[[commands]]
+id = "forgejo.open-in-browser"
+label = "Open pull request in browser"
+when = "bookmark.pr"
+menu = ["bookmark", "palette"]
+```
+
+`main.js`:
+
+```js
+// @ts-check
+/// <reference path="../../assets/diffui.d.ts" />
+import { auth, commands, forge, http, ui } from "diffui";
+
+/**
+ * Ask the Forgejo API about the repository's project.
+ *
+ * @param {import("diffui").Repo} repo
+ * @param {string} path Below `/api/v1/repos/<owner>/<name>`.
+ * @param {import("diffui").RequestInit} [init]
+ * @returns {Promise<any>}
+ */
+async function api(repo, path, init = {}) {
+  if (!repo.forgeRemote) throw new Error("This repository has no Forgejo remote");
+  const { host, owner, name, webUrl } = repo.forgeRemote;
+  const res = await http.fetch(`${new URL(webUrl).origin}/api/v1/repos/${owner}/${name}${path}`, {
+    ...init,
+    headers: {
+      accept: "application/json",
+      authorization: `token ${await auth.token(host)}`,
+      "content-type": "application/json",
+    },
+  });
+  if (!res.ok) throw new Error(`Forgejo ${res.status}: ${await said(res)}`);
+  return res.json();
+}
+
+/**
+ * What a failed response says: the API's `message`, else its text.
+ *
+ * @param {import("diffui").Response} res
+ */
+async function said(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text).message ?? text;
+  } catch {
+    return text.trim().slice(0, 200) || res.statusText;
+  }
+}
+
+/**
+ * @param {any} pr A pull request as the API returns it.
+ * @returns {import("diffui").PullRequest}
+ */
+const toPullRequest = (pr) => ({
+  number: pr.number,
+  url: pr.html_url,
+  title: pr.title,
+  head: pr.head.ref,
+  base: pr.base.ref,
+  headSha: pr.head.sha,
+  state: pr.merged ? "merged" : pr.state === "closed" ? "closed" : pr.draft ? "draft" : "open",
+});
+
+/** @type {Record<string, import("diffui").Checks["state"]>} */
+const CHECK_STATES = { success: "success", warning: "success", pending: "pending", failure: "failure", error: "failure" };
+
+/** @type {import("diffui").ForgeProvider} */
+const provider = {
+  async pullRequests(repo, { branches }) {
+    const recent = await api(repo, "/pulls?state=all&sort=recentupdate&limit=50");
+    return recent
+      .filter((/** @type {any} */ pr) => pr.head.repo_id === pr.base.repo_id && branches.includes(pr.head.ref))
+      .map(toPullRequest);
+  },
+
+  async checks(repo, sha) {
+    const combined = await api(repo, `/commits/${sha}/status`);
+    return {
+      state: combined.total_count ? (CHECK_STATES[combined.state] ?? "none") : "none",
+      url: combined.statuses?.[0]?.target_url ?? null,
+    };
+  },
+
+  async createPullRequest(repo, { head, base, title, body, draft }) {
+    // Forgejo has no draft flag; a "WIP:" title is how it marks one.
+    const request = { head, base, title: draft ? `WIP: ${title}` : title, body };
+    return toPullRequest(await api(repo, "/pulls", { method: "POST", body: JSON.stringify(request) }));
+  },
+
+  async updatePullRequest(repo, number, patch) {
+    return toPullRequest(await api(repo, `/pulls/${number}`, { method: "PATCH", body: JSON.stringify(patch) }));
+  },
+};
+
+forge.register(provider);
+
+commands.register("forgejo.open-in-browser", async ({ repo, bookmark }) => {
+  if (!bookmark) return;
+  const [pullRequest] = await provider.pullRequests(repo, { branches: [bookmark] });
+  if (pullRequest) {
+    await ui.openUrl(pullRequest.url);
+  } else {
+    await ui.toast(`No pull request for ${bookmark}`);
+  }
+});
+```
+
+### Pitfalls
+
+- There is no Node here: no `require`, `fs`, `process`, `Buffer` or npm
+  packages, and no global `fetch`. Import from `"diffui"` and from your own
+  files by relative path (`"./util.js"`); anything else fails the load with
+  a message that lists what exists.
+- `http.fetch` reaches only the hosts under `[permissions] http`, redirects
+  included. A new host is a manifest change, which the user is asked about.
+- Registration happens while the main module loads, and must match the
+  manifest: a `[[commands]]` row without `commands.register`, or
+  `[provides] forge` without `forge.register`, fails the load.
+- A handler that runs for more than half a second without awaiting, or a
+  heap past 64 MB, stops the plugin until it is reloaded. Await your I/O.
+- TypeScript is erased, not compiled: no `enum`, `namespace` or constructor
+  parameter properties, and types are imported with `import type`.
+- Plugins never draw. What they can show is in `ui`.
+- `repo.jj.run` resolves when diffui has accepted the command, not when it
+  has finished, and the handle is stale once the repository changed: one
+  command per handler, or carry on from the next event.
 
 ## Checking your work
 
