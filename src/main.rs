@@ -21,6 +21,7 @@ mod compare;
 mod config;
 mod conflicts;
 mod credentials;
+mod ctl;
 mod diff_panel;
 mod empty_states;
 mod field;
@@ -206,6 +207,10 @@ fn main() {
     if let Some(code) = diffui_core::cli::passthrough::jj_main() {
         std::process::exit(code.into());
     }
+    // `diffui ctl …` talks to the running app; `diffui skill` prints its guide.
+    if let Some(code) = ctl::client_main() {
+        std::process::exit(code);
+    }
     // First, while the process is still single-threaded: it may `set_var`.
     let path_repair = launch_env::repair_path();
     let cli = Cli::parse();
@@ -215,6 +220,9 @@ fn main() {
     }
     if let Err(error) = diffui_core::askpass::start() {
         tracing::warn!("credential prompts unavailable: {error}");
+    }
+    if let Err(error) = ctl::listen() {
+        tracing::warn!("diffui ctl unavailable: {error}");
     }
 
     // The UI thread runs inside the tokio runtime: the repository actor's channels

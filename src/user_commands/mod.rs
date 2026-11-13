@@ -10,16 +10,18 @@
 //! users (and agents) in `assets/agent/SKILL.md`; keep the two in step.
 
 mod run;
+#[cfg(test)]
+mod scenarios;
 mod spec;
 mod template;
 
 use std::borrow::Cow;
 use std::time::Duration;
 
-#[cfg(test)]
-pub(crate) use run::jj_line;
-pub(crate) use run::{Generation, RunId, Runs};
+pub(crate) use run::{Generation, RunId, Runs, jj_line};
 pub(crate) use spec::{SHIPPED, parse_commands};
+#[cfg(test)]
+pub(crate) use template::VARS;
 pub(crate) use template::Var;
 
 use crate::Diffui;

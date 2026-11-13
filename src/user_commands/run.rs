@@ -502,7 +502,11 @@ impl Diffui {
                         Exit::Cancelled
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Exit::Failed(format!("`{program}` isn't on PATH"))
+                        Exit::Failed(if program.contains('/') {
+                            format!("`{program}` doesn't exist")
+                        } else {
+                            format!("`{program}` isn't on PATH")
+                        })
                     }
                     Err(error) => Exit::Failed(error.to_string()),
                 };

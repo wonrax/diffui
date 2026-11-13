@@ -35,6 +35,8 @@ nucleo-matcher = "0.3"
 raw-window-handle = "0.6"
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
+# Already in the tree through the core; `diffui ctl` speaks JSON.
+serde_json = "1.0"
 tokio = { version = "1.44", features = ["process", "rt-multi-thread", "time"] }
 toml = "1.1"
 # The core logs through `tracing`; the app installs the subscriber (a size-capped

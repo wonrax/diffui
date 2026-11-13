@@ -439,6 +439,7 @@ impl Diffui {
 
         crate::app_menu::start(cx);
         crate::credentials::start(cx);
+        crate::ctl::start(cx);
         self.sync_background(cx);
     }
 

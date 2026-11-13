@@ -352,6 +352,11 @@ impl ActivityLog {
         });
     }
 
+    /// The `n` latest entries, newest first.
+    pub fn recent(&self, n: usize) -> impl Iterator<Item = &Activity> {
+        self.activities.iter().rev().take(n)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.activities.is_empty()
     }
