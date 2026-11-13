@@ -13,15 +13,15 @@
 # Reach things by the bookmarks in the manifest, not by offsets. An empty-repo
 # scene is just `jj git init <dir>`; nothing here covers it.
 #
-# Needs jj 0.45 or 0.46 ($JJ, which the dev shell sets) and git on PATH.
+# Needs jj 0.45 to 0.47 ($JJ, which the dev shell sets) and git on PATH.
 set -euo pipefail
 
 dest=${1:?usage: make-fixture.sh <dest>}
 [[ -e $dest ]] && { echo "make-fixture: $dest already exists" >&2; exit 1; }
-JJ=${JJ:?set JJ to a jj 0.45 or 0.46 (the dev shell does)}
+JJ=${JJ:?set JJ to a jj 0.45 to 0.47 (the dev shell does)}
 case "$("$JJ" --version)" in
-  "jj 0.45."* | "jj 0.46."*) ;;
-  *) echo "make-fixture: need jj 0.45.x or 0.46.x, got $("$JJ" --version)" >&2; exit 1 ;;
+  "jj 0.45."* | "jj 0.46."* | "jj 0.47."*) ;;
+  *) echo "make-fixture: need jj 0.45.x to 0.47.x, got $("$JJ" --version)" >&2; exit 1 ;;
 esac
 
 scratch=$(mktemp -d)
