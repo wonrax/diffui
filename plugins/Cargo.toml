@@ -16,5 +16,7 @@ swc_next_type_strip = "0.6"
 toml = "1.1"
 tracing = "0.1"
 # The build scripts of core and widgets already use it; here it is linked in,
-# with rustls, for about 1.7 MB of a stripped release binary.
-ureq = "3"
+# with rustls, for about 1.7 MB of a stripped release binary. Certificates
+# are checked by the platform's verifier (about 20 KB more), so a forge
+# behind a company CA is trusted the way the user's browser and git trust it.
+ureq = { version = "3", features = ["platform-verifier"] }

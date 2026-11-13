@@ -25,11 +25,18 @@ pub(crate) struct FetchRequest {
 
 /// The agent a plugin's requests share (its connection pool). Redirects are
 /// ours to follow, so each hop is checked; a 4xx or 5xx is a response, not an
-/// error.
+/// error. A server's certificate is checked by the operating system's
+/// verifier, against the roots the user's machine trusts.
 pub(crate) fn agent() -> ureq::Agent {
+    use ureq::tls::{RootCerts, TlsConfig};
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
         .user_agent("diffui")
         .build()
         .new_agent()
