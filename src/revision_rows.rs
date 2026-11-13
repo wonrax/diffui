@@ -923,7 +923,10 @@ pub(crate) mod scenes {
 
     /// A private copy of the fixture, for a test that mutates it.
     fn scratch_copy(name: &str) -> std::path::PathBuf {
-        let scratch = crate::harness::scratch_home().join(name);
+        // Under `repos`, which a launch that clears its home keeps: this
+        // copy is made before the test has its turn, while another test's
+        // launch may be clearing.
+        let scratch = crate::harness::scratch_home().join("repos").join(name);
         let _ = std::fs::remove_dir_all(&scratch);
         let copied = std::process::Command::new("cp")
             .arg("-R")

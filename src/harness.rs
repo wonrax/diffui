@@ -42,6 +42,19 @@ use crate::{Action, Cli, Cx, Diffui};
 /// What [`crate::open_url`] was asked to open, instead of opening it.
 pub(crate) static OPENED_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Every path under `dir`, for saying what a failed clear left behind.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        }
+        found.push(path);
+    }
+    found
+}
+
 /// A view to show instead of the app: see [`Harness::show`].
 pub(crate) type Scene = Rc<dyn Fn(&Diffui, ThemeSpec, &mut Window, &mut Cx) -> AnyElement>;
 
@@ -54,6 +67,15 @@ pub(crate) struct Harness {
     _turn: Turn,
     /// The UI thread runs inside the tokio runtime, as `main` does.
     _tokio: tokio::runtime::EnterGuard<'static>,
+}
+
+impl Drop for Harness {
+    /// Plugins a test installed go with its harness, while it still holds
+    /// its turn: most launches keep the home they find, and one that found a
+    /// plugin folder there would open on its permission dialog.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(scratch_home().join(".config/diffui/plugins"));
+    }
 }
 
 /// A scene's window, unless it asks for another.
@@ -297,7 +319,10 @@ impl Harness {
                 } else {
                     std::fs::remove_file(&path)
                 };
-                removed.expect("clear the scratch home");
+                removed.unwrap_or_else(|error| {
+                    let left: Vec<_> = walk(&path);
+                    panic!("clear {}: {error}; still there: {left:?}", path.display())
+                });
             }
         }
         let dir = home.join(".config/diffui");
