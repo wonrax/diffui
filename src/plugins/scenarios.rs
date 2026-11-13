@@ -642,6 +642,92 @@ fn a_plugin_fills_the_ui_slots_and_asks_through_the_apps_dialogs() {
     assert_eq!(answers(&mut h, before), "ok [null,false,null]");
 }
 
+/// `diffui ctl plugins` says what each plugin is doing, `ctl reload` starts
+/// them afresh, and Settings' Show log puts a plugin's log in the output
+/// panel.
+#[test]
+fn ctl_lists_and_reloads_plugins_and_the_log_opens() {
+    use crate::ctl::Request;
+    let ask = |h: &mut Harness, request: Request| {
+        let (reply, mut answer) = futures::channel::oneshot::channel();
+        h.act(|ui, cx| ui.on_ctl_request(request, reply, cx));
+        let mut value = None;
+        h.wait_until("the answer", |_| {
+            if value.is_none() {
+                value = answer.try_recv().ok().flatten();
+            }
+            value.is_some()
+        });
+        value.expect("answered")
+    };
+    let chatty = PluginDir::new(
+        "chatty",
+        "",
+        &["hi"],
+        "import { commands, events } from \"diffui\";\nconsole.log(\"loaded\");\nconsole.warn(\"careful\");\ncommands.register(\"chatty.hi\", () => {});\nevents.on(\"fetched\", () => {});\n",
+    );
+    let broken = PluginDir::new("broken", "", &[], "throw new Error(\"no good\");\n");
+    let none = "http = []\nexec = []\njj = \"none\"";
+    let settings = format!("{}\n{}", allowed("chatty", none), allowed("broken", none));
+    let (mut h, _) = launch(&[broken, chatty], &settings);
+    wait_running(&mut h, "chatty");
+    h.wait_until("the broken one", |ui| {
+        matches!(state(ui, "broken"), State::Failed(_))
+    });
+
+    let listed = ask(&mut h, Request::Plugins);
+    let plugins = listed["plugins"].as_array().expect("plugins");
+    assert_eq!(plugins.len(), 2, "{listed}");
+    assert_eq!(plugins[0]["id"], "broken");
+    assert_eq!(plugins[0]["state"], "failed");
+    assert_eq!(plugins[0]["error"], "main.js:1:11: Error: no good");
+    assert_eq!(plugins[1]["id"], "chatty");
+    assert_eq!(plugins[1]["state"], "running");
+    assert_eq!(plugins[1]["commands"], serde_json::json!(["chatty.hi"]));
+    assert_eq!(plugins[1]["events"], serde_json::json!(["fetched"]));
+    assert_eq!(plugins[1]["log"], serde_json::json!(["loaded", "careful"]));
+
+    h.perform(Action::Plugin(PluginAction::ShowLog("chatty".to_owned())));
+    h.read(|ui| {
+        let run = ui.shown_cli_run().expect("the log in the output panel");
+        assert_eq!(run.program, "Chatty log");
+        let lines: Vec<&str> = run.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(lines, ["loaded", "careful"]);
+        assert_eq!(run.lines[1].stream, diffui_core::cli::CliStream::Stderr);
+    });
+    h.perform(Action::CommandLine(crate::cmdline::CmdAction::Output(
+        crate::cli_output::OutputAction::Close,
+    )));
+
+    // A reload starts every plugin again and says so.
+    let reloaded = ask(&mut h, Request::Reload);
+    assert_eq!(reloaded["ok"], true, "{reloaded}");
+    h.wait_until("the reload", |ui| {
+        toasts(ui)
+            .iter()
+            .any(|(title, ..)| title == "Reloaded Chatty")
+    });
+    wait_running(&mut h, "chatty");
+
+    // Turned off, its command is gone; turned on, it is back.
+    h.perform(Action::Plugin(PluginAction::Enable(
+        "chatty".to_owned(),
+        false,
+    )));
+    h.read(|ui| {
+        assert_eq!(state(ui, "chatty"), State::Disabled);
+        assert!(ui.registry.get("chatty.hi").is_none());
+    });
+    assert!(settings_on_disk().contains("enabled = false"));
+    h.perform(Action::Plugin(PluginAction::Enable(
+        "chatty".to_owned(),
+        true,
+    )));
+    wait_running(&mut h, "chatty");
+    h.read(|ui| assert!(ui.registry.get("chatty.hi").is_some()));
+    assert!(!settings_on_disk().contains("enabled = false"));
+}
+
 /// Plugins hear what happens, each event once it is true.
 #[test]
 fn a_plugin_hears_the_events_it_subscribed_to() {
