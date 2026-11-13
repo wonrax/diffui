@@ -29,6 +29,7 @@ pub(crate) mod walk;
 pub(crate) mod workspace;
 
 pub use push::validate_bookmark_name;
+pub use undo::is_push_description;
 pub use walk::jj_log_revset;
 /// Driving the walk from outside the actor, against a workspace it opens
 /// itself, is only ever the `track-alloc` memory profile: everything in the app
@@ -37,15 +38,13 @@ pub use walk::jj_log_revset;
 pub use walk::walk_jj_commits;
 pub use workspace::read_jj_op_head;
 
-pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair_inner, read_jj_source_file};
-pub(crate) use diff::{
-    DiffOptions, diff_jj_range, diff_jj_with_repo, jj_revision_details, resolve_base,
-};
+pub(crate) use browse::{list_jj_source_tree, read_jj_file_pair, read_jj_source_file};
+pub(crate) use diff::{DiffOptions, DiffSides, diff_jj, jj_revision_details};
 pub(crate) use fetch::fetch_jj;
 pub(crate) use mutate::{ImmutableRewriteError, apply_mutation, check_bookmark_move_backwards};
 pub(crate) use preview::preview_at_operation;
 pub(crate) use resolve::{conflict_files, conflict_text, prepare_merge_tool};
 pub(crate) use walk::{WorkspaceView, compute_jj_empty_status, walk_jj_with_repo};
 pub(crate) use workspace::{
-    SnapshotContext, load_workspace, read_op_head_with, resolve_revision, snapshot_working_copy,
+    SnapshotContext, load_workspace, read_op_heads, resolve_revision, snapshot_working_copy,
 };

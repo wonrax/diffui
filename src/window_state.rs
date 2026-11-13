@@ -27,7 +27,7 @@ const MIN_RESTORE_DIMENSION: f32 = 100.0;
 /// Window geometry, sidebar split, and the open-repo session persisted between
 /// runs. Every field is optional / defaulted so a partial or older file still
 /// loads — a missing field just falls back to the in-app default. Geometry is
-/// logical pixels; the type is intentionally iced-free (plain `f32` / `String`)
+/// logical pixels; the type is intentionally UI-free (plain `f32` / `String`)
 /// so persistence stays decoupled from the UI layer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WindowState {
@@ -42,6 +42,11 @@ pub struct WindowState {
     pub x: Option<f32>,
     #[serde(default)]
     pub y: Option<f32>,
+    /// The display `x` and `y` are relative to, by UUID, on platforms that report
+    /// a window's position per display. `None` means the primary one, or global
+    /// coordinates where that's what the platform reports.
+    #[serde(default)]
+    pub display: Option<String>,
     #[serde(default)]
     pub sidebar_width: Option<f32>,
     /// Last expanded width of the changed-files tree.
@@ -86,6 +91,65 @@ pub struct WindowState {
     pub recent_repos: Vec<String>,
 }
 
+/// Each repository's filter and panel layout, kept for the ones that aren't
+/// open too, so one reopens the way it was closed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RepoLayouts {
+    pub(crate) revsets: BTreeMap<String, String>,
+    pub(crate) history_panel_collapsed: BTreeMap<String, bool>,
+    pub(crate) files_panel_collapsed: BTreeMap<String, bool>,
+}
+
+impl RepoLayouts {
+    pub(crate) fn from_saved(saved: &WindowState) -> Self {
+        Self {
+            revsets: saved.revsets.clone(),
+            history_panel_collapsed: saved.history_panel_collapsed.clone(),
+            files_panel_collapsed: saved.files_panel_collapsed.clone(),
+        }
+    }
+
+    /// A never-loaded tab for `repository`, laid out as it was last left.
+    pub(crate) fn tab_state(&self, repository: crate::Repository) -> crate::TabState {
+        let key = repository.root.to_string_lossy().into_owned();
+        let revset = self
+            .revsets
+            .get(&key)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let mut state = crate::TabState::unloaded(Some(repository), revset);
+        state.history_panel_collapsed = self.history_panel_collapsed.get(&key) == Some(&true);
+        state.files_panel_collapsed = self.files_panel_collapsed.get(&key) == Some(&true);
+        state
+    }
+
+    /// Record how `tab` is laid out now. PR tabs have no root to key it by.
+    pub(crate) fn remember(&mut self, tab: &crate::Tab) {
+        let Some(root) = tab.root() else {
+            return;
+        };
+        let key = root.to_string_lossy().into_owned();
+        let state = &tab.state;
+        if state.session.revset.is_empty() {
+            self.revsets.remove(&key);
+        } else {
+            self.revsets
+                .insert(key.clone(), state.session.revset.clone());
+        }
+        self.history_panel_collapsed
+            .insert(key.clone(), state.history_panel_collapsed);
+        self.files_panel_collapsed
+            .insert(key, state.files_panel_collapsed);
+    }
+
+    /// Forget the repositories `keep` doesn't name.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.revsets.retain(|root, _| keep(root));
+        self.history_panel_collapsed.retain(|root, _| keep(root));
+        self.files_panel_collapsed.retain(|root, _| keep(root));
+    }
+}
+
 impl WindowState {
     /// Load persisted state. A missing file or unparseable contents both yield
     /// `WindowState::default()` (everything `None`); the unparseable case is
@@ -114,26 +178,12 @@ impl WindowState {
     /// Best-effort: errors are dropped.
     pub fn save(&self) {
         let Some(path) = state_path() else { return };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let Ok(raw) = toml::to_string(self) else {
             return;
         };
-        // Write beside the file and rename over it rather than truncating in
-        // place: a save that dies part-way (a quit mid-write, a full disk)
-        // would otherwise leave a truncated file, and since the session lives
-        // here that costs the user their open tabs, not just the geometry.
-        // Rename is atomic on the platforms we ship, so a reader sees either
-        // the whole old file or the whole new one.
-        let temp = path.with_extension("toml.new");
-        if std::fs::write(&temp, raw).is_err() {
-            let _ = std::fs::remove_file(&temp);
-            return;
-        }
-        if std::fs::rename(&temp, &path).is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
+        // Atomic: the session lives here, so a torn write would cost the user
+        // their open tabs, not just the geometry.
+        let _ = crate::app_files::write_atomic(&path, raw.as_bytes());
     }
 
     /// Validated logical size, or `None` if absent or implausible (a corrupt
@@ -172,7 +222,7 @@ const DEFAULT_MAX_SIZE: (f32, f32) = (1800.0, 1150.0);
 
 /// The window size for a launch with no saved geometry: most of the screen's
 /// usable area (`visible`, logical points, menu bar and Dock excluded), up to
-/// a cap. iced's fixed 1024-wide default leaves a three-pane split view too
+/// a cap. A fixed 1024-wide default would leave a three-pane split view too
 /// narrow to read. `None` without a screen to measure.
 pub fn default_window_size(visible: Option<(f32, f32)>) -> Option<(f32, f32)> {
     let (width, height) = visible.filter(|(w, h)| {
@@ -188,29 +238,8 @@ pub fn default_window_size(visible: Option<(f32, f32)>) -> Option<(f32, f32)> {
     ))
 }
 
-/// Resolve the per-platform state file path. Uses runtime `cfg!` branches
-/// (not `#[cfg]`) so every platform's path logic is type-checked in every
-/// build; the untaken branches are dead but harmless.
 fn state_path() -> Option<PathBuf> {
-    use std::env;
-
-    let dir = if cfg!(windows) {
-        // Per-machine, non-roaming state: window coordinates shouldn't roam to
-        // a machine with a different monitor layout. Fall back to roaming.
-        env::var_os("LOCALAPPDATA")
-            .or_else(|| env::var_os("APPDATA"))
-            .map(PathBuf::from)?
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from(env::var_os("HOME")?).join("Library/Application Support")
-    } else {
-        // Linux / other unixes: the XDG state dir, else its spec'd default.
-        env::var_os("XDG_STATE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?
-    };
-
-    Some(dir.join("diffui").join("window.toml"))
+    crate::app_files::app_file(crate::app_files::AppDir::State, "window.toml")
 }
 
 #[cfg(test)]
@@ -289,6 +318,7 @@ mod tests {
             height: Some(800.0),
             x: Some(100.0),
             y: Some(50.0),
+            display: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".to_owned()),
             sidebar_width: Some(280.0),
             file_nav_width: Some(220.0),
             history_panel_collapsed: BTreeMap::from([
@@ -311,6 +341,7 @@ mod tests {
         let parsed: WindowState = toml::from_str(&raw).expect("deserialize");
         assert_eq!(parsed.size(), Some((1200.0, 800.0)));
         assert_eq!(parsed.position(), Some((100.0, 50.0)));
+        assert_eq!(parsed.display, state.display);
         assert_eq!(parsed.sidebar_width, Some(280.0));
         assert_eq!(parsed.file_nav_width, Some(220.0));
         assert_eq!(parsed.history_panel_collapsed.get("/a/repo"), Some(&true));

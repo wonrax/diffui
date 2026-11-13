@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use diffui_core::repo::{Command, Payload, RepoError};
 use diffui_core::{
-    BookmarksInfo, MutationOp, PushAllow, PushCheck, PushRequest, PushTarget, RevisionSelection,
+    BookmarksInfo, MutationOp, PushAllow, PushCandidate, PushCheck, PushRequest, PushTarget,
+    RevisionSelection,
 };
 use harness::{TestRepo, scratch_repo, write};
 
@@ -586,12 +587,95 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
     })
     .expect("create bookmark");
 
+    // What the toolbar's Push says it sends, before it does.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "main".to_owned(),
+            tag: false,
+            ahead: 1,
+        }]
+    );
+
     let outcome = repo
         .mutate(push("origin", vec![PushTarget::Tracked]))
         .expect("plain push");
     assert_eq!(outcome.message, "Pushed main to origin");
     assert_eq!(remote_ref(&remote, "main"), Some(second));
     assert_eq!(remote_ref(&remote, "local-only"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
+}
+
+/// `jj git push` with no targets carries tracked tags pointing into the
+/// default range along with the bookmarks; an untracked tag stays home.
+#[test]
+fn tracked_push_sends_tracked_tags_too() {
+    let Some((mut repo, remote)) = setup("push-tracked-tags") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    let second = commit(&mut repo, "b.txt", "second");
+    harness::block_on(async {
+        let workspace = harness::load_workspace(&repo.root);
+        let base = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .expect("load repo");
+        let mut tx = base.start_transaction();
+        let id = jj_lib::backend::CommitId::try_from_hex(&second).expect("commit id");
+        for (name, tracked) in [("v1", true), ("v2", false)] {
+            let name = jj_lib::ref_name::RefName::new(name);
+            tx.repo_mut()
+                .set_local_tag_target(name, jj_lib::op_store::RefTarget::normal(id.clone()));
+            if tracked {
+                tx.repo_mut().set_remote_tag(
+                    name.to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                    jj_lib::op_store::RemoteRef {
+                        target: jj_lib::op_store::RefTarget::absent(),
+                        state: jj_lib::op_store::RemoteRefState::Tracked,
+                    },
+                );
+            }
+        }
+        tx.commit("test: tags").await.expect("commit the tags");
+    });
+
+    // The toolbar's Push offers the tag alone, since no bookmark moved.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "v1".to_owned(),
+            tag: true,
+            ahead: 1,
+        }]
+    );
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Tracked]))
+        .expect("plain push");
+    assert_eq!(outcome.message, "Pushed v1 to origin");
+    let tag = |name: &str| {
+        let out = harness::run_git(
+            &remote,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/tags/{name}"),
+            ],
+        );
+        Some(out.trim().to_owned()).filter(|out| !out.is_empty())
+    };
+    assert_eq!(tag("v1"), Some(second));
+    assert_eq!(tag("v2"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
 #[test]
@@ -654,13 +738,23 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
     };
     assert!(plan.is_confirmation());
     assert_eq!(
-        plan.plan,
+        plan.plan(),
         vec![format!(
             "bookmark: main [move forward from {} to {}]",
             &first[..12],
             &second[..12]
         )]
     );
+    let [moved] = plan.moves.as_slice() else {
+        panic!("one bookmark moves: {:?}", plan.moves);
+    };
+    assert_eq!(moved.kind, diffui_core::MoveKind::Forward);
+    assert!(moved.kind.is_fast_forward());
+    assert_eq!(
+        moved.revision_count, 1,
+        "only `second` is new to the remote"
+    );
+    assert_eq!(moved.revisions.len(), 1);
     assert_eq!(
         remote_ref(&remote, "main"),
         Some(first),
@@ -867,13 +961,20 @@ fn sign_on_push_skips_immutable_commits_with_a_warning() {
         "push-sign-immutable",
         "keep",
         false,
-        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"frozen*\")'\n",
+        // A bookmark rather than a description: describing `@` into
+        // `immutable()` would start a new `@` on top of it, as jj-cli does.
+        "[revset-aliases]\n'immutable_heads()' = 'present(frozen)'\n",
     );
     let Some((mut repo, remote)) = setup_with_config("push-sign-immutable", Some(&config)) else {
         return;
     };
     let frozen = commit(&mut repo, "a.txt", "frozen");
     let frozen_change = repo.graph("@-")[0].summary.change_id.clone();
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "frozen".to_owned(),
+        to: at(&frozen),
+    })
+    .expect("freeze the first commit");
     let next = commit(&mut repo, "b.txt", "next");
     repo.mutate(MutationOp::CreateBookmark {
         name: "feature".to_owned(),
@@ -928,4 +1029,49 @@ fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
     assert_eq!(one(&mut repo, "feature"), first);
     assert_eq!(one(&mut repo, "@"), wc);
     assert_eq!(harness::operation_log(&repo.root).len(), ops);
+}
+
+/// Undoing a push rolls back only the local record of the remote; jj-cli
+/// warns that it often leaves conflicted bookmarks. The undo is refused until
+/// the user confirms it, and the confirmed rerun is still a plain `jj undo`.
+#[test]
+fn undoing_a_push_asks_first() {
+    let Some((mut repo, remote)) = setup("push-undo") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("push");
+
+    let undo = MutationOp::Undo { operation_id: None };
+    match repo.mutate(undo.clone()) {
+        Err(RepoError::UndoesPush { summary }) => {
+            assert!(summary.contains("Pushed feature"), "{summary}")
+        }
+        other => panic!("expected the push guard, got {other:?}"),
+    }
+
+    let events = repo.run(|job| Command::Mutate {
+        job,
+        op: undo,
+        allow_immutable: true,
+        seen_op: None,
+        seen_wc: None,
+    });
+    assert!(
+        matches!(events.last(), Some(Payload::MutationDone { .. })),
+        "{events:?}"
+    );
+    let args = harness::head_operation_args(&repo.root).unwrap_or_default();
+    assert!(!args.contains("--ignore-immutable"), "{args}");
+    assert_eq!(
+        remote_ref(&remote, "feature"),
+        Some(first),
+        "the remote keeps what was pushed"
+    );
 }

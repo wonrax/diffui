@@ -5,17 +5,16 @@
 //! Keys come from the live keymap, so a rebinding shows here as bound, and a
 //! command with no key isn't advertised at all.
 
-use iced::{
-    Element, Length, Padding,
-    widget::{container, text},
-};
-
-use diffui_core::DraftKind;
-
-use crate::commands::{CommandId, Context};
-use crate::theme::{self, ThemeSpec, text_size};
+use crate::Cx;
 use crate::typography::{self, Aligned};
-use crate::{Diffui, Message};
+use diffui_core::DraftKind;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
+
+use crate::Diffui;
+use crate::commands::{CommandId, Context};
+use crate::theme::{self, text_size};
+use crate::ui::Look;
 
 /// A hint: the commands whose keys it shows (several for a pair like `j k`),
 /// and what pressing them does. No commands: a pointer gesture, shown as
@@ -37,8 +36,8 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         return Some((
             Context::ConflictEdit,
             vec![
-                hint(&["conflict.edit.save"], "save"),
-                hint(&["conflict.edit.cancel"], "cancel"),
+                hint(&["conflict.edit.save"], "Save"),
+                hint(&["conflict.edit.cancel"], "Cancel"),
             ],
         ));
     }
@@ -46,27 +45,27 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         let kind = draft.draft.kind;
         let mut hints = vec![hint(
             &["draft.candidate.next", "draft.candidate.previous"],
-            "pick",
+            "Pick",
         )];
         if kind.uses_placement() {
             hints.extend([
-                hint(&["draft.place.onto"], "onto"),
-                hint(&["draft.place.after"], "after"),
-                hint(&["draft.place.before"], "before"),
+                hint(&["draft.place.onto"], "Onto"),
+                hint(&["draft.place.after"], "After"),
+                hint(&["draft.place.before"], "Before"),
             ]);
         }
         let toggle = match kind {
             DraftKind::New => None,
-            DraftKind::Merge => Some("add parent"),
-            DraftKind::Parallelize => Some("add revision"),
-            _ => Some("add source"),
+            DraftKind::Merge => Some("Add parent"),
+            DraftKind::Parallelize => Some("Add revision"),
+            _ => Some("Add source"),
         };
         if let Some(toggle) = toggle {
             hints.push(hint(&["draft.toggle-source"], toggle));
         }
         hints.extend([
-            hint(&["draft.confirm"], "apply"),
-            hint(&["draft.cancel"], "cancel"),
+            hint(&["draft.confirm"], "Apply"),
+            hint(&["draft.cancel"], "Cancel"),
         ]);
         return Some((Context::Draft, hints));
     }
@@ -76,10 +75,10 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             vec![
                 hint(&[], "Click or drag lines"),
                 hint(&[], "\u{21e7}-click a range"),
-                hint(&["lines.next", "lines.previous"], "move"),
-                hint(&["lines.extend-next", "lines.extend-previous"], "extend"),
-                hint(&["lines.toggle-line"], "pick"),
-                hint(&["lines.exit"], "done"),
+                hint(&["lines.next", "lines.previous"], "Move"),
+                hint(&["lines.extend-next", "lines.extend-previous"], "Extend"),
+                hint(&["lines.toggle-line"], "Pick"),
+                hint(&["lines.exit"], "Done"),
             ],
         ));
     }
@@ -89,26 +88,26 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
         let leave = match mode {
             RangeMode::Since => {
                 hints.push(hint(&[], "Click a revision to move the end"));
-                "stop diffing since trunk"
+                "Stop diffing since trunk"
             }
-            RangeMode::Span(_) => "clear the marks",
-            RangeMode::Fixed => "leave the range",
+            RangeMode::Span(_) => "Clear the marks",
+            RangeMode::Fixed => "Leave the range",
         };
-        hints.push(hint(&["range.edit"], "edit revset"));
+        hints.push(hint(&["range.edit"], "Edit revset"));
         hints.push(hint(&["compare.exit"], leave));
         hints.push(hint(&["selection.clear"], leave));
         return Some((Context::Base, hints));
     }
     if crate::compare::comparing(ui) {
         let mut hints = vec![
-            hint(&["compare.swap"], "swap sides"),
-            hint(&["compare.interdiff"], "interdiff"),
-            hint(&["compare.exit"], "stop comparing"),
+            hint(&["compare.swap"], "Swap sides"),
+            hint(&["compare.interdiff"], "Interdiff"),
+            hint(&["compare.exit"], "Stop comparing"),
         ];
         // Esc leaves a comparison once no rows are marked (it clears the
         // marks first).
         if tab.revision_multi_selection.is_empty() {
-            hints.push(hint(&["selection.clear"], "stop comparing"));
+            hints.push(hint(&["selection.clear"], "Stop comparing"));
         }
         return Some((Context::Base, hints));
     }
@@ -119,11 +118,11 @@ fn active_hints(ui: &Diffui) -> Option<(Context, Vec<Hint>)> {
             vec![
                 hint(
                     &["conflict.region.next", "conflict.region.previous"],
-                    "region",
+                    "Region",
                 ),
-                hint(&["conflict.region.take-side-1"], "take side 1"),
-                hint(&["conflict.region.take-side-2"], "take side 2"),
-                hint(&["conflict.region.take-base"], "take base"),
+                hint(&["conflict.region.take-side-1"], "Take side 1"),
+                hint(&["conflict.region.take-side-2"], "Take side 2"),
+                hint(&["conflict.region.take-base"], "Take base"),
             ],
         ));
     }
@@ -145,17 +144,23 @@ fn keys(ui: &Diffui, context: Context, commands: &[CommandId]) -> Vec<String> {
 }
 
 /// The strip for the active mode, or `None` when no mode with keys is on.
-pub(crate) fn strip<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
+pub(crate) fn strip(
+    ui: &Diffui,
+    look: Look,
+    _window: &mut Window,
+    _cx: &mut Cx,
+) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     let (context, hints) = active_hints(ui)?;
-    let font = ui.config.ui_font;
-    let mut line: Vec<Aligned<'a, Message>> = Vec::new();
+    let font = look.font;
+    let mut line: Vec<Aligned> = Vec::new();
     let mut seen_what: Vec<&str> = Vec::new();
     let mut any_key = false;
     for hint in hints {
         let keys = keys(ui, context, hint.commands);
-        // An unbound command has nothing to teach; a second binding of the
-        // same thing (Esc and compare.exit both stopping a comparison)
-        // would only repeat it.
+        // An unbound command has nothing to teach; a second binding of the same
+        // thing (Esc and compare.exit both stopping a comparison) would only
+        // repeat it.
         if (keys.is_empty() && !hint.commands.is_empty()) || seen_what.contains(&hint.what) {
             continue;
         }
@@ -165,21 +170,14 @@ pub(crate) fn strip<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, 
         }
         let gesture = keys.is_empty();
         any_key |= !gesture;
-        for (index, key) in keys.into_iter().enumerate() {
-            if index > 0 {
-                line.push(Aligned::gap(theme::space::XS));
-            }
-            line.push(crate::shortcuts::keycap(ui, theme, key));
+        if !gesture {
+            line.push(crate::ui::chord_aligned(keys, look));
         }
         if !gesture {
             line.push(Aligned::gap(theme::space::SM));
         }
         line.push(Aligned::text(
-            text(hint.what)
-                .size(text_size::CAPTION)
-                .font(font)
-                .color(theme.muted_text)
-                .wrapping(text::Wrapping::None),
+            typography::line(hint.what, font, text_size::CAPTION, theme.muted_text),
             font,
             text_size::CAPTION,
         ));
@@ -189,23 +187,19 @@ pub(crate) fn strip<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, 
         return None;
     }
     Some(
-        container(typography::baseline_row(line, 0.0))
-            .width(Length::Fill)
-            .clip(true)
-            .padding(Padding::from([
-                theme::space::SM,
-                crate::diff_view::HEADER_HORIZONTAL_PADDING,
-            ]))
-            .style(move |_| {
-                container::Style::default()
-                    .background(theme.file_header)
-                    .border(iced::Border {
-                        width: 1.0,
-                        color: theme.border,
-                        radius: 0.0.into(),
-                    })
-            })
-            .into(),
+        div()
+            .w_full()
+            .flex_none()
+            .overflow_hidden()
+            .px(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+            .py(px(theme::space::SM))
+            .bg(theme.file_header)
+            // Docked on the pane's bottom: the status bar's rule is under it
+            // and the pane dividers beside it.
+            .border_t_1()
+            .border_color(theme.border)
+            .child(typography::baseline_row(line, 0.0))
+            .into_any_element(),
     )
 }
 
@@ -216,19 +210,21 @@ mod tests {
 
     #[test]
     fn keys_follow_the_live_keymap() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/hints");
-        assert_eq!(
-            keys(
-                &ui,
-                Context::Draft,
-                &["draft.candidate.next", "draft.candidate.previous"]
-            ),
-            vec!["j".to_owned(), "k".to_owned()]
-        );
-        // Unbound by default: nothing to show.
-        assert!(keys(&ui, Context::Base, &["compare.swap"]).is_empty());
-        assert!(active_hints(&ui).is_none());
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/hints");
+            assert_eq!(
+                keys(
+                    &ui,
+                    Context::Draft,
+                    &["draft.candidate.next", "draft.candidate.previous"]
+                ),
+                vec!["j".to_owned(), "k".to_owned()]
+            );
+            // Unbound by default: nothing to show.
+            assert!(keys(&ui, Context::Base, &["compare.swap"]).is_empty());
+            assert!(active_hints(&ui).is_none());
+        });
     }
 
     #[test]

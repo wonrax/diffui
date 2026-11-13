@@ -7,6 +7,11 @@
 //! like that, ask the user's login shell for its `PATH` (the way a terminal
 //! would have set it up) and fall back to appending the usual install dirs.
 //!
+//! The shell's answer is cached: a launch takes the last one and asks the
+//! shell again in the background for the next, so an interactive login
+//! shell (up to [`SHELL_TIMEOUT`] of rc files) runs ahead of the window only
+//! on the first launch.
+//!
 //! A terminal launch is left alone, minimal `PATH` or not: there the user (or
 //! their shell) chose it.
 
@@ -47,7 +52,15 @@ pub(crate) fn repair_path() -> Option<String> {
             .ok()
             .filter(|shell| !shell.is_empty())
             .unwrap_or_else(|| "/bin/zsh".to_owned());
-        let from_shell = login_shell_path(&shell);
+        let cache = crate::app_files::app_file(crate::app_files::AppDir::State, "login-path");
+        let cached = cache
+            .as_deref()
+            .and_then(|cache| std::fs::read_to_string(cache).ok())
+            .filter(|path| path.contains('/'));
+        let from_shell = match &cached {
+            Some(path) => Ok(path.clone()),
+            None => login_shell_path(&shell),
+        };
         let repaired = merge_paths(from_shell.as_ref().ok().map(String::as_str), &current, {
             let mut dirs = fallback_dirs();
             dirs.retain(|dir| dir.is_dir());
@@ -57,7 +70,28 @@ pub(crate) fn repair_path() -> Option<String> {
         // has spawned a thread, so nothing can be reading the environment
         // concurrently.
         unsafe { std::env::set_var("PATH", &repaired) };
+        // Threads may exist from here on; refresh the cache for next time.
+        if let Some(cache) = cache {
+            let shell = shell.clone();
+            let ask = cached.is_some();
+            let fresh = from_shell.clone().ok();
+            let _ = std::thread::Builder::new()
+                .name("diffui-login-path".to_owned())
+                .spawn(move || {
+                    let path = if ask {
+                        login_shell_path(&shell).ok()
+                    } else {
+                        fresh
+                    };
+                    if let Some(path) = path {
+                        let _ = crate::app_files::write_atomic(&cache, path.as_bytes());
+                    }
+                });
+        }
         Some(match from_shell {
+            Ok(_) if cached.is_some() => {
+                format!("GUI launch: PATH from login shell {shell}, cached: {repaired}")
+            }
             Ok(_) => format!("GUI launch: PATH taken from login shell {shell}: {repaired}"),
             Err(error) => {
                 format!("GUI launch: login shell {shell} gave no PATH ({error}); using {repaired}")

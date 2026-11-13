@@ -5,13 +5,13 @@
 //! The command itself comes from core ([`diffui_core::plan`]); this module
 //! names revisions from the loaded graph and draws the line.
 
+use crate::typography::{self, Aligned};
+use crate::ui::Tip as _;
+use crate::{Action, Cx, icons};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use std::cell::RefCell;
 use std::collections::HashMap;
-
-use iced::{
-    Element, Length,
-    widget::{button, responsive, text},
-};
 
 use diffui_core::cli::highlight::{self, Mark};
 use diffui_core::plan::{self, Phrase};
@@ -19,22 +19,21 @@ use diffui_core::{JjCli, MutationOp, RevisionSelection, Vcs};
 
 use crate::ellipsis;
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, ghost_button_style, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Action, Diffui, Message, icons, ui};
+use crate::theme::text_size;
+use crate::ui::Look;
+use crate::{Diffui, TabState};
 
 /// Size of the line's glyphs.
 const GLYPH: f32 = 12.0;
 
 /// The jj command `op` is equivalent to, as a user would type it, named
-/// from the active tab's graph. `None` outside a jj repository.
-pub(crate) fn op_command(ui: &Diffui, op: &MutationOp, allow_immutable: bool) -> Option<String> {
-    let tab = ui.active();
+/// from `tab`'s graph. `None` outside a jj repository.
+pub(crate) fn op_command(tab: &TabState, op: &MutationOp, allow_immutable: bool) -> Option<String> {
     if tab.repository.as_ref().map(|repository| repository.vcs) != Some(Vcs::Jj) {
         return None;
     }
     let equivalent = op.cli_equivalent(&tab.session.commits);
-    let equivalent = if allow_immutable {
+    let equivalent = if allow_immutable && !op.restores_operation() {
         plan::ignoring_immutable(equivalent)
     } else {
         equivalent
@@ -52,7 +51,7 @@ pub(crate) fn draft_command(
     op: Option<&MutationOp>,
 ) -> Option<String> {
     match op {
-        Some(op) => op_command(ui, op, false),
+        Some(op) => op_command(ui.active(), op, false),
         None => ui
             .active()
             .repository
@@ -138,107 +137,78 @@ fn marked_prose(text: &str, marks: &[highlight::Marked]) -> Prose {
 const CHROME: f32 = GLYPH + 6.0 + 4.0 + GLYPH + 4.0;
 
 /// The command's text, highlighted.
-fn command_text(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-) -> ellipsis::Line<'static> {
-    let mono = ui.config.mono_font;
-    command_prose(command).line(mono, mono, theme.muted_text, theme, size)
+fn command_text(look: Look, command: &str, size: f32) -> ellipsis::Line<'static> {
+    let Look { theme, .. } = look;
+    command_prose(command).line(
+        Look {
+            font: look.mono,
+            ..look
+        },
+        theme.muted_text,
+        size,
+    )
 }
 
 /// Whether the command fits `width` on one line, glyph and copy button
 /// included.
-pub(crate) fn command_fits(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    command: &str,
-    size: f32,
-    width: f32,
-) -> bool {
-    let line = command_text(ui, theme, command, size);
+pub(crate) fn command_fits(look: Look, command: &str, size: f32, width: f32) -> bool {
+    let line = command_text(look, command, size);
     !line.is_multiline() && line.fits(width - CHROME)
 }
 
-/// The command on one line: a terminal glyph, the command in mono (cut
-/// short with an ellipsis when it doesn't fit) and a copy button, which
-/// copies the whole command.
-pub(crate) fn command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
+/// The command on one line: a terminal glyph, the command in mono (cut short
+/// with an ellipsis when it doesn't fit) and a copy button, which copies the
+/// whole command.
+pub(crate) fn command_line(
+    look: Look,
     command: &str,
     size: f32,
-) -> Element<'a, Message> {
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let line = command_text(ui, theme, command, size);
-    let command = command.to_owned();
-    responsive(move |bounds| {
-        laid_out(
-            line.cut(bounds.width - CHROME),
-            &command,
-            mono,
-            size,
-            ui_font,
-            theme,
-        )
-    })
-    .height(Length::Shrink)
-    .into()
+    _window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    // Width-free: the line gives up what its row can't hold, so it fits anywhere it
+    // is placed and the copy button stays right behind the text.
+    let text = command_text(look, command, size).view();
+    laid_out(text, command, size, look, cx)
 }
 
-/// The whole command, wrapped to the width it gets, its later lines under
-/// the command's first rather than under the glyph, the copy button after
-/// it.
-pub(crate) fn wrapped_command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
+/// The whole command, wrapped to the width it gets, its later lines under the
+/// command's first rather than under the glyph, the copy button after it.
+pub(crate) fn wrapped_command_line(
+    look: Look,
     command: &str,
     size: f32,
-) -> Element<'a, Message> {
-    let (ui_font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let line = command_text(ui, theme, command, size);
-    let command = command.to_owned();
-    responsive(move |bounds| {
-        let room = (bounds.width - CHROME).max(0.0);
-        let width = if !line.is_multiline() && line.fits(room) {
-            Length::Shrink
-        } else {
-            // Wrapped: as wide as its widest line, at most the room, so the
-            // copy button stays by the text.
-            Length::Fixed((line.natural_width() + 1.0).ceil().min(room))
-        };
-        laid_out(
-            line.wrapped().width(width),
-            &command,
-            mono,
-            size,
-            ui_font,
-            theme,
-        )
-    })
-    .height(Length::Shrink)
-    .into()
+    _window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let text = command_text(look, command, size).wrapped();
+    laid_out(text, command, size, look, cx)
 }
 
-fn laid_out<'a>(
-    text: text::Rich<'a, (), Message>,
-    command: &str,
-    mono: iced::Font,
-    size: f32,
-    ui_font: iced::Font,
-    theme: ThemeSpec,
-) -> Element<'a, Message> {
-    let copy = ui::tooltip(
-        button(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
-            .padding(2)
-            .on_press(Message::Action(Action::Copy(command.to_owned())))
-            .style(move |_, status| ghost_button_style(theme, status)),
-        "Copy command",
-        iced::widget::tooltip::Position::Top,
-        ui_font,
-        theme,
-    );
+fn laid_out(text: gpui_kit::Div, command: &str, size: f32, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    // Commands repeat across a list: the text says which one this is.
+    let id = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        command.hash(&mut hasher);
+        hasher.finish() as usize
+    };
+    let copy = div()
+        .id(("copy-command-tip", id))
+        .tip("Copy command", look)
+        // Above a row that opens on press, a press here is the button's alone.
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation()
+        })
+        .child(
+            look.bare_button(("copy-command", id))
+                .size(px(GLYPH + 4.0))
+                .p(px(0.0))
+                .child(icons::icon(icons::COPY, GLYPH, theme.subtle_text))
+                .on_click(Diffui::on_action(Action::Copy(command.to_owned()), cx)),
+        );
     typography::baseline_row(
         [
             Aligned::glyph(
@@ -246,21 +216,23 @@ fn laid_out<'a>(
                 GLYPH,
             ),
             Aligned::gap(6.0),
-            Aligned::text(text, mono, size),
+            Aligned::text(text, mono, size).shrink(),
             Aligned::gap(4.0),
             Aligned::glyph(copy, GLYPH + 4.0),
         ],
         0.0,
     )
+    .into_any_element()
 }
 
 /// [`command_line`] at caption size, the size the logs use.
-pub(crate) fn caption_command_line<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
+pub(crate) fn caption_command_line(
+    look: Look,
     command: &str,
-) -> Element<'a, Message> {
-    command_line(ui, theme, command, text_size::CAPTION)
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    command_line(look, command, text_size::CAPTION, window, cx)
 }
 
 #[cfg(test)]

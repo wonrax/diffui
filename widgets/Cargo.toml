@@ -5,8 +5,15 @@ edition = "2024"
 
 [dependencies]
 diffui-core = { path = "../core" }
-iced = { workspace = true }
+gpui-kit = { workspace = true }
+# Already in the tree through GPUI: the diff's no-shaping wrap breaks lines where the
+# engine would.
+icu_segmenter = "2.3"
 raw-window-handle = "0.6"
+tracing = "0.1"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
 
 # Build-time only: fetch + checksum the Lucide icon font (see build.rs). `ureq`
 # rides on rustls so the download needs no system TLS libs on any platform.
@@ -18,3 +25,6 @@ ureq = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true, features = ["NSString", "NSGeometry"] }
+# Already in the tree through gpui-kit; named so a measurement can shape text off
+# the main thread, which building a whole platform refuses to do (tests run there).
+gpui-apple = { package = "gpui-pre-apple", version = "=0.3.11" }

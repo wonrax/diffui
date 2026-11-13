@@ -7,20 +7,19 @@
 //! [`Diffui::start_mutation_op`], so activity rows, queueing and the
 //! confirmation stack work the way they do for every other mutation.
 
-use iced::{
-    Element, Length, Padding, Task,
-    widget::{Space, column, text_input},
-};
-
+use crate::{Action, Cx, input, ui};
 use diffui_core::{PushAllow, PushRejection, PushRequest, PushTarget, RevisionSelection};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::commands::CommandArg;
 use crate::menu::MenuEntry;
 use crate::modes::{Mode, ModeKind};
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, input_style, text_size};
-use crate::{Action, ConfirmDialog, Diffui, Message, PendingMutation, activity, ui};
+use crate::theme::{self};
+use crate::ui::Look;
+use crate::{ConfirmDialog, Diffui, PendingMutation, TabState, activity};
 
 pub(crate) const NAME_PROMPT_INPUT_ID: &str = "bookmark-name-input";
 
@@ -84,29 +83,29 @@ enum PromptVerdict {
 }
 
 impl Diffui {
-    pub(crate) fn update_bookmark(&mut self, action: BookmarkAction) -> Task<Message> {
+    pub(crate) fn update_bookmark(&mut self, action: BookmarkAction, cx: &mut Cx) {
         match action {
-            BookmarkAction::Create { at } => self.open_name_prompt(PromptKind::Create { at }, ""),
+            BookmarkAction::Create { at } => {
+                self.open_name_prompt(PromptKind::Create { at }, "", cx)
+            }
             BookmarkAction::Rename { name } => {
                 let value = name.clone();
-                self.open_name_prompt(PromptKind::Rename { old: name }, &value)
+                self.open_name_prompt(PromptKind::Rename { old: name }, &value, cx)
             }
             BookmarkAction::PromptInput(value) => {
                 if let Some(prompt) = self.name_prompt_mut() {
                     prompt.value = value;
                 }
-                Task::none()
             }
             BookmarkAction::PromptCancel => {
                 self.pop_mode(ModeKind::NamePrompt);
-                Task::none()
             }
             BookmarkAction::PromptSubmit => {
                 let Some(prompt) = self.name_prompt() else {
-                    return Task::none();
+                    return;
                 };
                 let op = match (self.prompt_verdict(prompt), &prompt.kind) {
-                    (PromptVerdict::Invalid(_), _) => return Task::none(),
+                    (PromptVerdict::Invalid(_), _) => return,
                     (PromptVerdict::Create(name), PromptKind::Create { at }) => {
                         MutationOp::CreateBookmark {
                             name,
@@ -123,7 +122,7 @@ impl Diffui {
                     (PromptVerdict::Rename { old, new }, _) => {
                         MutationOp::RenameBookmark { old, new }
                     }
-                    _ => return Task::none(),
+                    _ => return,
                 };
                 self.pop_mode(ModeKind::NamePrompt);
                 self.start_mutation_op(op)
@@ -172,7 +171,7 @@ impl Diffui {
         }
     }
 
-    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>) -> Task<Message> {
+    fn start_push(&mut self, remote: String, targets: Vec<PushTarget>) {
         // A plain push sends whatever tracked bookmarks moved, which nobody
         // picked one by one: confirm the plan first.
         let confirm = targets.contains(&PushTarget::Tracked);
@@ -186,7 +185,7 @@ impl Diffui {
 
     /// `jj git push` without `--remote` falls back to `origin`; with several
     /// remotes, none called that, and no `git.push`, there's nothing to guess.
-    fn no_push_remote(&mut self) -> Task<Message> {
+    fn no_push_remote(&mut self) {
         let remotes = &self.active().session.bookmarks.remotes;
         let body = if remotes.is_empty() {
             "This repository has no git remotes.".to_owned()
@@ -199,19 +198,17 @@ impl Diffui {
             )
         };
         self.push_error_toast("Push needs a remote", &body);
-        Task::none()
     }
 
-    fn open_name_prompt(&mut self, kind: PromptKind, value: &str) -> Task<Message> {
+    fn open_name_prompt(&mut self, kind: PromptKind, value: &str, cx: &mut Cx) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         self.push_mode(Mode::NamePrompt(NamePrompt {
             kind,
             value: value.to_owned(),
         }));
-        iced::widget::operation::focus(NAME_PROMPT_INPUT_ID)
-            .chain(iced::widget::operation::select_all(NAME_PROMPT_INPUT_ID))
+        crate::input::focus_and_select_all(NAME_PROMPT_INPUT_ID, cx);
     }
 
     pub(crate) fn name_prompt(&self) -> Option<&NamePrompt> {
@@ -267,27 +264,25 @@ impl Diffui {
     /// `jj git push`'s commit checks refused `pending`. Where the CLI has an
     /// escape hatch for every reason, offer the push again with exactly those
     /// allowances; otherwise it's an error with the list.
-    pub(crate) fn push_rejected(
-        &mut self,
-        pending: PendingMutation,
-        rejection: PushRejection,
-    ) -> Task<Message> {
+    pub(crate) fn push_rejected(&mut self, pending: PendingMutation, rejection: PushRejection) {
         if rejection.is_confirmation() {
-            if let Some(log) = self.activity_log_for(pending.tab_id) {
-                log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-            }
             let mut request = rejection.request;
             request.confirm = false;
-            self.push_mode(Mode::Confirm(ConfirmDialog {
-                title: Prose::from("Push to ").remote(&request.remote).text("?"),
-                body: rejection.plan.join("\n").into(),
+            self.ask(ConfirmDialog {
+                title: push_title(&rejection.moves, &request.remote),
+                body: push_explanation(&rejection.moves, &request.remote),
                 confirm_label: "Push".to_owned(),
+                look: crate::ConfirmLook {
+                    routine: true,
+                    moves: rejection.moves,
+                    callouts: Vec::new(),
+                },
                 pending: PendingMutation {
                     op: MutationOp::Push(request),
                     ..pending
                 },
-            }));
-            return Task::none();
+            });
+            return;
         }
         let lines = rejection.lines();
         let Some(allow) = rejection.allowances() else {
@@ -299,7 +294,6 @@ impl Diffui {
         };
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             log.extend_output(pending.activity_id, lines);
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
         }
         let count = rejection.commits.len();
         let commits = if count == 1 && !rejection.truncated {
@@ -334,34 +328,37 @@ impl Diffui {
                 .code(revset)
                 .text(" (git.private-commits).");
         }
-        body = body.text(format!(
-            "\n\nChanges to push:\n{}",
-            rejection.plan.join("\n")
-        ));
+        let mut callouts = Vec::new();
         if rejection.commits.iter().any(|commit| commit.working_copy) {
-            body = body
-                .text("\n\nOne of them is ")
-                .rev("@")
-                .text(", still being edited.");
+            callouts.push((
+                Prose::from("One of them is ")
+                    .rev("@")
+                    .text(", still being edited."),
+                Some(working_copy_push_warning()),
+            ));
         }
         let mut request = rejection.request;
         request.allow = allow;
         request.confirm = false;
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: Prose::from("Push to ")
                 .remote(&request.remote)
                 .text(" anyway?"),
             body,
             confirm_label: "Push anyway".to_owned(),
+            look: crate::ConfirmLook {
+                routine: false,
+                moves: rejection.moves,
+                callouts,
+            },
             pending: PendingMutation {
                 op: MutationOp::Push(request),
                 ..pending
             },
-        }));
-        Task::none()
+        });
     }
 
-    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String) -> Task<Message> {
+    fn finish_mutation_error(&mut self, pending: PendingMutation, error: String) {
         let mut failure = None;
         if let Some(log) = self.activity_log_for(pending.tab_id) {
             let title = log
@@ -379,7 +376,6 @@ impl Diffui {
         if let Some(title) = failure {
             self.push_error_toast(title, &error);
         }
-        Task::none()
     }
 
     /// Run `pending`, unless it publishes the working-copy commit: then ask
@@ -387,61 +383,29 @@ impl Diffui {
     /// push is snapshotted into it and the bookmark moves off what the remote
     /// has. The CLI doesn't refuse it outright, so this is a warning, not a
     /// guard (an undescribed `@` is refused by the push checks regardless).
-    pub(crate) fn run_mutation_checking_wc_push(
-        &mut self,
-        pending: PendingMutation,
-    ) -> Task<Message> {
-        if !self.publishes_working_copy(&pending.op) {
+    pub(crate) fn run_mutation_checking_wc_push(&mut self, pending: PendingMutation) {
+        let publishes = self
+            .tab(pending.tab_id)
+            .is_some_and(|tab| tab.publishes_working_copy(&pending.op));
+        if !publishes {
             return self.run_mutation(pending);
         }
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: Prose::from("Push the working-copy commit?"),
-            body: working_copy_push_warning(),
+            body: Prose::from("This puts ")
+                .rev("@")
+                .text(" on the remote as it stands now."),
             confirm_label: "Push anyway".to_owned(),
+            look: crate::ConfirmLook {
+                routine: true,
+                moves: Vec::new(),
+                callouts: vec![(
+                    Prose::from("The working copy is part of this push."),
+                    Some(working_copy_push_warning()),
+                )],
+            },
             pending,
-        }));
-        Task::none()
-    }
-
-    /// Whether `op` would put the working-copy commit on a remote.
-    pub(crate) fn publishes_working_copy(&self, op: &MutationOp) -> bool {
-        let session = &self.active().session;
-        let Some(wc) = session
-            .bookmarks
-            .working_copy_commit
-            .as_deref()
-            .or_else(|| session.commits.working_copy().map(|row| row.commit_id()))
-        else {
-            return false;
-        };
-        let is_wc = |selection: &RevisionSelection| match selection {
-            RevisionSelection::WorkingCopy => true,
-            RevisionSelection::Commit(hex) => hex == wc,
-        };
-        let bookmark_at_wc = |name: &str| {
-            session
-                .bookmarks
-                .entry(name)
-                .is_some_and(|entry| entry.local_targets.iter().any(|t| t == wc))
-        };
-        match op {
-            MutationOp::MoveBookmark {
-                to,
-                push_remote: Some(_),
-                ..
-            } => is_wc(to),
-            MutationOp::PushBookmark { name, .. } => bookmark_at_wc(name),
-            MutationOp::Push(request) => request.targets.iter().any(|target| match target {
-                PushTarget::Bookmark(name) => bookmark_at_wc(name),
-                PushTarget::SetBookmark { to, .. } => is_wc(to),
-                PushTarget::Change(revision) => is_wc(revision),
-                PushTarget::DeleteBookmark(_) | PushTarget::Tracked => false,
-            }),
-            _ => false,
-        }
+        });
     }
 
     // ── Revision context menu ───────────────────────────────────────────
@@ -582,6 +546,46 @@ impl Diffui {
     }
 }
 
+impl TabState {
+    /// Whether `op` would put the working-copy commit on a remote.
+    pub(crate) fn publishes_working_copy(&self, op: &MutationOp) -> bool {
+        let session = &self.session;
+        let Some(wc) = session
+            .bookmarks
+            .working_copy_commit
+            .as_deref()
+            .or_else(|| session.commits.working_copy().map(|row| row.commit_id()))
+        else {
+            return false;
+        };
+        let is_wc = |selection: &RevisionSelection| match selection {
+            RevisionSelection::WorkingCopy => true,
+            RevisionSelection::Commit(hex) => hex == wc,
+        };
+        let bookmark_at_wc = |name: &str| {
+            session
+                .bookmarks
+                .entry(name)
+                .is_some_and(|entry| entry.local_targets.iter().any(|t| t == wc))
+        };
+        match op {
+            MutationOp::MoveBookmark {
+                to,
+                push_remote: Some(_),
+                ..
+            } => is_wc(to),
+            MutationOp::PushBookmark { name, .. } => bookmark_at_wc(name),
+            MutationOp::Push(request) => request.targets.iter().any(|target| match target {
+                PushTarget::Bookmark(name) => bookmark_at_wc(name),
+                PushTarget::SetBookmark { to, .. } => is_wc(to),
+                PushTarget::Change(revision) => is_wc(revision),
+                PushTarget::DeleteBookmark(_) | PushTarget::Tracked => false,
+            }),
+            _ => false,
+        }
+    }
+}
+
 /// Why pushing `@` is usually a mistake.
 pub(crate) fn working_copy_push_warning() -> Prose {
     Prose::new()
@@ -589,6 +593,71 @@ pub(crate) fn working_copy_push_warning() -> Prose {
         .text(" is still being edited, so later saves drift from what the remote has. Usually you push ")
         .rev("@-")
         .text(" instead.")
+}
+
+/// What a push sends, by kind: "bookmark", "tag", or "bookmarks and tags"
+/// when both go; plural when `plural`.
+pub(crate) fn ref_noun(tags: usize, total: usize, plural: bool) -> &'static str {
+    match (tags, plural) {
+        (0, false) => "bookmark",
+        (0, true) => "bookmarks",
+        (t, false) if t == total => "tag",
+        (t, true) if t == total => "tags",
+        _ => "bookmarks and tags",
+    }
+}
+
+/// "1 tag", "2 bookmarks", "3 bookmarks and tags".
+pub(crate) fn ref_count(tags: usize, total: usize) -> String {
+    format!("{total} {}", ref_noun(tags, total, total != 1))
+}
+
+/// [`ref_noun`] for a push's moves.
+fn moves_noun<'a>(moves: impl IntoIterator<Item = &'a diffui_core::BookmarkMove>) -> &'static str {
+    let (tags, total) = moves.into_iter().fold((0, 0), |(tags, total), m| {
+        (tags + usize::from(m.tag), total + 1)
+    });
+    ref_noun(tags, total, total > 1)
+}
+
+/// A push confirmation's title: how many bookmarks and tags go to which
+/// remote.
+pub(crate) fn push_title(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
+    let count = ref_count(moves.iter().filter(|m| m.tag).count(), moves.len());
+    Prose::from(format!("Push {count} to "))
+        .remote(remote)
+        .text("?")
+}
+
+/// One plain line on what a push does to the remote: whether anything there
+/// is lost.
+pub(crate) fn push_explanation(moves: &[diffui_core::BookmarkMove], remote: &str) -> Prose {
+    use diffui_core::MoveKind;
+    let noun = moves_noun(moves);
+    let rewinds = moves
+        .iter()
+        .filter(|m| matches!(m.kind, MoveKind::Backward | MoveKind::Sideways));
+    if rewinds.clone().next().is_some() {
+        return Prose::from("Not a fast-forward: revisions only ")
+            .remote(remote)
+            .text(format!(
+                " has are dropped from its {}.",
+                moves_noun(rewinds)
+            ));
+    }
+    if moves.iter().any(|m| m.kind == MoveKind::Delete) {
+        return Prose::from("Deletes the bookmark on ")
+            .remote(remote)
+            .text(". The revisions stay here.");
+    }
+    let verb = if moves.len() > 1 { "are" } else { "is" };
+    if moves.iter().all(|m| m.kind == MoveKind::Add) {
+        return Prose::from(format!("The {noun} {verb} new on "))
+            .remote(remote)
+            .text(", and tracked from here on.");
+    }
+    Prose::from(format!("This moves the remote {noun} forward. "))
+        .text("Nobody else's work is overwritten.")
 }
 
 /// Activity label for a push.
@@ -604,7 +673,7 @@ pub(crate) fn push_label(request: &PushRequest) -> Prose {
             }
             PushTarget::DeleteBookmark(name) => label.text("deletion of ").bookmark(name),
             PushTarget::Change(_) => label.text("new bookmark"),
-            PushTarget::Tracked => label.text("tracked bookmarks"),
+            PushTarget::Tracked => label.text("tracked bookmarks and tags"),
         };
     }
     label.text(" to ").remote(&request.remote)
@@ -624,23 +693,27 @@ pub(crate) fn local_bookmark_label(label: &str) -> Option<&str> {
     )
 }
 
-// ── Name prompt view ────────────────────────────────────────────────────
-
 /// The bookmark-name prompt: a modal card with the field, a line under it
 /// only when there is something to say (what Enter will do instead, or why
 /// it can't), and the buttons. Empty when closed.
-pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+pub(crate) fn build_name_prompt(
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
     let Some(prompt) = ui.name_prompt() else {
-        return Space::new().into();
+        return div().into_any_element();
     };
-    let (font, mono) = (ui.config.ui_font, ui.config.mono_font);
-    let cancel = Message::Action(Action::Bookmark(BookmarkAction::PromptCancel));
-    let submit = Message::Action(Action::Bookmark(BookmarkAction::PromptSubmit));
+    let mono = look.mono;
+    let cancel = Action::Bookmark(BookmarkAction::PromptCancel);
+    let submit = Action::Bookmark(BookmarkAction::PromptSubmit);
 
     let verdict = ui.prompt_verdict(prompt);
     let (title, verb) = match &prompt.kind {
         PromptKind::Create { at } => (
-            Prose::from("New bookmark at ").then(ui.revision_prose(at)),
+            Prose::from("New bookmark at ").then(ui.active().revision_prose(at)),
             "Create",
         ),
         PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
@@ -673,59 +746,60 @@ pub(crate) fn build_name_prompt(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Me
         }
     };
 
-    let input = text_input("bookmark name", &prompt.value)
-        .id(NAME_PROMPT_INPUT_ID)
-        .padding(crate::typography::trimmed_padding(
-            Padding::from([theme::space::SM, theme::space::MD]),
-            mono,
-            text_size::BODY,
-        ))
-        .size(text_size::BODY)
-        .font(mono)
-        .on_input(|value| Message::Action(Action::Bookmark(BookmarkAction::PromptInput(value))))
-        .on_submit(submit.clone())
-        .style(move |_, _| input_style(theme));
-    let mut field =
-        column![crate::input::single_line(input, &prompt.value, mono)].spacing(theme::space::SM);
+    let on_input = Diffui::listen(cx, |this, value: &String, _, cx| {
+        this.perform(
+            Action::Bookmark(BookmarkAction::PromptInput(value.clone())),
+            cx,
+        );
+    });
+    let on_submit = Diffui::on_action(submit.clone(), cx);
+    let spec = input::FieldSpec::new(NAME_PROMPT_INPUT_ID, &prompt.value)
+        .placeholder("bookmark name")
+        .on_input(move |value, window, cx| on_input(&value, window, cx))
+        .on_submit(move |window, cx| on_submit(&(), window, cx));
+    let mut card = crate::overlay_kit::Dialog::new(&title, look).child(crate::field::dialog_input(
+        spec,
+        Look { font: mono, ..look },
+        window,
+        cx,
+    ));
     if !note.is_empty() {
         let color = if error {
             theme.removed_text
         } else {
             theme.muted_text
         };
-        field = field.push(
-            note.view(font, mono, color, theme)
-                .size(text_size::UI)
-                .width(Length::Fill),
+        card = card.child(
+            div()
+                .w_full()
+                .text_size(px(theme::text_size::BODY))
+                .child(note.view(look, color)),
         );
     }
 
-    let mut accept = ui::text_button(
-        None,
-        verb,
-        ui::Variant::Primary,
-        ui::Size::Standard,
-        font,
-        theme,
-    );
-    if !matches!(verdict, PromptVerdict::Invalid(_)) {
-        accept = accept.on_press(submit);
+    let enabled = !matches!(verdict, PromptVerdict::Invalid(_));
+    let mut accept = look
+        .button("name-prompt-accept", verb)
+        .primary()
+        .disabled(!enabled);
+    if enabled {
+        accept = accept.on_click(Diffui::on_action(submit, cx));
     }
-    let cancel_button = ui::cancel_button(ui::Size::Standard, font, theme).on_press(cancel.clone());
+    let cancel_button = look
+        .cancel_button("name-prompt-cancel")
+        .on_click(Diffui::on_action(cancel, cx));
 
-    let body = column![
-        ui::dialog_title(&title, font, mono, theme),
-        field,
-        ui::button_row(None, [cancel_button.into(), accept.into()]),
-    ]
-    .spacing(ui::DIALOG_SPACING);
-
-    ui::modal(
-        ui::dialog_card(body, ui::DIALOG_WIDTH, theme),
-        crate::toolbar::modal_top(),
-        cancel,
-        Message::Ui(crate::UiEvent::ConfirmNoOp),
-    )
+    let card = card
+        .hint(&[crate::keymap::key_label("enter")], verb)
+        .bound_hint(
+            ui,
+            crate::commands::Context::Prompt,
+            &["bookmark.prompt-cancel"],
+            "Cancel",
+        )
+        .buttons([cancel_button.into_any_element(), accept.into_any_element()])
+        .build();
+    ui::input_modal("name-prompt-modal", card, crate::toolbar::modal_top()).into_any_element()
 }
 
 #[cfg(test)]
@@ -738,7 +812,7 @@ mod tests {
     const WC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const MAIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    fn ui_with_bookmarks() -> (Diffui, TabId) {
+    fn ui_with_bookmarks(_cx: &mut crate::Cx) -> (Diffui, TabId) {
         let mut ui = app();
         let tab = push_tab(&mut ui, "/tmp/repo");
         let session = &mut ui.tab_mut(tab).unwrap().session;
@@ -767,6 +841,7 @@ mod tests {
             git_push: None,
             tags: Default::default(),
             trunk: None,
+            tracked_push: Vec::new(),
         };
         (ui, tab)
     }
@@ -802,157 +877,201 @@ mod tests {
                 allow: PushAllow::default(),
                 confirm: false,
             },
-            plan: vec!["bookmark: main [add to aaaaaaaaaaaa]".to_owned()],
+            moves: vec![diffui_core::BookmarkMove {
+                bookmark: "main".to_owned(),
+                tag: false,
+                from: None,
+                to: Some("aaaaaaaaaaaa".to_owned()),
+                kind: diffui_core::MoveKind::Add,
+                revisions: vec!["zzzzzzzz".to_owned()],
+                revision_count: 1,
+            }],
         }
     }
 
     #[test]
     fn an_overridable_rejection_offers_the_push_with_those_allowances() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let held = pending(
-            &mut ui,
-            tab,
-            MutationOp::PushBookmark {
-                name: "main".to_owned(),
-                remote: "origin".to_owned(),
-            },
-        );
-        let _ = ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]));
-        let dialog = ui.confirm().expect("a confirmation is raised");
-        let body = dialog.body.to_string();
-        assert!(body.contains("has no description"), "{body}");
-        match &dialog.pending.op {
-            MutationOp::Push(request) => {
-                assert!(request.allow.empty_description);
-                assert!(!request.allow.private && !request.allow.conflicts);
-                assert_eq!(
-                    request.targets,
-                    vec![PushTarget::SetBookmark {
-                        name: "main".to_owned(),
-                        to: RevisionSelection::WorkingCopy,
-                    }],
-                    "the rerun carries the move the refusal rolled back"
-                );
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let held = pending(
+                &mut ui,
+                tab,
+                MutationOp::PushBookmark {
+                    name: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                },
+            );
+            ui.push_rejected(held, rejection(vec![PushCheck::EmptyDescription]));
+            let dialog = ui.confirm().expect("a confirmation is raised");
+            let body = dialog.body.to_string();
+            assert!(body.contains("has no description"), "{body}");
+            match &dialog.pending.op {
+                MutationOp::Push(request) => {
+                    assert!(request.allow.empty_description);
+                    assert!(!request.allow.private && !request.allow.conflicts);
+                    assert_eq!(
+                        request.targets,
+                        vec![PushTarget::SetBookmark {
+                            name: "main".to_owned(),
+                            to: RevisionSelection::WorkingCopy,
+                        }],
+                        "the rerun carries the move the refusal rolled back"
+                    );
+                }
+                other => panic!("expected a push rerun, got {other:?}"),
             }
-            other => panic!("expected a push rerun, got {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn a_rejection_without_an_escape_hatch_is_just_an_error() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let held = pending(
-            &mut ui,
-            tab,
-            MutationOp::PushBookmark {
-                name: "main".to_owned(),
-                remote: "origin".to_owned(),
-            },
-        );
-        let _ = ui.push_rejected(
-            held,
-            rejection(vec![
-                PushCheck::EmptyDescription,
-                PushCheck::MissingIdentity,
-            ]),
-        );
-        assert!(ui.confirm().is_none(), "no override for a missing author");
-        assert!(!ui.active().activities.any_running());
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let held = pending(
+                &mut ui,
+                tab,
+                MutationOp::PushBookmark {
+                    name: "main".to_owned(),
+                    remote: "origin".to_owned(),
+                },
+            );
+            ui.push_rejected(
+                held,
+                rejection(vec![
+                    PushCheck::EmptyDescription,
+                    PushCheck::MissingIdentity,
+                ]),
+            );
+            assert!(ui.confirm().is_none(), "no override for a missing author");
+            assert!(!ui.active().activities.any_running());
+        });
     }
 
     #[test]
     fn pushing_the_working_copy_asks_first() {
-        let (mut ui, tab) = ui_with_bookmarks();
-        let wc_push = MutationOp::Push(PushRequest {
-            remote: "origin".to_owned(),
-            targets: vec![PushTarget::Bookmark("wip".to_owned())],
-            allow: PushAllow::default(),
-            confirm: false,
-        });
-        assert!(ui.publishes_working_copy(&wc_push));
-        assert!(!ui.publishes_working_copy(&MutationOp::PushBookmark {
-            name: "main".to_owned(),
-            remote: "origin".to_owned(),
-        }));
-        assert!(ui.publishes_working_copy(&MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::Commit(WC.to_owned()),
-            push_remote: Some("origin".to_owned()),
-        }));
-        assert!(!ui.publishes_working_copy(&MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::WorkingCopy,
-            push_remote: None,
-        }));
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, tab) = ui_with_bookmarks(cx);
+            let wc_push = MutationOp::Push(PushRequest {
+                remote: "origin".to_owned(),
+                targets: vec![PushTarget::Bookmark("wip".to_owned())],
+                allow: PushAllow::default(),
+                confirm: false,
+            });
+            assert!(ui.active().publishes_working_copy(&wc_push));
+            assert!(
+                !ui.active()
+                    .publishes_working_copy(&MutationOp::PushBookmark {
+                        name: "main".to_owned(),
+                        remote: "origin".to_owned(),
+                    })
+            );
+            assert!(
+                ui.active()
+                    .publishes_working_copy(&MutationOp::MoveBookmark {
+                        name: "main".to_owned(),
+                        to: RevisionSelection::Commit(WC.to_owned()),
+                        push_remote: Some("origin".to_owned()),
+                    })
+            );
+            assert!(
+                !ui.active()
+                    .publishes_working_copy(&MutationOp::MoveBookmark {
+                        name: "main".to_owned(),
+                        to: RevisionSelection::WorkingCopy,
+                        push_remote: None,
+                    })
+            );
 
-        let held = pending(&mut ui, tab, wc_push);
-        let _ = ui.run_mutation_checking_wc_push(held);
-        assert!(ui.confirm().is_some());
-        assert!(ui.tab_mut(tab).unwrap().jobs.mutation.is_none());
+            let held = pending(&mut ui, tab, wc_push);
+            ui.run_mutation_checking_wc_push(held);
+            assert!(ui.confirm().is_some());
+            assert!(ui.tab_mut(tab).unwrap().jobs.mutation().is_none());
+        });
     }
 
     #[test]
     fn the_prompt_moves_an_existing_name_and_refuses_bad_ones() {
-        let (mut ui, _tab) = ui_with_bookmarks();
-        let _ = ui.update_bookmark(BookmarkAction::Create {
-            at: RevisionSelection::WorkingCopy,
-        });
-        let verdict = |ui: &mut Diffui, value: &str| {
-            let _ = ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()));
-            ui.prompt_verdict(ui.name_prompt().unwrap())
-        };
-        assert!(
-            matches!(verdict(&mut ui, "feature"), PromptVerdict::Create(name) if name == "feature")
-        );
-        assert!(matches!(verdict(&mut ui, "main"), PromptVerdict::Move(name) if name == "main"));
-        assert!(matches!(verdict(&mut ui, "a b"), PromptVerdict::Invalid(_)));
-        assert!(matches!(verdict(&mut ui, ""), PromptVerdict::Invalid(_)));
+        crate::tabs::tests::with_cx(|cx| {
+            let (mut ui, _tab) = ui_with_bookmarks(cx);
+            ui.update_bookmark(
+                BookmarkAction::Create {
+                    at: RevisionSelection::WorkingCopy,
+                },
+                cx,
+            );
+            let verdict = |ui: &mut Diffui, value: &str, cx: &mut crate::Cx| {
+                ui.update_bookmark(BookmarkAction::PromptInput(value.to_owned()), cx);
+                ui.prompt_verdict(ui.name_prompt().unwrap())
+            };
+            assert!(
+                matches!(verdict(&mut ui, "feature", cx), PromptVerdict::Create(name) if name == "feature")
+            );
+            assert!(
+                matches!(verdict(&mut ui, "main", cx), PromptVerdict::Move(name) if name == "main")
+            );
+            assert!(matches!(
+                verdict(&mut ui, "a b", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "", cx),
+                PromptVerdict::Invalid(_)
+            ));
 
-        let _ = ui.update_bookmark(BookmarkAction::PromptCancel);
-        let _ = ui.update_bookmark(BookmarkAction::Rename {
-            name: "wip".to_owned(),
+            ui.update_bookmark(BookmarkAction::PromptCancel, cx);
+            ui.update_bookmark(
+                BookmarkAction::Rename {
+                    name: "wip".to_owned(),
+                },
+                cx,
+            );
+            assert!(matches!(
+                verdict(&mut ui, "main", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "wip", cx),
+                PromptVerdict::Invalid(_)
+            ));
+            assert!(matches!(
+                verdict(&mut ui, "done", cx),
+                PromptVerdict::Rename { old, new } if old == "wip" && new == "done"
+            ));
         });
-        assert!(matches!(
-            verdict(&mut ui, "main"),
-            PromptVerdict::Invalid(_)
-        ));
-        assert!(matches!(verdict(&mut ui, "wip"), PromptVerdict::Invalid(_)));
-        assert!(matches!(
-            verdict(&mut ui, "done"),
-            PromptVerdict::Rename { old, new } if old == "wip" && new == "done"
-        ));
     }
 
     #[test]
     fn several_remotes_without_a_default_get_a_chooser() {
-        let (ui, _tab) = ui_with_bookmarks();
-        assert_eq!(ui.active().session.bookmarks.default_push_remote(), None);
-        let rows = ui.revision_bookmark_rows(&RevisionSelection::WorkingCopy);
-        assert!(
+        crate::tabs::tests::with_cx(|cx| {
+            let (ui, _tab) = ui_with_bookmarks(cx);
+            assert_eq!(ui.active().session.bookmarks.default_push_remote(), None);
+            let rows = ui.revision_bookmark_rows(&RevisionSelection::WorkingCopy);
+            assert!(
             rows.iter().any(|row| matches!(
                 row,
                 MenuEntry::Submenu { label, items } if label == "Push as new bookmark" && items.len() == 2
             )),
             "{rows:?}"
         );
-        // A bookmark no remote tracks can still be pushed: one row per remote.
-        let wip = ui.active().session.bookmarks.entry("wip").unwrap().clone();
-        let labels: Vec<String> = ui
-            .local_bookmark_rows(&wip)
-            .into_iter()
-            .filter_map(|row| match row {
-                MenuEntry::Item { label, .. } => Some(label),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            labels.contains(&"Push to fork (new)".to_owned()),
-            "{labels:?}"
-        );
-        assert!(
-            labels.contains(&"Push to upstream (new)".to_owned()),
-            "{labels:?}"
-        );
+            // A bookmark no remote tracks can still be pushed: one row per remote.
+            let wip = ui.active().session.bookmarks.entry("wip").unwrap().clone();
+            let labels: Vec<String> = ui
+                .local_bookmark_rows(&wip)
+                .into_iter()
+                .filter_map(|row| match row {
+                    MenuEntry::Item { label, .. } => Some(label),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                labels.contains(&"Push to fork (new)".to_owned()),
+                "{labels:?}"
+            );
+            assert!(
+                labels.contains(&"Push to upstream (new)".to_owned()),
+                "{labels:?}"
+            );
+        });
     }
 
     #[test]

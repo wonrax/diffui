@@ -1,16 +1,21 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use jj_cli::ui::Ui;
 use jj_lib::{
     backend::{CommitId, TreeId},
     git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
     graph::TopoGroupedGraph,
+    id_prefix::IdPrefixIndex,
     merge::Merge,
     object_id::ObjectId,
     op_store::LocalRemoteRefTarget,
-    ref_name::WorkspaceName,
+    ref_name::{RemoteName, WorkspaceName},
     repo::{ReadonlyRepo, Repo},
     revset::{
         RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
@@ -25,8 +30,8 @@ use jj_lib::{
 use super::settings::*;
 use crate::graph::LaneAssigner;
 use crate::model::{
-    BookmarkEntry, BookmarksInfo, BranchStatus, CommitSummary, LoadProgress, RemoteBookmarkRef,
-    StreamRow,
+    BookmarkEntry, BookmarksInfo, BranchStatus, CommitSummary, LoadProgress, PushCandidate,
+    RemoteBookmarkRef, StreamRow,
 };
 use crate::repo::CancelFlag;
 
@@ -312,6 +317,15 @@ pub async fn walk_jj_with_repo(
     };
     let on_trunk_fn = on_trunk_revset.as_ref().map(|rs| rs.containing_fn());
 
+    // Change-id prefixes as short as `jj log` shows them: unique within
+    // `revsets.short-prefixes` first. Best-effort: an index that won't load
+    // falls back to whole-repo uniqueness.
+    let id_prefixes = super::revset::id_prefix_context(repo_root, repo.settings(), workspace_name);
+    let id_prefix_index = id_prefixes.populate(repo).unwrap_or_else(|error| {
+        tracing::warn!("revsets.short-prefixes unavailable: {error}");
+        IdPrefixIndex::empty()
+    });
+
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
     let mut ids: Vec<CommitId> = Vec::new();
@@ -350,8 +364,8 @@ pub async fn walk_jj_with_repo(
             });
 
             let description = commit.description().lines().next().unwrap_or("").trim();
-            let shortest_change_id_len = repo
-                .shortest_unique_change_id_prefix_len(commit.change_id())
+            let shortest_change_id_len = id_prefix_index
+                .shortest_change_prefix_len(repo, commit.change_id())
                 .await
                 .with_context(|| {
                     format!(
@@ -402,6 +416,7 @@ pub async fn walk_jj_with_repo(
                     description.to_owned()
                 },
                 author: commit.author().name.clone(),
+                author_timestamp: Some(commit.author().timestamp.timestamp.0),
                 has_description: !description.is_empty(),
                 is_empty: None,
                 has_conflict: commit.has_conflict(),
@@ -463,6 +478,9 @@ pub async fn walk_jj_with_repo(
     // delete/push) — a single bookmarks() walk on the same repo.
     let mut bookmarks = compute_bookmarks_info(repo, wc_commit_id);
     bookmarks.trunk = trunk_id.map(|id| id.hex());
+    if let Some(remote) = bookmarks.default_push_remote().map(str::to_owned) {
+        bookmarks.tracked_push = compute_tracked_push(repo, wc_commit_id, &remote).await;
+    }
     Ok(Some((empty_updates, branch_status, bookmarks)))
 }
 
@@ -663,7 +681,105 @@ pub(super) fn compute_bookmarks_info(
         git_push,
         tags,
         trunk: None,
+        tracked_push: Vec::new(),
     }
+}
+
+/// The bookmarks and tags a plain `jj git push --remote <remote>` would send,
+/// picked as the push's tracked mode picks them (`jj::push`): tracked refs
+/// whose local target sits in `remote_bookmarks(remote=<remote>)..@`. Each
+/// carries how many commits it is ahead of the remote's copy. Conflicted
+/// refs, and bookmarks the remote no longer has, are left out, as the push
+/// skips them. A tracked tag the remote doesn't have yet goes, as it does in
+/// the push, counted from the remote's bookmarks.
+/// Best-effort, like the branch summary: a failure leaves the list empty.
+pub(super) async fn compute_tracked_push(
+    repo: &ReadonlyRepo,
+    wc_commit_id: &CommitId,
+    remote: &str,
+) -> Vec<PushCandidate> {
+    match tracked_push_inner(repo, wc_commit_id, RemoteName::new(remote)).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!("failed to work out what a push would send: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+async fn tracked_push_inner(
+    repo: &ReadonlyRepo,
+    wc_commit_id: &CommitId,
+    remote: &RemoteName,
+) -> Result<Vec<PushCandidate>> {
+    let view = repo.view();
+    let remote_heads: Vec<CommitId> = view
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let in_range: HashSet<CommitId> = RevsetExpression::commits(remote_heads.clone())
+        .range(&RevsetExpression::commit(wc_commit_id.clone()))
+        .evaluate(repo)
+        .context("failed to evaluate the default push range")?
+        .stream()
+        .map(|entry| entry.context("failed to walk the default push range"))
+        .try_collect()
+        .await?;
+    let mut candidates = Vec::new();
+    for (name, targets) in view.local_remote_bookmarks(remote) {
+        if !targets.remote_ref.is_tracked() {
+            continue;
+        }
+        let (Some(local), Some(theirs)) = (
+            targets.local_target.as_normal(),
+            targets.remote_ref.target.as_normal(),
+        ) else {
+            continue;
+        };
+        if !in_range.contains(local) {
+            continue;
+        }
+        candidates.push(PushCandidate {
+            name: name.as_str().to_owned(),
+            tag: false,
+            ahead: count_ahead(repo, vec![theirs.clone()], local).await?,
+        });
+    }
+    for (name, targets) in view.local_remote_tags(remote) {
+        if !targets.remote_ref.is_tracked() {
+            continue;
+        }
+        let Some(local) = targets.local_target.as_normal() else {
+            continue;
+        };
+        if !in_range.contains(local) {
+            continue;
+        }
+        let base = match targets.remote_ref.target.as_normal() {
+            Some(theirs) if theirs == local => continue,
+            Some(theirs) => vec![theirs.clone()],
+            None if targets.remote_ref.target.is_absent() => remote_heads.clone(),
+            None => continue,
+        };
+        candidates.push(PushCandidate {
+            name: name.as_str().to_owned(),
+            tag: true,
+            ahead: count_ahead(repo, base, local).await?,
+        });
+    }
+    Ok(candidates)
+}
+
+/// How many commits `base..local` holds: what a push of `local` adds.
+async fn count_ahead(repo: &ReadonlyRepo, base: Vec<CommitId>, local: &CommitId) -> Result<usize> {
+    Ok(RevsetExpression::commits(base)
+        .range(&RevsetExpression::commit(local.clone()))
+        .evaluate(repo)
+        .context("failed to count a ref's unpushed commits")?
+        .stream()
+        .count()
+        .await)
 }
 
 /// Compute the working-copy's branch summary: the nearest local bookmark at or

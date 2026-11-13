@@ -1,22 +1,20 @@
-use iced::{
-    Background, Border, Color, Element, Length, alignment,
-    widget::{Space, column, container, row, stack, text, tooltip},
-};
-
 use crate::chip::{self, Chip};
 use crate::config::AppConfig;
-use crate::graph_layout::GraphLayout;
-use crate::graph_view::{self, RevisionGraphStyle};
-use crate::icons;
+use crate::field;
+use crate::graph_view::RevisionGraphStyle;
 use crate::measure;
 use crate::repository::Vcs;
-use crate::revision_list::{
-    self, FileRowView, RevisionList, RevisionListStyle, RevisionRowView, RowSelectionKey,
+use crate::revision_list::{self, DropSpot, RevisionListStyle};
+use crate::theme::{
+    self, Color, Padding, ThemeSpec, Weight, chip_background, emphasis_font, text_size,
 };
-use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, sidebar_panel_style};
 use crate::typography::{self, Aligned};
-use crate::{Action, Diffui, HoverTarget, LoadStatus, Message, ToolbarMenu, UiEvent};
-use diffui_core::{DiffFile, FileTreeRow, RevisionSelection, RowView, file_tree_rows};
+use crate::ui::Look;
+use crate::{Action, Cx, Diffui, HoverTarget, LoadStatus, ToolbarMenu, icons, ui};
+use diffui_core::{DiffFile, FileTreeRow, RowView, file_tree_rows};
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -28,33 +26,27 @@ use std::rc::Rc;
 pub const DEFAULT_WIDTH: f32 = 340.0;
 pub const RESIZE_HIT_PADDING: f32 = 2.0;
 
-/// Minimum sidebar width for the current font config. Picked so the top
-/// row of a revision can always fit its load-bearing columns at this font:
-/// change-id (12 chars) + commit-id (12 chars) + an abbreviated author +
-/// the `+N` bookmark-overflow chip + the loudest status chip
-/// (`divergent`, 9 chars). Below this width the chip rail starts dropping
-/// rails, so the user loses the conflict/divergence signal.
+/// Minimum sidebar width for the current font config. Picked so a revision's
+/// id line can always fit its load-bearing columns at this font beside a
+/// one-lane gutter: the change id (8 chars), commit id (8 chars), an
+/// abbreviated author, the `+N` bookmark-overflow chip and the loudest
+/// status chip (`divergent`); on the working copy's row, the "Working copy"
+/// label, the change id and that status chip. Below this width the chip rail
+/// starts dropping rails, so the user loses the conflict/divergence signal.
 pub fn min_width(config: AppConfig) -> f32 {
     let id_width =
         |content: &str| measure::line_width(content, CAPTION_TEXT_SIZE, config.mono_font);
 
     let change_id_w = id_width(&"a".repeat(REVISION_ID_CHARS));
     let commit_id_w = id_width(&"a".repeat(COMMIT_ID_CHARS));
-    let at_w = id_width("@");
     let author_w = measure::line_width("Author Name", CAPTION_TEXT_SIZE, config.ui_font);
     let plus_n_w = chip::width("+9", None, config.ui_font);
     let conflict_w = chip::width("divergent", None, config.mono_font);
+    let label_w = revision_list::working_copy_label_width(config.ui_font);
 
-    let at_gap = 4.0;
     let id_gap = 8.0;
     let chip_gap = 6.0;
-    // Gutter for a typical 1-lane row: `lane_strip_width(1) = LANE_WIDTH`.
-    let gutter =
-        revision_list::GUTTER_LEFT_PADDING + graph_view::LANE_WIDTH + revision_list::GUTTER_PADDING;
-
-    let row_content = at_w
-        + at_gap
-        + change_id_w
+    let row = change_id_w
         + id_gap
         + commit_id_w
         + id_gap
@@ -63,112 +55,19 @@ pub fn min_width(config: AppConfig) -> f32 {
         + plus_n_w
         + chip_gap
         + conflict_w;
-    gutter + row_content + REVISION_CONTENT_RIGHT_PAD
+    let working_copy_row = label_w + id_gap + change_id_w + chip_gap + conflict_w;
+    revision_list::revision_gutter_width(1) + row.max(working_copy_row) + theme::list::PAD_END
 }
-
-/// Mirrors `revision_list::CONTENT_PADDING` — the right-edge padding
-/// inside a revision row. Kept here so `min_width` can budget the row
-/// without exposing the constant through `revision_list`.
-const REVISION_CONTENT_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
 
 const CAPTION_TEXT_SIZE: f32 = theme::text_size::CAPTION;
 pub(crate) const REVISION_ID_CHARS: usize = 8;
 pub(crate) const COMMIT_ID_CHARS: usize = 8;
 
-pub fn build_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    // The "Changes" header is gone; the list starts flush at the top of the
-    // pane. Each row carries its own internal vertical padding, so the first
-    // row's content isn't cramped against the top edge — adding a panel-colored
-    // gap above it instead just reads as a stray strip above the selected row.
-    let revision_list = build_revision_list(ui, theme);
-
-    let mut body = column![].spacing(0);
-    // The revset / revision-range filter sits at the very top of the pane.
-    body = body.push(
-        container(
-            row![
-                build_revset_filter(ui, theme),
-                crate::field::panel_toggle_button(
-                    ui.config.ui_font,
-                    theme,
-                    icons::MINUS,
-                    "Hide revision history",
-                    Action::ToggleHistoryPanel,
-                ),
-            ]
-            .spacing(crate::field::PANEL_TOGGLE_INSET)
-            .align_y(alignment::Vertical::Center),
-        )
-        .width(Length::Fill)
-        .padding(crate::field::PANEL_HEADER_PADDING),
-    );
-    if let Some(error) = crate::revset_assist::error_strip(ui, theme) {
-        body = body.push(error);
-    }
-    if let Some(banner) = crate::history_panel::file_filter_banner(ui, theme) {
-        body = body.push(banner);
-    }
-    // Load failures no longer have a header to live under — surface them as a
-    // soft alert card above the list rather than bare red text.
-    // A revset error is told once: by the field, under it, when its own
-    // check has it; the card only for what that check couldn't foresee.
-    if let LoadStatus::Failed(error) = &ui.active().session.status
-        && !(crate::empty_states::is_revset_error(error)
-            && crate::revset_assist::explains_revset_error(ui))
-    {
-        body = body.push(crate::empty_states::load_error(ui, theme, error));
-    }
-    let list = crate::empty_states::revision_list_placeholder(ui, theme).unwrap_or(revision_list);
-    // The revset field's completions hang over the top of the list.
-    body = body.push(match crate::revset_assist::dropdown(ui, theme) {
-        Some(dropdown) => Element::from(
-            stack![list, dropdown]
-                .width(Length::Fill)
-                .height(Length::Fill),
-        ),
-        None => list,
-    });
-    // Target mode: the op bar floats between the list and the footer while a
-    // rebase/squash draft is picking its destination.
-    if ui.active().op_draft().is_some() {
-        body = body.push(build_op_bar(ui, theme));
-    }
-    body = body.push(build_footer(ui, theme));
-
-    let draft_active = ui.active().op_draft().is_some();
-    container(body)
-        .width(Length::Fixed(ui.sidebar_width))
-        .height(Length::Fill)
-        .style(move |_| {
-            if draft_active {
-                container::Style::default().background(draft_panel_background(theme))
-            } else {
-                sidebar_panel_style(theme)
-            }
-        })
-        .into()
-}
-
-pub fn build_collapsed_sidebar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    container(crate::field::panel_toggle_button(
-        ui.config.ui_font,
-        theme,
-        icons::GIT_BRANCH,
-        "Show revision history",
-        Action::ToggleHistoryPanel,
-    ))
-    .width(Length::Fixed(crate::theme::COLLAPSED_PANEL_WIDTH))
-    .height(Length::Fill)
-    .padding(crate::field::COLLAPSED_RAIL_PADDING)
-    .style(move |_| sidebar_panel_style(theme))
-    .into()
-}
-
 /// The sidebar's whole-pane wash while target mode is on: a light accent
 /// tint over the panel, so "a draft is in progress" reads from anywhere in
 /// the pane — not just the op bar. Also fed to the revision list's own
 /// background fill (the widget paints over the container).
-fn draft_panel_background(theme: ThemeSpec) -> Color {
+pub(crate) fn draft_panel_background(theme: ThemeSpec) -> Color {
     theme::mix(theme.panel_background, theme.accent, 0.05)
 }
 
@@ -180,12 +79,500 @@ fn commit_list_summary(commits: &[String]) -> String {
     }
 }
 
+/// The op bar's verdict for a simulation that only forecasts conflicts:
+/// "No new conflicts" or which revisions would conflict, over `counts`.
+fn conflict_verdict(
+    new_conflicts: &[String],
+    counts: Option<String>,
+    theme: ThemeSpec,
+) -> (Option<&'static str>, String, Color, Option<String>) {
+    if new_conflicts.is_empty() {
+        (
+            Some(icons::CHECK),
+            "No new conflicts".to_owned(),
+            theme.added_text,
+            counts,
+        )
+    } else {
+        (
+            Some(icons::ALERT_TRIANGLE),
+            format!("Conflicts in {}", commit_list_summary(new_conflicts)),
+            theme.conflict_marker,
+            counts,
+        )
+    }
+}
+
+/// Focus target id for the revset input.
+pub const REVSET_INPUT_ID: &str = "revset-input";
+
+/// The graph's lane colours for `theme`.
+pub(crate) fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
+    RevisionGraphStyle {
+        lanes: theme.lanes,
+        missing_color: theme.subtle_text,
+        neutral: theme.subtle_text,
+        surface: theme.panel_background,
+        accent: theme.accent,
+        accent_foreground: theme.panel_background,
+        conflict: theme.conflict_marker,
+    }
+}
+
+/// The bookmark and tag chips the graph draws on row `index`, for views
+/// that show a revision's refs the way the graph does.
+pub(crate) fn graph_ref_chips(
+    session: &diffui_core::Session,
+    index: usize,
+    look: Look,
+) -> Vec<Chip> {
+    let Look { theme, .. } = look;
+    let commit = session.commits.row(index);
+    let lane = session.graph.frame(index, usize::MAX).node_lane;
+    let mut chips = bookmark_chips_for(
+        commit.bookmarks(),
+        revision_graph_style(theme).lane_color(lane),
+        look,
+    );
+    if let Some(tags) = session.bookmarks.tags.get(commit.commit_id()) {
+        chips.extend(tag_chips_for(tags, look));
+    }
+    chips
+}
+
+/// Bookmark chips for a revision row. Shared with the source browser's
+/// revision-header row and the commit header, so every rail styles them alike.
+///
+/// One neutral chip for every ref, so the rail stays quiet next to the status
+/// chips; the bookmark glyph wears `lane_color`, tying the name to its branch
+/// in the graph. Core authors the label shapes and jj forbids `@` inside
+/// bookmark and remote names, so a trailing `@` can only be another
+/// workspace's working copy (`name@`, a folder glyph) and an interior `@` a
+/// remote bookmark (`main@origin`): outlined, with the remote in subtle text.
+/// A local bookmark that differs from its remote keeps its `*` in the modified
+/// colour, and a conflicted one its `??` in the conflict colour.
+pub(crate) fn bookmark_chips_for(bookmarks: &[String], lane_color: Color, look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            let is_workspace = bookmark.ends_with('@');
+            let remote_at = (!is_workspace).then(|| bookmark.find('@')).flatten();
+            let (label, suffix) = if let Some(at) = remote_at {
+                (
+                    bookmark[..at].to_owned(),
+                    Some((bookmark[at..].to_owned(), theme.subtle_text)),
+                )
+            } else if let Some(name) = bookmark.strip_suffix("??") {
+                (
+                    name.to_owned(),
+                    Some(("??".to_owned(), theme.conflict_marker)),
+                )
+            } else if let Some(name) = bookmark.strip_suffix('*') {
+                (
+                    name.to_owned(),
+                    Some(("*".to_owned(), theme.modified_token)),
+                )
+            } else {
+                (bookmark.clone(), None)
+            };
+            Chip {
+                label,
+                font: look.font,
+                background: if remote_at.is_some() {
+                    crate::theme::TRANSPARENT
+                } else {
+                    neutral_chip_background(theme)
+                },
+                text_color: theme.muted_text,
+                border_color: remote_at.is_some().then_some(theme.border),
+                border_dashed: false,
+                icon: Some(if is_workspace {
+                    icons::FOLDER
+                } else {
+                    icons::BOOKMARK
+                }),
+                icon_color: Some(lane_color),
+                suffix,
+            }
+        })
+        .collect()
+}
+
+/// The fill every neutral chip shares: bookmarks, tags and the `+N` overflow.
+pub(crate) fn neutral_chip_background(theme: ThemeSpec) -> Color {
+    chip_background(theme.muted_text)
+}
+
+/// Read-only tag chips for a revision row: neutral rather than lane-colored,
+/// and wearing the tag glyph, so they never read as bookmarks. A remote tag
+/// that differs from the local one (`v1@origin`) is outlined, like a remote
+/// bookmark.
+pub(crate) fn tag_chips_for(tags: &[String], look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
+    tags.iter()
+        .map(|tag| Chip {
+            label: tag.clone(),
+            font: look.font,
+            background: neutral_chip_background(theme),
+            text_color: theme.muted_text,
+            border_color: tag.contains('@').then_some(theme.border),
+            border_dashed: false,
+            icon: Some(icons::TAG),
+            icon_color: None,
+            suffix: None,
+        })
+        .collect()
+}
+
+/// Status chips (`empty`, `conflict`, `hidden`/`divergent`) for a commit row.
+/// Shared with the source browser's revision-header row.
+pub(crate) fn status_chips_for(commit: RowView, look: Look) -> Vec<Chip> {
+    let Look { theme, .. } = look;
+    let mut status_chips = Vec::new();
+    if commit.is_empty() == Some(true) {
+        status_chips.push(Chip {
+            label: "empty".to_owned(),
+            font: look.mono,
+            background: crate::theme::TRANSPARENT,
+            text_color: theme.subtle_text,
+            border_color: Some(theme.subtle_text),
+            border_dashed: true,
+            icon: None,
+            icon_color: None,
+            suffix: None,
+        });
+    }
+    if commit.has_conflict() {
+        status_chips.push(Chip {
+            label: "conflict".to_owned(),
+            font: look.mono,
+            background: chip_background(theme.conflict_marker),
+            text_color: theme.conflict_marker,
+            border_color: None,
+            border_dashed: false,
+            icon: None,
+            icon_color: None,
+            suffix: None,
+        });
+    }
+    if commit.is_hidden() {
+        // jj log's "(hidden)": rewritten/abandoned, still shown because a ref
+        // (e.g. a stale remote bookmark) pins it into the revset. Takes
+        // precedence over the divergent chip, matching jj's log template.
+        status_chips.push(Chip {
+            label: "hidden".to_owned(),
+            font: look.mono,
+            background: crate::theme::TRANSPARENT,
+            text_color: theme.subtle_text,
+            border_color: Some(theme.subtle_text),
+            border_dashed: false,
+            icon: None,
+            icon_color: None,
+            suffix: None,
+        });
+    } else if commit.is_divergent() {
+        // jj log flags these with a change-offset suffix: the change id maps
+        // to several visible commits. Amber (not conflict-red) — it's a
+        // warning about identity, not about tree state.
+        status_chips.push(Chip {
+            label: "divergent".to_owned(),
+            font: look.mono,
+            background: chip_background(theme.modified_token),
+            text_color: theme.modified_token,
+            border_color: None,
+            border_dashed: false,
+            icon: None,
+            icon_color: None,
+            suffix: None,
+        });
+    }
+    status_chips
+}
+
+/// View-time memo for the changed-files tree. The tree is rebuilt only when the
+/// document or directory-collapse set changes, rather than on every diff scroll.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SidebarFileCache {
+    tree: Option<(TreeKey, Rc<Vec<FileTreeRow>>)>,
+}
+
+/// The tree folds in the collapse set (it prunes collapsed dirs) but, unlike the
+/// widths, is independent of font and theme — so it gets its own key.
+#[derive(Debug, Clone, PartialEq)]
+struct TreeKey {
+    document_id: u64,
+    file_count: usize,
+    collapsed: HashSet<String>,
+}
+
+impl SidebarFileCache {
+    pub(crate) fn tree_rows(
+        &mut self,
+        document_id: u64,
+        file_count: usize,
+        collapsed: &HashSet<String>,
+        files: &[DiffFile],
+    ) -> Rc<Vec<FileTreeRow>> {
+        if let Some((key, rows)) = &self.tree
+            && key.document_id == document_id
+            && key.file_count == file_count
+            && &key.collapsed == collapsed
+        {
+            return Rc::clone(rows);
+        }
+        let rows = Rc::new(file_tree_rows(files, collapsed));
+        self.tree = Some((
+            TreeKey {
+                document_id,
+                file_count,
+                collapsed: collapsed.clone(),
+            },
+            Rc::clone(&rows),
+        ));
+        rows
+    }
+}
+
+pub(crate) fn revision_list_style(look: Look) -> RevisionListStyle {
+    let Look { theme, .. } = look;
+    RevisionListStyle {
+        graph: revision_graph_style(theme),
+        background: theme.panel_background,
+        selected_background: theme.selected_file,
+        accent: theme.accent,
+        control: theme.info,
+        border: theme.border,
+        muted_text: theme.muted_text,
+        subtle_text: theme.subtle_text,
+        accent_text: theme.accent,
+        change_id: theme.change_id,
+        accent_foreground: theme.panel_background,
+        primary_font: look.font,
+        mono_font: look.mono,
+        floating: theme,
+    }
+}
+
+pub(crate) fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
+    REVISION_ID_CHARS
+        .max(unique_len)
+        .min(revision_id.chars().count())
+}
+
+pub(crate) fn truncate_end(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+pub(crate) fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
+    if commit.has_description() {
+        return theme.text;
+    }
+
+    match commit.is_empty() {
+        Some(true) => theme.added_text,
+        Some(false) => theme.note_text,
+        None => theme.note_text,
+    }
+}
+
+pub(crate) fn build_sidebar(
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    // The "Changes" header is gone; the list starts flush at the top of the
+    // pane. Each row carries its own internal vertical padding, so the first
+    // row's content isn't cramped against the top edge — adding a panel-colored
+    // gap above it instead just reads as a stray strip above the selected row.
+    let revision_list = crate::revision_rows::build_revision_list(ui, look, window, cx);
+
+    let draft_active = ui.active().op_draft().is_some();
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(if draft_active {
+            draft_panel_background(theme)
+        } else {
+            theme.panel_background
+        })
+        // The revset / revision-range filter sits at the very top of the pane.
+        .child(
+            ui::panel_header()
+                .pl(px(field::list_field_insets().0))
+                .pr(px(field::list_field_insets().1))
+                .gap(px(field::PANEL_TOGGLE_INSET))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(field::FIELD_HEIGHT))
+                        .child(build_revset_filter(ui, look, window, cx)),
+                ),
+        )
+        .children(crate::revset_assist::error_strip(ui, look, window, cx))
+        .children(crate::history_panel::file_filter_banner(
+            ui, look, window, cx,
+        ));
+    // Load failures no longer have a header to live under — surface them as a
+    // soft alert card above the list rather than bare red text.
+    // A revset error is told once: by the field, under it, when its own
+    // check has it; the card only for what that check couldn't foresee.
+    if let LoadStatus::Failed(error) = &ui.active().session.status
+        && !(crate::empty_states::is_revset_error(error)
+            && crate::revset_assist::explains_revset_error(ui))
+    {
+        body = body.child(crate::empty_states::load_error(ui, look, error, cx));
+    }
+    let list =
+        crate::empty_states::revision_list_placeholder(ui, look, cx).unwrap_or(revision_list);
+    // The revset field's completions hang over the top of the list, which
+    // recedes under a veil of the pane's colour while they're open. The veil
+    // takes no presses: the list stays live.
+    let dropdown = crate::revset_assist::dropdown(ui, look, window, cx);
+    let veil = dropdown.is_some().then(|| {
+        div().absolute().inset_0().bg(Color {
+            a: DROPDOWN_VEIL,
+            ..theme.panel_background
+        })
+    });
+    body = body.child(
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(list)
+            .children(veil)
+            .children(
+                dropdown
+                    .map(|dropdown| div().absolute().top_0().left_0().right_0().child(dropdown)),
+            ),
+    );
+    // Target mode: the op bar floats under the list while a rebase/squash
+    // draft is picking its destination.
+    if draft_active {
+        body = body.child(build_op_bar(ui, look, window, cx));
+    }
+    body.into_any_element()
+}
+
+/// How much of the list the veil under the revset completions hides.
+const DROPDOWN_VEIL: f32 = 0.65;
+
+/// How a target row of the op bar reads.
+#[derive(Clone, Copy, PartialEq)]
+enum RowTone {
+    /// What would actually happen.
+    Armed,
+    /// A chosen placement still waiting on a target.
+    Chosen,
+    Idle,
+}
+
+/// One way the operation can land: its label, keycap and what it means for the
+/// armed target.
+///
+/// Armed is a light accent tint with accent ink, not a solid fill — a
+/// full-width solid bar next to the washed sidebar was glaring. It still
+/// outranks Chosen (accent ink, no row fill) by owning the only tinted row
+/// surface.
+#[allow(clippy::too_many_arguments)]
+fn op_target_row(
+    id: &'static str,
+    label: &'static str,
+    key: Option<String>,
+    tone: RowTone,
+    description: Option<String>,
+    on_press: Option<Action>,
+    look: Look,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let (ui_font, mono_font) = (look.font, look.mono);
+    let (label_color, key_color, key_bg, desc_color) = match tone {
+        RowTone::Armed => (
+            theme.accent,
+            theme.accent,
+            chip_background(theme.accent),
+            theme.accent,
+        ),
+        RowTone::Chosen => (
+            theme.accent,
+            theme.accent,
+            chip_background(theme.accent),
+            theme.muted_text,
+        ),
+        RowTone::Idle => (
+            theme.muted_text,
+            theme.subtle_text,
+            chip_background(theme.subtle_text),
+            theme.subtle_text,
+        ),
+    };
+    // The label, the keycap and the description share a baseline (see
+    // `crate::typography`).
+    let label_font = emphasis_font(ui_font, Weight::SEMIBOLD);
+    let mut content = vec![
+        Aligned::text(
+            typography::line(label, label_font, text_size::BODY, label_color),
+            label_font,
+            text_size::BODY,
+        )
+        .map(|label| div().w(px(52.0)).child(label).into_any_element()),
+    ];
+    if let Some(key) = key {
+        content.push(
+            crate::ui::tag(key, key_color, crate::ui::TagSize::Regular, ui_font)
+                .mono(mono_font)
+                .fill(key_bg)
+                .aligned(),
+        );
+    }
+    if let Some(description) = description {
+        // A long description ellipsises rather than running off the strip.
+        content.push(
+            Aligned::text(
+                typography::line(description, ui_font, text_size::BODY, desc_color).text_ellipsis(),
+                ui_font,
+                text_size::BODY,
+            )
+            .shrink(),
+        );
+    }
+    let shell = ui::ListRow::fit(theme::list::PAD_X, theme::radius::CONTROL);
+    let mut row = if tone == RowTone::Armed {
+        theme::squircle(
+            div().w_full().flex().items_center().px(px(shell.pad_x)),
+            shell.radius,
+            Some(chip_background(theme.accent)),
+            None,
+        )
+    } else {
+        ui::list_row(shell, false, theme)
+    }
+    .id(id)
+    .when(on_press.is_none(), |row| row.cursor_default())
+    .overflow_hidden()
+    .py(px(6.0))
+    .test_support()
+    .child(typography::baseline_row(content, 8.0).flex_1().min_w_0());
+    if let Some(action) = on_press {
+        row = row.on_click(Diffui::on_action(action, cx));
+    }
+    row.into_any_element()
+}
+
 /// The target-mode strip: what's being moved, the placement toggle
 /// (rebase only), the live preview line, and the key hints.
-fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+fn build_op_bar(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     use diffui_core::{DraftKind, PlacementKind};
     let Some(draft_ui) = ui.active().op_draft() else {
-        return Space::new().into();
+        return div().into_any_element();
     };
     let draft = &draft_ui.draft;
     // Row-index helpers against the loaded graph.
@@ -207,11 +594,11 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     // The armed target: the row under a live drag, else the candidate
     // (hover / click / j-k all arm it). A gap spot has no single row.
     let hover_row = match draft_ui.hover_spot {
-        Some(revision_list::DropSpot::OnRow(index)) => Some(index),
+        Some(DropSpot::OnRow(index)) => Some(index),
         _ => None,
     };
     let gap_sides = match draft_ui.hover_spot {
-        Some(revision_list::DropSpot::Gap { above, below }) => Some((below, above)),
+        Some(DropSpot::Gap { above, below }) => Some((below, above)),
         _ => None,
     };
     let armed = hover_row.or(draft.candidate).filter(|&index| index < len);
@@ -286,189 +673,66 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     .then_some(("Can't target the revision being moved", theme.removed_text));
     // The verb, the mono names and the suffix share a baseline; the glyph
     // and the close button centre on the caps (see `crate::typography`).
-    let verb_font = emphasis_font(ui.config.ui_font, iced::font::Weight::Semibold);
-    let names_font = emphasis_font(ui.config.mono_font, iced::font::Weight::Medium);
+    let (ui_font, mono_font) = (look.font, look.mono);
+    let verb_font = emphasis_font(ui_font, Weight::SEMIBOLD);
+    let names_font = emphasis_font(mono_font, Weight::MEDIUM);
     let mut operation = vec![
         Aligned::glyph(icons::icon(glyph, 15.0, theme.accent), 15.0),
         Aligned::gap(7.0),
         Aligned::text(
-            text(verb)
-                .size(theme::text_size::BODY)
-                .font(verb_font)
-                .color(theme.text),
+            typography::line(verb, verb_font, text_size::BODY, theme.text),
             verb_font,
-            theme::text_size::BODY,
+            text_size::BODY,
         ),
         Aligned::gap(7.0),
         Aligned::text(
-            text(names.clone())
-                .size(theme::text_size::BODY)
-                .font(names_font)
-                .color(theme.text),
+            typography::line(names.clone(), names_font, text_size::BODY, theme.text),
             names_font,
-            theme::text_size::BODY,
+            text_size::BODY,
         ),
     ];
     if let Some(suffix) = descendants_suffix {
         operation.push(Aligned::gap(7.0));
         operation.push(Aligned::text(
-            text(suffix)
-                .size(theme::text_size::BODY)
-                .font(ui.config.ui_font)
-                .color(theme.muted_text),
-            ui.config.ui_font,
-            theme::text_size::BODY,
+            typography::line(suffix, ui_font, text_size::BODY, theme.muted_text),
+            ui_font,
+            text_size::BODY,
         ));
     }
-    let operation = row![
-        typography::baseline_row(operation, 0.0),
-        Space::new().width(Length::Fill),
-        crate::ui::icon_button(
-            icons::CLOSE,
-            theme.muted_text,
-            crate::ui::Size::Compact,
-            theme,
+    let operation = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(typography::baseline_row(operation, 0.0)),
         )
-        .on_press(Message::Action(Action::DraftCancel)),
-    ]
-    .align_y(alignment::Vertical::Center);
-    let mut headline = column![operation].spacing(2).width(Length::Fill);
-    if let Some((hint, color)) = state_hint {
-        headline = headline.push(
-            container(
-                text(hint)
-                    .size(theme::text_size::BODY)
-                    .font(ui.config.ui_font)
-                    .color(color),
-            )
-            .padding(iced::Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 22.0,
-            }),
+        .child(
+            look.icon_button("op-bar-cancel", icons::CLOSE, theme.muted_text)
+                .on_click(Diffui::on_action(Action::DraftCancel, cx)),
         );
-    }
+    let headline = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(2.0))
+        .child(operation)
+        .children(state_hint.map(|(hint, color)| {
+            div()
+                .pl(px(22.0))
+                .child(typography::line(hint, ui_font, text_size::BODY, color))
+        }));
 
     // ---- Target rows: every way the op can land, each resolving what it
     // means for the armed target ("After → between llpz and kymz"). The row
     // that would actually happen wears the solid accent fill; a chosen
     // placement still waiting on a target wears a quiet tint. Keycaps ride
     // inside the rows, so the hints line below stays short.
-    #[derive(Clone, Copy, PartialEq)]
-    enum RowTone {
-        Armed,
-        Chosen,
-        Idle,
-    }
-    let ui_font = ui.config.ui_font;
-    let mono_font = ui.config.mono_font;
-    let target_row = |label: &'static str,
-                      key: Option<String>,
-                      tone: RowTone,
-                      description: Option<String>,
-                      on_press: Option<Message>|
-     -> Element<'_, Message> {
-        // Armed is a light accent tint with accent ink, not a solid fill —
-        // a full-width solid bar next to the washed sidebar was glaring.
-        // It still outranks Chosen (accent ink, no row fill) by owning the
-        // only tinted row surface.
-        let (label_color, key_color, key_bg, desc_color) = match tone {
-            RowTone::Armed => (
-                theme.accent,
-                theme.accent,
-                chip_background(theme.accent),
-                theme.accent,
-            ),
-            RowTone::Chosen => (
-                theme.accent,
-                theme.accent,
-                chip_background(theme.accent),
-                theme.muted_text,
-            ),
-            RowTone::Idle => (
-                theme.muted_text,
-                theme.subtle_text,
-                chip_background(theme.subtle_text),
-                theme.subtle_text,
-            ),
-        };
-        // The label, the keycap and the description share a baseline (see
-        // `crate::typography`).
-        let label_font = emphasis_font(ui_font, iced::font::Weight::Semibold);
-        let mut content = vec![
-            Aligned::text(
-                text(label)
-                    .size(theme::text_size::UI)
-                    .font(label_font)
-                    .color(label_color),
-                label_font,
-                theme::text_size::UI,
-            )
-            .map(|label| container(label).width(Length::Fixed(52.0)).into()),
-        ];
-        if let Some(key) = key {
-            content.push(Aligned::chip(
-                text(key)
-                    .size(theme::text_size::CAPTION)
-                    .font(mono_font)
-                    .color(key_color),
-                mono_font,
-                theme::text_size::CAPTION,
-                iced::Padding::from([0, 5]),
-                move |_| container::Style {
-                    background: Some(Background::Color(key_bg)),
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: 4.0.into(),
-                    },
-                    ..container::Style::default()
-                },
-            ));
-        }
-        if let Some(description) = description {
-            content.push(Aligned::text(
-                text(description)
-                    .size(theme::text_size::UI)
-                    .font(ui_font)
-                    .color(desc_color),
-                ui_font,
-                theme::text_size::UI,
-            ));
-        }
-        let content = typography::baseline_row(content, 8.0);
-        let armed = tone == RowTone::Armed;
-        let styled = iced::widget::button(content)
-            .width(Length::Fill)
-            .padding([6, 10])
-            .style(move |_, status| {
-                let background = if armed {
-                    Some(Background::Color(chip_background(theme.accent)))
-                } else if matches!(status, iced::widget::button::Status::Hovered) {
-                    Some(Background::Color(chip_background(theme.subtle_text)))
-                } else {
-                    None
-                };
-                iced::widget::button::Style {
-                    background,
-                    text_color: label_color,
-                    border: Border {
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
-                        radius: theme::radius::CONTROL.into(),
-                    },
-                    shadow: Default::default(),
-                    snap: true,
-                }
-            });
-        match on_press {
-            Some(message) => styled.on_press(message).into(),
-            None => styled.into(),
-        }
-    };
-
-    let mut rows_column = column![].spacing(2);
+    let mut rows_column = div().flex().flex_col().w_full().gap(px(2.0));
     match draft.kind {
         DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
             // While a drag is live the fill mirrors what a drop would do —
@@ -514,22 +778,40 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                     RowTone::Chosen
                 }
             };
-            for (label, command, placement) in [
-                ("Onto", "draft.place.onto", PlacementKind::Onto),
-                ("After", "draft.place.after", PlacementKind::After),
-                ("Before", "draft.place.before", PlacementKind::Before),
+            for (id, label, command, placement) in [
+                (
+                    "op-place-onto",
+                    "Onto",
+                    "draft.place.onto",
+                    PlacementKind::Onto,
+                ),
+                (
+                    "op-place-after",
+                    "After",
+                    "draft.place.after",
+                    PlacementKind::After,
+                ),
+                (
+                    "op-place-before",
+                    "Before",
+                    "draft.place.before",
+                    PlacementKind::Before,
+                ),
             ] {
                 // The key as bound, so a rebinding shows here too.
                 let key = ui
                     .keymap
                     .chord_for(crate::commands::Context::Draft, command)
                     .map(crate::keymap::Chord::display);
-                rows_column = rows_column.push(target_row(
+                rows_column = rows_column.child(op_target_row(
+                    id,
                     label,
                     key,
                     tone(placement),
                     describe(placement),
-                    Some(Message::Action(Action::DraftPlacement(placement))),
+                    Some(Action::DraftPlacement(placement)),
+                    look,
+                    cx,
                 ));
             }
             // A drag over a gap is its own, transient way to land: exactly
@@ -538,12 +820,15 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
                 && !gap_invalid
                 && let (Some(parent), Some(child)) = (short_id(parent), short_id(child))
             {
-                rows_column = rows_column.push(target_row(
+                rows_column = rows_column.child(op_target_row(
+                    "op-place-between",
                     "Between",
                     None,
                     RowTone::Armed,
                     Some(format!("{parent} and {child}")),
                     None,
+                    look,
+                    cx,
                 ));
             }
         }
@@ -556,7 +841,16 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             let description = fold_target
                 .and_then(short_id)
                 .map(|id| format!("folds {names} into {id} · descriptions combine"));
-            rows_column = rows_column.push(target_row("Into", None, tone, description, None));
+            rows_column = rows_column.child(op_target_row(
+                "op-place-into",
+                "Into",
+                None,
+                tone,
+                description,
+                None,
+                look,
+                cx,
+            ));
         }
         DraftKind::Merge | DraftKind::Parallelize => {}
     }
@@ -570,7 +864,7 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         }
     );
     let (status_icon, status_text, status_color, counts): (
-        Option<&str>,
+        Option<&'static str>,
         String,
         Color,
         Option<String>,
@@ -702,23 +996,22 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
         ));
     }
     verdict.push(Aligned::text(
-        text(status_text)
-            .size(theme::text_size::UI)
-            .font(ui_font)
-            .color(status_color),
+        typography::line(status_text, ui_font, text_size::BODY, status_color),
         ui_font,
-        theme::text_size::UI,
+        text_size::BODY,
     ));
-    let verdict = typography::baseline_row(verdict, 6.0);
-    let mut summary = column![verdict].spacing(2).width(Length::Fill);
-    if let Some(counts) = counts {
-        summary = summary.push(
-            text(counts)
-                .size(theme::text_size::UI)
-                .font(ui_font)
-                .color(theme.muted_text),
+    let summary = div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(typography::baseline_row(verdict, 6.0))
+        .children(
+            counts
+                .map(|counts| typography::line(counts, ui_font, text_size::BODY, theme.muted_text)),
         );
-    }
 
     // Merge can be complete from its selected parents alone; other drafts
     // execute on the armed candidate. Gap spots only exist mid-drag, where
@@ -729,24 +1022,16 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
     } else {
         theme.subtle_text
     };
-    let apply_font = emphasis_font(ui_font, iced::font::Weight::Medium);
-    let apply = crate::ui::button(
-        typography::baseline_row(
-            [
-                Aligned::text(
-                    text("Apply").size(theme::text_size::UI).font(apply_font),
-                    apply_font,
-                    theme::text_size::UI,
-                ),
-                Aligned::glyph(icons::icon(icons::ENTER, 12.0, apply_color), 12.0),
-            ],
-            6.0,
-        ),
-        crate::ui::Variant::Primary,
-        crate::ui::Size::Compact,
-        theme,
-    )
-    .on_press_maybe(can_apply.then_some(Message::Action(Action::DraftConfirm)));
+    let mut apply = look
+        .button("op-bar-apply", "Apply")
+        .primary()
+        .compact()
+        .disabled(!can_apply)
+        .gap(px(6.0))
+        .child(icons::icon(icons::ENTER, 12.0, apply_color));
+    if can_apply {
+        apply = apply.on_click(Diffui::on_action(Action::DraftConfirm, cx));
+    }
 
     // ---- The plan: what Apply will do, in words and as the jj command.
     // Until a destination is armed the command stops where it goes.
@@ -781,960 +1066,125 @@ fn build_op_bar(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
             command
         }
     });
-    let mut plan = column![].spacing(3).width(Length::Fill);
-    if let Some(sentence) = sentence {
-        plan = plan.push(
-            sentence
-                .view(ui_font, mono_font, theme.text, theme)
-                .size(theme::text_size::UI)
-                .wrapping(text::Wrapping::WordOrGlyph),
-        );
-    }
-    if let Some(command) = command {
-        plan = plan.push(
-            container(crate::plan::caption_command_line(ui, theme, &command))
-                .width(Length::Fill)
-                .clip(true),
-        );
-    }
+    let plan = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(3.0))
+        .children(sentence.map(|sentence| {
+            div()
+                .w_full()
+                .text_size(px(text_size::BODY))
+                .child(sentence.view(look, theme.text))
+        }))
+        .children(command.map(|command| {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(crate::plan::caption_command_line(
+                    look, &command, window, cx,
+                ))
+        }));
 
     // The mode's other keys are in the hint strip docked under the diff
     // (see `crate::mode_hints`); the rows carry their own keycaps and Apply
     // its ↵.
-    let band = container(
-        column![
-            row![summary, apply]
-                .spacing(8)
-                .align_y(alignment::Vertical::Center),
-            plan,
-        ]
-        .spacing(8),
-    )
-    .width(Length::Fill)
-    .padding([8, 12])
-    .style(move |_| container::Style {
-        background: Some(Background::Color(theme.panel_background)),
-        ..container::Style::default()
-    });
+    let band = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .py(px(8.0))
+        .px(px(12.0))
+        .bg(theme.panel_background)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(summary)
+                .child(apply),
+        )
+        .child(plan);
 
     // Hairline on top so the bar reads as its own surface pinned above the
     // footer; the rows sit on the elevated surface, the verdict band on the
     // plain panel below them.
-    let hairline = container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
-            ..container::Style::default()
-        });
     let shows_target_rows = !matches!(draft.kind, DraftKind::Merge | DraftKind::Parallelize);
-    column![
-        hairline,
-        container(column![
-            container(headline)
-                .width(Length::Fill)
-                .padding(iced::Padding {
-                    top: 8.0,
-                    right: 12.0,
-                    bottom: if shows_target_rows { 4.0 } else { 8.0 },
-                    left: 12.0,
-                }),
-            container(rows_column)
-                .width(Length::Fill)
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: 6.0,
-                    bottom: if shows_target_rows { 8.0 } else { 0.0 },
-                    left: 6.0,
-                }),
-        ])
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            ..container::Style::default()
-        }),
-        band,
-    ]
-    .into()
-}
-
-/// The op bar's verdict for a simulation that only forecasts conflicts:
-/// "No new conflicts" or which revisions would conflict, over `counts`.
-fn conflict_verdict(
-    new_conflicts: &[String],
-    counts: Option<String>,
-    theme: ThemeSpec,
-) -> (Option<&'static str>, String, Color, Option<String>) {
-    if new_conflicts.is_empty() {
-        (
-            Some(icons::CHECK),
-            "No new conflicts".to_owned(),
-            theme.added_text,
-            counts,
+    div()
+        .flex_none()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(crate::root::horizontal_divider(theme))
+        .child(
+            div()
+                .w_full()
+                .bg(theme.panel_background_elevated)
+                .child(
+                    Padding {
+                        top: 8.0,
+                        right: 12.0,
+                        bottom: if shows_target_rows { 4.0 } else { 8.0 },
+                        left: 12.0,
+                    }
+                    .apply(div())
+                    .w_full()
+                    .child(headline),
+                )
+                .child(
+                    Padding {
+                        top: 0.0,
+                        right: 6.0,
+                        bottom: if shows_target_rows { 8.0 } else { 0.0 },
+                        left: 6.0,
+                    }
+                    .apply(div())
+                    .w_full()
+                    .child(rows_column),
+                ),
         )
-    } else {
-        (
-            Some(icons::ALERT_TRIANGLE),
-            format!("Conflicts in {}", commit_list_summary(new_conflicts)),
-            theme.conflict_marker,
-            counts,
-        )
-    }
+        .child(band)
+        .into_any_element()
 }
-
-/// Focus target id for the revset input.
-pub const REVSET_INPUT_ID: &str = "revset-input";
 
 /// The monospace revset (jj) / revision-range (git) input at the top of the
 /// sidebar, with a caret that opens the presets menu. Submitting (Enter) or
 /// picking a preset re-evaluates the log.
-fn build_revset_filter(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+fn build_revset_filter(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let placeholder = match ui.active().repository.as_ref().map(|r| r.vcs) {
         Some(Vcs::Git) => "Revisions, e.g. --all",
         _ => "Revset, e.g. all()",
     };
-    crate::field::filter_field(
-        theme,
-        ui.config.mono_font,
-        crate::field::FilterField {
+    field::filter_field(
+        Look {
+            font: look.mono,
+            ..look
+        },
+        field::FilterField {
             id: REVSET_INPUT_ID,
             leading_icon: Some(icons::GIT_BRANCH),
             placeholder,
             value: &ui.active().session.revset,
-            on_input: |value| Message::Ui(UiEvent::RevsetChanged(value)),
-            on_submit: Some(Message::Action(Action::SubmitRevset)),
-            caret: Some(crate::field::FilterCaret {
+            on_input: |this, value, cx| this.revset_field_edited(value, cx),
+            on_submit: Some(|this, cx| this.perform(Action::SubmitRevset, cx)),
+            caret: Some(field::FilterCaret {
                 hovered: ui.hovered == Some(HoverTarget::RevsetCaret),
                 target: HoverTarget::RevsetCaret,
                 menu: ToolbarMenu::RevsetPresets,
             }),
         },
+        window,
+        cx,
     )
 }
-
-const FOOTER_TEXT_SIZE: f32 = theme::text_size::UI;
-/// One control step, so the footer is as tall as the header above the list.
-const FOOTER_HEIGHT: f32 = theme::control::COMPACT;
 
 /// Thin status bar pinned to the bottom of the commit-log pane: the working
 /// copy's branch + ahead/behind on the left, the total change count on the
 /// right. Monospace, dim, with a hairline top border. The "uncommitted files"
 /// count common to git tools is deliberately omitted — jj's `@` is always a
 /// commit, so it would be semantically wrong here.
-fn build_footer(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
-    let font = ui.config.mono_font;
-    let dim = theme.subtle_text;
-    // Every run sits on one baseline and the arrows centre on the digits'
-    // caps (see `crate::typography`).
-    let label = |value: String, color: Color| {
-        Aligned::text(
-            text(value).size(FOOTER_TEXT_SIZE).font(font).color(color),
-            font,
-            FOOTER_TEXT_SIZE,
-        )
-    };
-    let glyph = |glyph: &'static str, color: Color| {
-        Aligned::glyph(
-            icons::icon(glyph, FOOTER_TEXT_SIZE, color),
-            FOOTER_TEXT_SIZE,
-        )
-    };
-
-    let mut left: Vec<Aligned<'_, Message>> = Vec::new();
-    if let Some(status) = &ui.active().session.branch_status {
-        // Branch glyph + name; the tracked upstream rides along as a tooltip.
-        let name = typography::group(
-            [
-                glyph(icons::GIT_BRANCH, dim),
-                label(status.branch.clone(), dim),
-            ],
-            5.0,
-        );
-        left.push(match &status.upstream {
-            Some(upstream) => name.map(|name| {
-                crate::ui::tooltip(name, upstream, tooltip::Position::Top, font, theme)
-            }),
-            None => name,
-        });
-        // Ahead/behind only mean something against a tracked upstream.
-        if status.upstream.is_some() {
-            if status.ahead == 0 && status.behind == 0 {
-                left.push(label("in sync".to_owned(), dim));
-            } else {
-                if status.ahead > 0 {
-                    left.push(typography::group(
-                        [
-                            glyph(icons::ARROW_UP, theme.added_text),
-                            label(status.ahead.to_string(), theme.added_text),
-                        ],
-                        1.0,
-                    ));
-                }
-                if status.behind > 0 {
-                    left.push(typography::group(
-                        [
-                            glyph(icons::ARROW_DOWN, theme.removed_text),
-                            label(status.behind.to_string(), theme.removed_text),
-                        ],
-                        1.0,
-                    ));
-                }
-            }
-        }
-    }
-
-    // jj counts changes; git has only commits.
-    let noun = match ui.active().repository.as_ref().map(|r| r.vcs) {
-        Some(Vcs::Git) => "commits",
-        _ => "changes",
-    };
-    let right = label(
-        format!("{} {noun}", thousands(ui.active().session.commits.len())),
-        dim,
-    );
-
-    let bar = row![
-        typography::baseline_row(left, 8.0),
-        Space::new().width(Length::Fill),
-        typography::baseline_row([right], 0.0),
-    ]
-    .align_y(alignment::Vertical::Center)
-    .spacing(8);
-
-    // iced's `Border` paints all four edges; draw the hairline top rule as a
-    // 1px line above the bar instead.
-    let hairline = container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.border)),
-            ..container::Style::default()
-        });
-
-    column![
-        hairline,
-        container(bar)
-            .width(Length::Fill)
-            .height(Length::Fixed(FOOTER_HEIGHT))
-            .padding([0.0, theme::space::LG])
-            .center_y(Length::Fixed(FOOTER_HEIGHT))
-            .style(move |_| container::Style::default().background(theme.panel_background)),
-    ]
-    .into()
-}
-
-/// Group an integer with `,` thousands separators, e.g. 1410 -> "1,410".
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn build_revision_list<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    let graph_style = revision_graph_style(theme);
-    let tab = ui.active();
-    let reveal_target = tab
-        .op_draft()
-        .as_ref()
-        .and_then(|draft| draft.draft.candidate)
-        .and_then(|candidate| tab.list_row(candidate));
-
-    // The per-row lane fold + prefix lengths are precomputed once and held in
-    // `Diffui`; the closures below build a single visible row's view from them
-    // on demand, so the widget never materializes all ~N rows.
-    let graph = &tab.session.graph;
-    let prefix_lens = &tab.session.sidebar_prefix_lens;
-    let commits = &tab.session.commits;
-    let multi_selection = tab.revision_multi_selection.as_slice();
-    let config = ui.config;
-    let draft = tab.op_draft();
-    let tags = &tab.session.bookmarks.tags;
-    // While the palette holds a command line, the rows its focused revset
-    // argument matches wear the target-mode wash, labelled with the flag.
-    let tint = ui
-        .command_line()
-        .filter(|_| draft.is_none())
-        .and_then(|command| command.tint());
-    // While a draft is previewed the list's rows are the post-op graph's.
-    let preview = tab.shown_preview().cloned();
-    let row_count = preview
-        .as_ref()
-        .map_or(commits.len(), |preview| preview.len());
-    let build_revision = Box::new(move |row: usize| {
-        let prefix_len = |index: usize| prefix_lens.get(index).copied();
-        let slot = match &preview {
-            Some(preview) => {
-                let role = preview.rows[row];
-                let commit = preview.commit(commits, row);
-                RowSlot {
-                    commit,
-                    layout: &preview.layout,
-                    row,
-                    unique_len: match role.source {
-                        diffui_core::RowSource::Loaded(index) => prefix_len(index),
-                        diffui_core::RowSource::Extra(_) => commit.shortest_change_id_len(),
-                    },
-                    target: preview.target_at(row),
-                    preview: Some(role),
-                }
-            }
-            None => RowSlot {
-                commit: commits.row(row),
-                layout: graph,
-                row,
-                unique_len: prefix_len(row),
-                target: Some(row),
-                preview: None,
-            },
-        };
-        let ghost = slot.preview.is_some_and(|row| row.role.is_ghost());
-        let commit_id = slot.commit.commit_id();
-        let mut row = build_revision_row(slot, theme, config, &graph_style, multi_selection, draft);
-        if let Some((flag, matched)) = &tint
-            && !row.draft_source
-            && matched.contains(commit_id)
-        {
-            row.draft_source = true;
-            if !flag.is_empty() {
-                row.status_chips.insert(
-                    0,
-                    Chip {
-                        label: flag.clone(),
-                        font: config.mono_font,
-                        background: Color::TRANSPARENT,
-                        text_color: theme.accent,
-                        border_color: Some(theme.accent),
-                        border_dashed: true,
-                        icon: None,
-                    },
-                );
-            }
-        }
-        // Tags trail the bookmarks, so the rail's `+N` overflow sheds them
-        // first.
-        if !ghost && let Some(tags) = tags.get(commit_id) {
-            row.bookmark_chips
-                .extend(tag_chips_for(tags, theme, config));
-        }
-        row
-    });
-    let build_file: Box<dyn Fn(usize) -> FileRowView> =
-        Box::new(|_| unreachable!("history does not contain file rows"));
-
-    let selected_row = match &ui.active().session.selected_revision {
-        RevisionSelection::WorkingCopy => Some(RowSelectionKey::WorkingCopy),
-        RevisionSelection::Commit(id) => Some(RowSelectionKey::Commit(id.clone())),
-    };
-
-    // The widget fills its own background, so the target-mode wash has to
-    // reach it too — a tinted container alone would be painted over.
-    let mut list_style = revision_list_style(theme, ui.config, 0.0);
-    if ui.active().op_draft().is_some() {
-        list_style.background = draft_panel_background(theme);
-    }
-    let mut list = RevisionList::new(
-        row_count,
-        None,
-        build_revision,
-        build_file,
-        selected_row,
-        None,
-        tab.session
-            .selected_commit_index
-            .and_then(|index| tab.list_row(index)),
-        list_style,
-        |key| Message::Ui(UiEvent::SelectRowKey(key)),
-        |row| Message::Ui(UiEvent::SidebarFileRow(row)),
-    )
-    .at_window_edge()
-    .multi_selection_count(multi_selection.len())
-    .width(Length::Fill)
-    .reveal_selected(ui.active().revision_reveal_token)
-    .reveal_file(ui.sidebar_file_reveal_token, reveal_target)
-    .on_scroll(|offset| Message::Ui(UiEvent::SidebarScrolled(offset)))
-    .restore_scroll(ui.active().sidebar_scroll_offset, ui.scroll_restore_token)
-    .on_context_menu(|key, rect, point| Message::Ui(UiEvent::RevisionContextMenu(key, rect, point)))
-    .on_file_context_menu(|row, rect, point| {
-        Message::Ui(UiEvent::SidebarFileContextMenu(row, rect, point))
-    });
-    // Drag-to-rebase, for mutable (local jj) repos only.
-    if ui.active().session.capabilities.mutate {
-        list = list
-            .on_drag(revision_list::DragHooks {
-                start: |index| Message::Ui(UiEvent::RevisionDragStart(index)),
-                hover: |spot| Message::Ui(UiEvent::RevisionDragHover(spot)),
-                drop: |spot| Message::Ui(UiEvent::RevisionDragDrop(spot)),
-            })
-            .gap_edges(Box::new(move |row| {
-                // A gap is a real parent edge between two loaded rows that are
-                // neighbours in the list too.
-                match (tab.target_row(row), tab.target_row(row + 1)) {
-                    (Some(above), Some(below)) => {
-                        below == above + 1 && commits.row(above).next_row_is_parent()
-                    }
-                    _ => false,
-                }
-            }));
-        if ui.active().op_draft().is_some() {
-            list = list.on_target_hover(|index| Message::Ui(UiEvent::DraftHoverCandidate(index)));
-        }
-        // A preview rearranges the rows under a still cursor: draw the drop
-        // where the draft has it, not where the cursor last reported it.
-        if tab.shown_preview().is_some()
-            && let Some(spot) = tab.op_draft().and_then(|draft| draft.hover_spot)
-        {
-            let shown = match spot {
-                revision_list::DropSpot::OnRow(index) => {
-                    tab.list_row(index).map(revision_list::DropSpot::OnRow)
-                }
-                revision_list::DropSpot::Gap { above, below } => tab
-                    .list_row(above)
-                    .zip(tab.list_row(below))
-                    .map(|(above, below)| revision_list::DropSpot::Gap { above, below }),
-            };
-            list = list.drop_indicator(shown);
-        }
-    }
-    list.into()
-}
-
-/// One list row's inputs: its commit data, where its lanes live, and how it
-/// relates to the loaded graph.
-struct RowSlot<'a> {
-    commit: RowView<'a>,
-    layout: &'a GraphLayout,
-    /// The row's index in `layout` (and in the list).
-    row: usize,
-    unique_len: Option<usize>,
-    /// The loaded row this row aims at as a draft destination.
-    target: Option<usize>,
-    /// What the previewed operation does to it, while a preview is drawn.
-    preview: Option<diffui_core::PreviewRow>,
-}
-
-/// Build the display view for one revision row from the precomputed fold +
-/// store. Called only for on-screen rows.
-fn build_revision_row(
-    slot: RowSlot<'_>,
-    theme: ThemeSpec,
-    config: AppConfig,
-    graph_style: &RevisionGraphStyle,
-    multi_selection: &[String],
-    draft: Option<&crate::DraftUi>,
-) -> RevisionRowView {
-    let RowSlot {
-        commit,
-        layout: graph,
-        row: index,
-        unique_len,
-        target,
-        preview,
-    } = slot;
-    let role = preview.map(|row| row.role);
-    let ghost = role.is_some_and(diffui_core::PreviewRole::is_ghost);
-    let created = role == Some(diffui_core::PreviewRole::Created);
-    let change_id = if created { "" } else { commit.change_id() };
-    let lane_frame = graph.frame(index, usize::MAX);
-    // Warped display columns for this row and the one above (row 0 has no
-    // transition, so its own packing stands in).
-    let columns = lane_frame.display_columns();
-    let prev_columns = if index > 0 {
-        graph.frame(index - 1, usize::MAX).display_columns()
-    } else {
-        columns.clone()
-    };
-    let bookmarks = if ghost { &[] } else { commit.bookmarks() };
-    let unique_len = unique_len.unwrap_or(REVISION_ID_CHARS);
-    let label_len = revision_id_display_len(unique_len, change_id);
-    let id_prefix: String = change_id.chars().take(unique_len).collect();
-    let mut id_suffix: String = change_id
-        .chars()
-        .skip(unique_len)
-        .take(label_len.saturating_sub(unique_len))
-        .collect();
-    // jj log prints divergent / hidden copies as `changeid/N`; the suffix is
-    // how a revset addresses one copy (`-r xyz/1`), so render the same form.
-    if let Some(offset) = commit.change_offset() {
-        id_suffix.push('/');
-        id_suffix.push_str(&offset.to_string());
-    }
-    // Git has no change ids: its rows carry the commit hash in both slots, and
-    // its synthesized working copy a placeholder in both. Show the hash once,
-    // and nothing but the `@` marker on the working copy.
-    let single_id = created
-        || commit.commit_id().starts_with(change_id)
-        || change_id.starts_with(commit.commit_id());
-    let (id_prefix, id_suffix) = if single_id && commit.is_working_copy() {
-        (String::new(), String::new())
-    } else {
-        (id_prefix, id_suffix)
-    };
-    let commit_id_short = if single_id {
-        String::new()
-    } else {
-        truncate_end(commit.commit_id(), COMMIT_ID_CHARS)
-    };
-
-    let lane_color = graph_style.lane_color(lane_frame.node_lane);
-    let bookmark_chips = bookmark_chips_for(bookmarks, lane_color, theme, config);
-    let mut status_chips = if ghost {
-        Vec::new()
-    } else {
-        status_chips_for(commit, theme, config)
-    };
-    // A conflict the operation would cause wears the outlined (forecast)
-    // form of the conflict chip.
-    if preview.is_some_and(|row| row.new_conflict) {
-        for chip in status_chips
-            .iter_mut()
-            .filter(|chip| chip.label == "conflict")
-        {
-            chip.background = Color::TRANSPARENT;
-            chip.border_color = Some(theme.conflict_marker);
-            chip.border_dashed = true;
-        }
-    }
-
-    let selection_key = if commit.is_working_copy() && !ghost {
-        RowSelectionKey::WorkingCopy
-    } else {
-        RowSelectionKey::Commit(commit.commit_id().to_owned())
-    };
-    let multi_selected = multi_selection.iter().any(|id| id == commit.commit_id());
-
-    // Target-mode decorations: the draft's sources wear the lifted-off wash —
-    // and so does every row the last simulation resolved into the moved set,
-    // so a branch-mode draft shows the whole branch that would move. The
-    // keyboard candidate wears its destination marker (the widget draws live
-    // *drag* indicators itself, so they're suppressed here mid-drag).
-    let draft_source = !ghost
-        && !created
-        && draft.is_some_and(|ui| {
-            ui.draft.is_source(commit.commit_id())
-                || ui.moved_highlight.contains(commit.commit_id())
-        });
-    let draft_marker = draft.and_then(|ui| {
-        use diffui_core::{DraftKind, PlacementKind};
-        use revision_list::DraftMarker;
-        if ui.hover_spot.is_some()
-            || matches!(ui.draft.kind, DraftKind::Merge) && ui.draft.sources.len() >= 2
-            || matches!(ui.draft.kind, DraftKind::Parallelize)
-        {
-            return None;
-        }
-        // Hover can arm any row as candidate, including a source (keyboard
-        // nav skips them) — an invalid target gets the red op-bar hint, not
-        // a destination decoration.
-        if !ui.draft.target_valid(commit.commit_id()) {
-            return None;
-        }
-        let candidate = ui.draft.candidate?;
-        (Some(candidate) == target).then_some(match ui.draft.kind {
-            DraftKind::Squash | DraftKind::Merge | DraftKind::Parallelize => DraftMarker::Ring,
-            DraftKind::Rebase { .. } | DraftKind::New | DraftKind::Duplicate => {
-                match ui.draft.placement {
-                    PlacementKind::Onto => DraftMarker::Ring,
-                    // After = between the target and its children ⇒ lands just
-                    // above the row; Before ⇒ just below it.
-                    PlacementKind::After => DraftMarker::LineAbove,
-                    PlacementKind::Before => DraftMarker::LineBelow,
-                }
-            }
-        })
-    });
-    // Target-mode role chips: say in words what the wash/marker mean — every
-    // revision that would move wears the verb, the live destination wears the
-    // op bar's destination word. Lead the status rail so the role reads first.
-    // Styled apart from the bookmark pills sharing the rail: moved rows are
-    // dashed-outlined (the app's transient/preview language) with a ↑ "lifting
-    // off" glyph — quiet enough to repeat down a whole branch — while the one
-    // destination row is the only solid-filled chip in the app, with a ↓
-    // "lands here" glyph. Background-colored text on the accent fill is
-    // legible in every theme because accent is itself legible on background.
-    if let Some(ui) = draft {
-        use diffui_core::{DraftKind, PlacementKind};
-        if draft_source {
-            status_chips.insert(
-                0,
-                Chip {
-                    label: match ui.draft.kind {
-                        DraftKind::Rebase { .. } => "move",
-                        DraftKind::Squash => "squash",
-                        DraftKind::Merge => "merge",
-                        DraftKind::New => "new",
-                        DraftKind::Duplicate => "copy",
-                        DraftKind::Parallelize => "parallel",
-                    }
-                    .to_owned(),
-                    font: config.mono_font,
-                    background: Color::TRANSPARENT,
-                    text_color: theme.accent,
-                    border_color: Some(theme.accent),
-                    border_dashed: true,
-                    icon: Some(icons::ARROW_UP),
-                },
-            );
-        } else {
-            // The live destination: the drag spot's row while dragging, else
-            // the armed candidate. A gap spot gets no row chip — the
-            // insertion line carries the "between" meaning.
-            let merge_ready = matches!(ui.draft.kind, DraftKind::Merge)
-                && ui.draft.sources.len() >= 2
-                || matches!(ui.draft.kind, DraftKind::Parallelize);
-            let destination_word = if merge_ready {
-                None
-            } else {
-                match ui.hover_spot {
-                    Some(revision_list::DropSpot::OnRow(spot)) if Some(spot) == target => {
-                        Some(match ui.draft.kind {
-                            // Drops land Onto regardless of the armed placement.
-                            DraftKind::Rebase { .. }
-                            | DraftKind::New
-                            | DraftKind::Duplicate
-                            | DraftKind::Parallelize => "onto",
-                            DraftKind::Squash => "into",
-                            DraftKind::Merge => "with",
-                        })
-                    }
-                    Some(_) => None,
-                    None => (ui
-                        .draft
-                        .candidate
-                        .is_some_and(|candidate| Some(candidate) == target))
-                    .then_some(match ui.draft.kind {
-                        DraftKind::Rebase { .. }
-                        | DraftKind::New
-                        | DraftKind::Duplicate
-                        | DraftKind::Parallelize => match ui.draft.placement {
-                            PlacementKind::Onto => "onto",
-                            PlacementKind::After => "after",
-                            PlacementKind::Before => "before",
-                        },
-                        DraftKind::Squash => "into",
-                        DraftKind::Merge => "with",
-                    }),
-                }
-            };
-            if let Some(word) = destination_word {
-                status_chips.insert(
-                    0,
-                    Chip {
-                        label: word.to_owned(),
-                        font: config.mono_font,
-                        background: theme.accent,
-                        text_color: theme.background,
-                        border_color: None,
-                        border_dashed: false,
-                        icon: Some(icons::ARROW_DOWN),
-                    },
-                );
-            }
-        }
-    }
-    // A commit the operation creates says which kind, in the same outlined
-    // language as the moving rows.
-    if created && let Some(ui) = draft {
-        use diffui_core::DraftKind;
-        status_chips.insert(
-            0,
-            Chip {
-                label: match ui.draft.kind {
-                    DraftKind::Merge => "merge",
-                    DraftKind::Duplicate => "copy",
-                    _ => "new",
-                }
-                .to_owned(),
-                font: config.mono_font,
-                background: Color::TRANSPARENT,
-                text_color: theme.accent,
-                border_color: Some(theme.accent),
-                border_dashed: true,
-                icon: None,
-            },
-        );
-    }
-
-    let lane = graph.fold(index, usize::MAX);
-    RevisionRowView {
-        selection_key,
-        change_id_prefix: id_prefix,
-        change_id_suffix: id_suffix,
-        commit_id_short,
-        author: commit.author().to_owned(),
-        description: commit.description().to_owned(),
-        description_color: commit_description_color(commit, theme),
-        bookmark_chips,
-        status_chips,
-        lane_color,
-        frame: lane_frame,
-        columns,
-        prev_columns,
-        lane_labels: lane.labels,
-        lane_segments_before: lane.segments_before,
-        lane_segments_after: lane.segments_after,
-        collapse_chevron: None,
-        draft_source,
-        multi_selected: multi_selected && !ghost,
-        draft_marker,
-        inert: role.is_some_and(|role| !role.is_target()),
-        ghost,
-    }
-}
-
-/// Bookmark chips for a revision row, wearing `lane_color`. Shared with the
-/// source browser's revision-header row so both rails style identically.
-///
-/// Core authors the label shapes and jj forbids `@` inside bookmark and
-/// remote names, so a trailing `@` can only be another workspace's working
-/// copy (`name@`) and an interior `@` a remote bookmark (`main@origin`).
-/// Workspace chips get a folder glyph (another working-copy *directory*) and
-/// the working-copy accent — the lane palette is deliberately decoupled from
-/// it — so they read as a different kind of thing than the bookmark pills
-/// sharing the rail. Remotes render outlined (transparent fill + 1px
-/// lane-color border) so they read as "tracking" rather than "live".
-/// The graph's lane colours for `theme`.
-fn revision_graph_style(theme: ThemeSpec) -> RevisionGraphStyle {
-    RevisionGraphStyle {
-        lane_base_color: theme.lane_base,
-        missing_color: theme.subtle_text,
-    }
-}
-
-/// The bookmark and tag chips the graph draws on row `index`, for views
-/// that show a revision's refs the way the graph does.
-pub(crate) fn graph_ref_chips(
-    session: &diffui_core::Session,
-    index: usize,
-    theme: ThemeSpec,
-    config: AppConfig,
-) -> Vec<Chip> {
-    let commit = session.commits.row(index);
-    let lane = session.graph.frame(index, usize::MAX).node_lane;
-    let mut chips = bookmark_chips_for(
-        commit.bookmarks(),
-        revision_graph_style(theme).lane_color(lane),
-        theme,
-        config,
-    );
-    if let Some(tags) = session.bookmarks.tags.get(commit.commit_id()) {
-        chips.extend(tag_chips_for(tags, theme, config));
-    }
-    chips
-}
-
-pub(crate) fn bookmark_chips_for(
-    bookmarks: &[String],
-    lane_color: Color,
-    theme: ThemeSpec,
-    config: AppConfig,
-) -> Vec<Chip> {
-    let mut chips = Vec::with_capacity(bookmarks.len());
-    for bookmark in bookmarks {
-        let is_workspace = bookmark.ends_with('@');
-        let is_remote = !is_workspace && bookmark.contains('@');
-        let chip_color = if is_workspace {
-            theme.accent
-        } else {
-            lane_color
-        };
-        chips.push(Chip {
-            label: bookmark.clone(),
-            font: config.ui_font,
-            background: if is_remote {
-                Color::TRANSPARENT
-            } else {
-                chip_background(chip_color)
-            },
-            text_color: chip_color,
-            border_color: is_remote.then_some(lane_color),
-            border_dashed: false,
-            icon: is_workspace.then_some(icons::FOLDER),
-        });
-    }
-    chips
-}
-
-/// Read-only tag chips for a revision row: neutral rather than lane-colored,
-/// and wearing the tag glyph, so they never read as bookmarks. A remote tag
-/// that differs from the local one (`v1@origin`) is outlined, like a remote
-/// bookmark.
-pub(crate) fn tag_chips_for(tags: &[String], theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
-    tags.iter()
-        .map(|tag| Chip {
-            label: tag.clone(),
-            font: config.ui_font,
-            background: chip_background(theme.muted_text),
-            text_color: theme.muted_text,
-            border_color: tag.contains('@').then_some(theme.subtle_text),
-            border_dashed: false,
-            icon: Some(icons::TAG),
-        })
-        .collect()
-}
-
-/// Status chips (`empty`, `conflict`, `hidden`/`divergent`) for a commit row.
-/// Shared with the source browser's revision-header row.
-pub(crate) fn status_chips_for(commit: RowView, theme: ThemeSpec, config: AppConfig) -> Vec<Chip> {
-    let mut status_chips = Vec::new();
-    if commit.is_empty() == Some(true) {
-        status_chips.push(Chip {
-            label: "empty".to_owned(),
-            font: config.mono_font,
-            background: Color::TRANSPARENT,
-            text_color: theme.subtle_text,
-            border_color: Some(theme.subtle_text),
-            border_dashed: true,
-            icon: None,
-        });
-    }
-    if commit.has_conflict() {
-        status_chips.push(Chip {
-            label: "conflict".to_owned(),
-            font: config.mono_font,
-            background: chip_background(theme.conflict_marker),
-            text_color: theme.conflict_marker,
-            border_color: None,
-            border_dashed: false,
-            icon: None,
-        });
-    }
-    if commit.is_hidden() {
-        // jj log's "(hidden)": rewritten/abandoned, still shown because a ref
-        // (e.g. a stale remote bookmark) pins it into the revset. Takes
-        // precedence over the divergent chip, matching jj's log template.
-        status_chips.push(Chip {
-            label: "hidden".to_owned(),
-            font: config.mono_font,
-            background: Color::TRANSPARENT,
-            text_color: theme.subtle_text,
-            border_color: Some(theme.subtle_text),
-            border_dashed: false,
-            icon: None,
-        });
-    } else if commit.is_divergent() {
-        // jj log flags these with a change-offset suffix: the change id maps
-        // to several visible commits. Amber (not conflict-red) — it's a
-        // warning about identity, not about tree state.
-        status_chips.push(Chip {
-            label: "divergent".to_owned(),
-            font: config.mono_font,
-            background: chip_background(theme.modified_token),
-            text_color: theme.modified_token,
-            border_color: None,
-            border_dashed: false,
-            icon: None,
-        });
-    }
-    status_chips
-}
-
-/// View-time memo for the changed-files tree. The tree is rebuilt only when the
-/// document or directory-collapse set changes, rather than on every diff scroll.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SidebarFileCache {
-    tree: Option<(TreeKey, Rc<Vec<FileTreeRow>>)>,
-}
-
-/// The tree folds in the collapse set (it prunes collapsed dirs) but, unlike the
-/// widths, is independent of font and theme — so it gets its own key.
-#[derive(Debug, Clone, PartialEq)]
-struct TreeKey {
-    document_id: u64,
-    file_count: usize,
-    collapsed: HashSet<String>,
-}
-
-impl SidebarFileCache {
-    pub(crate) fn tree_rows(
-        &mut self,
-        document_id: u64,
-        file_count: usize,
-        collapsed: &HashSet<String>,
-        files: &[DiffFile],
-    ) -> Rc<Vec<FileTreeRow>> {
-        if let Some((key, rows)) = &self.tree
-            && key.document_id == document_id
-            && key.file_count == file_count
-            && &key.collapsed == collapsed
-        {
-            return Rc::clone(rows);
-        }
-        let rows = Rc::new(file_tree_rows(files, collapsed));
-        self.tree = Some((
-            TreeKey {
-                document_id,
-                file_count,
-                collapsed: collapsed.clone(),
-            },
-            Rc::clone(&rows),
-        ));
-        rows
-    }
-}
-
-pub(crate) fn revision_list_style(
-    theme: ThemeSpec,
-    config: AppConfig,
-    file_badge_width: f32,
-) -> RevisionListStyle {
-    RevisionListStyle {
-        graph: RevisionGraphStyle {
-            // Lane 0 (the trunk) wears `theme.lane_base` — violet by
-            // design — and subsequent lanes derive from it via HSL
-            // rotation in `RevisionGraphStyle::lane_color`. Kept
-            // separate from `theme.accent` so the coral accent stays
-            // reserved for working-copy / selection signalling and
-            // doesn't compete with the diff add/del greens and reds.
-            lane_base_color: theme.lane_base,
-            missing_color: theme.subtle_text,
-        },
-        background: theme.panel_background,
-        selected_background: theme.selected_file,
-        accent: theme.accent,
-        control: theme.info,
-        border: theme.border,
-        muted_text: theme.muted_text,
-        subtle_text: theme.subtle_text,
-        accent_text: theme.accent,
-        primary_font: config.ui_font,
-        mono_font: config.mono_font,
-        file_badge_width,
-        tooltip_background: theme.panel_background_elevated,
-        tooltip_text: theme.text,
-        tooltip_border: theme.border,
-        scrollbar: theme::scrollbar_style(theme),
-    }
-}
-
-pub(crate) fn revision_id_display_len(unique_len: usize, revision_id: &str) -> usize {
-    REVISION_ID_CHARS
-        .max(unique_len)
-        .min(revision_id.chars().count())
-}
-
-pub(crate) fn truncate_end(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
-fn commit_description_color(commit: RowView, theme: ThemeSpec) -> Color {
-    if commit.has_description() {
-        return theme.text;
-    }
-
-    match commit.is_empty() {
-        Some(true) => theme.added_text,
-        Some(false) => theme.note_text,
-        None => theme.note_text,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1747,6 +1197,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,

@@ -1,6 +1,6 @@
 //! A bounded memo over [`crate::measure::line_width`].
 //!
-//! Measuring a string builds a fresh cosmic-text buffer and shapes it. The
+//! Measuring a string shapes it. The
 //! sidebar asks for eight to fifteen of those per visible row — the change-id
 //! prefix and suffix, the commit id, the author, the ellipsis, every bookmark
 //! chip — and it asks again on every frame, for strings that have not changed
@@ -14,9 +14,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use iced::Font;
-
 use crate::measure;
+use crate::theme::Font;
 
 /// Entries kept before the memo is cleared. The working set is one screenful of
 /// rows; the cap is there so a long scroll through a million commits cannot
@@ -33,9 +32,9 @@ struct Key {
     font: Font,
 }
 
-/// Shaped widths seen so far. Interior mutability because `draw` gets the
-/// widget tree by shared reference — measuring is a read as far as the widget
-/// is concerned, and the memo is an implementation detail of that read.
+/// Shaped widths seen so far. Interior mutability because a painter holds it by
+/// shared reference: measuring is a read as far as the caller is concerned, and
+/// the memo is an implementation detail of that read.
 #[derive(Debug, Default)]
 pub struct WidthMemo {
     widths: RefCell<HashMap<Key, f32>>,

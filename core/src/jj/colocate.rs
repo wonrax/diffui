@@ -46,20 +46,22 @@ pub(crate) fn is_colocated(store: &Store, workspace_root: &Path) -> Result<bool>
 }
 
 /// The tail of a mutating transaction, before it commits: in a colocated
-/// workspace point this worktree's git `HEAD` at `@`'s first parent and reset
-/// the index to match, then export the bookmarks. Elsewhere only the export
-/// runs, as it always did here.
+/// workspace point this worktree's git `HEAD` at `@`'s first parent, reset
+/// the index to match, and export the bookmarks. Elsewhere nothing runs, as
+/// in jj-cli: a backing git repo that isn't this working copy (`jj git init
+/// --git-repo=<clone>`) keeps its branches until a push or `jj git export`.
 ///
 /// A `HEAD` some other process moved in the meantime is left alone with a
-/// warning — the CLI does the same, and the next snapshot imports it.
+/// warning — the CLI does the same, and the next prologue imports it.
 pub(crate) async fn sync_git_after_transaction(
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
     workspace_root: &Path,
 ) -> Result<()> {
-    if is_colocated(mut_repo.store(), workspace_root)?
-        && let Some(wc_id) = mut_repo.view().get_wc_commit_id(workspace_name).cloned()
-    {
+    if !is_colocated(mut_repo.store(), workspace_root)? {
+        return Ok(());
+    }
+    if let Some(wc_id) = mut_repo.view().get_wc_commit_id(workspace_name).cloned() {
         let wc_commit = mut_repo
             .store()
             .get_commit_async(&wc_id)

@@ -330,12 +330,23 @@ pub fn parse(config: &CliConfig, input: &str) -> Result<ParsedCommand, ParseErro
     } else {
         classify(&view)
     };
+    let revsets = view.revset_slots();
+    // diffui's resolver reads a blank revset as the whole graph; jj refuses it.
+    if let Some(blank) = revsets.iter().find(|slot| slot.revset.trim().is_empty())
+        && let Err(error) = jj_lib::revset::parse_program(&blank.revset)
+    {
+        return Err(ParseError {
+            message: format!("Failed to parse revset: {}", error.kind()),
+            span: blank.span.clone(),
+            hint: None,
+        });
+    }
     Ok(ParsedCommand {
         command,
         path: scan.path().iter().map(|s| (*s).to_owned()).collect(),
         args,
         passthrough_args,
-        revsets: view.revset_slots(),
+        revsets,
         ignore_immutable: view.flag("ignore_immutable"),
     })
 }
@@ -587,7 +598,13 @@ impl ArgsView<'_> {
         })
     }
 
+    /// The revsets to resolve and tint. None for a line that runs against
+    /// another repository or operation (`-R`, `--at-op`): the current graph
+    /// can't say what they mean there, so they're left to the CLI.
     fn revset_slots(&self) -> Vec<RevsetSlot> {
+        if self.flag("repository") || self.flag("at_operation") {
+            return Vec::new();
+        }
         self.value_slots()
             .into_iter()
             .filter(|(_, slot)| slot.kind == ValueKind::Revset)
@@ -636,37 +653,47 @@ impl ArgsView<'_> {
     }
 }
 
-/// A plain bookmark name: no string-pattern prefix and no glob characters,
-/// so it names exactly one bookmark. `exact:NAME` is unwrapped.
+/// A name pattern (`jj bookmark move/delete/forget`, `jj git push -b`) that
+/// names exactly one bookmark, read the way jj's `parse_union_name_patterns`
+/// reads it: `"a b"` and `exact:main` are one name, `feat-*` and `a|b` are
+/// patterns. `None` for a pattern or something jj won't parse.
 fn plain_name(name: Spanned<String>) -> Option<Spanned<String>> {
-    if let Some(exact) = name.value.strip_prefix("exact:") {
-        let value = exact.trim_matches('"').to_owned();
-        return Some(Spanned {
-            value,
-            span: name.span,
-        });
-    }
-    let pattern = name.value.contains(['*', '?', '[', ']'])
-        || [
-            "glob:",
-            "regex:",
-            "substring:",
-            "glob-i:",
-            "exact-i:",
-            "regex-i:",
-            "substring-i:",
-        ]
-        .iter()
-        .any(|prefix| name.value.starts_with(prefix));
-    (!pattern).then_some(name)
+    use jj_lib::str_util::StringExpression;
+    let expression = jj_lib::revset::parse_string_expression(
+        &mut jj_lib::revset::RevsetDiagnostics::new(),
+        &name.value,
+    )
+    .ok()?;
+    let StringExpression::Pattern(pattern) = expression else {
+        return None;
+    };
+    Some(Spanned {
+        value: pattern.as_exact()?.to_owned(),
+        span: name.span,
+    })
+}
+
+/// A bookmark name where jj takes exactly one (`jj bookmark create/set/
+/// rename`): a revset symbol, quotes taken off. jj's own grammar already
+/// refused anything else (`main@origin`, `a|b`).
+fn symbol_name(name: Spanned<String>) -> Option<Spanned<String>> {
+    Some(Spanned {
+        value: jj_lib::revset::parse_symbol(&name.value).ok()?,
+        span: name.span,
+    })
+}
+
+fn single(view: &ArgsView, id: &str) -> Option<Spanned<String>> {
+    let mut names = view.values(id);
+    (names.len() == 1).then(|| names.remove(0))
 }
 
 fn single_name(view: &ArgsView, id: &str) -> Option<Spanned<String>> {
-    let mut names = view.values(id);
-    if names.len() != 1 {
-        return None;
-    }
-    plain_name(names.remove(0))
+    single(view, id).and_then(plain_name)
+}
+
+fn single_symbol(view: &ArgsView, id: &str) -> Option<Spanned<String>> {
+    single(view, id).and_then(symbol_name)
 }
 
 /// Which kind the line is, and its typed arguments when diffui runs it.
@@ -856,20 +883,20 @@ fn classify(view: &ArgsView) -> CliCommand {
             }))
         }
         ["bookmark", "create"] if view.only(&["names", "revision"]) => native(
-            single_name(view, "names").map(|name| MutationCommand::BookmarkCreate {
+            single_symbol(view, "names").map(|name| MutationCommand::BookmarkCreate {
                 name,
                 to: view.single_or_at(&["revision"]).expect("-r is single"),
             }),
         ),
         ["bookmark", "set"] if view.only(&["names", "revision", "allow_backwards"]) => native(
-            single_name(view, "names").map(|name| MutationCommand::BookmarkSet {
+            single_symbol(view, "names").map(|name| MutationCommand::BookmarkSet {
                 name,
                 to: view.single_or_at(&["revision"]).expect("-r is single"),
                 allow_backwards: view.flag("allow_backwards"),
             }),
         ),
         ["bookmark", "move"] if view.only(&["names", "to", "allow_backwards"]) => native(
-            single_name(view, "names").map(|name| MutationCommand::BookmarkSet {
+            single_name(view, "names").map(|name| MutationCommand::BookmarkMove {
                 name,
                 to: view.single_or_at(&["to"]).expect("--to is single"),
                 allow_backwards: view.flag("allow_backwards"),
@@ -882,7 +909,10 @@ fn classify(view: &ArgsView) -> CliCommand {
             native(single_name(view, "names").map(|name| MutationCommand::BookmarkForget { name }))
         }
         ["bookmark", "rename"] if view.only(&["old", "new"]) => {
-            match (view.value("old"), view.value("new")) {
+            match (
+                view.value("old").and_then(symbol_name),
+                view.value("new").and_then(symbol_name),
+            ) {
                 (Some(old), Some(new)) => {
                     CliCommand::Mutation(MutationCommand::BookmarkRename { old, new })
                 }
@@ -892,26 +922,24 @@ fn classify(view: &ArgsView) -> CliCommand {
         ["bookmark", verb @ ("track" | "untrack")] if view.only(&["names", "remotes"]) => {
             let names = view.values("names");
             let remotes = view.values("remotes");
+            // jj's `parse_name_patterns_or_remote_symbols`: a `name@remote`
+            // symbol, or a name pattern with `--remote` patterns.
             let target = match (names.as_slice(), remotes.as_slice()) {
-                ([symbol], []) => symbol
-                    .value
-                    .rsplit_once('@')
-                    .map(|(name, remote)| (name.to_owned(), remote.to_owned())),
-                ([name], [remote]) if !name.value.contains('@') => {
-                    Some((name.value.clone(), remote.value.clone()))
-                }
+                ([symbol], []) => match jj_lib::revset::parse_program(&symbol.value) {
+                    Ok(node) => match node.kind {
+                        jj_lib::revset::ExpressionKind::RemoteSymbol(symbol) => Some((
+                            symbol.name.as_str().to_owned(),
+                            symbol.remote.as_str().to_owned(),
+                        )),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                },
+                ([name], [remote]) => plain_name(name.clone())
+                    .zip(plain_name(remote.clone()))
+                    .map(|(name, remote)| (name.value, remote.value)),
                 _ => None,
-            }
-            .filter(|(name, remote)| {
-                !name.is_empty()
-                    && !remote.is_empty()
-                    && plain_name(Spanned {
-                        value: name.clone(),
-                        span: 0..0,
-                    })
-                    .is_some()
-                    && !remote.contains(['*', '?', '[', ':'])
-            });
+            };
             native(target.map(|(name, remote)| match *verb {
                 "track" => MutationCommand::BookmarkTrack { name, remote },
                 _ => MutationCommand::BookmarkUntrack { name, remote },
@@ -1208,11 +1236,49 @@ mod tests {
         ));
         assert!(matches!(
             mutation("jj bookmark move main --to x -B"),
-            MutationCommand::BookmarkSet {
+            MutationCommand::BookmarkMove {
                 allow_backwards: true,
                 ..
             }
         ));
+        // Names are read the way jj reads them: quotes come off, and what
+        // isn't one name is jj's to handle (or refuse).
+        assert!(matches!(
+            mutation("jj bookmark set '\"my topic\"'"),
+            MutationCommand::BookmarkSet { name, .. } if name.value == "my topic"
+        ));
+        for line in [
+            "jj bookmark set main@origin",
+            "jj bookmark create 'a|b'",
+            "jj bookmark create exact:a",
+        ] {
+            assert!(
+                error(line)
+                    .message
+                    .contains("Failed to parse bookmark name"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            command("jj bookmark move main@origin --to x"),
+            CliCommand::Passthrough
+        );
+        assert_eq!(command("jj bookmark delete 'a|b'"), CliCommand::Passthrough);
+        assert!(matches!(
+            mutation("jj bookmark delete '\"a b\"'"),
+            MutationCommand::BookmarkDelete { name } if name.value == "a b"
+        ));
+        assert!(matches!(
+            mutation("jj bookmark rename '\"a b\"' c"),
+            MutationCommand::BookmarkRename { old, new } if old.value == "a b" && new.value == "c"
+        ));
+        assert_eq!(
+            mutation("jj bookmark track '\"a b\"@origin'"),
+            MutationCommand::BookmarkTrack {
+                name: "a b".to_owned(),
+                remote: "origin".to_owned()
+            }
+        );
         assert_eq!(
             command("jj bookmark delete 'glob:feat-*'"),
             CliCommand::Passthrough
@@ -1325,6 +1391,22 @@ mod tests {
         assert_eq!(command("jj -R ../other new"), CliCommand::Passthrough);
         // The leading `jj` is optional.
         assert_eq!(parse_ok("new").path, ["new"]);
+    }
+
+    #[test]
+    fn revsets_elsewhere_are_the_clis() {
+        // Another operation or repository: nothing to resolve here, and the
+        // line runs as typed.
+        for line in ["jj --at-op abc log -r xyz", "jj -R ../other log -r xyz"] {
+            let parsed = parse_ok(line);
+            assert!(parsed.revsets.is_empty(), "{line}");
+            assert_eq!(parsed.command, CliCommand::Passthrough, "{line}");
+            assert!(revset_slots(&CliConfig::builtin(), line).is_empty());
+        }
+        // A blank revset is jj's syntax error, not the whole graph.
+        let blank = error("jj log -r ' '");
+        assert_eq!(blank.message, "Failed to parse revset: Syntax error");
+        assert_eq!(blank.span, 11..12);
     }
 
     #[test]

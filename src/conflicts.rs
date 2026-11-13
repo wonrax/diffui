@@ -9,19 +9,20 @@
 //! left open for minutes doesn't stall the tab; its result lands as an
 //! ordinary [`MutationOp::ResolveConflict`].
 
+use crate::Cx;
 use diffui_core::{
     ConflictFile, ConflictPick, ConflictResolution, DiffFileStatus, JobId, MergeToolInvocation,
     MutationOp, RevisionSelection, hunk_conflict_region,
 };
-use iced::widget::{column, container, responsive, text, text_editor};
-use iced::{Element, Length, Task, alignment};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::changes::{ChangesMsg, editable};
 use crate::commands::CommandArg;
 use crate::prose::Prose;
-use crate::theme::{ThemeSpec, text_size};
-use crate::typography;
-use crate::{Action, Diffui, Message, PendingMutation, TabId, TabState, activity, icons, ui};
+use crate::theme::{self, text_size};
+use crate::ui::Look;
+use crate::{Action, Diffui, PendingMutation, TabId, TabState, activity, icons, input, typography};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConflictMsg {
@@ -46,7 +47,7 @@ pub(crate) enum ConflictMsg {
     },
     /// Open the marker editor on `path`.
     EditMarkers(String),
-    EditorAction(text_editor::Action),
+    EditorEdited(String),
     EditorSave,
     EditorCancel,
 }
@@ -76,7 +77,7 @@ pub(crate) struct MarkerEditor {
     revision: RevisionSelection,
     path: String,
     original: String,
-    content: text_editor::Content,
+    content: String,
     /// The marker length jj wrote, to parse the edit back with.
     marker_len: usize,
     /// The save in flight; the editor is read-only meanwhile.
@@ -332,11 +333,11 @@ fn markers_left(text: &str, marker_len: usize) -> usize {
 }
 
 impl Diffui {
-    pub(crate) fn on_conflict(&mut self, msg: ConflictMsg) -> Task<Message> {
+    pub(crate) fn on_conflict(&mut self, msg: ConflictMsg, cx: &mut Cx) {
         match msg {
             ConflictMsg::Resolve { path, resolution } => {
                 if !editable(self.active()) {
-                    return Task::none();
+                    return;
                 }
                 let target = self.active().session.selected_revision.clone();
                 // A region pick keeps the keyboard on that region's slot.
@@ -360,33 +361,35 @@ impl Diffui {
             ConflictMsg::StepRegion(by) => match self.step_region(by) {
                 // The banner follows the region's file.
                 Some(file) if file != self.active().selected_file => {
-                    self.perform(Action::SelectFile(file))
+                    self.perform(Action::SelectFile(file), cx)
                 }
-                _ => Task::none(),
+                _ => {}
             },
             ConflictMsg::TakeRegion { path, pick } => {
                 let tab = self.active();
                 let Some(at) = target_region(tab, path.as_deref()) else {
-                    return Task::none();
+                    return;
                 };
                 let path = region_path(tab, &at).to_owned();
-                self.on_conflict(ConflictMsg::Resolve {
-                    path,
-                    resolution: ConflictResolution::Region {
-                        region: at.region,
-                        regions: at.regions,
-                        pick,
+                self.on_conflict(
+                    ConflictMsg::Resolve {
+                        path,
+                        resolution: ConflictResolution::Region {
+                            region: at.region,
+                            regions: at.regions,
+                            pick,
+                        },
                     },
-                })
+                    cx,
+                )
             }
-            ConflictMsg::EditMarkers(path) => self.open_marker_editor(path),
-            ConflictMsg::EditorAction(action) => {
+            ConflictMsg::EditMarkers(path) => self.open_marker_editor(path, cx),
+            ConflictMsg::EditorEdited(text) => {
                 if let Some(editor) = self.active_mut().changes.conflicts.editor.as_mut()
                     && editor.saving.is_none()
                 {
-                    editor.content.perform(action);
+                    editor.content = text;
                 }
-                Task::none()
             }
             ConflictMsg::EditorSave => self.save_marker_editor(),
             ConflictMsg::EditorCancel => {
@@ -398,7 +401,6 @@ impl Diffui {
                 {
                     conflicts.editor = None;
                 }
-                Task::none()
             }
             ConflictMsg::OpenMergeTool(path) => self.open_merge_tool(path),
             ConflictMsg::MergeToolDone {
@@ -436,7 +438,6 @@ impl Diffui {
                             );
                         }
                         self.push_error_toast("Merge tool".to_owned(), &error);
-                        Task::none()
                     }
                 }
             }
@@ -445,9 +446,9 @@ impl Diffui {
 
     /// Run `op` on `tab`, which may no longer be the active one (a merge
     /// tool finishing after a tab switch).
-    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose) -> Task<Message> {
+    fn resolve_in(&mut self, tab: TabId, op: MutationOp, label: Prose) {
         if self.tab_mut(tab).is_none() {
-            return Task::none();
+            return;
         }
         let (activity_id, _) = self.begin_activity(tab, label, false);
         self.run_mutation(PendingMutation {
@@ -492,13 +493,13 @@ impl Diffui {
 
     /// Ask for `path`'s text with its markers; the editor opens when it
     /// arrives.
-    fn open_marker_editor(&mut self, path: String) -> Task<Message> {
+    fn open_marker_editor(&mut self, path: String, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let state = self.active_mut();
         if !editable(state) {
-            return Task::none();
+            return;
         }
         let revision = state.session.selected_revision.clone();
         let conflicts = &state.changes.conflicts;
@@ -507,20 +508,19 @@ impl Diffui {
             && editor.path == path
         {
             // Already open (with any edits in it): just show it.
-            return self.select_file_path(&path);
+            return self.select_file_path(&path, cx);
         }
         if conflicts
             .editor
             .as_ref()
             .is_some_and(|editor| editor.saving.is_some())
         {
-            return Task::none();
+            return;
         }
         let job = state.session.next_job();
         state.changes.conflicts.text_job = Some((job, revision.clone(), path.clone()));
-        let select = self.select_file_path(&path);
-        Task::batch([
-            select,
+        self.select_file_path(&path, cx);
+        {
             self.send(
                 tab,
                 diffui_core::Command::ConflictText {
@@ -528,12 +528,12 @@ impl Diffui {
                     revision,
                     path,
                 },
-            ),
-        ])
+            );
+        }
     }
 
     /// Show `path` in the diff pane, if the document has it.
-    fn select_file_path(&mut self, path: &str) -> Task<Message> {
+    fn select_file_path(&mut self, path: &str, cx: &mut Cx) {
         match self
             .active()
             .session
@@ -543,27 +543,27 @@ impl Diffui {
             .position(|file| file.path == path)
         {
             Some(index) if index != self.active().selected_file => {
-                self.perform(Action::SelectFile(index))
+                self.perform(Action::SelectFile(index), cx)
             }
-            _ => Task::none(),
+            _ => {}
         }
     }
 
-    fn save_marker_editor(&mut self) -> Task<Message> {
+    fn save_marker_editor(&mut self) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let Some(editor) = editor_shown(self) else {
-            return Task::none();
+            return;
         };
         if editor.saving.is_some() {
-            return Task::none();
+            return;
         }
-        let text = editor.content.text();
+        let text = editor.content.clone();
         if text == editor.original {
             // Nothing edited: nothing to write.
             self.active_mut().changes.conflicts.editor = None;
-            return Task::none();
+            return;
         }
         let op = MutationOp::ResolveConflict {
             target: editor.revision.clone(),
@@ -621,14 +621,14 @@ impl Diffui {
         }
     }
 
-    fn open_merge_tool(&mut self, path: String) -> Task<Message> {
+    fn open_merge_tool(&mut self, path: String) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let state = self.active_mut();
         let conflicts = &state.changes.conflicts;
         if !editable(state) || conflicts.tool_job.is_some() || conflicts.tool_running.is_some() {
-            return Task::none();
+            return;
         }
         let job = state.session.next_job();
         let revision = state.session.selected_revision.clone();
@@ -645,13 +645,13 @@ impl Diffui {
 
     /// Ask for the conflicts of the active tab's revision when it has some
     /// and they aren't loaded yet. Cheap enough to call after every message.
-    pub(crate) fn sync_conflicts(&mut self) -> Task<Message> {
+    pub(crate) fn sync_conflicts(&mut self) {
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let tab = self.active();
         if !editable(tab) {
-            return Task::none();
+            return;
         }
         let revision = tab.session.selected_revision.clone();
         let document_id = tab.session.document_id;
@@ -665,13 +665,13 @@ impl Diffui {
             .as_ref()
             .is_some_and(|(_, asked, id)| *asked == revision && *id == document_id);
         if loaded || asked || tab.session.diff_in_flight() {
-            return Task::none();
+            return;
         }
-        let row = match &revision {
-            RevisionSelection::WorkingCopy => tab.session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => tab.session.commits.find_by_commit_id(hex),
-        };
-        let conflicted = row.is_some_and(|row| row.has_conflict())
+        let conflicted = tab
+            .session
+            .commits
+            .find(&revision)
+            .is_some_and(|row| row.has_conflict())
             || tab
                 .session
                 .document
@@ -687,27 +687,31 @@ impl Diffui {
                 files: Vec::new(),
             });
             state.changes.conflicts.reveal_on_load = false;
-            return Task::none();
+            return;
         }
         let job = state.session.next_job();
         state.changes.conflicts.job = Some((job, revision.clone(), document_id));
         self.send(tab_id, diffui_core::Command::ConflictInfo { job, revision })
     }
 
-    /// Route a repository event answering one of our jobs. `None` when the
-    /// event isn't ours.
+    /// Route a repository event answering one of our jobs, or hand it back
+    /// when it isn't ours.
     pub(crate) fn take_conflict_job(
         &mut self,
         tab: TabId,
-        event: &diffui_core::Event,
-    ) -> Option<Task<Message>> {
+        event: diffui_core::Event,
+        cx: &mut Cx,
+    ) -> Option<diffui_core::Event> {
         use diffui_core::Payload;
-        let job = event.job()?;
+        let owned = event.job().is_some_and(|job| {
+            self.tab(tab)
+                .is_some_and(|state| state.changes.conflicts.owns(job))
+        });
+        let (true, Some(job)) = (owned, event.job()) else {
+            return Some(event);
+        };
         let conflicts = &mut self.tab_mut(tab)?.changes.conflicts;
-        if !conflicts.owns(job) {
-            return None;
-        }
-        Some(match &event.payload {
+        match event.payload {
             Payload::ConflictInfoLoaded { files, .. } => {
                 if let Some((_, revision, document_id)) = conflicts.job.take() {
                     if std::mem::take(&mut conflicts.reveal_on_load) {
@@ -721,10 +725,9 @@ impl Diffui {
                     conflicts.loaded = Some(LoadedConflicts {
                         revision,
                         document_id,
-                        files: files.clone(),
+                        files,
                     });
                 }
-                Task::none()
             }
             Payload::MergeToolPrepared { invocation, .. } => {
                 let path = conflicts
@@ -733,7 +736,7 @@ impl Diffui {
                     .map(|(_, path)| path)
                     .unwrap_or_else(|| invocation.path.clone());
                 conflicts.tool_running = Some(path.clone());
-                let invocation = Box::new(invocation.clone());
+                let invocation = Box::new(invocation);
                 let (activity, _) = self.begin_activity(
                     tab,
                     Prose::from("Resolving ")
@@ -741,7 +744,7 @@ impl Diffui {
                         .text(format!(" in {}", invocation.tool)),
                     false,
                 );
-                Task::perform(
+                Self::run_async(
                     async move {
                         tokio::task::spawn_blocking(move || {
                             let result = invocation.run();
@@ -751,30 +754,32 @@ impl Diffui {
                         .await
                         .unwrap_or_else(|error| Err(format!("the merge tool thread died: {error}")))
                     },
-                    move |result| {
-                        Message::Changes(ChangesMsg::Conflict(ConflictMsg::MergeToolDone {
-                            tab,
-                            activity,
-                            result,
-                        }))
+                    cx,
+                    move |this, result, cx| {
+                        this.on_changes(
+                            ChangesMsg::Conflict(ConflictMsg::MergeToolDone {
+                                tab,
+                                activity,
+                                result,
+                            }),
+                            cx,
+                        );
                     },
-                )
+                );
             }
             Payload::ConflictTextLoaded {
                 text, marker_len, ..
             } => {
-                let Some((_, revision, path)) = conflicts.text_job.take() else {
-                    return Some(Task::none());
-                };
+                let (_, revision, path) = conflicts.text_job.take()?;
                 conflicts.editor = Some(MarkerEditor {
                     revision,
                     path,
                     original: text.clone(),
-                    content: text_editor::Content::with_text(text),
-                    marker_len: *marker_len,
+                    content: text,
+                    marker_len,
                     saving: None,
                 });
-                iced::widget::operation::focus(iced::widget::Id::new(MARKER_EDITOR_ID))
+                crate::input::focus(MARKER_EDITOR_ID, cx)
             }
             Payload::Failed { error, .. } => {
                 let tool = conflicts.tool_job.take_if(|(id, _)| *id == job);
@@ -785,15 +790,14 @@ impl Diffui {
                 } else if text.is_some() {
                     self.push_error_toast("Edit markers".to_owned(), &error.to_string());
                 }
-                Task::none()
             }
             _ => {
                 conflicts.job.take_if(|(id, ..)| *id == job);
                 conflicts.tool_job.take_if(|(id, _)| *id == job);
                 conflicts.text_job.take_if(|(id, ..)| *id == job);
-                Task::none()
             }
-        })
+        }
+        None
     }
 }
 
@@ -867,8 +871,8 @@ fn picks(conflict: &ConflictFile) -> Vec<ConflictPick> {
         .collect()
 }
 
-fn resolve(path: &str, resolution: ConflictResolution) -> Message {
-    Message::Changes(ChangesMsg::Conflict(ConflictMsg::Resolve {
+fn resolve(path: &str, resolution: ConflictResolution) -> Action {
+    Action::Changes(ChangesMsg::Conflict(ConflictMsg::Resolve {
         path: path.to_owned(),
         resolution,
     }))
@@ -899,10 +903,9 @@ fn file_label(conflict: &ConflictFile) -> String {
 fn term_runs(
     conflict: &ConflictFile,
     pick: ConflictPick,
-    font: iced::Font,
-    mono: iced::Font,
-    theme: ThemeSpec,
+    look: Look,
 ) -> Vec<crate::hunk_actions::Run> {
+    let Look { theme, font, mono } = look;
     use crate::hunk_actions::Run;
     let run = |text: String, font, color| Run { text, font, color };
     match pick {
@@ -923,11 +926,11 @@ fn file_strip(
     ui: &Diffui,
     file: usize,
     conflict: &ConflictFile,
-    theme: ThemeSpec,
+    look: Look,
 ) -> (crate::hunk_actions::FileStrip, Vec<FileButton>) {
+    let Look { theme, .. } = look;
     use crate::hunk_actions::{Button, FileStrip, Row, Run, Tool};
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
     let path = conflict.path.as_str();
     let tool = |icon: &str, label: &str, enabled: bool| Tool {
         runs: vec![
@@ -974,7 +977,8 @@ fn file_strip(
         }
         for pick in picks(conflict) {
             takes.push(Button {
-                runs: term_runs(conflict, pick, font, mono, theme),
+                runs: term_runs(conflict, pick, look),
+                tone: crate::hunk_actions::Tone::Raised,
             });
             buttons.push(FileButton::Take(pick));
         }
@@ -993,18 +997,20 @@ fn file_strip(
                 color: theme.muted_text,
             }),
             buttons: takes,
+            hover: false,
         },
     };
     (strip, buttons)
 }
 
-/// The conflict controls the diff paints: a strip under each conflicted
-/// file's header, and take-a-side buttons on every conflict region's hunk
-/// header.
-pub(crate) fn hunk_actions<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<crate::hunk_actions::HunkActions<'a, Message>> {
+/// The conflict controls the diff paints: a strip under each conflicted file's header,
+/// and take-a-side buttons on every conflict region's hunk header.
+pub(crate) fn hunk_actions(
+    ui: &Diffui,
+    look: Look,
+    cx: &mut Cx,
+) -> Option<crate::hunk_actions::HunkActions> {
+    let Look { theme, .. } = look;
     use crate::hunk_actions::{Button, Row, Run};
     let tab = ui.active();
     if !editable(tab) || editor_shown(ui).is_some() {
@@ -1015,7 +1021,7 @@ pub(crate) fn hunk_actions<'a>(
     let mut file_targets = Vec::new();
     for (index, file) in tab.session.document.files.iter().enumerate() {
         if let Some(conflict) = conflicts.iter().find(|conflict| conflict.path == file.path) {
-            let (strip, buttons) = file_strip(ui, index, conflict, theme);
+            let (strip, buttons) = file_strip(ui, index, conflict, look);
             files.push(strip);
             file_targets.push((conflict.path.clone(), buttons));
         }
@@ -1024,8 +1030,7 @@ pub(crate) fn hunk_actions<'a>(
     if all.is_empty() && files.is_empty() {
         return None;
     }
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
+    let font = look.font;
     let focus = focused(tab, &all);
     let mut rows = Vec::with_capacity(all.len());
     let mut targets = Vec::with_capacity(all.len());
@@ -1035,7 +1040,8 @@ pub(crate) fn hunk_actions<'a>(
         let buttons = picks(conflict)
             .into_iter()
             .map(|pick| Button {
-                runs: term_runs(conflict, pick, font, mono, theme),
+                runs: term_runs(conflict, pick, look),
+                tone: crate::hunk_actions::Tone::Raised,
             })
             .collect();
         rows.push(Row {
@@ -1048,57 +1054,76 @@ pub(crate) fn hunk_actions<'a>(
                 color: theme.muted_text,
             }),
             buttons,
+            hover: false,
         });
         targets.push((path.to_owned(), at.region, at.regions, picks(conflict)));
     }
-    let fill = |status| match crate::theme::raised_button_style(theme, status).background {
-        Some(iced::Background::Color(color)) => color,
-        _ => theme.panel_background,
+    // A handful of regions: built here, looked up by their hunk.
+    let rows = std::rc::Rc::new(rows);
+    let row_of = {
+        let rows = rows.clone();
+        move |file: usize, hunk: usize| {
+            rows.iter()
+                .position(|row: &Row| (row.file, row.hunk) == (file, hunk))
+        }
     };
-    let ghost_hover_fill =
-        match crate::theme::ghost_button_style(theme, iced::widget::button::Status::Hovered)
-            .background
-        {
-            Some(iced::Background::Color(color)) => color,
-            _ => theme.panel_background,
-        };
+    let raised = crate::theme::raised_button_style(theme);
+    let build_row = {
+        let (rows, row_of) = (rows.clone(), row_of.clone());
+        move |file: usize, hunk: usize, _: &gpui_kit::App| Some(rows[row_of(file, hunk)?].clone())
+    };
     Some(crate::hunk_actions::HunkActions {
-        rows,
+        rows: std::rc::Rc::new(build_row),
         style: crate::hunk_actions::Style {
-            size: text_size::UI,
-            fill: fill(iced::widget::button::Status::Active),
-            hover_fill: fill(iced::widget::button::Status::Hovered),
-            ghost_hover_fill,
+            size: crate::theme::text_size::BODY,
+            fill: raised.rest.unwrap_or(theme.panel_background),
+            hover_fill: raised.hover,
+            ghost_hover_fill: crate::theme::ghost_button_style(theme).hover,
             border: theme.border,
             focus: theme.accent,
-            radius: crate::theme::radius::BUTTON,
+            on_fill: theme.accent,
+            radius: crate::theme::radius::CONTROL,
         },
-        on_press: Box::new(move |row, button| {
-            let (path, region, regions, picks) = &targets[row];
-            resolve(
-                path,
-                ConflictResolution::Region {
-                    region: *region,
-                    regions: *regions,
-                    pick: picks[button],
-                },
-            )
-        }),
+        on_press: std::rc::Rc::new(Diffui::listen(
+            cx,
+            move |this, &(file, hunk, button): &(usize, usize, usize), _, cx| {
+                let Some(row) = row_of(file, hunk) else {
+                    return;
+                };
+                let (path, region, regions, picks) = &targets[row];
+                let action = resolve(
+                    path,
+                    ConflictResolution::Region {
+                        region: *region,
+                        regions: *regions,
+                        pick: picks[button],
+                    },
+                );
+                this.perform(action, cx);
+            },
+        )),
         files,
-        on_file_press: Box::new(move |strip, button| {
-            let (path, buttons) = &file_targets[strip];
-            let msg = match buttons[button] {
-                FileButton::EditMarkers => ConflictMsg::EditMarkers(path.clone()),
-                FileButton::MergeTool => ConflictMsg::OpenMergeTool(path.clone()),
-                FileButton::Take(ConflictPick::Side(side)) => {
-                    return resolve(path, ConflictResolution::Side(side));
-                }
-                FileButton::Take(ConflictPick::Base(base)) => {
-                    return resolve(path, ConflictResolution::Base(base));
-                }
-            };
-            Message::Changes(ChangesMsg::Conflict(msg))
-        }),
+        on_file_press: std::rc::Rc::new(Diffui::listen(
+            cx,
+            move |this, &(strip, button): &(usize, usize), _, cx| {
+                let (path, buttons) = &file_targets[strip];
+                let action = match buttons[button] {
+                    FileButton::EditMarkers => Action::Changes(ChangesMsg::Conflict(
+                        ConflictMsg::EditMarkers(path.clone()),
+                    )),
+                    FileButton::MergeTool => Action::Changes(ChangesMsg::Conflict(
+                        ConflictMsg::OpenMergeTool(path.clone()),
+                    )),
+                    FileButton::Take(ConflictPick::Side(side)) => {
+                        resolve(path, ConflictResolution::Side(side))
+                    }
+                    FileButton::Take(ConflictPick::Base(base)) => {
+                        resolve(path, ConflictResolution::Base(base))
+                    }
+                };
+                this.perform(action, cx);
+            },
+        )),
         reveal: focus.map(|index| {
             (
                 all[index].file,
@@ -1112,101 +1137,126 @@ pub(crate) fn hunk_actions<'a>(
 /// The marker editor in place of the diff: the file with jj's conflict
 /// markers in the app's editor, and a footer saying how many conflicts are
 /// left in it.
-pub(crate) fn marker_editor<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
+pub(crate) fn marker_editor(
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     const GAP: f32 = 8.0;
     let editor = editor_shown(ui)?;
     let saving = editor.saving.is_some();
-    let mono = ui.config.mono_font;
+    let mono = look.mono;
     let size = ui.config.code_type.size;
-    let font = ui.config.ui_font;
-    let input = responsive(move |bounds| {
-        let bar = crate::theme::control::COMPACT;
-        let height = (bounds.height - 2.0 * (bar + GAP)).max(60.0);
-        let title = container(typography::centered(
-            Prose::new()
-                .text("Editing ")
-                .path(editor.path.as_str())
-                .view(font, mono, theme.text, theme)
-                .size(text_size::UI)
-                .wrapping(text::Wrapping::None),
+    let font = look.font;
+    let title = div()
+        .h(px(theme::control::COMPACT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .child(typography::centered(
+            div()
+                .whitespace_nowrap()
+                .text_size(px(text_size::BODY))
+                .child(
+                    Prose::new()
+                        .text("Editing ")
+                        .path(editor.path.as_str())
+                        .view(look, theme.text),
+                ),
             font,
-            text_size::UI,
-        ))
-        .height(Length::Fixed(bar))
-        .align_y(alignment::Vertical::Center);
-        let on_action =
-            |action| Message::Changes(ChangesMsg::Conflict(ConflictMsg::EditorAction(action)));
-        let input = crate::input::multi_line(
-            &editor.content,
-            crate::input::MultiLine {
-                id: Some(MARKER_EDITOR_ID),
-                placeholder: "",
-                font: mono,
-                size,
-                height,
-            },
-            theme,
-            (!saving).then_some(on_action),
-        );
-        column![title, input, editor_footer(ui, theme, editor)].spacing(GAP)
-    });
+            text_size::BODY,
+        ));
+    let mut spec = input::FieldSpec::new(MARKER_EDITOR_ID, &editor.content);
+    if !saving {
+        let on_input = Diffui::listen(cx, |this, text: &String, _, cx| {
+            this.on_conflict(ConflictMsg::EditorEdited(text.clone()), cx);
+        });
+        spec = spec.on_input(move |text, window, cx| on_input(&text, window, cx));
+    }
+    // The well is ours: kit's own focus ring isn't the app's.
+    let (field, focused) = input::multi_line_with_focus(spec, mono, window, cx);
+    let field = div()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .child(field.appearance(false).text_size(px(size)).h_full());
     Some(
-        container(input)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding([10.0, crate::theme::space::XL])
-            .style(move |_| container::Style::default().background(theme.panel_background))
-            .into(),
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .py(px(10.0))
+            .px(px(theme::space::XL))
+            .bg(theme.panel_background)
+            .child(title)
+            .child(
+                crate::field::field_well(focused, theme)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(field)
+                    .child(editor_footer(ui, look, editor, cx)),
+            )
+            .into_any_element(),
     )
 }
 
 /// How many conflicts the edit still holds, Cancel and Save.
-fn editor_footer<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    editor: &'a MarkerEditor,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
+fn editor_footer(ui: &Diffui, look: Look, editor: &MarkerEditor, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let font = look.font;
     let saving = editor.saving.is_some();
-    let hint = match markers_left(&editor.content.text(), editor.marker_len) {
+    let hint = match markers_left(&editor.content, editor.marker_len) {
         0 => "No conflict markers left: saving resolves the file".to_owned(),
         1 => "1 conflict left: saving keeps it conflicted".to_owned(),
         n => format!("{n} conflicts left: saving keeps them conflicted"),
     };
-    let hint = typography::centered(
-        text(hint)
-            .size(text_size::UI)
-            .font(font)
-            .color(theme.subtle_text),
-        font,
-        text_size::UI,
-    );
-    let keyed = |button: iced::widget::Button<'a, Message>, key: &'static str| {
-        ui::tooltip(
-            button,
-            key,
-            iced::widget::tooltip::Position::Top,
-            font,
-            theme,
+    let cancel = look
+        .cancel_button("marker-cancel")
+        .compact()
+        .disabled(saving)
+        .on_click(Diffui::listen(cx, |this, _, _, cx| {
+            this.on_conflict(ConflictMsg::EditorCancel, cx);
+        }));
+    let save = look
+        .button(
+            "marker-save",
+            if saving { "Saving\u{2026}" } else { "Save" },
         )
-    };
-    let message = |msg| Message::Changes(ChangesMsg::Conflict(msg));
-    let cancel = ui::cancel_button(ui::Size::Compact, font, theme)
-        .on_press_maybe((!saving).then(|| message(ConflictMsg::EditorCancel)));
-    let save = ui::text_button(
-        None,
-        if saving { "Saving\u{2026}" } else { "Save" },
-        ui::Variant::Primary,
-        ui::Size::Compact,
-        font,
+        .primary()
+        .compact()
+        .disabled(!(!saving))
+        .on_click(Diffui::listen(cx, |this, _, _, cx| {
+            this.on_conflict(ConflictMsg::EditorSave, cx);
+        }));
+    crate::overlay_kit::footer_with_buttons(
+        crate::overlay_kit::Density::Well,
+        crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
+        [
+            ("conflict.edit.save", "Save"),
+            ("conflict.edit.cancel", "Cancel"),
+        ]
+        .into_iter()
+        .filter_map(|(id, label)| {
+            crate::overlay_kit::bound_hint(
+                ui,
+                crate::commands::Context::ConflictEdit,
+                &[id],
+                label,
+                look,
+            )
+        })
+        .map(IntoElement::into_any_element)
+        .chain([crate::overlay_kit::hint_note(hint, theme.subtle_text, font)])
+        .collect(),
+        [cancel.into_any_element(), save.into_any_element()],
         theme,
     )
-    .on_press_maybe((!saving).then(|| message(ConflictMsg::EditorSave)));
-    ui::button_row(
-        Some(hint),
-        [keyed(cancel, "Esc"), keyed(save, "\u{2318}\u{21b5}")],
-    )
-    .into()
+    .into_any_element()
 }
 
 #[cfg(test)]

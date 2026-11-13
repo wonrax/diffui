@@ -7,7 +7,6 @@
 //! frontend never has to ask which backend it is talking to.
 
 use tokio::sync::mpsc;
-use tracing::Instrument as _;
 
 /// Rows per `Batch`, as the jj walk streams them, so a long log is folded in
 /// steps rather than in one message.
@@ -15,7 +14,7 @@ const BATCH_SIZE: usize = 256;
 
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, Payload, RepoError, RepoId};
-use super::{Envelope, Jobs, catch_panic, route_commands};
+use super::{Envelope, Jobs, route_commands, run_job};
 use crate::repository::Repository;
 
 pub(super) fn spawn(
@@ -35,42 +34,39 @@ pub(super) fn spawn(
         while let Some(envelope) = work.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
+                // A save in the worktree changes what the working-copy diff
+                // shows, not the history, so it asks for a snapshot rather
+                // than a reload (`Session` escalates one that finds the
+                // working copy turned clean or dirty). Anything under `.git`
+                // may have moved refs.
                 Envelope::Watch(batch) => {
-                    if batch.worktree || batch.git_metadata {
-                        let _ = events.send(Event::new(id.clone(), Payload::RepositoryChanged));
-                    }
+                    let payload = if batch.git_metadata {
+                        Payload::RepositoryChanged
+                    } else if batch.worktree {
+                        Payload::WorkingCopyChanged
+                    } else {
+                        continue;
+                    };
+                    let _ = events.send(Event::new(id.clone(), payload));
                 }
                 Envelope::Run {
                     repository,
                     command,
                 } => {
                     let Some(job) = command.job() else { continue };
-                    let cancel = match jobs.lock() {
-                        Ok(mut jobs) => jobs.begin(job),
-                        Err(_) => CancelFlag::default(),
-                    };
                     let span = tracing::info_span!("repo_command", repo = %id, job = job.0);
-                    let work = async {
+                    let emit = |payload| {
+                        let _ = events.send(Event::new(id.clone(), payload));
+                    };
+                    run_job(&jobs, job, span, emit, |ticket| async move {
                         #[cfg(feature = "fault-injection")]
                         super::fault::trip(&repository.root);
-                        run(&repository, command, &cancel).await
-                    };
-                    let payloads = match catch_panic(work).instrument(span.clone()).await {
-                        Ok(payloads) => payloads,
-                        Err(message) => {
-                            span.in_scope(|| tracing::error!("command panicked: {message}"));
-                            vec![Payload::Failed {
-                                job,
-                                error: RepoError::Crashed(message),
-                            }]
+                        for payload in run(&repository, *command, ticket.flag()).await {
+                            emit(payload);
                         }
-                    };
-                    for payload in payloads {
-                        let _ = events.send(Event::new(id.clone(), payload));
-                    }
-                    if let Ok(mut jobs) = jobs.lock() {
-                        jobs.finish(job);
-                    }
+                        Ok(())
+                    })
+                    .await;
                 }
             }
             if events.is_closed() {
@@ -125,24 +121,44 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
                 error: RepoError::Unsupported,
             }]
         }
-        Command::LoadDiff { job, revision, .. } => {
-            match crate::git::load_git_diff(repository, &revision).await {
-                Ok((document, details)) => vec![Payload::DiffLoaded {
-                    job,
-                    revision,
-                    document,
-                    details,
-                }],
-                Err(error) => failed(job, error),
-            }
+        Command::LoadDiff {
+            job,
+            revision,
+            expand,
+            ..
+        } => match crate::git::load_git_diff(repository, &revision, &expand).await {
+            Ok((document, details)) => vec![Payload::DiffLoaded {
+                job,
+                revision,
+                document,
+                details,
+            }],
+            Err(error) => failed(job, error),
+        },
+        Command::ExpandFile { job, base, .. } if base.is_compare() => {
+            vec![Payload::Failed {
+                job,
+                error: RepoError::Unsupported,
+            }]
         }
-        Command::Snapshot { job, origin } => {
+        Command::ExpandFile {
+            job,
+            revision,
+            path,
+            ..
+        } => match crate::git::load_git_file_diff(repository, &revision, &path).await {
+            Ok(file) => vec![Payload::FileExpanded { job, path, file }],
+            Err(error) => failed(job, error),
+        },
+        // No snapshot exists in git: every `DiskSync` reads the worktree.
+        Command::Snapshot { job, origin, .. } => {
             match crate::git::load_git_repository_snapshot(&repository.root).await {
                 Ok(snapshot) => vec![Payload::SnapshotDone {
                     job,
                     origin,
                     snapshot,
                     warnings: Vec::new(),
+                    disk: Default::default(),
                 }],
                 Err(error) => failed(job, error),
             }
@@ -213,13 +229,14 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
         | Command::PrepareMergeTool { job, .. }
         | Command::ConflictText { job, .. }
         | Command::History { job, .. }
-        | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }
         | Command::ResolveDiff { job, .. }
         | Command::RunCli { job, .. } => vec![Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }],
-        Command::Cancel { .. } => unreachable!("cancels are handled before dispatch"),
+        Command::Cancel { .. } | Command::SetRefreshMode { .. } => {
+            unreachable!("jobless commands are handled before dispatch")
+        }
     }
 }

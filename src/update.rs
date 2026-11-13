@@ -1,21 +1,20 @@
-//! `impl Diffui` — the application reducer (`update`), lifecycle (`new`,
-//! `view`, `subscription`, `theme`), and all the orchestration/menu/tab helper
-//! methods. Split out of `main.rs`; the type defs + free fns it calls stay at
-//! the crate root and are reached via `super::*` / `crate::`.
+//! `impl Diffui`: construction, [`Diffui::perform`], the repository event
+//! router, and the orchestration helpers they share. The types and free
+//! functions it uses stay at the crate root, reached via `super::*`.
 
 use super::*;
+use crate::Cx;
+use crate::keys as keyboard;
+use diffui_core::SyntaxSpan;
 // `super::*` is a glob, which loses to the prelude for the `column!` macro name
 // — import it directly so `column![…]` in `view` resolves. The other widget
 // builders (`row!`/`stack!`/`container`) aren't shadowed and come via the glob.
-use crate::find::FindMessage;
-use crate::menu::MenuMessage;
-use crate::palette::PaletteMessage;
 use crate::prose::Prose;
-use iced::widget::column;
 
 impl Diffui {
-    pub(crate) fn new(cli: Cli, saved: WindowState) -> (Self, Task<Message>) {
-        let (config, raw_keys, config_error) = AppConfig::load();
+    pub(crate) fn new(cli: Cli, saved: WindowState, cx: &mut Cx) -> Self {
+        let (config, raw_keys, config_files) = AppConfig::load();
+        crate::typography::set_ui_font(config.ui_font);
         // A keymap problem is never fatal: a config written against another
         // build still opens the app, having said once what it had to skip.
         let (keymap, problems) = Keymap::build(&raw_keys);
@@ -32,7 +31,7 @@ impl Diffui {
         let window_size = saved
             .size()
             .map(|(w, h)| Size::new(w, h))
-            .unwrap_or_else(|| window::Settings::default().size);
+            .unwrap_or(DEFAULT_WINDOW_SIZE);
         let requested_sidebar_width = saved
             .sidebar_width
             .filter(|w| w.is_finite() && *w > 0.0)
@@ -53,6 +52,7 @@ impl Diffui {
             (window_size.width - sidebar_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
         );
         let window_position = saved.position().map(|(x, y)| Point::new(x, y));
+        let window_display = saved.display.clone();
 
         // Launch precedence: paths named on the command line (`diffui .`,
         // `--path`) win; else restore the last session, plus the current
@@ -136,15 +136,7 @@ impl Diffui {
             })
             .unwrap_or(0);
 
-        // A repo's persisted revset (keyed by root); `None` starts it on the
-        // repo's own default, which `TabState::unloaded` reads once.
-        let revset_for = |repository: &Repository| -> Option<String> {
-            saved
-                .revsets
-                .get(&repository.root.to_string_lossy().into_owned())
-                .filter(|value| !value.is_empty())
-                .cloned()
-        };
+        let repo_layouts = crate::window_state::RepoLayouts::from_saved(&saved);
 
         let mut next_tab_id = 0u64;
         let mut tabs = Vec::with_capacity(targets.len());
@@ -156,19 +148,7 @@ impl Diffui {
                         vcs: repository.vcs,
                         root: repository.root.clone(),
                     };
-                    let key = repository.root.to_string_lossy().into_owned();
-                    let mut state =
-                        TabState::unloaded(Some(repository.clone()), revset_for(repository));
-                    state.history_panel_collapsed = saved
-                        .history_panel_collapsed
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(false);
-                    state.files_panel_collapsed = saved
-                        .files_panel_collapsed
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(false);
+                    let state = repo_layouts.tab_state(repository.clone());
                     (owner, name, source, state)
                 }
                 BootTarget::Pr(spec) => (
@@ -220,7 +200,7 @@ impl Diffui {
         let mut app = Self {
             app_focused: true,
             selected_theme: config.theme,
-            system_theme: iced_theme::Mode::None,
+            system_theme: cx.window_appearance().into(),
             sidebar_width,
             file_nav_width,
             diff_wrap: saved.diff_wrap.unwrap_or(true),
@@ -231,13 +211,13 @@ impl Diffui {
             sidebar_min_width,
             window_size,
             window_position,
-            scale_factor: 1.0,
+            window_display,
             geometry_dirty_since: None,
-            zoom_anim: None,
-            zoom_restore: None,
             config,
+            config_files,
             keymap,
             modes: Vec::new(),
+            focus_before_modes: None,
             recents: Recents::load(),
             sidebar_file_reveal_token: 0,
             scroll_restore_token: 0,
@@ -249,18 +229,27 @@ impl Diffui {
             next_tab_id,
             next_document_id: 0,
             recent_repos,
+            repo_layouts,
             next_activity_id: 0,
             hovered: None,
-            changed_files_peek_open: false,
-            changed_files_trigger_hovered: false,
-            changed_files_rail_hovered: false,
-            changed_files_popup_hovered: false,
+            panel_peek: None,
+            tab_strip: Default::default(),
             modifiers: keyboard::Modifiers::default(),
             toasts: Vec::new(),
             next_toast_id: 0,
+            window: None,
+            background: Default::default(),
+            palette_query: Default::default(),
+            command_line_settle: Default::default(),
+            panes: None,
+            #[cfg(test)]
+            renders: 0,
         };
 
-        if let Some(error) = config_error {
+        if let Some(error) = app.config_files.settings_error.clone() {
+            app.push_sticky_toast("settings.toml ignored".to_owned(), &error);
+        }
+        if let Some(error) = app.config_files.config_error.clone() {
             app.push_sticky_toast("config.toml ignored, using defaults".to_owned(), &error);
         } else if let Some(first) = problems.first() {
             let more = match problems.len() {
@@ -272,13 +261,11 @@ impl Diffui {
                 &format!("{first}{more}"),
             );
         }
-        let theme_task =
-            system::theme().map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode)));
-        // Kicks the streaming load for whatever the active tab is — a repo
-        // walk, a PR stream, or nothing when no tab opened.
-        let load_task = app.ensure_active_loaded();
-        let welcome = app.ensure_welcome_prompt();
-        (app, Task::batch([load_task, theme_task, welcome]))
+        // Kicks the streaming load for whatever the active tab is: a repo walk,
+        // a PR stream, or nothing when no tab opened.
+        app.ensure_active_loaded();
+        app.ensure_welcome_prompt(cx);
+        app
     }
 
     /// Fold one repository event into the tab that asked for it.
@@ -288,7 +275,7 @@ impl Diffui {
     /// outlives its tab entirely is dropped. The jobless events (the actor's
     /// handshake, an operation head moving, a working-tree edit) go to every
     /// tab on that repository.
-    fn on_repo_event(&mut self, event: diffui_core::Event) -> Task<Message> {
+    pub(crate) fn on_repo_event(&mut self, event: diffui_core::Event, cx: &mut Cx) {
         use diffui_core::Payload;
 
         if let Payload::Ready {
@@ -296,7 +283,6 @@ impl Diffui {
             capabilities,
         } = event.payload
         {
-            let mut tasks = Vec::new();
             for index in 0..self.tabs.len() {
                 if self.tabs[index].repo_id().as_ref() != Some(&event.repo) {
                     continue;
@@ -313,32 +299,37 @@ impl Diffui {
                 state.handle = Some(handle.with_scope(scope));
                 state.session.repo = Some(event.repo.clone());
                 state.session.capabilities = capabilities;
+                // Before anything loads: the mode picks what a snapshot does,
+                // and the actor goes by jj's setting alone until told.
+                let effects = state.session.set_refresh_mode(self.config.refresh);
+                self.run_effects(id, effects);
                 // Only the tab on screen loads now; the rest load when they are
                 // first activated, as they always have. Their actors are up
                 // either way, so the switch is instant.
                 if self.is_active(id) {
-                    tasks.push(self.start_tab_load(id));
+                    self.start_tab_load(id);
                 }
             }
             if capabilities.mutate {
-                tasks.push(crate::jj_version::check_once());
+                crate::jj_version::check_once(cx);
             }
-            return Task::batch(tasks);
+            return;
         }
 
         let Some(tab) = self.route_event(&event) else {
-            return Task::none();
+            return;
         };
-        if let Some(task) = self.take_conflict_job(tab, &event) {
-            return task;
-        }
-        if let Some(task) = self.history_event(tab, &event) {
-            return task;
-        }
-        // A job can be both the frontend's and the projection's — a mutation
-        // owns an activity row *and* a slot — so the two run in order rather
-        // than one short-circuiting the other.
-        let own = self.take_own_job(tab, &event).unwrap_or_else(Task::none);
+        let Some(event) = self.take_conflict_job(tab, event, cx) else {
+            return;
+        };
+        let Some(event) = self.history_event(tab, event, cx) else {
+            return;
+        };
+        // A mutation is both the frontend's and the projection's — it owns an
+        // activity row *and* a slot — so its event comes back for the second.
+        let Some(event) = self.take_own_job(tab, event, cx) else {
+            return;
+        };
         // Read the draft's destination off the store this event is about to
         // replace, so it can be re-found by commit id afterwards.
         let candidate = self.draft_candidate_commit(tab);
@@ -346,22 +337,43 @@ impl Diffui {
         // deferred "Edit description", so note it while the payload is here.
         let diff_landed = matches!(event.payload, Payload::DiffLoaded { .. });
         let Some(target) = self.tab_mut(tab) else {
-            return own;
+            return;
+        };
+        // A browsed working copy re-lists when a snapshot lands that moved it,
+        // or one a refresh asked for: ignored files never move it, and an
+        // open `target/` should still track the disk.
+        let relist_source = match &event.payload {
+            Payload::SnapshotDone {
+                job,
+                origin,
+                snapshot,
+                ..
+            } => {
+                target.session.owns_job(*job)
+                    && (matches!(origin, RefreshOrigin::Focus)
+                        || target
+                            .session
+                            .repository_snapshot
+                            .as_ref()
+                            .is_none_or(|known| known.fingerprint != snapshot.fingerprint))
+            }
+            _ => false,
         };
         let effects = target.session.apply(event);
         let replaced = effects
             .iter()
             .any(|effect| matches!(effect, diffui_core::Effect::GraphReplaced));
-        let folded = self.run_effects(tab, effects);
+        self.run_effects(tab, effects);
         if replaced {
             self.rearm_draft_candidate(tab, candidate);
         }
-        let description = if diff_landed {
-            self.open_pending_description_edit(tab)
-        } else {
-            Task::none()
-        };
-        Task::batch([own, folded, description, self.drain_queued_mutation(tab)])
+        if diff_landed {
+            self.open_pending_description_edit(tab, cx);
+        }
+        if relist_source {
+            self.refresh_source_if_working_copy(tab, cx);
+        }
+        self.drain_queued_mutation(tab);
     }
 
     /// Open the editor a context-menu "Edit description" is still waiting on.
@@ -372,24 +384,23 @@ impl Diffui {
     /// is off screen keeps the pending target instead of losing it — the
     /// editor is a focused control, so opening it under another tab would take
     /// the keyboard from what the user is looking at. Activation retries.
-    pub(crate) fn open_pending_description_edit(&mut self, tab: TabId) -> Task<Message> {
+    pub(crate) fn open_pending_description_edit(&mut self, tab: TabId, cx: &mut Cx) {
         if !self.is_active(tab) {
-            return Task::none();
+            return;
         }
         let state = self.active();
         let Some(pending) = state.pending_description_edit.clone() else {
-            return Task::none();
+            return;
         };
         if state.session.selected_revision != pending {
-            return Task::none();
+            return;
         }
         self.active_mut().pending_description_edit = None;
         let commit = std::mem::take(&mut self.active_mut().pending_commit);
-        let task = self.open_description_editor();
+        self.open_description_editor(cx);
         if commit && let Some(editor) = self.active_mut().description_editor_mut() {
             editor.commit = true;
         }
-        task
     }
 
     /// The commit id under `tab`'s draft destination candidate, if it has one.
@@ -456,202 +467,208 @@ impl Diffui {
         }
     }
 
-    /// Handle the results the projection has no state to fold: previews, the
-    /// source browser, fetches, mutations and file pairs. Returns `None` when
-    /// the event isn't one of those, so the caller hands it to `Session::apply`.
-    fn take_own_job(&mut self, tab: TabId, event: &diffui_core::Event) -> Option<Task<Message>> {
+    /// Finish a job the tab issued itself: previews, the source browser,
+    /// fetches, mutations and file pairs. Hands the event back when the
+    /// projection must see it too: when it isn't one of these, and for a
+    /// mutation, whose slot the projection also holds.
+    fn take_own_job(
+        &mut self,
+        tab: TabId,
+        event: diffui_core::Event,
+        cx: &mut Cx,
+    ) -> Option<diffui_core::Event> {
         use diffui_core::Payload;
 
-        let job = event.job()?;
-        let target = self.tab_mut(tab)?;
-        let owns = target.jobs.owns(job)
-            || target
-                .pending_detail_copy
-                .as_ref()
-                .is_some_and(|(id, ..)| *id == job);
-        if !owns {
-            return None;
+        let Some(job) = event.job() else {
+            return Some(event);
+        };
+        let Some(pending) = self.tab_mut(tab).and_then(|state| state.jobs.take(job)) else {
+            return Some(event);
+        };
+        let handed_back = matches!(pending, Pending::Mutation(_)).then(|| event.clone());
+        match event.payload {
+            Payload::Failed { error, .. } => self.fail_own_job(tab, job, pending, error, cx),
+            Payload::Cancelled { .. } => self.cancel_own_job(tab, job, pending),
+            payload => self.finish_own_job(tab, job, pending, payload, cx),
         }
-        Some(match &event.payload {
-            Payload::PreviewDone { simulation, .. }
-                if target
-                    .jobs
-                    .trunk_rebase
-                    .as_ref()
-                    .is_some_and(|(id, _)| *id == job) =>
-            {
-                self.finish_trunk_preview(tab, job, Ok(simulation))
-            }
-            Payload::PreviewDone {
-                simulation, graph, ..
-            } => {
-                self.tab_mut(tab)?.jobs.preview = None;
-                self.apply_draft_preview(tab, Ok((simulation.clone(), graph.clone())))
-            }
-            Payload::TreeListed {
-                revision, entries, ..
-            } => self.apply_source_tree(tab, revision.clone(), Ok(entries.clone())),
-            Payload::FileRead { path, file, .. } => {
-                self.apply_source_file(tab, path.clone(), Ok(file.clone()))
-            }
-            Payload::FetchDone { outcome, .. } => self.finish_fetch(tab, Ok(outcome.clone())),
-            Payload::MutationDone { outcome, .. } => self.finish_mutation(tab, Ok(outcome.clone())),
-            Payload::BookmarkChecked { backwards, .. } => {
-                self.apply_bookmark_check(tab, Ok(*backwards))
-            }
-            Payload::FilePairRead { old, new, .. } => {
-                self.apply_file_pair(tab, job, old.clone(), new.clone())
-            }
-            Payload::RevsetResolved { revset, result, .. }
-                if self.tab_mut(tab)?.jobs.revset_field == Some(job) =>
-            {
-                self.revset_field_resolved(tab, revset, result.clone())
-            }
-            Payload::RevsetResolved { revset, result, .. } => {
-                self.command_revset_resolved(tab, job, revset, result.clone())
-            }
-            Payload::CliOutput { lines, .. } => {
-                self.cli_output(tab, job, lines);
-                Task::none()
-            }
-            Payload::CliExited { code, .. } => {
-                self.finish_cli_run(tab, job, crate::cli_output::Exit::Code(*code))
-            }
-            Payload::DetailsLoaded { details, .. } => {
-                let field = self
-                    .tab_mut(tab)
-                    .and_then(|state| state.pending_detail_copy.take());
-                match field {
-                    Some((_, field, fallback)) => {
-                        iced::clipboard::write(format_detail(details, field).unwrap_or(fallback))
-                            .discard()
-                    }
-                    None => Task::none(),
-                }
-            }
-            Payload::Failed { error, .. } => self.fail_own_job(tab, job, error.clone()),
-            Payload::Cancelled { .. } => {
-                // Resolve whatever row was showing the job before releasing
-                // its slot: a cancelled fetch or mutation left "Running" spins
-                // in the log forever, and calling it "Done" would claim work
-                // that never happened.
-                let activity = self.tab_mut(tab).and_then(|state| {
-                    let jobs = &state.jobs;
-                    jobs.fetch
-                        .as_ref()
-                        .filter(|(id, ..)| *id == job)
-                        .map(|(_, activity, _)| *activity)
-                        .or_else(|| {
-                            jobs.mutation
-                                .as_ref()
-                                .filter(|(id, _)| *id == job)
-                                .map(|(_, pending)| pending.activity_id)
-                        })
-                        .or_else(|| {
-                            jobs.bookmark_check
-                                .as_ref()
-                                .filter(|(id, _)| *id == job)
-                                .map(|(_, pending)| pending.activity_id)
-                        })
-                });
-                if self.tab_mut(tab)?.jobs.cli.contains_key(&job) {
-                    return Some(self.finish_cli_run(tab, job, crate::cli_output::Exit::Cancelled));
-                }
-                if let Some(activity_id) = activity
-                    && let Some(log) = self.activity_log_for(tab)
-                {
-                    log.finish(
-                        activity_id,
-                        activity::ActivityStatus::Cancelled,
-                        Some("Canceled".to_owned()),
-                    );
-                }
-                self.tab_mut(tab)?.jobs.clear(job);
-                Task::none()
-            }
-            // A job this tab owns can't produce anything else.
-            _ => Task::none(),
-        })
+        handed_back
     }
 
-    /// A frontend-routed job failed. Each kind has its own recovery — an
+    /// A job the tab issued answered. An answer of another shape than the job
+    /// asked for can't happen; it is dropped with the job.
+    fn finish_own_job(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        pending: Pending,
+        payload: diffui_core::Payload,
+        cx: &mut Cx,
+    ) {
+        use diffui_core::Payload;
+
+        match (pending, payload) {
+            (
+                Pending::Preview,
+                Payload::PreviewDone {
+                    simulation, graph, ..
+                },
+            ) => self.apply_draft_preview(tab, Ok((simulation, graph))),
+            (Pending::TrunkRebase(op), Payload::PreviewDone { simulation, .. }) => {
+                self.finish_trunk_preview(tab, op, Ok(&simulation))
+            }
+            (
+                Pending::Tree(_),
+                Payload::TreeListed {
+                    revision, entries, ..
+                },
+            ) => self.apply_source_tree(tab, revision, Ok(entries)),
+            (Pending::File(_), Payload::FileRead { path, file, .. }) => {
+                self.apply_source_file(tab, path, Ok(file))
+            }
+            (Pending::Fetch(activity, target), Payload::FetchDone { outcome, .. }) => {
+                self.finish_fetch(tab, activity, target, Ok(outcome))
+            }
+            (Pending::Mutation(pending), Payload::MutationDone { outcome, .. }) => {
+                self.finish_mutation(tab, pending, Ok(outcome))
+            }
+            (Pending::BookmarkCheck(pending), Payload::BookmarkChecked { backwards, .. }) => {
+                self.apply_bookmark_check(tab, pending, Ok(backwards))
+            }
+            (
+                Pending::FilePair(document_id, file_index),
+                Payload::FilePairRead { old, new, .. },
+            ) => self.apply_file_pair(tab, document_id, file_index, old, new, cx),
+            (Pending::CommandRevset(_), Payload::RevsetResolved { revset, result, .. }) => {
+                self.command_revset_resolved(tab, job, &revset, result, cx)
+            }
+            (Pending::RevsetField(_), Payload::RevsetResolved { revset, result, .. }) => {
+                self.revset_field_resolved(tab, &revset, result)
+            }
+            (Pending::Cli(activity), Payload::CliOutput { lines, .. }) => {
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Cli(activity));
+                }
+                self.cli_output(tab, job, &lines);
+            }
+            (Pending::Cli(activity), Payload::CliExited { code, .. }) => {
+                self.finish_cli_run(tab, job, activity, crate::cli_output::Exit::Code(code))
+            }
+            (Pending::DetailCopy(field, fallback), Payload::DetailsLoaded { details, .. }) => {
+                crate::write_clipboard(format_detail(&details, field).unwrap_or(fallback), cx)
+            }
+            // A fetch or mutation reporting how far it got: the job runs on.
+            (Pending::Fetch(activity, target), Payload::Progress { loaded, total, .. }) => {
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Fetch(activity, target));
+                }
+                if let Some(log) = self.activity_log_for(tab) {
+                    log.set_progress(activity, loaded, total);
+                }
+            }
+            (Pending::Mutation(pending), Payload::Progress { loaded, total, .. }) => {
+                let activity = pending.activity_id;
+                if let Some(state) = self.tab_mut(tab) {
+                    state.jobs.issue(job, Pending::Mutation(pending));
+                }
+                if let Some(log) = self.activity_log_for(tab) {
+                    log.set_progress(activity, loaded, total);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A job the tab issued failed. Each kind has its own recovery — an
     /// immutable rejection re-raises the confirmation, a preview just vanishes
     /// — so they can't share the projection's generic failure path.
     fn fail_own_job(
         &mut self,
         tab: TabId,
         job: diffui_core::JobId,
+        pending: Pending,
         error: diffui_core::RepoError,
-    ) -> Task<Message> {
-        let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        let jobs = &mut target.jobs;
-        if jobs.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job) {
-            return self.finish_trunk_preview(tab, job, Err(error.to_string()));
-        }
-        if jobs.cli.contains_key(&job) {
-            return self.fail_cli_run(tab, job, error);
-        }
-        if jobs.cmdline.remove(&job) || jobs.revset_field.take_if(|id| *id == job).is_some() {
-            return Task::none();
-        }
-        if jobs.preview == Some(job) {
-            jobs.preview = None;
-            return self.apply_draft_preview(tab, Err(error.to_string()));
-        }
-        if jobs.tree.as_ref().is_some_and(|(id, _)| *id == job) {
-            let revision = jobs.tree.take().map(|(_, revision)| revision);
-            return match revision {
-                Some(revision) => self.apply_source_tree(tab, revision, Err(error.to_string())),
-                None => Task::none(),
-            };
-        }
-        if jobs.file.as_ref().is_some_and(|(id, _)| *id == job) {
-            let path = jobs.file.take().map(|(_, path)| path);
-            return match path {
-                Some(path) => self.apply_source_file(tab, path, Err(error.to_string())),
-                None => Task::none(),
-            };
-        }
-        if jobs.fetch.as_ref().is_some_and(|(id, ..)| *id == job) {
-            return self.finish_fetch(tab, Err(error.to_string()));
-        }
-        if jobs
-            .bookmark_check
-            .as_ref()
-            .is_some_and(|(id, _)| *id == job)
-        {
+        cx: &mut Cx,
+    ) {
+        match pending {
+            Pending::Preview => self.apply_draft_preview(tab, Err(error.to_string())),
+            Pending::TrunkRebase(op) => self.finish_trunk_preview(tab, op, Err(error.to_string())),
+            Pending::Tree(revision) => {
+                self.apply_source_tree(tab, revision, Err(error.to_string()))
+            }
+            Pending::File(path) => self.apply_source_file(tab, path, Err(error.to_string())),
+            Pending::Fetch(activity, target) => {
+                self.finish_fetch(tab, activity, target, Err(error.to_string()))
+            }
+            Pending::Mutation(pending) => self.finish_mutation(tab, pending, Err(error)),
             // The ancestry check failed, so we can't tell a backwards move from
             // a fast-forward; `apply_bookmark_check` refuses the move.
-            return self.apply_bookmark_check(tab, Err(error.to_string()));
+            Pending::BookmarkCheck(pending) => {
+                self.apply_bookmark_check(tab, pending, Err(error.to_string()))
+            }
+            // A file-pair read that failed leaves its file unhighlighted, but the
+            // queue must still advance — otherwise two failures wedge it at the
+            // concurrency limit and nothing else is ever highlighted.
+            Pending::FilePair(document_id, _) => self.release_file_pair(tab, document_id),
+            // Settled as a refusal, so an Enter waiting on it doesn't wait forever.
+            Pending::CommandRevset(revset) => {
+                let refused = Err(diffui_core::RevsetError::new(error.to_string()));
+                self.command_revset_resolved(tab, job, &revset, refused, cx)
+            }
+            Pending::RevsetField(revset) => {
+                let refused = Err(diffui_core::RevsetError::new(error.to_string()));
+                self.revset_field_resolved(tab, &revset, refused)
+            }
+            Pending::Cli(activity) => {
+                let exit = crate::cli_output::Exit::Failed(error.to_string());
+                self.finish_cli_run(tab, job, activity, exit)
+            }
+            // Copy what the graph knows instead.
+            Pending::DetailCopy(_, fallback) => crate::write_clipboard(fallback, cx),
         }
-        if jobs.mutation.as_ref().is_some_and(|(id, _)| *id == job) {
-            return self.finish_mutation(tab, Err(error));
+    }
+
+    /// A job the tab issued was cancelled: resolve whatever row was showing
+    /// it. A cancelled fetch or mutation left "Running" spins in the log
+    /// forever, and calling it "Done" would claim work that never happened.
+    fn cancel_own_job(&mut self, tab: TabId, job: diffui_core::JobId, pending: Pending) {
+        let activity = match pending {
+            Pending::Fetch(activity, _) => activity,
+            Pending::Mutation(pending) | Pending::BookmarkCheck(pending) => pending.activity_id,
+            Pending::Cli(activity) => {
+                return self.finish_cli_run(tab, job, activity, crate::cli_output::Exit::Cancelled);
+            }
+            Pending::Preview
+            | Pending::FilePair(..)
+            | Pending::TrunkRebase(_)
+            | Pending::Tree(_)
+            | Pending::File(_)
+            | Pending::CommandRevset(_)
+            | Pending::RevsetField(_)
+            | Pending::DetailCopy(..) => return,
+        };
+        if let Some(log) = self.activity_log_for(tab) {
+            log.finish(
+                activity,
+                activity::ActivityStatus::Cancelled,
+                Some("Canceled".to_owned()),
+            );
         }
-        // A file-pair read that failed leaves its file unhighlighted, but the
-        // queue must still advance — otherwise two failures wedge it at the
-        // concurrency limit and nothing else is ever highlighted.
-        if let Some((document_id, _)) = jobs.file_pairs.remove(&job) {
-            target.session.highlight_in_flight =
-                target.session.highlight_in_flight.saturating_sub(1);
-            return self.spawn_highlights(document_id);
+    }
+
+    /// A highlight job ended without sources: free its place in the queue.
+    fn release_file_pair(&mut self, tab: TabId, document_id: u64) {
+        if let Some(state) = self.tab_mut(tab) {
+            state.session.highlight_in_flight = state.session.highlight_in_flight.saturating_sub(1);
+            self.spawn_highlights(document_id);
         }
-        Task::none()
     }
 
     /// Carry out what the projection asked for. Commands go straight down the
-    /// actor's channel — the answer comes back through the subscription — so
-    /// most effects produce no `Task` at all.
-    pub(crate) fn run_effects(
-        &mut self,
-        tab: TabId,
-        effects: Vec<diffui_core::Effect>,
-    ) -> Task<Message> {
+    /// actor's channel; the answer comes back through the repository loop.
+    pub(crate) fn run_effects(&mut self, tab: TabId, effects: Vec<diffui_core::Effect>) {
         use diffui_core::{Effect, session::Activity};
 
         let is_active = self.is_active(tab);
-        let mut tasks = Vec::new();
         for effect in effects {
             match effect {
                 Effect::Send(command) => {
@@ -671,7 +688,7 @@ impl Diffui {
                     if is_active {
                         self.document_version = self.document_version.wrapping_add(1);
                     }
-                    tasks.push(self.spawn_highlights(document_id));
+                    self.spawn_highlights(document_id);
                 }
                 Effect::GraphReplaced => {
                     // Every row index is stale. Drop the draft's destination
@@ -710,68 +727,25 @@ impl Diffui {
                 }
             }
         }
-        Task::batch(tasks)
-    }
-
-    /// The reducer. Five kinds of message, five shapes of handling: a user
-    /// intent, a repository actor reporting, widget plumbing, the platform, and
-    /// each overlay's own chatter.
-    pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
-        let task = match message {
-            Message::Action(action) => self.perform(action),
-            Message::MenuBar(tag) => self.on_menu_bar_pick(tag),
-            Message::Repo(event) => self.on_repo_event(*event),
-            Message::Ui(event) => self.on_ui_event(event),
-            Message::Window(event) => self.on_window_event(event),
-            Message::Palette(message) => self.on_palette_message(message),
-            Message::Find(message) => self.on_find_message(message),
-            Message::Menu(message) => self.on_menu_message(message),
-            Message::Changes(message) => self.on_changes(message),
-            Message::JjCliVersion(version) => self.on_jj_cli_version(version),
-            Message::Askpass(event) => self.on_askpass_event(event),
-            Message::CommandLine(event) => self.on_cmd_event(event),
-        };
-        // A mode that isn't on screen must not keep the keyboard.
-        self.prune_stale_modes();
-        crate::app_menu::refresh_availability(self);
-        self.keep_graph_anchor();
-        let preview = self.cancel_unwanted_preview();
-        let welcome = self.ensure_welcome_prompt();
-        let conflicts = self.sync_conflicts();
-        let history = self.sync_history();
-        let media = self.sync_media();
-        // Chokepoint: if the active tab coalesced a refresh while busy and it's
-        // now idle, run it. A no-op when nothing's pending (the common case).
-        let refresh = match self.active_tab_id() {
-            Some(tab) => {
-                let effects = match self.tab_mut(tab) {
-                    Some(target) => target.session.take_pending_refresh(),
-                    None => Vec::new(),
-                };
-                self.run_effects(tab, effects)
-            }
-            None => Task::none(),
-        };
-        Task::batch([task, refresh, preview, welcome, conflicts, history, media])
     }
 
     /// With no repository open the welcome screen *is* the open prompt, so
     /// its state has to exist whenever there are no tabs — and the field
     /// takes the keyboard the moment the screen appears.
-    pub(crate) fn ensure_welcome_prompt(&mut self) -> Task<Message> {
+    pub(crate) fn ensure_welcome_prompt(&mut self, cx: &mut Cx) {
         if !self.tabs.is_empty() || self.open_repo_dialog().is_some() {
-            return Task::none();
+            return;
         }
         self.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
-        widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
+        crate::input::focus(tab_bar::OPEN_REPO_INPUT_ID, cx);
     }
 
     /// Carry out one user intent, whichever producer resolved it.
     ///
-    /// This is the only place an intent is executed. Nothing in here re-enters
-    /// `update` or re-emits a `Message` at itself: a handler that needs another
-    /// intent's work calls the helper both of them share, so a fix lands once.
-    pub(crate) fn perform(&mut self, action: Action) -> Task<Message> {
+    /// This is the only place an intent is executed. A handler that needs
+    /// another intent's work calls the helper both of them share, so a fix
+    /// lands once.
+    pub(crate) fn perform(&mut self, action: Action, cx: &mut Cx) {
         match action {
             // ── Revisions ───────────────────────────────────────────────
             Action::SelectRevision(selection) => self.select_revision(selection),
@@ -786,17 +760,16 @@ impl Diffui {
                 self.active_mut().revision_multi_selection.clear();
                 // A span is the marks shown as one diff; it goes with them.
                 if self.active().session.span.is_some() {
-                    return self.perform_compare(crate::compare::CompareAction::Exit);
+                    self.perform_compare(crate::compare::CompareAction::Exit);
                 }
-                Task::none()
             }
             Action::Mutate(op) => self.start_mutation_op(op),
             Action::ConfirmMutation(op) => self.confirm_mutation_op(op),
-            Action::StartDraft { kind, source } => self.start_draft(kind, source),
+            Action::StartDraft { kind, source } => self.start_draft(kind, source, cx),
             Action::EditDescription { target } => {
                 let target =
                     target.unwrap_or_else(|| self.active().session.selected_revision.clone());
-                self.edit_description(target)
+                self.edit_description(target, cx)
             }
             Action::SaveDescription => self.save_description(),
             Action::CancelDescription => {
@@ -808,7 +781,6 @@ impl Diffui {
                     self.active_mut().pop_mode(ModeKind::Description);
                     self.active_mut().pending_description_edit = None;
                 }
-                Task::none()
             }
             Action::BrowseSource { revision, path } => self.open_source_browser(revision, path),
 
@@ -817,9 +789,8 @@ impl Diffui {
                 if index < self.active().session.document.files.len() {
                     self.active_mut().selected_file = index;
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self);
+                    scroll_sidebar_to_file(self);
                 }
-                Task::none()
             }
             Action::SelectNextFile => {
                 if self.active().main_view == MainView::Source {
@@ -830,9 +801,8 @@ impl Diffui {
                     target.selected_file = (target.selected_file + 1)
                         .min(target.session.document.files.len().saturating_sub(1));
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self);
+                    scroll_sidebar_to_file(self);
                 }
-                Task::none()
             }
             Action::SelectPreviousFile => {
                 if self.active().main_view == MainView::Source {
@@ -843,25 +813,23 @@ impl Diffui {
                 if previous != target.selected_file {
                     target.selected_file = previous;
                     self.reveal_selected_file_in_tree();
-                    return scroll_sidebar_to_file(self);
+                    scroll_sidebar_to_file(self);
                 }
-                Task::none()
             }
             Action::JumpToFile(path) => {
                 self.jump_to_file_path(&path);
-                Task::none()
             }
 
             // ── Target mode ─────────────────────────────────────────────
-            Action::DraftCandidate(delta) => self.move_draft_candidate(delta),
-            Action::DraftPlacement(placement) => self.set_draft_placement(placement),
+            Action::DraftCandidate(delta) => self.move_draft_candidate(delta, cx),
+            Action::DraftPlacement(placement) => self.set_draft_placement(placement, cx),
             Action::DraftApplyPlacement(placement) => {
                 // With a keyboard candidate armed, `o`/`a`/`b` applies right
                 // away (jjui's flow); before that they just flip the toggle.
                 let candidate = self.active().op_draft().and_then(|ui| ui.draft.candidate);
                 match candidate.and_then(|index| self.selection_at_index(index)) {
                     Some(target) => self.confirm_draft_on(target, Some(placement)),
-                    None => self.set_draft_placement(placement),
+                    None => self.set_draft_placement(placement, cx),
                 }
             }
             Action::DraftConfirm => {
@@ -880,13 +848,12 @@ impl Diffui {
                     .and_then(|ui| ui.draft.candidate)
                     .and_then(|index| self.selection_at_index(index))
                 else {
-                    return Task::none();
+                    return;
                 };
                 self.confirm_draft_on(target, None)
             }
             Action::DraftCancel => {
                 self.active_mut().pop_mode(ModeKind::Draft);
-                Task::none()
             }
             Action::DraftToggleSource => {
                 let Some(target) = self
@@ -895,69 +862,60 @@ impl Diffui {
                     .and_then(|ui| ui.draft.candidate)
                     .and_then(|index| self.selection_at_index(index))
                 else {
-                    return Task::none();
+                    return;
                 };
-                self.draft_toggle_source(target)
+                self.draft_toggle_source(target, cx)
             }
 
             // ── Overlays ────────────────────────────────────────────────
-            Action::OpenPalette => self.open_palette(),
+            Action::OpenPalette => self.open_palette(cx),
             Action::ClosePalette => {
                 self.pop_mode(ModeKind::Palette);
-                Task::none()
             }
             Action::TogglePalette => {
                 if self.palette().is_some() {
                     self.pop_mode(ModeKind::Palette);
-                    Task::none()
                 } else {
-                    self.open_palette()
+                    self.open_palette(cx)
                 }
             }
             Action::PalettePop => {
                 let popped = self.palette_mut().map(|state| state.pop());
                 match popped {
-                    Some(true) => {
-                        widget::operation::focus(iced::widget::Id::new(palette::PALETTE_INPUT_ID))
-                    }
+                    Some(true) => crate::input::focus(palette::PALETTE_INPUT_ID, cx),
                     Some(false) => {
                         self.pop_mode(ModeKind::Palette);
-                        Task::none()
                     }
-                    None => Task::none(),
+                    None => {}
                 }
             }
-            Action::PaletteMove(delta) => self.palette_move(delta),
+            Action::PaletteMove(delta) => self.palette_move(delta, cx),
             Action::PaletteActions if self.command_line().is_some() => {
-                self.command_line_complete().unwrap_or_else(Task::none)
+                self.command_line_complete(cx).unwrap_or(())
             }
             Action::PaletteActions => {
                 let Some(mut state) = self.take_palette() else {
-                    return Task::none();
+                    return;
                 };
                 let pushed = state.push_actions(self);
                 self.push_mode(Mode::Palette(state));
                 if pushed {
-                    return widget::operation::focus(palette::PALETTE_INPUT_ID);
+                    crate::input::focus(palette::PALETTE_INPUT_ID, cx);
                 }
-                Task::none()
             }
-            Action::OpenFind => self.open_find(),
+            Action::OpenFind => self.open_find(cx),
             Action::CloseFind => {
                 self.active_mut().pop_mode(ModeKind::Find);
-                Task::none()
             }
             Action::FindNext => {
                 self.find_advance(1);
-                Task::none()
             }
             Action::FindPrevious => {
                 self.find_advance(-1);
-                Task::none()
             }
             Action::OpenRepoDialog if self.tabs.is_empty() => {
                 // The welcome screen already shows the prompt inline.
-                widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
+                crate::input::focus(tab_bar::OPEN_REPO_INPUT_ID, cx)
             }
             Action::OpenRepoDialog => {
                 // Mutually exclusive with the other overlays: they share one
@@ -965,7 +923,7 @@ impl Diffui {
                 self.pop_mode(ModeKind::Palette);
                 self.active_mut().pop_mode(ModeKind::Find);
                 self.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
-                widget::operation::focus(tab_bar::OPEN_REPO_INPUT_ID)
+                crate::input::focus(tab_bar::OPEN_REPO_INPUT_ID, cx)
             }
             Action::CloseRepoDialog => {
                 // On the welcome screen the prompt is the page, not a dialog:
@@ -973,60 +931,40 @@ impl Diffui {
                 if !self.tabs.is_empty() {
                     self.pop_mode(ModeKind::OpenRepo);
                 }
-                Task::none()
             }
-            Action::ChooseRepoFolder => {
-                #[cfg(target_os = "macos")]
-                if let Some(path) = crate::macos_native::choose_repository_folder() {
-                    return self.open_repository(&path);
-                }
-                Task::none()
-            }
+            Action::ChooseRepoFolder => self.choose_repo_folder(cx),
             Action::SubmitRepoDialog => {
                 let Some(dialog) = self.open_repo_dialog() else {
-                    return Task::none();
+                    return;
                 };
                 match dialog.selected {
-                    Some(row) => self.pick_open_repo_suggestion(row),
+                    Some(row) => self.open_repo_pick_row(row, cx),
                     None => {
                         let path = dialog.path.clone();
-                        self.open_repository(&path)
+                        self.open_repository(&path, cx)
                     }
                 }
             }
             Action::OpenRepoMove(delta) => {
+                let len = self.open_repo_row_count();
                 if let Some(dialog) = self.open_repo_dialog_mut() {
-                    let len = dialog.suggestions().map_or(0, |(_, rows)| rows.len());
                     dialog.selected = (len > 0).then(|| match dialog.selected {
                         Some(row) => (row as i32 + delta).rem_euclid(len as i32) as usize,
                         None if delta < 0 => len - 1,
                         None => 0,
                     });
                 }
-                Task::none()
             }
-            Action::OpenRepoComplete => {
-                let completed = self.open_repo_dialog().and_then(|dialog| {
-                    let (query, rows) = dialog.suggestions()?;
-                    let entry = rows.get(dialog.selected.unwrap_or(0))?;
-                    Some(query.complete(entry))
-                });
-                match completed {
-                    Some(path) => self.browse_open_repo_path(path),
-                    None => Task::none(),
-                }
-            }
-            Action::OpenRepoPick(row) => self.pick_open_repo_suggestion(row),
-            Action::OpenRepo(path) => self.open_repository(&path),
+            Action::OpenRepoComplete => self.open_repo_complete(cx),
+            Action::OpenRepoPick(row) => self.pick_open_repo_suggestion(row, cx),
+            Action::OpenRepo(path) => self.open_repository(&path, cx),
             Action::RemoveRecentRepo(path) => {
                 self.recent_repos.retain(|recent| recent != &path);
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::ClearRecentRepos => {
                 self.recent_repos.clear();
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::ToggleActivityPopover => {
                 if self.activity_popover_open() {
@@ -1035,34 +973,33 @@ impl Diffui {
                     self.pop_mode(ModeKind::Menu);
                     self.push_mode(Mode::ActivityPopover);
                 }
-                Task::none()
             }
             Action::CloseActivityPopover => {
                 self.pop_mode(ModeKind::ActivityPopover);
-                Task::none()
             }
             Action::ClearActivities => {
                 self.active_mut().activities.clear_finished();
-                Task::none()
             }
             Action::DismissMenu => {
                 self.pop_mode(ModeKind::Menu);
-                Task::none()
             }
             Action::ToggleShortcuts => self.toggle_shortcuts(),
             Action::CloseShortcuts => {
                 self.pop_mode(ModeKind::Shortcuts);
-                Task::none()
+            }
+            Action::OpenSettings => self.open_settings(),
+            Action::CloseSettings => {
+                self.pop_mode(ModeKind::Settings);
             }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
-                    return Task::none();
+                    return;
                 };
                 self.run_mutation(dialog.pending)
             }
             Action::ConfirmCancel => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
-                    return Task::none();
+                    return;
                 };
                 // Resolve the held activity so it doesn't sit queued forever,
                 // and as *cancelled* — a row that reads "Done" for something
@@ -1082,28 +1019,32 @@ impl Diffui {
                     editor.saving_activity = None;
                 }
                 self.marker_save_finished(dialog.pending.tab_id, dialog.pending.activity_id, false);
-                Task::none()
             }
 
             // ── Repository ──────────────────────────────────────────────
             Action::Refresh => {
                 let Some(tab) = self.active_tab_id() else {
-                    return Task::none();
+                    return;
                 };
                 if !self.active().session.capabilities.graph {
-                    return Task::none();
+                    return;
                 }
                 // A manual refresh is a full reload: the user may have run an
-                // external jj op since the last load. An up-to-date refresh
-                // that finds nothing changed is silent.
-                self.start_repository_snapshot(tab, RefreshOrigin::Focus)
+                // external jj op since the last load. It also folds the disk
+                // and updates a stale checkout in either refresh mode. An
+                // up-to-date refresh that finds nothing changed is silent.
+                let effects = self.active_mut().session.sync_disk();
+                self.run_effects(tab, effects)
             }
             Action::Fetch(target) => self.start_fetch(target),
             Action::Undo => self.start_undo(),
             Action::Redo => self.start_redo(),
+            Action::UpdateStaleWorkingCopy => {
+                self.start_cli_run(vec!["workspace".to_owned(), "update-stale".to_owned()])
+            }
             Action::UndoOperation(activity_id, operation_id) => {
                 let Some(tab_id) = self.active_tab_id() else {
-                    return Task::none();
+                    return;
                 };
                 // One-shot: clear the button so a second click can't
                 // double-revert the same operation.
@@ -1118,7 +1059,7 @@ impl Diffui {
                 self.active_mut().session.revset = expr;
                 self.evaluate_revset()
             }
-            Action::SubmitRevset => self.submit_revset_field(),
+            Action::SubmitRevset => self.submit_revset_field(cx),
 
             // ── View ────────────────────────────────────────────────────
             Action::ToggleWrap => {
@@ -1128,18 +1069,15 @@ impl Diffui {
                 // usual geometry debounce.
                 self.document_version = self.document_version.wrapping_add(1);
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::SetSvgSource(source) => {
                 // The previews stand in for rows, so the layout moves; the
                 // widget re-keys its height index off the flag.
                 self.svg_source = source;
-                Task::none()
             }
             Action::ToggleCommitDetails => {
                 self.commit_details_collapsed = !self.commit_details_collapsed;
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::ToggleSplit => {
                 self.diff_split = !self.diff_split;
@@ -1147,59 +1085,50 @@ impl Diffui {
                 // change shaping, the height index re-keys off the flag.
                 self.document_version = self.document_version.wrapping_add(1);
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::ToggleHistoryPanel => {
                 let target = self.active_mut();
                 target.history_panel_collapsed = !target.history_panel_collapsed;
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::ToggleFilesPanel => {
                 let target = self.active_mut();
                 target.files_panel_collapsed = !target.files_panel_collapsed;
-                self.close_changed_files_peek();
                 self.mark_geometry_dirty();
-                Task::none()
             }
             Action::SetTheme(theme) => {
                 self.selected_theme = theme;
-                // Switching to System: sync to the live OS appearance now rather
-                // than render one stale frame until the first poll tick lands.
-                if theme == ThemePreference::System {
-                    let current = chrome::system_appearance();
-                    if current != iced_theme::Mode::None {
-                        self.system_theme = current;
-                    }
-                }
-                Task::none()
+                self.apply_theme(cx);
+                self.persist_setting(config::Setting::Theme(theme));
             }
-            Action::SetMainView(mode) => self.set_main_view(mode),
+            Action::SetRefreshMode(mode) => {
+                self.set_refresh_mode(mode);
+                self.persist_setting(config::Setting::Refresh(mode));
+            }
+            Action::ChangeSetting(setting) => self.change_setting(setting),
+            Action::SetMainView(mode) => self.set_main_view(mode, cx),
 
             // ── Tabs ────────────────────────────────────────────────────
-            Action::SelectTab(id) => self.activate_tab(id),
-            Action::SelectTabIndex(index) => match self.tabs.get(index) {
-                Some(tab) => {
+            Action::SelectTab(id) => self.activate_tab(id, cx),
+            Action::SelectTabIndex(index) => {
+                if let Some(tab) = self.tabs.get(index) {
                     let id = tab.id;
-                    self.activate_tab(id)
+                    self.activate_tab(id, cx)
                 }
-                None => Task::none(),
-            },
-            Action::CloseTab(id) => self.close_tab(id),
-            Action::CloseActiveTab => match self.tabs.get(self.active) {
-                Some(tab) => {
+            }
+            Action::CloseTab(id) => self.close_tab(id, cx),
+            Action::CloseActiveTab => {
+                if let Some(tab) = self.tabs.get(self.active) {
                     let id = tab.id;
-                    self.close_tab(id)
+                    self.close_tab(id, cx)
                 }
-                None => Task::none(),
-            },
+            }
             Action::MoveTab { id, to } => {
                 self.move_tab(id, to);
-                Task::none()
             }
 
             // ── Clipboard ───────────────────────────────────────────────
-            Action::Copy(text) => iced::clipboard::write(text).discard(),
+            Action::Copy(text) => crate::write_clipboard(text, cx),
             Action::CopyDetail {
                 revision,
                 field,
@@ -1209,676 +1138,521 @@ impl Diffui {
                 // graph, so ask the actor for the revision's header and copy
                 // from that, falling back to the in-memory value.
                 let Some(tab) = self.active_tab_id() else {
-                    return Task::none();
+                    return;
                 };
                 let Some(state) = self.tab_mut(tab) else {
-                    return Task::none();
+                    return;
                 };
                 if !state.session.capabilities.details {
-                    return iced::clipboard::write(fallback).discard();
+                    return crate::write_clipboard(fallback, cx);
                 }
                 let job = state.session.next_job();
-                state.pending_detail_copy = Some((job, field, fallback));
+                state.jobs.issue(job, Pending::DetailCopy(field, fallback));
                 self.send(tab, diffui_core::Command::RevisionDetails { job, revision })
             }
-            Action::CopyFileDiff => match current_file_diff_text(self) {
-                Some(text) => iced::clipboard::write(text).discard(),
-                None => Task::none(),
-            },
+            Action::CopyFileDiff => {
+                if let Some(text) = current_file_diff_text(self) {
+                    crate::write_clipboard(text, cx)
+                }
+            }
             Action::OpenUrl(url) => {
                 open_url(&url);
-                Task::none()
             }
-            Action::Bookmark(action) => self.update_bookmark(action),
-            Action::Revops(action) => self.perform_revops(action),
-            Action::Credential(action) => self.update_credential(action),
-            Action::CommandLine(action) => self.on_command_line_action(action),
+            Action::Bookmark(action) => self.update_bookmark(action, cx),
+            Action::Revops(action) => self.perform_revops(action, cx),
+            Action::Credential(action) => self.update_credential(action, cx),
+            Action::CommandLine(action) => self.on_command_line_action(action, cx),
             Action::RebaseOntoTrunk(sources) => self.rebase_onto_trunk(sources),
-            Action::Changes(message) => self.on_changes(message),
-            Action::History(action) => self.perform_history(action),
+            Action::Changes(message) => self.on_changes(message, cx),
+            Action::History(action) => self.perform_history(action, cx),
             Action::RevealLogFile => {
                 crate::logging::reveal_log_file();
-                Task::none()
             }
-            Action::OpenConfigFile => crate::app_menu::open_config_file(),
+            Action::RevealConfigFile(file) => self.reveal_config_file(file),
             Action::Compare(action) => self.perform_compare(action),
-            Action::Range(action) => self.perform_range(action),
+            Action::Range(action) => self.perform_range(action, cx),
             Action::ExpandFile(index) => self.expand_collapsed_file(index),
         }
     }
 
     /// Widget plumbing: positions, hovers, ticks, and the clicks whose meaning
     /// depends on state the widget can't see.
-    fn on_ui_event(&mut self, event: UiEvent) -> Task<Message> {
-        match event {
-            UiEvent::SelectRowKey(key) => {
-                self.close_revset_field();
-                return self.on_revision_row_click(key);
-            }
-            UiEvent::SidebarFileRow(display_index) => {
-                let target = self.active_mut();
-                let rows = diffui_core::file_tree_rows(
-                    &target.session.document.files,
-                    &target.collapsed_dirs,
-                );
-                match rows.get(display_index) {
-                    Some(diffui_core::FileTreeRow::File { file_index, .. }) => {
-                        if *file_index < target.session.document.files.len() {
-                            target.selected_file = *file_index;
-                        }
-                    }
-                    // `remove()` mutates, so it stays out of a match guard.
-                    #[allow(clippy::collapsible_match)]
-                    Some(diffui_core::FileTreeRow::Dir { path, .. }) => {
-                        if !target.collapsed_dirs.remove(path) {
-                            target.collapsed_dirs.insert(path.clone());
-                        }
-                    }
-                    None => {}
-                }
-                self.close_changed_files_peek();
-            }
-            UiEvent::SidebarScrolled(offset) => {
-                self.active_mut().sidebar_scroll_offset = offset;
-            }
-            UiEvent::ChangedFilesScrolled(offset) => {
-                self.active_mut().file_tree_scroll_offset = offset;
-            }
-            UiEvent::DiffScrolled(offset) => {
-                self.active_mut().diff_scroll_offset = offset;
-            }
-            UiEvent::SourceScrolled(offset) => {
-                self.active_mut().source.scroll_offset = offset;
-            }
-            UiEvent::SourceTreeScrolled(offset) => {
-                self.active_mut().source.tree_scroll_offset = offset;
-            }
-            UiEvent::SetHover(target) => self.hovered = target,
-            UiEvent::ChangedFilesTriggerEntered => {
-                self.changed_files_trigger_hovered = true;
-                self.changed_files_peek_open = true;
-            }
-            UiEvent::ChangedFilesPopupEntered => {
-                self.changed_files_popup_hovered = true;
-                self.changed_files_peek_open = true;
-            }
-            UiEvent::ChangedFilesRailEntered => self.changed_files_rail_hovered = true,
-            UiEvent::ChangedFilesTriggerExited => {
-                self.changed_files_trigger_hovered = false;
-                return Self::close_changed_files_peek_later();
-            }
-            UiEvent::ChangedFilesRailExited => {
-                self.changed_files_rail_hovered = false;
-                return Self::close_changed_files_peek_later();
-            }
-            UiEvent::ChangedFilesPopupExited => {
-                self.changed_files_popup_hovered = false;
-                return Self::close_changed_files_peek_later();
-            }
-            UiEvent::CloseChangedFilesPeek => {
-                if !self.changed_files_trigger_hovered
-                    && !self.changed_files_rail_hovered
-                    && !self.changed_files_popup_hovered
-                {
-                    self.changed_files_peek_open = false;
+    pub(crate) fn on_select_row_key(&mut self, key: revision_list::RowSelectionKey, cx: &mut Cx) {
+        self.close_revset_field();
+        self.close_panel_peek();
+        self.on_revision_row_click(key, cx);
+    }
+
+    pub(crate) fn on_sidebar_file_row(&mut self, display_index: usize) {
+        let target = self.active_mut();
+        let rows =
+            diffui_core::file_tree_rows(&target.session.document.files, &target.collapsed_dirs);
+        match rows.get(display_index) {
+            Some(diffui_core::FileTreeRow::File { file_index, .. }) => {
+                if *file_index < target.session.document.files.len() {
+                    target.selected_file = *file_index;
                 }
             }
-            UiEvent::ToastDismiss(id) => self.toasts.retain(|toast| toast.id != id),
-            UiEvent::ToastTick => self
-                .toasts
-                .retain(|toast| toast.sticky || toast.born.elapsed() < TOAST_TTL),
-            UiEvent::LoadingTick => {}
-            UiEvent::RevisionContextMenu(key, row_rect, cursor) => {
-                return self.open_revision_menu(key, row_rect, cursor);
-            }
-            UiEvent::SidebarFileContextMenu(display_index, row_rect, cursor) => {
-                return self.open_file_context_menu(display_index, row_rect, cursor);
-            }
-            UiEvent::OpenToolbarMenu(which, anchor) => {
-                self.pop_mode(ModeKind::ActivityPopover);
-                return self.open_toolbar_menu(which, anchor);
-            }
-            UiEvent::DescriptionAction(action) => {
-                if let Some(editor) = self.active_mut().description_editor_mut()
-                    && editor.saving_activity.is_none()
-                {
-                    editor.content.perform(action);
-                    editor.switch_blocked = false;
+            // `remove()` mutates, so it stays out of a match guard.
+            #[allow(clippy::collapsible_match)]
+            Some(diffui_core::FileTreeRow::Dir { path, .. }) => {
+                if !target.collapsed_dirs.remove(path) {
+                    target.collapsed_dirs.insert(path.clone());
                 }
             }
-            UiEvent::ActivityExpand(id) => self.active_mut().activities.toggle_expand(id),
-            UiEvent::ActivityDetailAction(id, action) => {
-                // Selection/caret/scroll only — the log drops edit actions,
-                // keeping the output buffer read-only.
-                self.active_mut()
-                    .activities
-                    .perform_detail_action(id, action);
+            None => {}
+        }
+        // A pick closes a peeked tree; folding a folder keeps it.
+        if matches!(
+            rows.get(display_index),
+            Some(diffui_core::FileTreeRow::File { .. })
+        ) {
+            self.close_panel_peek();
+        }
+    }
+
+    pub(crate) fn on_changed_files_scrolled(&mut self, offset: f64) {
+        self.active_mut().file_tree_scroll_offset = offset;
+    }
+
+    pub(crate) fn on_diff_scrolled(&mut self, offset: f32) {
+        self.active_mut().diff_scroll_offset = offset;
+    }
+
+    pub(crate) fn on_source_scrolled(&mut self, offset: f32) {
+        self.active_mut().source.scroll_offset = offset;
+    }
+
+    pub(crate) fn on_source_tree_scrolled(&mut self, offset: f64) {
+        self.active_mut().source.tree_scroll_offset = offset;
+    }
+
+    pub(crate) fn on_set_hover(&mut self, target: Option<HoverTarget>) {
+        self.hovered = target;
+    }
+
+    pub(crate) fn on_toast_dismiss(&mut self, id: u64) {
+        self.toasts.retain(|toast| toast.id != id);
+    }
+
+    pub(crate) fn on_toast_tick(&mut self) {
+        self.toasts
+            .retain(|toast| toast.sticky || toast.born.elapsed() < TOAST_TTL);
+    }
+
+    pub(crate) fn on_open_toolbar_menu(
+        &mut self,
+        which: ToolbarMenu,
+        anchor: Rectangle,
+        cx: &mut Cx,
+    ) {
+        self.pop_mode(ModeKind::ActivityPopover);
+        self.open_toolbar_menu(which, anchor, cx);
+    }
+
+    pub(crate) fn on_description_edited(&mut self, text: String) {
+        if let Some(editor) = self.active_mut().description_editor_mut()
+            && editor.saving_activity.is_none()
+        {
+            editor.content = text;
+            editor.switch_blocked = false;
+        }
+    }
+
+    pub(crate) fn on_activity_expand(&mut self, id: activity::ActivityId) {
+        self.active_mut().activities.toggle_expand(id);
+    }
+
+    pub(crate) fn on_open_repo_listed(&mut self, listing: crate::path_browse::Listing) {
+        if let Some(dialog) = self.open_repo_dialog_mut() {
+            if dialog.listing_pending.as_ref() == Some(&listing.dir) {
+                dialog.listing_pending = None;
             }
-            UiEvent::ActivityNoOp | UiEvent::ConfirmNoOp | UiEvent::OpenRepoNoOp => {}
-            UiEvent::OpenRepoPathChanged(path) => return self.set_open_repo_path(path),
-            UiEvent::OpenRepoListed(listing) => {
-                if let Some(dialog) = self.open_repo_dialog_mut() {
-                    if dialog.listing_pending.as_ref() == Some(&listing.dir) {
-                        dialog.listing_pending = None;
-                    }
-                    // A read for a folder the path has since left is
-                    // dropped, so the rows on screen stay up.
-                    let query = crate::path_browse::Query::parse(&dialog.path);
-                    if let Some(query) = query.filter(|query| query.dir == listing.dir) {
-                        dialog.listing = Some(listing);
-                        dialog.listed_query = Some(query);
-                    }
-                }
-            }
-            UiEvent::RevsetChanged(value) => return self.revset_field_edited(value),
-            UiEvent::SidebarWidthChanged(width) => {
-                if width <= self.sidebar_min_width + f32::EPSILON {
-                    self.active_mut().history_panel_collapsed = true;
-                    self.mark_geometry_dirty();
-                    return Task::none();
-                }
-                let files_width = if self.active().session.document.files.is_empty() {
-                    0.0
-                } else if self.active().files_panel_collapsed {
-                    crate::theme::COLLAPSED_PANEL_WIDTH
-                } else {
-                    self.file_nav_width
-                };
-                let dividers = if files_width == 0.0 { 1.0 } else { 2.0 };
-                let clamped = resize_handle::clamp_width_with_reserve(
-                    width,
-                    self.sidebar_min_width,
-                    self.window_size.width,
-                    files_width + dividers + resize_handle::MIN_DIFF_PANE_WIDTH,
-                );
-                if clamped != self.sidebar_width {
-                    self.sidebar_width = clamped;
-                    self.mark_geometry_dirty();
-                }
-            }
-            UiEvent::ChangedFilesWidthChanged(handle_x) => {
-                let history_width = if self.active().history_panel_collapsed {
-                    crate::theme::COLLAPSED_PANEL_WIDTH
-                } else {
-                    self.sidebar_width
-                };
-                let width = handle_x - history_width - 1.0;
-                if width <= diff_panel::MIN_FILE_NAV_WIDTH + f32::EPSILON {
-                    self.active_mut().files_panel_collapsed = true;
-                    self.mark_geometry_dirty();
-                    return Task::none();
-                }
-                let available = (self.window_size.width - history_width - 2.0)
-                    .max(diff_panel::MIN_FILE_NAV_WIDTH);
-                let clamped =
-                    resize_handle::clamp_width(width, diff_panel::MIN_FILE_NAV_WIDTH, available);
-                if clamped != self.file_nav_width {
-                    self.file_nav_width = clamped;
-                    self.mark_geometry_dirty();
-                }
-            }
-            UiEvent::SourceSidebarRow(display_index) => {
-                let (entries, rows) = self.source_entries_and_rows();
-                match rows.get(display_index).cloned() {
-                    Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
-                        if unlisted {
-                            // Unenumerated ignored dir: expanding it is a
-                            // lazy disk listing. Mark it expanded now so the
-                            // arriving children render straight away.
-                            let Some(tab) = self.active_tab_id() else {
-                                return Task::none();
-                            };
-                            self.active_mut().source.expanded.insert(path.clone());
-                            return self.list_ignored_dir(tab, path);
-                        }
-                        let expanded = &mut self.active_mut().source.expanded;
-                        if !expanded.remove(&path) {
-                            expanded.insert(path);
-                        }
-                    }
-                    Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
-                        let path = entries.get(entry_index).map(|entry| entry.path.clone());
-                        if let Some(path) = path {
-                            return self.select_source_file(path);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            UiEvent::SourceHeaderClicked => {}
-            UiEvent::SourceFilterChanged(query) => {
-                self.active_mut().source.filter = query;
-                // New result set — jump the list back to the top. The code
-                // pane's restore re-applies its own live offset, so only the
-                // sidebar actually moves.
-                self.active_mut().source.tree_scroll_offset = 0.0;
-                self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
-            }
-            UiEvent::SourceFilterSubmit => {
-                // Open the best match (the ranked list's first row). A no-op
-                // when the box is empty — the first tree row is a directory.
-                let (entries, rows) = self.source_entries_and_rows();
-                if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
-                    && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
-                {
-                    return self.select_source_file(path);
-                }
-            }
-            UiEvent::BrowseFileFromDiff(file_index) => {
-                let target = self.active();
-                let Some(file) = target.session.document.files.get(file_index) else {
-                    return Task::none();
-                };
-                let revision = target.session.selected_revision.clone();
-                let path = file.path.clone();
-                return self.open_source_browser(revision, Some(path));
-            }
-            UiEvent::RevisionDragStart(row) => {
-                // A ghost or landed row drags the commit it stands for.
-                let Some(index) = self.active().origin_row(row) else {
-                    return Task::none();
-                };
-                return self.on_drag_start(index);
-            }
-            UiEvent::RevisionDragHover(spot) => {
-                // Over a preview-only row (a ghost, where the moved commits
-                // land), the spot stays where it was: the preview put those
-                // rows under the cursor, they aren't somewhere new to aim.
-                let spot = match spot {
-                    Some(spot) => match self.active().loaded_spot(spot) {
-                        Some(spot) => Some(spot),
-                        None => return Task::none(),
-                    },
-                    None => None,
-                };
-                let Some(draft) = self.active_mut().op_draft_mut() else {
-                    return Task::none();
-                };
-                if draft.hover_spot == spot {
-                    return Task::none();
-                }
-                draft.hover_spot = spot;
-                draft.draft.candidate = match spot {
-                    Some(revision_list::DropSpot::OnRow(index)) => Some(index),
-                    _ => None,
-                };
-                return self.kick_draft_preview();
-            }
-            UiEvent::RevisionDragDrop(spot) => {
-                // Released over a preview-only row: drop where the preview
-                // shows it landing.
-                let spot = spot.and_then(|spot| {
-                    self.active()
-                        .loaded_spot(spot)
-                        .or_else(|| self.active().op_draft().and_then(|draft| draft.hover_spot))
-                });
-                return self.on_drag_drop(spot);
-            }
-            UiEvent::DraftHoverCandidate(index) => {
-                // Mouse-hover targeting: arm the hovered row as the candidate,
-                // exactly like j/k. Leaving the rows (`None`) keeps the last
-                // candidate armed — same persistence the keyboard gets.
-                let Some(index) = index.and_then(|row| self.active().target_row(row)) else {
-                    return Task::none();
-                };
-                let target = self.active_mut();
-                let commits = target.session.commits.len();
-                let Some(draft) = target.op_draft_mut() else {
-                    return Task::none();
-                };
-                if draft.draft.candidate == Some(index) || index >= commits {
-                    return Task::none();
-                }
-                draft.draft.candidate = Some(index);
-                return self.kick_draft_preview();
-            }
-            UiEvent::DraftPreviewKick(version) => return self.run_parked_preview(version),
-            UiEvent::MediaDecoded(decoded) => return self.on_media_decoded(*decoded),
-            UiEvent::FileHighlighted(document_id, file_index, spans) => {
-                let Some((tab, target)) = self.document_target_mut(document_id) else {
-                    // The document was replaced; this result highlighted a
-                    // dead snapshot.
-                    return Task::none();
-                };
-                let session = &mut target.session;
-                session.highlight_in_flight = session.highlight_in_flight.saturating_sub(1);
-                let mut applied = false;
-                if let Some(file) = session.document.files.get_mut(file_index) {
-                    for (hunk_index, line_index, line_spans) in spans {
-                        if let Some(line) = file
-                            .hunks
-                            .get_mut(hunk_index)
-                            .and_then(|hunk| hunk.lines.get_mut(line_index))
-                        {
-                            line.syntax = line_spans;
-                            applied = true;
-                        }
-                    }
-                }
-                // Repaint (re-shape) the rows now carrying spans; the layout
-                // is untouched, so the height index survives — that's the
-                // whole point of the paint/layout version split. A backgrounded
-                // tab repaints when it's next activated.
-                if applied && self.is_active(tab) {
-                    self.document_version = self.document_version.wrapping_add(1);
-                }
-                return self.spawn_highlights(document_id);
+            // A read for a folder the path has since left is
+            // dropped, so the rows on screen stay up.
+            let query = crate::path_browse::Query::parse(&dialog.path);
+            if let Some(query) = query.filter(|query| query.dir == listing.dir) {
+                dialog.listing = Some(listing);
+                dialog.listed_query = Some(query);
             }
         }
-        Task::none()
     }
 
-    /// Drop the changed-files peek along with every hover flag holding it
-    /// open. The widgets reporting those hovers may be gone by the next frame
-    /// (the rail, once the panel expands), and a widget that is gone never
-    /// reports its exit.
-    fn close_changed_files_peek(&mut self) {
-        self.changed_files_peek_open = false;
-        self.changed_files_trigger_hovered = false;
-        self.changed_files_rail_hovered = false;
-        self.changed_files_popup_hovered = false;
+    /// A drag on the history seam. Down to the minimum it collapses the pane;
+    /// past it again, in the same drag, the pane comes back.
+    pub(crate) fn on_sidebar_width_changed(&mut self, width: f32) {
+        let collapsed = self.active().history_panel_collapsed;
+        if width <= self.sidebar_min_width + f32::EPSILON {
+            if !collapsed {
+                self.active_mut().history_panel_collapsed = true;
+                self.mark_geometry_dirty();
+            }
+            return;
+        }
+        if collapsed {
+            self.active_mut().history_panel_collapsed = false;
+            self.mark_geometry_dirty();
+        }
+        let files_width = self.files_pane_width();
+        let files = if files_width > 0.0 {
+            files_width + 1.0
+        } else {
+            0.0
+        };
+        let clamped = resize_handle::clamp_width_with_reserve(
+            width,
+            self.sidebar_min_width,
+            self.window_size.width,
+            files + 1.0 + resize_handle::MIN_DIFF_PANE_WIDTH,
+        );
+        if clamped != self.sidebar_width {
+            self.sidebar_width = clamped;
+            self.mark_geometry_dirty();
+        }
     }
 
-    /// Re-check the peek once the pointer has had time to reach whichever of
-    /// the icon, the rail or the tree it was heading for.
-    fn close_changed_files_peek_later() -> Task<Message> {
-        Task::perform(tokio::time::sleep(Duration::from_millis(140)), |()| {
-            Message::Ui(UiEvent::CloseChangedFilesPeek)
-        })
+    pub(crate) fn on_changed_files_width_changed(&mut self, handle_x: f32) {
+        let history_width = self.left_pane_width();
+        let lead = if history_width > 0.0 {
+            history_width + 1.0
+        } else {
+            0.0
+        };
+        let width = handle_x - lead;
+        let collapsed = self.active().files_panel_collapsed;
+        if width <= diff_panel::MIN_FILE_NAV_WIDTH + f32::EPSILON {
+            if !collapsed {
+                self.active_mut().files_panel_collapsed = true;
+                self.mark_geometry_dirty();
+            }
+            return;
+        }
+        if collapsed {
+            self.active_mut().files_panel_collapsed = false;
+            self.mark_geometry_dirty();
+        }
+        let available = (self.window_size.width - lead - 1.0).max(diff_panel::MIN_FILE_NAV_WIDTH);
+        let clamped = resize_handle::clamp_width(width, diff_panel::MIN_FILE_NAV_WIDTH, available);
+        if clamped != self.file_nav_width {
+            self.file_nav_width = clamped;
+            self.mark_geometry_dirty();
+        }
+    }
+
+    pub(crate) fn on_source_sidebar_row(&mut self, display_index: usize, cx: &mut Cx) {
+        let (entries, rows) = self.source_entries_and_rows();
+        match rows.get(display_index).cloned() {
+            Some(diffui_core::SourceTreeRow::Dir { path, unlisted, .. }) => {
+                if unlisted {
+                    // Unenumerated ignored dir: expanding it is a
+                    // lazy disk listing. Mark it expanded now so the
+                    // arriving children render straight away.
+                    let Some(tab) = self.active_tab_id() else {
+                        return;
+                    };
+                    self.active_mut().source.expanded.insert(path.clone());
+                    return self.list_ignored_dir(tab, path, cx);
+                }
+                let expanded = &mut self.active_mut().source.expanded;
+                if !expanded.remove(&path) {
+                    expanded.insert(path);
+                }
+            }
+            Some(diffui_core::SourceTreeRow::File { entry_index, .. }) => {
+                let path = entries.get(entry_index).map(|entry| entry.path.clone());
+                if let Some(path) = path {
+                    self.select_source_file(path);
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) fn on_source_filter_changed(&mut self, query: String) {
+        self.active_mut().source.filter = query;
+        // New result set — jump the list back to the top. The code
+        // pane's restore re-applies its own live offset, so only the
+        // sidebar actually moves.
+        self.active_mut().source.tree_scroll_offset = 0.0;
+        self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
+    }
+
+    pub(crate) fn on_source_filter_submit(&mut self) {
+        // Open the best match (the ranked list's first row). A no-op
+        // when the box is empty — the first tree row is a directory.
+        let (entries, rows) = self.source_entries_and_rows();
+        if let Some(diffui_core::SourceTreeRow::File { entry_index, .. }) = rows.first()
+            && let Some(path) = entries.get(*entry_index).map(|entry| entry.path.clone())
+        {
+            self.select_source_file(path);
+        }
+    }
+
+    pub(crate) fn on_browse_file_from_diff(&mut self, file_index: usize) {
+        let target = self.active();
+        let Some(file) = target.session.document.files.get(file_index) else {
+            return;
+        };
+        let revision = target.session.selected_revision.clone();
+        let path = file.path.clone();
+        self.open_source_browser(revision, Some(path));
+    }
+
+    pub(crate) fn on_revision_drag_start(&mut self, row: usize, cx: &mut Cx) {
+        // A ghost or landed row drags the commit it stands for.
+        let Some(index) = self.active().origin_row(row) else {
+            return;
+        };
+        self.on_drag_start(index, cx);
+    }
+
+    pub(crate) fn on_revision_drag_hover(
+        &mut self,
+        spot: Option<revision_list::DropSpot>,
+        cx: &mut Cx,
+    ) {
+        // Over a preview-only row (a ghost, where the moved commits
+        // land), the spot stays where it was: the preview put those
+        // rows under the cursor, they aren't somewhere new to aim.
+        let spot = match spot {
+            Some(spot) => match self.active().loaded_spot(spot) {
+                Some(spot) => Some(spot),
+                None => return,
+            },
+            None => None,
+        };
+        let Some(draft) = self.active_mut().op_draft_mut() else {
+            return;
+        };
+        if draft.hover_spot == spot {
+            return;
+        }
+        draft.hover_spot = spot;
+        draft.draft.candidate = match spot {
+            Some(revision_list::DropSpot::OnRow(index)) => Some(index),
+            _ => None,
+        };
+        self.kick_draft_preview(cx);
+    }
+
+    pub(crate) fn on_revision_drag_drop(&mut self, spot: Option<revision_list::DropSpot>) {
+        // Released over a preview-only row: drop where the preview
+        // shows it landing.
+        let spot = spot.and_then(|spot| {
+            self.active()
+                .loaded_spot(spot)
+                .or_else(|| self.active().op_draft().and_then(|draft| draft.hover_spot))
+        });
+        self.on_drag_drop(spot);
+    }
+
+    pub(crate) fn on_draft_hover_candidate(&mut self, index: Option<usize>, cx: &mut Cx) {
+        // Mouse-hover targeting: arm the hovered row as the candidate,
+        // exactly like j/k. Leaving the rows (`None`) keeps the last
+        // candidate armed — same persistence the keyboard gets.
+        let Some(index) = index.and_then(|row| self.active().target_row(row)) else {
+            return;
+        };
+        let target = self.active_mut();
+        let commits = target.session.commits.len();
+        let Some(draft) = target.op_draft_mut() else {
+            return;
+        };
+        if draft.draft.candidate == Some(index) || index >= commits {
+            return;
+        }
+        draft.draft.candidate = Some(index);
+        self.kick_draft_preview(cx);
+    }
+
+    pub(crate) fn on_file_highlighted(
+        &mut self,
+        document_id: u64,
+        file_index: usize,
+        spans: Vec<(usize, usize, Vec<SyntaxSpan>)>,
+    ) {
+        let Some((_, target)) = self.document_target_mut(document_id) else {
+            // The document was replaced; this result highlighted a
+            // dead snapshot.
+            return;
+        };
+        let session = &mut target.session;
+        session.highlight_in_flight = session.highlight_in_flight.saturating_sub(1);
+        let mut applied = false;
+        if let Some(file) = session.document.files.get_mut(file_index) {
+            for (hunk_index, line_index, line_spans) in spans {
+                if let Some(line) = file
+                    .hunks
+                    .get_mut(hunk_index)
+                    .and_then(|hunk| hunk.lines.get_mut(line_index))
+                {
+                    line.syntax = line_spans;
+                    applied = true;
+                }
+            }
+        }
+        // Re-shape this file's rows, now carrying spans. The text and layout
+        // are untouched, so every other cache survives.
+        if applied {
+            if target.paint_stamps.len() <= file_index {
+                target.paint_stamps.resize(file_index + 1, 0);
+            }
+            target.paint_stamps[file_index] = target.paint_stamps[file_index].wrapping_add(1);
+        }
+        self.spawn_highlights(document_id);
     }
 
     /// The platform half: window geometry and lifecycle, modifiers, the OS
     /// appearance, and the raw key presses the keymap resolves.
-    fn on_window_event(&mut self, event: WindowEvent) -> Task<Message> {
-        match event {
-            WindowEvent::KeyPressed {
-                key,
-                modifiers,
-                consumed,
-            } => return self.on_key_pressed(&key, modifiers, consumed),
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
-            WindowEvent::SystemThemeChanged(theme) => self.system_theme = theme,
-            WindowEvent::PollSystemTheme => {
-                // iced pins the window's NSAppearance to our resolved theme,
-                // which makes winit stop reporting OS appearance changes (it
-                // ignores them once a window has an explicit appearance). So
-                // while following the OS we read the live application appearance
-                // ourselves and re-resolve on a change. `Mode::None` means
-                // "undeterminable" — leave the last known value untouched.
-                let current = chrome::system_appearance();
-                if current != iced_theme::Mode::None && current != self.system_theme {
-                    self.system_theme = current;
-                }
-            }
-            WindowEvent::FocusChanged(focused) => {
-                let gained_focus = focused && !self.app_focused;
-                let lost_focus = !focused && self.app_focused;
-                self.app_focused = focused;
+    pub(crate) fn on_window_focus_changed(&mut self, focused: bool) {
+        let gained_focus = focused && !self.app_focused;
+        let lost_focus = !focused && self.app_focused;
+        self.app_focused = focused;
 
-                // Flush pending geometry immediately on focus loss. App-switch
-                // and quit almost always blur the window first, so this closes
-                // the gap between a resize and the debounce timer firing.
-                if lost_focus && self.geometry_dirty_since.is_some() {
-                    self.geometry_dirty_since = None;
-                    self.current_window_state().save();
-                }
-
-                if gained_focus && let Some(tab) = self.active_tab_id() {
-                    return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
-                }
-            }
-            WindowEvent::Opened(position, size) => {
-                crate::app_menu::install(self);
-                // Seed tracking from the real window without marking dirty: the
-                // geometry we'd persist already matches what's on disk.
-                self.window_size = size;
-                if position.is_some() {
-                    self.window_position = position;
-                }
-                // The saved sidebar width was clamped against the *saved*
-                // window size. Opening onto a smaller screen — an external
-                // display unplugged since the last run — gives a narrower
-                // window, and without this the split stays where it was and
-                // the diff pane opens below its minimum.
-                let files_width = if self.active().session.document.files.is_empty() {
-                    0.0
-                } else if self.active().files_panel_collapsed {
-                    crate::theme::COLLAPSED_PANEL_WIDTH
-                } else {
-                    self.file_nav_width
-                };
-                self.sidebar_width = resize_handle::clamp_width_with_reserve(
-                    self.sidebar_width,
-                    self.sidebar_min_width,
-                    size.width,
-                    files_width
-                        + if files_width == 0.0 { 1.0 } else { 2.0 }
-                        + resize_handle::MIN_DIFF_PANE_WIDTH,
-                );
-                let history_width = if self.active().history_panel_collapsed {
-                    crate::theme::COLLAPSED_PANEL_WIDTH
-                } else {
-                    self.sidebar_width
-                };
-                self.file_nav_width = resize_handle::clamp_width(
-                    self.file_nav_width,
-                    diff_panel::MIN_FILE_NAV_WIDTH,
-                    (size.width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
-                );
-                // Center the native window controls on the tab strip, and arm
-                // the native resize observer that keeps them centered without a
-                // frame of lag while the window is dragged (see
-                // `chrome::install_window_resize_observer`).
-                return Task::batch([
-                    self.reposition_window_controls(),
-                    self.install_resize_observer(),
-                    self.configure_custom_titlebar(),
-                ]);
-            }
-            WindowEvent::Rescaled(scale_factor) => self.scale_factor = scale_factor,
-            WindowEvent::Resized(size) => {
-                if self.window_size != size {
-                    self.window_size = size;
-                    // Shrinking the window can push the split past the diff
-                    // pane's minimum, so re-clamp rather than persist a width
-                    // the new size can't show.
-                    let files_width = if self.active().session.document.files.is_empty() {
-                        0.0
-                    } else if self.active().files_panel_collapsed {
-                        crate::theme::COLLAPSED_PANEL_WIDTH
-                    } else {
-                        self.file_nav_width
-                    };
-                    self.sidebar_width = resize_handle::clamp_width_with_reserve(
-                        self.sidebar_width,
-                        self.sidebar_min_width,
-                        size.width,
-                        files_width
-                            + if files_width == 0.0 { 1.0 } else { 2.0 }
-                            + resize_handle::MIN_DIFF_PANE_WIDTH,
-                    );
-                    let history_width = if self.active().history_panel_collapsed {
-                        crate::theme::COLLAPSED_PANEL_WIDTH
-                    } else {
-                        self.sidebar_width
-                    };
-                    self.file_nav_width = resize_handle::clamp_width(
-                        self.file_nav_width,
-                        diff_panel::MIN_FILE_NAV_WIDTH,
-                        (size.width - history_width - 2.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
-                    );
-                    self.mark_geometry_dirty();
-                }
-                // The native resize observer (armed on open) re-centers the
-                // traffic lights in step with AppKit's layout. This message-loop
-                // reposition stays as a harmless fallback — it runs a frame
-                // later and just re-applies the same position the observer
-                // already set, so it can't reintroduce the jump.
-                return self.reposition_window_controls();
-            }
-            WindowEvent::Moved(position) => {
-                if self.window_position != Some(position) {
-                    self.window_position = Some(position);
-                    self.mark_geometry_dirty();
-                }
-            }
-            WindowEvent::PersistState => {
-                // Only write once the changes have settled — a drag keeps
-                // bumping `geometry_dirty_since`, so the elapsed check holds the
-                // write back until the burst stops.
-                if let Some(since) = self.geometry_dirty_since
-                    && since.elapsed() >= WINDOW_STATE_DEBOUNCE
-                {
-                    self.geometry_dirty_since = None;
-                    self.current_window_state().save();
-                }
-            }
-            WindowEvent::CloseRequested => {
-                // The app owns the close (`exit_on_close_request(false)`) so
-                // the debounced write can't be cut off by the process going
-                // away — ⌘Q and the close button raise no `Unfocused`, so
-                // without this the last resize, tab or revset is lost.
-                self.geometry_dirty_since = None;
-                self.current_window_state().save();
-                return iced::exit();
-            }
-            WindowEvent::TitleBarDrag => {
-                // Resolve the (single) window and begin an interactive drag.
-                // No-op if the window id isn't available yet.
-                return window::latest().then(|id| id.map_or_else(Task::none, window::drag));
-            }
-            WindowEvent::TitleBarDoubleClick => {
-                // A native title bar runs the system double-click action for free;
-                // our custom strip has to resolve it. Read the window frame, its
-                // screen's visible frame, and the configured action on the main
-                // thread, then act on the result in `TitleBarDoubleClickPlan`.
-                return window::latest()
-                    .then(|maybe_id| {
-                        maybe_id.map_or_else(Task::none, |id| {
-                            window::run(id, |window| {
-                                window
-                                    .window_handle()
-                                    .ok()
-                                    .map(|h| chrome::read_double_click_plan(h.as_raw()))
-                                    .unwrap_or(([0.0; 4], [0.0; 4], 2, 0.0))
-                            })
-                        })
-                    })
-                    .map(|(current, visible, action, duration)| {
-                        Message::Window(WindowEvent::TitleBarDoubleClickPlan {
-                            current,
-                            visible,
-                            action,
-                            duration,
-                        })
-                    });
-            }
-            WindowEvent::TitleBarDoubleClickPlan {
-                current,
-                visible,
-                action,
-                duration,
-            } => {
-                match action {
-                    // Minimize: let iced/winit miniaturize the window.
-                    1 => {
-                        return window::latest().then(|id| {
-                            id.map_or_else(Task::none, |id| window::minimize(id, true))
-                        });
-                    }
-                    // None: the user asked for nothing on double-click.
-                    2 => {}
-                    // Zoom (the default): toggle between the visible frame and the
-                    // saved restore frame, driven by our own animation. Ignore a
-                    // re-trigger mid-flight, and bail if the read came back empty.
-                    _ => {
-                        if self.zoom_anim.is_some() || visible[2] <= 0.0 {
-                            return Task::none();
-                        }
-                        let (to, dur) = if frames_approx_eq(current, visible) {
-                            // Un-zoom: restore the saved frame at the same duration
-                            // the zoom-in used (the resize is symmetric).
-                            self.zoom_restore.take().unwrap_or_else(|| {
-                                (zoom_default_restore(visible), ZOOM_FALLBACK_SECS)
-                            })
-                        } else {
-                            // Zoom in: remember where to come back to, and the
-                            // native duration to come back at.
-                            self.zoom_restore = Some((current, duration));
-                            (visible, duration)
-                        };
-                        self.zoom_anim = Some(ZoomAnim {
-                            start: Instant::now(),
-                            from: current,
-                            to,
-                            duration: dur,
-                        });
-                    }
-                }
-            }
-            WindowEvent::ZoomAnimTick => {
-                let Some(anim) = self.zoom_anim else {
-                    return Task::none();
-                };
-                // Normalized progress over the native-matched duration (guarded
-                // against a zero duration). Snap to the target on the final frame
-                // so we land exactly.
-                let t =
-                    (anim.start.elapsed().as_secs_f64() / anim.duration.max(0.001)).clamp(0.0, 1.0);
-                let done = t >= 1.0;
-                let frame = if done {
-                    self.zoom_anim = None;
-                    anim.to
-                } else {
-                    // Sinusoidal ease-in-out — slow at both ends, matching the
-                    // feel of AppKit's native window-resize curve.
-                    let e = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
-                    let mut f = [0.0; 4];
-                    for (i, slot) in f.iter_mut().enumerate() {
-                        *slot = anim.from[i] + (anim.to[i] - anim.from[i]) * e;
-                    }
-                    f
-                };
-                return window::latest()
-                    .then(move |maybe_id| {
-                        maybe_id.map_or_else(Task::none, move |id| {
-                            window::run(id, move |window| {
-                                if let Ok(handle) = window.window_handle() {
-                                    chrome::set_window_frame(handle.as_raw(), frame);
-                                }
-                            })
-                        })
-                    })
-                    .discard();
-            }
+        // Flush pending geometry immediately on focus loss. App-switch and quit
+        // almost always blur the window first, so this closes the gap between a
+        // resize and the debounce timer firing.
+        if lost_focus && self.geometry_dirty_since.is_some() {
+            self.geometry_dirty_since = None;
+            self.current_window_state().save();
         }
-        Task::none()
+
+        if gained_focus && let Some(tab) = self.active_tab_id() {
+            self.start_repository_snapshot(tab, RefreshOrigin::Focus);
+        }
+    }
+
+    /// Re-clamps the panes to the window, with the split unmarked: the saved
+    /// width was clamped against the *saved* window size. Opening onto a smaller
+    /// screen (an external display unplugged since the last run) gives a narrower
+    /// window, and without this the split stays where it was and the diff pane
+    /// opens below its minimum.
+    pub(crate) fn clamp_panes_to_window(&mut self) {
+        let width = self.window_size.width;
+        let files_width = self.files_pane_width();
+        self.sidebar_width = resize_handle::clamp_width_with_reserve(
+            self.sidebar_width,
+            self.sidebar_min_width,
+            width,
+            if files_width > 0.0 {
+                files_width + 1.0
+            } else {
+                0.0
+            } + 1.0
+                + resize_handle::MIN_DIFF_PANE_WIDTH,
+        );
+        let history_width = self.left_pane_width();
+        let lead = if history_width > 0.0 {
+            history_width + 1.0
+        } else {
+            0.0
+        };
+        self.file_nav_width = resize_handle::clamp_width(
+            self.file_nav_width,
+            diff_panel::MIN_FILE_NAV_WIDTH,
+            (width - lead - 1.0).max(diff_panel::MIN_FILE_NAV_WIDTH),
+        );
+    }
+
+    /// The window opened: seed tracking from the real window without marking
+    /// dirty, since the geometry we'd persist already matches what's on disk.
+    pub(crate) fn on_window_opened(&mut self, position: Option<Point>, size: Size) {
+        crate::app_menu::install(self);
+        self.window_size = size;
+        if position.is_some() {
+            self.window_position = position;
+        }
+        self.clamp_panes_to_window();
+    }
+
+    pub(crate) fn on_window_resized(&mut self, size: Size) {
+        if self.window_size != size {
+            self.window_size = size;
+            // Shrinking the window can push the split past the diff pane's
+            // minimum, so re-clamp rather than persist a width the new size
+            // can't show.
+            self.clamp_panes_to_window();
+            self.mark_geometry_dirty();
+        }
+    }
+
+    pub(crate) fn on_window_moved(&mut self, position: Point, display: Option<String>) {
+        if self.window_position != Some(position) || self.window_display != display {
+            self.window_position = Some(position);
+            self.window_display = display;
+            self.mark_geometry_dirty();
+        }
+    }
+
+    /// Debounce tick: only write once the changes have settled. A drag keeps
+    /// bumping `geometry_dirty_since`, so the elapsed check holds the write back
+    /// until the burst stops.
+    pub(crate) fn on_window_persist_state(&mut self) {
+        if let Some(since) = self.geometry_dirty_since
+            && since.elapsed() >= WINDOW_STATE_DEBOUNCE
+        {
+            self.geometry_dirty_since = None;
+            self.current_window_state().save();
+        }
+    }
+
+    /// The window is closing or the app quitting. ⌘Q and the close button raise
+    /// no focus loss, so without this the last resize, tab or revset is lost.
+    pub(crate) fn on_window_close_requested(&mut self) {
+        self.geometry_dirty_since = None;
+        self.current_window_state().save();
     }
 
     /// Resolve a key press through the keymap and run whatever it names.
     ///
-    /// `consumed` is iced's "a focused widget already took this key". The
-    /// revset box is an inline text input with no mode of its own, so without
-    /// that check its typing would also drive file navigation.
-    fn on_key_pressed(
+    /// `consumed` says a text input has the keyboard. The revset box is an inline
+    /// text input with no mode of its own, so without that check its typing would
+    /// also drive file navigation.
+    ///
+    /// Returns whether the key was taken. A taken key stops there, which is what
+    /// lets the app see Esc before a focused input does.
+    pub(crate) fn on_key_pressed(
         &mut self,
         key: &keyboard::Key,
         modifiers: keyboard::Modifiers,
         consumed: bool,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) -> bool {
+        if matches!(key, keyboard::Key::Named(keyboard::Named::Escape)) {
+            self.cancel_tab_drag(cx);
+        }
         let Some(chord) = Chord::from_event(key, modifiers) else {
-            return Task::none();
+            return false;
         };
         let context = self.key_context();
+        // A peeked panel is the topmost thing on screen until a mode opens over it.
         if context == Context::Base
-            && let Some(task) = self.revset_field_key(key, modifiers, consumed)
+            && self.panel_peek.is_some()
+            && matches!(key, keyboard::Key::Named(keyboard::Named::Escape))
         {
-            return task;
+            self.close_panel_peek();
+            return true;
+        }
+        if context == Context::Base
+            && self
+                .revset_field_key(key, modifiers, consumed, cx)
+                .is_some()
+        {
+            return true;
         }
         let Some(id) = self.resolve_chord(context, &chord, consumed) else {
-            return Task::none();
+            return false;
         };
-        self.run_command(id, CommandArg::None)
+        // A key a focused field also edits with (Backspace) stays the field's
+        // when the command bound to it has nothing to do right now.
+        if consumed
+            && commands::command(id)
+                .is_some_and(|command| (command.build)(self, CommandArg::None).is_none())
+        {
+            return false;
+        }
+        self.run_command(id, CommandArg::None, cx);
+        true
     }
 
     /// The command a chord names in `context`, falling back to the base context
@@ -1902,291 +1676,274 @@ impl Diffui {
         })
     }
 
-    fn on_palette_message(&mut self, message: PaletteMessage) -> Task<Message> {
-        match message {
-            PaletteMessage::QueryChanged(query) => {
-                // Take the palette out of `self` so the matcher can borrow
-                // `&self` (commits / files / recents) directly. Previously
-                // this cloned the entire app per keystroke; on a 40k-commit
-                // repo that deep clone was the bulk of the typing latency.
-                let Some(mut state) = self.take_palette() else {
-                    return Task::none();
-                };
-                let depth = state.stack.len().saturating_sub(1);
-                let mut task = Task::none();
-                if let Some(column) = state.top_mut() {
-                    let old = std::mem::replace(&mut column.query, query);
-                    if depth == 0
-                        && let Some(settle) = self.command_line_edited(column, &old)
-                    {
-                        column.matches.clear();
-                        column.dirty = false;
-                        self.push_mode(Mode::Palette(state));
-                        return settle;
-                    }
-                    column.dirty = true;
-                    // Editing resets `:` commit-search back to its "press ⏎"
-                    // prompt (the prior results are for a stale query).
-                    column.searched = false;
-                    column.query_version = column.query_version.wrapping_add(1);
-                    let version = column.query_version;
-                    // Debounce: the matcher scans every commit, so coalesce
-                    // fast typing rather than re-matching on each keystroke.
-                    task = Task::perform(
-                        async move {
-                            tokio::time::sleep(PALETTE_QUERY_DEBOUNCE).await;
-                            (depth, version)
-                        },
-                        |(depth, version)| {
-                            Message::Palette(PaletteMessage::Recompute(depth, version))
-                        },
-                    );
-                }
+    pub(crate) fn palette_on_query_changed(&mut self, query: String, cx: &mut Cx) {
+        // Take the palette out of `self` so the matcher can borrow
+        // `&self` (commits / files / recents) directly. Previously
+        // this cloned the entire app per keystroke; on a 40k-commit
+        // repo that deep clone was the bulk of the typing latency.
+        let Some(mut state) = self.take_palette() else {
+            return;
+        };
+        let depth = state.stack.len().saturating_sub(1);
+        if let Some(column) = state.top_mut() {
+            let old = std::mem::replace(&mut column.query, query);
+            if depth == 0
+                && let Some(settle) = self.command_line_edited(column, &old, cx)
+            {
+                column.matches.clear();
+                column.dirty = false;
                 self.push_mode(Mode::Palette(state));
-                task
+                return settle;
             }
-            PaletteMessage::Recompute(depth, version) => {
-                let Some(mut state) = self.take_palette() else {
-                    return Task::none();
-                };
-                let mut task = Task::none();
-                if let Some(column) = state.stack.get_mut(depth)
-                    && column.query_version == version
-                {
-                    column.selected = 0;
-                    // Re-running the matcher invalidates row positions; jump
-                    // the scroll back to the top so the first row is visible.
-                    column.scroll_y = 0.0;
-                    column.dirty = false;
-                    palette::recompute_matches(column, self, false);
-                    task = widget::operation::scroll_to(
-                        palette::results_scrollable_id(depth),
-                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-                    );
-                }
-                self.push_mode(Mode::Palette(state));
-                task
-            }
-            PaletteMessage::SelectIndex(_, index) if self.command_line().is_some() => {
-                self.command_line_select(index);
-                Task::none()
-            }
-            PaletteMessage::AcceptIndex(_, index) if self.command_line().is_some() => {
-                self.command_line_accept_index(index)
-            }
-            PaletteMessage::SelectIndex(depth, index) => {
-                if let Some(state) = self.palette_mut()
-                    && state.stack.len() == depth + 1
-                    && let Some(column) = state.stack.get_mut(depth)
-                    && index < column.matches.len()
-                {
-                    column.selected = index;
-                }
-                Task::none()
-            }
-            PaletteMessage::Accept => self.palette_submit(),
-            PaletteMessage::CommandEdit(action) => self.command_line_edit(action),
-            PaletteMessage::AcceptIndex(depth, index) => {
-                // The click carries the column it was drawn in: a push or pop
-                // between the press and its delivery must not run whatever row
-                // now sits at that index in a different column.
-                let addressed = self
-                    .palette_mut()
-                    .is_some_and(|state| state.stack.len() == depth + 1);
-                if !addressed {
-                    return Task::none();
-                }
-                if let Some(state) = self.palette_mut()
-                    && let Some(column) = state.stack.get_mut(depth)
-                    && index < column.matches.len()
-                {
-                    column.selected = index;
-                }
-                self.palette_accept_current()
-            }
-            PaletteMessage::NoOp | PaletteMessage::Tick => Task::none(),
+            column.dirty = true;
+            // Editing resets `:` commit-search back to its "press ⏎"
+            // prompt (the prior results are for a stale query).
+            column.searched = false;
+            column.query_version = column.query_version.wrapping_add(1);
+            // Debounce: the matcher scans every commit, so coalesce
+            // fast typing rather than re-matching on each keystroke.
+            self.palette_query
+                .arm(PALETTE_QUERY_DEBOUNCE, cx, move |this, _| {
+                    this.palette_on_recompute(depth);
+                });
+        }
+        self.push_mode(Mode::Palette(state));
+    }
+
+    /// Re-run the matcher for column `depth`, unless something else already
+    /// did since its query last changed.
+    pub(crate) fn palette_on_recompute(&mut self, depth: usize) {
+        let Some(mut state) = self.take_palette() else {
+            return;
+        };
+        if let Some(column) = state.stack.get_mut(depth)
+            && column.dirty
+        {
+            column.selected = 0;
+            column.dirty = false;
+            palette::recompute_matches(column, self, false);
+        }
+        self.push_mode(Mode::Palette(state));
+    }
+
+    pub(crate) fn palette_on_select_index(&mut self, depth: usize, index: usize) {
+        if self.command_line().is_some() {
+            self.command_line_select(index);
+            return;
+        }
+        if let Some(state) = self.palette_mut()
+            && state.stack.len() == depth + 1
+            && let Some(column) = state.stack.get_mut(depth)
+            && index < column.matches.len()
+        {
+            column.selected = index;
         }
     }
 
-    fn on_find_message(&mut self, message: FindMessage) -> Task<Message> {
-        match message {
-            FindMessage::QueryChanged(query) => {
-                if let Some(state) = self.active_mut().find_mut() {
-                    state.query = query;
-                    state.error = None;
-                    state.query_version = state.query_version.wrapping_add(1);
-                    let version = state.query_version;
-                    return Task::perform(
-                        async move {
-                            tokio::time::sleep(find::DEBOUNCE).await;
-                            version
-                        },
-                        |version| Message::Find(FindMessage::Recompute(version)),
-                    );
-                }
-            }
-            FindMessage::Recompute(version) => {
-                let target = self.active_mut();
-                if let Some(state) = target.find()
-                    && state.query_version == version
-                {
-                    let (matches, error) = find::compute_matches(state, target.find_files());
-                    if let Some(state) = self.active_mut().find_mut() {
-                        state.matches = matches;
-                        state.error = error;
-                        state.active = if state.matches.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-                        state.scroll_token = state.scroll_token.wrapping_add(1);
-                    }
-                }
-            }
-            FindMessage::ToggleCase => {
-                if let Some(state) = self.active_mut().find_mut() {
-                    state.case_sensitive = !state.case_sensitive;
-                    return self.refind_now();
-                }
-            }
-            FindMessage::ToggleRegex => {
-                if let Some(state) = self.active_mut().find_mut() {
-                    state.regex = !state.regex;
-                    return self.refind_now();
-                }
-            }
+    pub(crate) fn palette_on_accept_index(&mut self, depth: usize, index: usize, cx: &mut Cx) {
+        if self.command_line().is_some() {
+            self.command_line_accept_index(index, cx);
+            return;
         }
-        Task::none()
+        // The click carries the column it was drawn in: a push or pop
+        // between the press and its delivery must not run whatever row
+        // now sits at that index in a different column.
+        let addressed = self
+            .palette_mut()
+            .is_some_and(|state| state.stack.len() == depth + 1);
+        if !addressed {
+            return;
+        }
+        if let Some(state) = self.palette_mut()
+            && let Some(column) = state.stack.get_mut(depth)
+            && index < column.matches.len()
+        {
+            column.selected = index;
+        }
+        self.palette_accept_current(cx)
     }
 
-    fn on_menu_message(&mut self, message: MenuMessage) -> Task<Message> {
-        match message {
-            MenuMessage::Hover(path) => {
-                // Hover is `on_enter`-driven (geometry-free, can't mis-hit). On
-                // the open branch (or with no flyout open) it commits at once.
-                // An off-branch row while a flyout is open is held as *pending*
-                // only when the pointer is actually sweeping — a slow crawl onto
-                // a row is aim, not transit, and commits directly. A pending row
-                // commits once the cursor veers out of the trajectory wedge
-                // (MenuMouseMoved) or the sweep stalls (MenuTick).
-                let Some(m) = self.menu_mut() else {
-                    return Task::none();
-                };
-                m.entered = true;
-                if m.open_path.is_empty() || m.on_open_branch(&path) || m.moving_slowly() {
-                    m.activate(path);
+    pub(crate) fn find_on_query_changed(&mut self, query: String, cx: &mut Cx) {
+        if let Some(state) = self.active_mut().find_mut() {
+            state.query = query;
+            state.error = None;
+            let Some(tab) = self.active_tab_id() else {
+                return;
+            };
+            self.active_mut()
+                .find_debounce
+                .arm(find::DEBOUNCE, cx, move |this, _| {
+                    if this.is_active(tab) {
+                        this.find_on_recompute();
+                    }
+                });
+        }
+    }
+
+    pub(crate) fn find_on_recompute(&mut self) {
+        let target = self.active_mut();
+        if let Some(state) = target.find() {
+            let (matches, error) = find::compute_matches(state, target.find_files());
+            if let Some(state) = self.active_mut().find_mut() {
+                state.matches = matches;
+                state.error = error;
+                state.active = if state.matches.is_empty() {
+                    None
                 } else {
-                    m.pending_row = Some(path);
-                }
-            }
-            MenuMessage::MouseMoved(pos) => {
-                if self.menu().is_none() {
-                    return Task::none();
-                }
-                // Off-branch sweep pending: commit the row the moment the cursor
-                // leaves the triangle aimed at the flyout (a veer). The apex
-                // itself is eased toward the cursor on the menu tick (see
-                // `MenuTick`), frozen while a row is pending — so it sits upstream
-                // and the wedge has room during a sweep. No distance ceiling: a
-                // big menu can take as long as the sweep keeps moving (stalls are
-                // the tick's job). A not-yet-set apex (submenu only just opened)
-                // holds the row pending rather than stealing it.
-                let commit = {
-                    let m = self.menu().expect("just checked");
-                    m.pending_row.as_ref().map(|_| {
-                        match (m.flyout_origin, menu::flyout_rect(self, m)) {
-                            (Some(apex), Some(fly)) => !menu::heading_to_flyout(apex, pos, fly),
-                            _ => false,
-                        }
-                    })
+                    Some(0)
                 };
-                let m = self.menu_mut().expect("just checked");
-                m.note_cursor_move(pos);
-                m.entered = true;
-                if commit == Some(true)
-                    && let Some(path) = m.pending_row.take()
-                {
-                    m.activate(path);
-                }
+                state.scroll_token = state.scroll_token.wrapping_add(1);
             }
-            MenuMessage::Select(path, button) => {
-                let Some(open) = self.menu_mut() else {
-                    return Task::none();
-                };
-                // The opening press's own release picks nothing: the menu was
-                // drawn under a cursor that never pressed anything inside it, so
-                // running the row it happens to cover would fire an action the
-                // user only asked to *see*. A later press-release picks.
-                // Only a leaf picks; a release on a submenu/disabled/separator
-                // row leaves the (already hover-opened) menu as it is.
-                if !open.opening_release(button)
-                    && let Some(menu::MenuEntry::Item { command, arg, .. }) = open.entry_at(&path)
-                {
-                    let (command, arg) = (*command, arg.clone());
-                    self.pop_mode(ModeKind::Menu);
-                    return self.run_command(command, arg);
-                }
+        }
+    }
+
+    pub(crate) fn find_on_toggle_case(&mut self) {
+        if let Some(state) = self.active_mut().find_mut() {
+            state.case_sensitive = !state.case_sensitive;
+            self.refind_now();
+        }
+    }
+
+    pub(crate) fn find_on_toggle_regex(&mut self) {
+        if let Some(state) = self.active_mut().find_mut() {
+            state.regex = !state.regex;
+            self.refind_now();
+        }
+    }
+
+    pub(crate) fn menu_on_hover(&mut self, path: Vec<usize>) {
+        // Hover is `on_enter`-driven (geometry-free, can't mis-hit). On
+        // the open branch (or with no flyout open) it commits at once.
+        // An off-branch row while a flyout is open is held as *pending*
+        // only when the pointer is actually sweeping — a slow crawl onto
+        // a row is aim, not transit, and commits directly. A pending row
+        // commits once the cursor veers out of the trajectory wedge
+        // (MenuMouseMoved) or the sweep stalls (MenuTick).
+        let Some(m) = self.menu_mut() else {
+            return;
+        };
+        m.entered = true;
+        if m.open_path.is_empty() || m.on_open_branch(&path) || m.moving_slowly() {
+            m.activate(path);
+        } else {
+            m.pending_row = Some(path);
+        }
+    }
+
+    pub(crate) fn menu_on_mouse_moved(&mut self, pos: Point) {
+        if self.menu().is_none() {
+            return;
+        }
+        // Off-branch sweep pending: commit the row the moment the cursor
+        // leaves the triangle aimed at the flyout (a veer). The apex
+        // itself is eased toward the cursor on the menu tick (see
+        // `MenuTick`), frozen while a row is pending — so it sits upstream
+        // and the wedge has room during a sweep. No distance ceiling: a
+        // big menu can take as long as the sweep keeps moving (stalls are
+        // the tick's job). A not-yet-set apex (submenu only just opened)
+        // holds the row pending rather than stealing it.
+        let commit = {
+            let m = self.menu().expect("just checked");
+            m.pending_row
+                .as_ref()
+                .map(|_| match (m.flyout_origin, menu::flyout_rect(self, m)) {
+                    (Some(apex), Some(fly)) => !menu::heading_to_flyout(apex, pos, fly),
+                    _ => false,
+                })
+        };
+        let m = self.menu_mut().expect("just checked");
+        m.note_cursor_move(pos);
+        m.entered = true;
+        if commit == Some(true)
+            && let Some(path) = m.pending_row.take()
+        {
+            m.activate(path);
+        }
+    }
+
+    pub(crate) fn menu_on_select(
+        &mut self,
+        path: Vec<usize>,
+        button: gpui_kit::MouseButton,
+        cx: &mut Cx,
+    ) {
+        let Some(open) = self.menu_mut() else {
+            return;
+        };
+        // The opening press's own release picks nothing: the menu was
+        // drawn under a cursor that never pressed anything inside it, so
+        // running the row it happens to cover would fire an action the
+        // user only asked to *see*. A later press-release picks.
+        // Only a leaf picks; a release on a submenu/disabled/separator
+        // row leaves the (already hover-opened) menu as it is.
+        if !open.opening_release(button)
+            && let Some(menu::MenuEntry::Item { command, arg, .. }) = open.entry_at(&path)
+        {
+            let (command, arg) = (*command, arg.clone());
+            self.pop_mode(ModeKind::Menu);
+            self.run_command(command, arg, cx);
+        }
+    }
+
+    pub(crate) fn menu_on_card_scrolled(&mut self, depth: usize, offset: f32) {
+        if let Some(m) = self.menu_mut() {
+            if m.scrolls.len() <= depth {
+                m.scrolls.resize(depth + 1, 0.0);
             }
-            MenuMessage::CapturePress => {}
-            MenuMessage::CardScrolled(depth, offset) => {
-                if let Some(m) = self.menu_mut() {
-                    if m.scrolls.len() <= depth {
-                        m.scrolls.resize(depth + 1, 0.0);
-                    }
-                    m.scrolls[depth] = offset;
-                }
-            }
-            MenuMessage::Dismiss => {
+            m.scrolls[depth] = offset;
+        }
+    }
+
+    pub(crate) fn menu_on_dismiss(&mut self) {
+        self.pop_mode(ModeKind::Menu);
+    }
+
+    pub(crate) fn menu_on_scrim_release(&mut self, button: gpui_kit::MouseButton) {
+        if let Some(menu) = self.menu_mut() {
+            // Same gate the row `Select` uses, on the other half of the
+            // window: the opening press's release lands here when the
+            // cursor sits outside the cards — swallow it and keep the
+            // menu open. A later release — or one after the cursor has
+            // dragged into the menu — dismisses.
+            if !menu.opening_release(button) || menu.entered {
                 self.pop_mode(ModeKind::Menu);
             }
-            MenuMessage::ScrimRelease(button) => {
-                if let Some(menu) = self.menu_mut() {
-                    // Same gate the row `Select` uses, on the other half of the
-                    // window: the opening press's release lands here when the
-                    // cursor sits outside the cards — swallow it and keep the
-                    // menu open. A later release — or one after the cursor has
-                    // dragged into the menu — dismisses.
-                    if !menu.opening_release(button) || menu.entered {
-                        self.pop_mode(ModeKind::Menu);
-                    }
+        }
+    }
+
+    // Drives three time-based effects while a menu is open: the
+    // right-click glow pulse (re-running `view`), easing the trajectory
+    // apex toward the cursor, and the sweep-stall commit. Easing on this
+    // fixed clock — not on raw moves — is what makes the apex lag by a
+    // velocity-proportional amount during a sweep yet catch up when the
+    // cursor idles. Frozen while a row is pending so the wedge keeps a
+    // stable upstream origin mid-sweep.
+    pub(crate) fn menu_on_tick(&mut self) {
+        if let Some(m) = self.menu_mut() {
+            if m.pending_row.is_none() {
+                if let Some(cursor) = m.cursor {
+                    m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
                 }
-            }
-            // Drives three time-based effects while a menu is open: the
-            // right-click glow pulse (re-running `view`), easing the trajectory
-            // apex toward the cursor, and the sweep-stall commit. Easing on this
-            // fixed clock — not on raw moves — is what makes the apex lag by a
-            // velocity-proportional amount during a sweep yet catch up when the
-            // cursor idles. Frozen while a row is pending so the wedge keeps a
-            // stable upstream origin mid-sweep.
-            MenuMessage::Tick => {
-                if let Some(m) = self.menu_mut() {
-                    if m.pending_row.is_none() {
-                        if let Some(cursor) = m.cursor {
-                            m.flyout_origin = Some(menu::ease_apex(m.flyout_origin, cursor));
-                        }
-                    } else if m.sweep_stalled()
-                        && let Some(path) = m.pending_row.take()
-                    {
-                        // The wedge only protects an *ongoing* sweep. Idle or
-                        // crawling for a beat means the user settled on the row
-                        // they're over — the hold ends and that row wins, instead
-                        // of the guard pinning the old flyout open forever.
-                        m.activate(path);
-                    }
-                }
+            } else if m.sweep_stalled()
+                && let Some(path) = m.pending_row.take()
+            {
+                // The wedge only protects an *ongoing* sweep. Idle or
+                // crawling for a beat means the user settled on the row
+                // they're over — the hold ends and that row wins, instead
+                // of the guard pinning the old flyout open forever.
+                m.activate(path);
             }
         }
-        Task::none()
     }
 
     /// Open the palette. It shares one keyboard with the find bar and the
     /// open-repo dialog, so those close rather than sit behind the modal.
-    fn open_palette(&mut self) -> Task<Message> {
+    fn open_palette(&mut self, cx: &mut Cx) {
         self.active_mut().pop_mode(ModeKind::Find);
         self.pop_mode(ModeKind::OpenRepo);
         let state = PaletteState::open(self);
         self.push_mode(Mode::Palette(state));
-        widget::operation::focus(palette::PALETTE_INPUT_ID)
+        crate::input::focus(palette::PALETTE_INPUT_ID, cx)
     }
 
     /// Lift the palette out of the mode stack so the matcher can borrow `&self`
@@ -2201,45 +1958,37 @@ impl Diffui {
 
     /// Move the palette's highlighted row, scrolling it back into view when the
     /// move pushed it out.
-    fn palette_move(&mut self, delta: i32) -> Task<Message> {
-        if let Some(task) = self.command_line_move(delta) {
-            return task;
+    fn palette_move(&mut self, delta: i32, cx: &mut Cx) {
+        if self.command_line_move(delta, cx).is_some() {
+            return;
         }
         let Some(state) = self.palette_mut() else {
-            return Task::none();
+            return;
         };
-        let depth = state.stack.len().saturating_sub(1);
         let Some(column) = state.top_mut() else {
-            return Task::none();
+            return;
         };
         if column.matches.is_empty() {
-            return Task::none();
+            return;
         }
         let len = column.matches.len() as i32;
+        // The view scrolls the highlight into sight.
         column.selected = (column.selected as i32 + delta).rem_euclid(len) as usize;
-        if column.ensure_selected_visible() {
-            let y = column.scroll_y;
-            return widget::operation::scroll_to(
-                palette::results_scrollable_id(depth),
-                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
-            );
-        }
-        Task::none()
     }
 
     /// Open the find bar, closing the overlays that share its keyboard.
-    fn open_find(&mut self) -> Task<Message> {
+    fn open_find(&mut self, cx: &mut Cx) {
         self.pop_mode(ModeKind::Palette);
         self.pop_mode(ModeKind::OpenRepo);
         if self.active().find().is_none() {
             self.active_mut()
                 .push_mode(TabMode::Find(FindState::default()));
         }
-        widget::operation::focus(find::FIND_INPUT_ID)
+        crate::input::focus(find::FIND_INPUT_ID, cx)
     }
 
     /// Browse `selection`: the plain-click / palette-jump path.
-    pub(crate) fn select_revision(&mut self, selection: RevisionSelection) -> Task<Message> {
+    pub(crate) fn select_revision(&mut self, selection: RevisionSelection) {
         let target = self.active_mut();
         target.revision_multi_selection.clear();
         if target.session.selected_revision != selection {
@@ -2247,7 +1996,7 @@ impl Diffui {
                 && editor.is_dirty()
             {
                 editor.switch_blocked = true;
-                return Task::none();
+                return;
             }
             target.pop_mode(ModeKind::Description);
         }
@@ -2260,15 +2009,14 @@ impl Diffui {
             // Already loading this revision — let it land.
         } else if let Some(tab) = self.active_tab_id() {
             let effects = self.active_mut().session.browse(selection);
-            return self.run_effects(tab, effects);
+            self.run_effects(tab, effects);
         }
-        Task::none()
     }
 
     /// A click on a revision row. What it means depends on the modifiers held
     /// and on whether a draft is picking a destination, neither of which the
     /// widget can see — so the row publishes the click and this resolves it.
-    fn on_revision_row_click(&mut self, key: revision_list::RowSelectionKey) -> Task<Message> {
+    fn on_revision_row_click(&mut self, key: revision_list::RowSelectionKey, cx: &mut Cx) {
         let selection = selection_from_key(&key);
         // Target mode: a plain click *arms* the row as the destination
         // candidate (same as hover / j-k); the Apply button, ↵, or a
@@ -2279,7 +2027,7 @@ impl Diffui {
         // un-stack them.
         if self.active().op_draft().is_some() {
             if self.modifiers.command() {
-                return self.draft_toggle_source(selection);
+                return self.draft_toggle_source(selection, cx);
             }
             let index = match &selection {
                 RevisionSelection::WorkingCopy => {
@@ -2293,17 +2041,17 @@ impl Diffui {
                     .position(|row| row.commit_id() == id),
             };
             let Some(index) = index else {
-                return Task::none();
+                return;
             };
             let Some(draft) = self.active_mut().op_draft_mut() else {
-                return Task::none();
+                return;
             };
             if draft.draft.candidate == Some(index) {
-                return Task::none();
+                return;
             }
             draft.draft.candidate = Some(index);
             draft.hover_spot = None;
-            return self.kick_draft_preview();
+            return self.kick_draft_preview(cx);
         }
         // Outside target mode, ⌘-click marks/unmarks the row for a
         // batch action and ⇧-click marks the visible range between
@@ -2324,7 +2072,7 @@ impl Diffui {
                 RevisionSelection::Commit(id) => Some(id.clone()),
             };
             let Some(commit_id) = commit_id else {
-                return Task::none();
+                return;
             };
             if self.modifiers.shift() {
                 let clicked = self
@@ -2371,21 +2119,22 @@ impl Diffui {
 
     /// Right-click on a revision row: retarget the marks if needed, then pop
     /// the context menu.
-    fn open_revision_menu(
+    pub(crate) fn open_revision_menu(
         &mut self,
         key: revision_list::RowSelectionKey,
-        row_rect: iced::Rectangle,
-        cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        cursor: Point,
+        cx: &mut Cx,
+    ) {
         // Right-clicking during target mode reads as "do something
         // else instead" — drop the draft rather than nesting modes.
         self.active_mut().pop_mode(ModeKind::Draft);
         let Some(repository) = self.active().repository.clone() else {
-            return Task::none();
+            return;
         };
         // jj-only for now — the mutations are jj-lib transactions.
         if !matches!(repository.vcs, Vcs::Jj) {
-            return Task::none();
+            return;
         }
         // Right-click inside the marked set keeps it (the menu shows
         // the batch actions); outside it re-targets the clicked row
@@ -2407,24 +2156,23 @@ impl Diffui {
             }
         }
         // macOS pops the native menu (blocking) with a pulsing glow over
-        // `row_rect`; every other platform opens the iced overlay at the
+        // `row_rect`; every other platform opens the overlay at the
         // cursor. Either way the chosen command dispatches the same way.
-        self.open_revision_context_menu(repository, selection_from_key(&key), row_rect, cursor)
+        self.open_revision_context_menu(repository, selection_from_key(&key), row_rect, cursor, cx)
     }
 
     /// Turn the selected revision's description strip into its inline editor.
-    pub(crate) fn open_description_editor(&mut self) -> Task<Message> {
+    pub(crate) fn open_description_editor(&mut self, cx: &mut Cx) {
         let target = self.active_mut();
         if target
             .description_editor()
             .is_some_and(|editor| editor.target == target.session.selected_revision)
         {
-            return iced::widget::operation::focus(iced::widget::Id::new(
-                diff_panel::DESCRIPTION_EDITOR_ID,
-            ));
+            crate::input::focus(diff_panel::DESCRIPTION_EDITOR_ID, cx);
+            return;
         }
         if !target.session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         let Some(description) = target
             .session
@@ -2432,7 +2180,7 @@ impl Diffui {
             .as_ref()
             .map(|details| details.description.clone())
         else {
-            return Task::none();
+            return;
         };
         // The editor occupies the description's slot in the scrollable
         // revision header. Reveal it before focusing when editing was
@@ -2442,43 +2190,62 @@ impl Diffui {
         let editor = DescriptionEditor {
             target: target.session.selected_revision.clone(),
             original: description.clone(),
-            content: widget::text_editor::Content::with_text(&description),
+            content: description.clone(),
             saving_activity: None,
             switch_blocked: false,
             commit: false,
+            wc_change: target
+                .session
+                .commits
+                .working_copy()
+                .map(|row| row.change_id().to_owned()),
         };
         target.push_mode(TabMode::Description(editor));
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
-        iced::widget::operation::focus(iced::widget::Id::new(diff_panel::DESCRIPTION_EDITOR_ID))
+        crate::input::focus(diff_panel::DESCRIPTION_EDITOR_ID, cx)
     }
 
     /// Open the description editor on `target`, browsing to it first when it
     /// isn't the revision on screen.
-    fn edit_description(&mut self, target: RevisionSelection) -> Task<Message> {
+    fn edit_description(&mut self, target: RevisionSelection, cx: &mut Cx) {
         self.active_mut().pending_commit = false;
         if self.active().session.selected_revision == target {
-            return self.open_description_editor();
+            return self.open_description_editor(cx);
         }
         if let Some(editor) = self.active_mut().description_editor_mut()
             && (editor.is_dirty() || editor.saving_activity.is_some())
         {
             editor.switch_blocked = true;
-            return Task::none();
+            return;
         }
         self.active_mut().pending_description_edit = Some(target.clone());
         self.select_revision(target)
     }
 
-    fn save_description(&mut self) -> Task<Message> {
+    fn save_description(&mut self) {
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let Some(editor) = self.active().description_editor() else {
-            return Task::none();
+            return;
         };
         // A commit may keep the description as it stands.
         if editor.saving_activity.is_some() || !(editor.is_dirty() || editor.commit) {
-            return Task::none();
+            return;
+        }
+        let shown_wc = self
+            .active()
+            .session
+            .commits
+            .working_copy()
+            .map(|row| row.change_id());
+        if (editor.commit || editor.target == RevisionSelection::WorkingCopy)
+            && editor.wc_change.as_deref() != shown_wc
+        {
+            return self.push_error_toast(
+                "Description not saved",
+                "The working copy moved. Check the selection and try again.",
+            );
         }
         let (op, label) = crate::revops::description_save_op(editor);
         let (activity_id, _) = self.begin_activity(tab_id, label, false);
@@ -2501,35 +2268,37 @@ impl Diffui {
         &mut self,
         kind: mutations::DraftKind,
         source: RevisionSelection,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         if kind == mutations::DraftKind::New {
             return self.start_draft_with(
                 kind,
                 Vec::new(),
                 Some((source, mutations::PlacementKind::Onto)),
+                cx,
             );
         }
-        self.start_draft_with(kind, vec![source], None)
+        self.start_draft_with(kind, vec![source], None, cx)
     }
 
     /// Arm a placement on the active draft, re-previewing the result.
-    fn set_draft_placement(&mut self, placement: mutations::PlacementKind) -> Task<Message> {
+    fn set_draft_placement(&mut self, placement: mutations::PlacementKind, cx: &mut Cx) {
         if let Some(draft) = self.active_mut().op_draft_mut() {
             draft.draft.placement = placement;
             draft.hover_spot = None;
         }
-        self.kick_draft_preview()
+        self.kick_draft_preview(cx)
     }
 
     /// Walk the destination candidate `delta` rows, skipping draft sources.
-    fn move_draft_candidate(&mut self, delta: i32) -> Task<Message> {
+    fn move_draft_candidate(&mut self, delta: i32, cx: &mut Cx) {
         let target = self.active();
         let len = target.session.commits.len();
         let Some(draft) = target.op_draft() else {
-            return Task::none();
+            return;
         };
         if len == 0 {
-            return Task::none();
+            return;
         }
         // Walk from the current candidate in `delta`'s direction to
         // the next non-source row. The first move anchors on the
@@ -2564,25 +2333,24 @@ impl Diffui {
             next += step;
         };
         let Some(found) = found else {
-            return Task::none();
+            return;
         };
         if let Some(draft) = self.active_mut().op_draft_mut() {
             draft.draft.candidate = Some(found);
             draft.hover_spot = None;
         }
-        // Reveal the candidate row (the sidebar routes the file-reveal
-        // token at a draft candidate while target mode is active).
-        self.sidebar_file_reveal_token = self.sidebar_file_reveal_token.wrapping_add(1);
-        self.kick_draft_preview()
+        let tab = self.active_mut();
+        tab.candidate_reveal_token = tab.candidate_reveal_token.wrapping_add(1);
+        self.kick_draft_preview(cx)
     }
 
     /// A drag crossed the activation threshold on a commit row.
-    fn on_drag_start(&mut self, index: usize) -> Task<Message> {
+    fn on_drag_start(&mut self, index: usize, cx: &mut Cx) {
         // A drag that activates right after a confirm-on-press (the
         // press ran the draft, the move crossed the threshold) must
         // not spawn a phantom draft on the mutation's target.
         if self.mutation_busy() {
-            return Task::none();
+            return;
         }
         // Dragging a row that's already a source of the active draft
         // *continues* that draft — kind, mode, and stacked sources
@@ -2597,14 +2365,14 @@ impl Diffui {
                 .draft
                 .is_source(target.session.commits.row(index).commit_id())
         {
-            return Task::none();
+            return;
         }
         // A marked row drags the whole marked set; an unmarked one drags
         // itself. `start_draft_with` filters rows that left the graph and
         // clears the marks once the draft's source wash takes over.
         let sources = crate::revops::drag_sources(self, index);
         if sources.is_empty() {
-            return Task::none();
+            return;
         }
         // ⌥ at drag start opts into moving the whole subtree.
         let mode = if self.modifiers.alt() {
@@ -2612,21 +2380,21 @@ impl Diffui {
         } else {
             mutations::RebaseSourceMode::Revisions
         };
-        self.start_draft_with(mutations::DraftKind::Rebase { mode }, sources, None)
+        self.start_draft_with(mutations::DraftKind::Rebase { mode }, sources, None, cx)
     }
 
     /// A drag released: execute the draft on the spot, or keep target mode.
-    fn on_drag_drop(&mut self, spot: Option<revision_list::DropSpot>) -> Task<Message> {
+    fn on_drag_drop(&mut self, spot: Option<revision_list::DropSpot>) {
         let Some(spot) = spot else {
             // Released outside any spot: stay in target mode so the
             // op bar keeps offering click / keyboard picking.
             if let Some(draft) = self.active_mut().op_draft_mut() {
                 draft.hover_spot = None;
             }
-            return Task::none();
+            return;
         };
         let Some(ui) = self.active().op_draft() else {
-            return Task::none();
+            return;
         };
         let mut draft = ui.draft.clone();
         // The preview on screen is of this drop unless ⌥ changes the move.
@@ -2674,23 +2442,23 @@ impl Diffui {
                 if let Some(draft) = self.active_mut().op_draft_mut() {
                     draft.hover_spot = None;
                 }
-                Task::none()
             }
         }
     }
 
     /// The preview debounce timer fired: run the simulation that was parked at
-    /// kick time, unless a newer kick (or an Idle transition, which clears the
-    /// request) superseded it.
-    fn run_parked_preview(&mut self, version: u64) -> Task<Message> {
+    /// kick time, unless an Idle transition cleared the request.
+    fn run_parked_preview(&mut self) {
         let Some(draft) = self.active_mut().op_draft_mut() else {
-            return Task::none();
+            return;
         };
-        if draft.preview_version != version {
-            return Task::none();
-        }
         let Some(request) = draft.preview_request.take().map(|request| *request) else {
-            return Task::none();
+            return;
+        };
+        // Drafts are anchored on a revision; only rebase onto trunk isn't,
+        // and it never runs as a draft.
+        let Some(anchor) = request.destination.anchor().cloned() else {
+            return;
         };
         let draft = match request.kind {
             mutations::DraftKind::Rebase { mode } => diffui_core::PreviewRequest::Rebase {
@@ -2702,14 +2470,13 @@ impl Diffui {
                 // The merge's second parent is the destination's anchor
                 // (gap drops resolve to the parent side, like the
                 // confirm path).
-                let anchor = request.destination.anchor().clone();
                 diffui_core::PreviewRequest::Merge {
                     parents: request.sources.into_iter().chain([anchor]).collect(),
                 }
             }
             // Gap drops squash into the gap's parent side, the anchor.
             mutations::DraftKind::Squash => diffui_core::PreviewRequest::Squash {
-                into: request.destination.anchor().clone(),
+                into: anchor,
                 sources: request.sources,
                 selection: request.selection.map(|selection| *selection),
             },
@@ -2722,33 +2489,32 @@ impl Diffui {
             },
             _ => match crate::revops::parked_preview_request(request) {
                 Some(draft) => draft,
-                None => return Task::none(),
+                None => return,
             },
         };
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         // A superseded simulation is cancelled rather than left to
         // finish against a candidate the user has already left.
         let mut effects = Vec::new();
-        if let Some(previous) = state.jobs.preview.take() {
+        let (job, preview) = state.session.preview(draft);
+        if let Some(previous) = state.jobs.issue(job, Pending::Preview) {
             effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
                 job: previous,
             }));
         }
-        let (job, preview) = state.session.preview(draft);
-        state.jobs.preview = Some(job);
         effects.extend(preview);
         self.run_effects(tab, effects)
     }
 
     /// Toolbar view switcher: show the diff or the source browser.
-    fn set_main_view(&mut self, mode: MainView) -> Task<Message> {
+    fn set_main_view(&mut self, mode: MainView, cx: &mut Cx) {
         if mode == self.active().main_view {
-            return Task::none();
+            return;
         }
         match mode {
             MainView::Diff => {
@@ -2758,7 +2524,6 @@ impl Diffui {
                 // view's shaped-paragraph cache.
                 self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
                 self.document_version = self.document_version.wrapping_add(1);
-                Task::none()
             }
             MainView::Source => {
                 // First open browses the selected revision jumped
@@ -2784,7 +2549,7 @@ impl Diffui {
                     .flatten();
                 self.open_source_browser(revision, jump)
             }
-            MainView::History => self.enter_history_view(),
+            MainView::History => self.enter_history_view(cx),
         }
     }
 
@@ -2795,14 +2560,18 @@ impl Diffui {
     /// any other move off its target leaves it invisible — and, before it was a
     /// mode, still swallowing every keystroke including Esc. Popping it here
     /// means "not on screen" and "not holding the keyboard" cannot come apart.
-    fn prune_stale_modes(&mut self) {
+    pub(crate) fn prune_stale_modes(&mut self) {
         // With no repository open, `view` renders the welcome screen and the
         // open-repo dialog and nothing else — so every other mode would be
         // holding the keyboard from behind a surface that never draws it.
         if self.tabs.is_empty() {
             self.cancel_credentials();
-            self.modes
-                .retain(|mode| matches!(mode.kind(), ModeKind::OpenRepo | ModeKind::Shortcuts));
+            self.modes.retain(|mode| {
+                matches!(
+                    mode.kind(),
+                    ModeKind::OpenRepo | ModeKind::Shortcuts | ModeKind::Settings
+                )
+            });
             self.no_tab.modes.clear();
             return;
         }
@@ -2811,6 +2580,12 @@ impl Diffui {
         {
             self.pop_mode(ModeKind::CliOutput);
         }
+        // A confirmation for a closed tab has nothing left to run.
+        let tabs = &self.tabs;
+        self.modes.retain(|mode| match mode {
+            Mode::Confirm(dialog) => tabs.iter().any(|tab| tab.id == dialog.pending.tab_id),
+            _ => true,
+        });
         let stale = {
             let tab = self.active();
             tab.description_editor().is_some_and(|editor| {
@@ -2822,10 +2597,6 @@ impl Diffui {
         }
     }
 
-    /// Open (or re-focus) the source browser at `revision`, optionally jumped
-    /// to `jump` — the entry point behind the toolbar switcher, the revision
-    /// context menu, file-tree right-clicks, and the diff view's per-file
-    /// browse button. Repo tabs only; a PR tab has no tree to browse.
     /// Fold a finished draft simulation into the active draft.
     fn apply_draft_preview(
         &mut self,
@@ -2837,9 +2608,9 @@ impl Diffui {
             ),
             String,
         >,
-    ) -> Task<Message> {
+    ) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         // Laid over the rows on screen now; a graph load that replaces them
         // also drops this (see `Effect::GraphReplaced`).
@@ -2855,7 +2626,7 @@ impl Diffui {
             _ => None,
         };
         let Some(ui) = target.op_draft_mut() else {
-            return Task::none();
+            return;
         };
         ui.graph = laid;
         ui.preview = match result.map(|(simulation, _)| simulation) {
@@ -2876,7 +2647,6 @@ impl Diffui {
                 DraftPreviewState::Failed(error)
             }
         };
-        Task::none()
     }
 
     /// Fold a source-browser listing in. A failed re-list leaves the previous
@@ -2886,17 +2656,15 @@ impl Diffui {
         tab: TabId,
         revision: RevisionSelection,
         result: Result<Vec<diffui_core::SourceEntry>, String>,
-    ) -> Task<Message> {
+    ) {
         let is_active_tab = self.is_active(tab);
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         // A listing for a revision the browser has since left is stale.
         if source_panel::browsed_revision(&target.source) != revision {
-            target.jobs.tree = None;
-            return Task::none();
+            return;
         }
-        target.jobs.tree = None;
         let state = &mut target.source;
         match result {
             Ok(entries) => {
@@ -2917,7 +2685,6 @@ impl Diffui {
             }
             Err(error) => state.tree_error = Some(error),
         }
-        Task::none()
     }
 
     fn apply_source_file(
@@ -2925,18 +2692,17 @@ impl Diffui {
         tab: TabId,
         path: String,
         result: Result<diffui_core::SourceFileLoad, String>,
-    ) -> Task<Message> {
+    ) {
         // Allocated up front — the lookup below borrows self.
         let doc_id = self.allocate_document_id();
         let is_active_tab = self.is_active(tab);
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
-        target.jobs.file = None;
         let state = &mut target.source;
         // A selection that has since moved on drops the result.
         if state.selected.as_deref() != Some(path.as_str()) {
-            return Task::none();
+            return;
         }
         state.loading = None;
         match result {
@@ -2960,7 +2726,6 @@ impl Diffui {
         if is_active_tab {
             self.document_version = self.document_version.wrapping_add(1);
         }
-        Task::none()
     }
 
     /// Full file sources for one background highlight job: hand them to the
@@ -2968,26 +2733,25 @@ impl Diffui {
     fn apply_file_pair(
         &mut self,
         tab: TabId,
-        job: diffui_core::JobId,
+        document_id: u64,
+        file_index: usize,
         old: Option<String>,
         new: Option<String>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        let Some((document_id, file_index)) = target.jobs.file_pairs.remove(&job) else {
-            return Task::none();
+            return;
         };
         if target.session.document_id != document_id {
-            return Task::none();
+            return;
         }
         let Some(file) = target.session.document.files.get(file_index).cloned() else {
-            return Task::none();
+            return;
         };
         // Tens of milliseconds on a large file, plus mapping every span back
         // to its diff line: too long for the UI thread, and the actor's has
         // commands to serve.
-        Task::perform(
+        Self::run_async_on(
             async move {
                 tokio::task::spawn_blocking(move || {
                     diffui_core::syntax::highlight_file(file, old.as_deref(), new.as_deref())
@@ -2995,8 +2759,10 @@ impl Diffui {
                 .await
                 .unwrap_or_default()
             },
-            move |spans| Message::Ui(UiEvent::FileHighlighted(document_id, file_index, spans)),
-        )
+            crate::root::PaneSet::MAIN,
+            cx,
+            move |this, spans, _| this.on_file_highlighted(document_id, file_index, spans),
+        );
     }
 
     /// A fetch finished. "Up to date" when jj found nothing to change;
@@ -3007,13 +2773,10 @@ impl Diffui {
     fn finish_fetch(
         &mut self,
         tab: TabId,
+        activity_id: activity::ActivityId,
+        target: FetchTarget,
         result: Result<diffui_core::FetchOutcome, String>,
-    ) -> Task<Message> {
-        let Some((_, activity_id, target)) =
-            self.tab_mut(tab).and_then(|state| state.jobs.fetch.take())
-        else {
-            return Task::none();
-        };
+    ) {
         let summary = result.as_ref().ok().map(|outcome| {
             let mut summary = if !outcome.changed {
                 "Fetched \u{b7} up to date".to_owned()
@@ -3047,15 +2810,14 @@ impl Diffui {
                 .collect::<Vec<_>>()
         });
         let ok = result.is_ok();
-        let mut tasks = vec![self.finish_activity_row(tab, activity_id, result, summary)];
+        self.finish_activity_row(tab, activity_id, result, summary);
         if ok {
             let effects = match self.tab_mut(tab) {
                 Some(state) => state.session.snapshot(RefreshOrigin::Focus),
                 None => Vec::new(),
             };
-            tasks.push(self.run_effects(tab, effects));
+            self.run_effects(tab, effects);
         }
-        Task::batch(tasks)
     }
 
     /// A mutation finished. Success resolves its activity and arms the row's
@@ -3066,14 +2828,9 @@ impl Diffui {
     fn finish_mutation(
         &mut self,
         tab: TabId,
+        pending: PendingMutation,
         result: Result<mutations::MutationOutcome, diffui_core::RepoError>,
-    ) -> Task<Message> {
-        let Some((_, pending)) = self
-            .tab_mut(tab)
-            .and_then(|state| state.jobs.mutation.take())
-        else {
-            return Task::none();
-        };
+    ) {
         let activity_id = pending.activity_id;
         let description_save = self.tab_mut(tab).is_some_and(|target| {
             target
@@ -3100,13 +2857,15 @@ impl Diffui {
                     target.pop_mode(ModeKind::Description);
                 }
                 self.marker_save_finished(tab, activity_id, true);
-                Task::none()
             }
             Err(diffui_core::RepoError::Immutable { short_id }) => {
                 self.confirm_immutable(pending, &[short_id], true)
             }
             Err(diffui_core::RepoError::PushRejected(rejection)) => {
                 self.push_rejected(pending, *rejection)
+            }
+            Err(diffui_core::RepoError::UndoesPush { summary }) => {
+                self.confirm_push_undo(pending, &summary)
             }
             Err(error) => {
                 let error = error.to_string();
@@ -3126,28 +2885,26 @@ impl Diffui {
     /// Send the next mutation `tab` is holding, once the one before it has
     /// reported. Called after the projection has folded the completion in, so
     /// its slot is genuinely free by then.
-    fn drain_queued_mutation(&mut self, tab: TabId) -> Task<Message> {
+    fn drain_queued_mutation(&mut self, tab: TabId) {
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
-        if state.jobs.mutation.is_some() || state.session.mutation_in_flight() {
-            return Task::none();
+        if state.jobs.mutation().is_some() || state.session.mutation_in_flight() {
+            return;
         }
-        match state.queued_mutations.pop_front() {
-            Some(next) => self.dispatch_mutation(next),
-            None => Task::none(),
+        if let Some(next) = state.queued_mutations.pop_front() {
+            self.dispatch_mutation(next)
         }
     }
 
     /// The backwards-bookmark-move check resolved: run the move, or raise the
     /// confirmation the jj CLI's `--allow-backwards` stands for.
-    fn apply_bookmark_check(&mut self, tab: TabId, result: Result<bool, String>) -> Task<Message> {
-        let Some((_, pending)) = self
-            .tab_mut(tab)
-            .and_then(|state| state.jobs.bookmark_check.take())
-        else {
-            return Task::none();
-        };
+    fn apply_bookmark_check(
+        &mut self,
+        tab: TabId,
+        pending: PendingMutation,
+        result: Result<bool, String>,
+    ) {
         // A check that failed can't tell a backwards move from a fast-forward,
         // and running it anyway would let a backwards move-and-push rewrite
         // the remote with no confirmation. Fail closed: report, don't move.
@@ -3176,13 +2933,15 @@ impl Diffui {
         if !backwards {
             return self.run_mutation_checking_wc_push(pending);
         }
-        let target = self.revision_prose(to);
+        let Some(state) = self.tab(tab) else {
+            return;
+        };
+        let target = state.revision_prose(to);
         // A conflicted bookmark also lands here (it has no single commit to be
         // "a descendant of"), but there the move *is* the fix — the dialog
         // explains the resolution rather than warning about a backwards move
         // that isn't the story.
-        let conflicted_sides = self
-            .active()
+        let conflicted_sides = state
             .session
             .bookmarks
             .bookmarks
@@ -3226,18 +2985,18 @@ impl Diffui {
             (None, Some(_)) => "Move & resolve".to_owned(),
             (None, None) => "Move anyway".to_owned(),
         };
-        if self.publishes_working_copy(&pending.op) {
+        if state.publishes_working_copy(&pending.op) {
             body = body
                 .text(" ")
                 .then(crate::bookmarks::working_copy_push_warning());
         }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title,
             body,
             confirm_label,
+            look: Default::default(),
             pending,
-        }));
-        Task::none()
+        });
     }
 
     /// Record an operation's result on `tab`'s log, toasting a failure so it is
@@ -3249,7 +3008,7 @@ impl Diffui {
         activity_id: activity::ActivityId,
         result: Result<Vec<String>, String>,
         summary: Option<String>,
-    ) -> Task<Message> {
+    ) {
         let mut failure: Option<(Prose, String)> = None;
         if let Some(log) = self.activity_log_for(tab) {
             match result {
@@ -3281,20 +3040,23 @@ impl Diffui {
         if let Some((title, error)) = failure {
             self.push_error_toast(title, &error);
         }
-        Task::none()
     }
 
+    /// Open (or re-focus) the source browser at `revision`, optionally jumped
+    /// to `jump` — the entry point behind the toolbar switcher, the revision
+    /// context menu, file-tree right-clicks, and the diff view's per-file
+    /// browse button. Repo tabs only; a PR tab has no tree to browse.
     pub(crate) fn open_source_browser(
         &mut self,
         revision: RevisionSelection,
         jump: Option<String>,
-    ) -> Task<Message> {
+    ) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let target = self.active_mut();
         if target.repository.is_none() {
-            return Task::none();
+            return;
         }
         // The description editor lives in the diff view's revision header, so
         // leaving that view closes it. An unsaved edit blocks the move instead,
@@ -3302,7 +3064,7 @@ impl Diffui {
         if let Some(editor) = target.description_editor_mut() {
             if editor.is_dirty() || editor.saving_activity.is_some() {
                 editor.switch_blocked = true;
-                return Task::none();
+                return;
             }
             self.active_mut().pop_mode(ModeKind::Description);
         }
@@ -3381,14 +3143,12 @@ impl Diffui {
             self.aim_tree_scroll_at_selected();
         }
 
-        let mut tasks = Vec::new();
         if need_tree {
-            tasks.push(self.kick_source_tree_load(tab));
+            self.kick_source_tree_load(tab);
         }
         if need_file {
-            tasks.push(self.kick_source_file_load(tab));
+            self.kick_source_file_load(tab);
         }
-        Task::batch(tasks)
     }
 
     /// Point the source sidebar's saved scroll at the selected file's row
@@ -3420,7 +3180,7 @@ impl Diffui {
     /// Keyboard file navigation (j/k) in the source browser: move the
     /// selection to the next/previous *file* row among the currently visible
     /// tree rows (collapsed dirs stay skipped) and load it.
-    fn source_select_neighbor(&mut self, delta: i32) -> Task<Message> {
+    fn source_select_neighbor(&mut self, delta: i32) {
         let (entries, rows) = self.source_entries_and_rows();
         let file_rows: Vec<usize> = rows
             .iter()
@@ -3430,7 +3190,7 @@ impl Diffui {
             })
             .collect();
         if file_rows.is_empty() {
-            return Task::none();
+            return;
         }
         let selected_entry = self.active().source.selected.as_deref().and_then(|path| {
             entries
@@ -3450,10 +3210,10 @@ impl Diffui {
             None => 0,
         };
         let diffui_core::SourceTreeRow::File { entry_index, .. } = rows[file_rows[next_pos]] else {
-            return Task::none();
+            return;
         };
         let Some(path) = entries.get(entry_index).map(|entry| entry.path.clone()) else {
-            return Task::none();
+            return;
         };
         let target = self.active_mut();
         target.source.reveal_token = target.source.reveal_token.wrapping_add(1);
@@ -3463,14 +3223,14 @@ impl Diffui {
     /// Select `path` in the source browser and load its contents (a sidebar
     /// click or keyboard nav). The previous file stays visible until the new
     /// one lands, mirroring how a revision switch keeps the prior diff.
-    fn select_source_file(&mut self, path: String) -> Task<Message> {
+    fn select_source_file(&mut self, path: String) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let target = self.active_mut();
         let reselect = target.source.selected.as_deref() == Some(path.as_str());
         if reselect && (target.source.file.is_some() || target.source.loading.is_some()) {
-            return Task::none();
+            return;
         }
         if !reselect {
             target.source.scroll_offset = 0.0;
@@ -3481,34 +3241,34 @@ impl Diffui {
     }
 
     /// Ask for the tree listing of `tab`'s browsed revision.
-    fn kick_source_tree_load(&mut self, tab: TabId) -> Task<Message> {
+    fn kick_source_tree_load(&mut self, tab: TabId) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         if !target.session.capabilities.browse {
-            return Task::none();
+            return;
         }
         let revision = source_panel::browsed_revision(&target.source);
         let job = target.session.next_job();
-        target.jobs.tree = Some((job, revision.clone()));
+        target.jobs.issue(job, Pending::Tree(revision.clone()));
         self.send(tab, diffui_core::Command::ListTree { job, revision })
     }
 
     /// Ask for the contents of `tab`'s browser selection.
-    fn kick_source_file_load(&mut self, tab: TabId) -> Task<Message> {
+    fn kick_source_file_load(&mut self, tab: TabId) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         if !target.session.capabilities.browse {
-            return Task::none();
+            return;
         }
         let Some(path) = target.source.selected.clone() else {
-            return Task::none();
+            return;
         };
         target.source.loading = Some(path.clone());
         let revision = source_panel::browsed_revision(&target.source);
         let job = target.session.next_job();
-        target.jobs.file = Some((job, path.clone()));
+        target.jobs.issue(job, Pending::File(path.clone()));
         self.send(
             tab,
             diffui_core::Command::ReadFile {
@@ -3520,39 +3280,35 @@ impl Diffui {
     }
 
     /// Re-list + re-read `tab`'s browser when it's showing the working copy —
-    /// called wherever the repo refreshes (watcher edits, focus regain, the
-    /// post-mutation reload), so the browsed "directory" tracks the disk.
-    fn refresh_source_if_working_copy(&mut self, tab: TabId) -> Task<Message> {
+    /// called when a snapshot lands, so the browsed "directory" tracks the
+    /// disk.
+    fn refresh_source_if_working_copy(&mut self, tab: TabId, cx: &mut Cx) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         if target.main_view != MainView::Source
             || !matches!(target.source.revision, Some(RevisionSelection::WorkingCopy))
         {
-            return Task::none();
+            return;
         }
         let reload_file = target.source.selected.is_some();
         // Previously-expanded ignored dirs re-list too, so an open `target/`
         // exploration tracks the disk like the rest of the tree.
         let dirs: Vec<String> = target.source.dir_children.keys().cloned().collect();
-        let mut tasks = vec![self.kick_source_tree_load(tab)];
+        self.kick_source_tree_load(tab);
         if reload_file {
-            tasks.push(self.kick_source_file_load(tab));
+            self.kick_source_file_load(tab);
         }
         for dir in dirs {
-            tasks.push(self.list_ignored_dir(tab, dir));
+            self.list_ignored_dir(tab, dir, cx);
         }
-        Task::batch(tasks)
     }
 
-    /// Hand one command to `tab`'s actor. Returns a `Task` only so call sites
-    /// read like the other kickers; commands travel down the channel, not
-    /// through the runtime.
-    pub(crate) fn send(&mut self, tab: TabId, command: diffui_core::Command) -> Task<Message> {
+    /// Hand one command to `tab`'s actor, down its channel.
+    pub(crate) fn send(&mut self, tab: TabId, command: diffui_core::Command) {
         if let Some(handle) = self.tab_mut(tab).and_then(|target| target.handle.clone()) {
             handle.send(command);
         }
-        Task::none()
     }
 
     /// The composed source entries + their flattened display rows for the
@@ -3573,15 +3329,45 @@ impl Diffui {
 
     /// List one level of an unenumerated ignored directory. Ignored content
     /// exists only on disk, so this reads the filesystem directly rather than
-    /// going through the actor's tree.
-    fn list_ignored_dir(&mut self, tab: TabId, dir: String) -> Task<Message> {
+    /// going through the actor's tree, off the UI thread: a slow volume
+    /// mustn't stall a frame.
+    fn list_ignored_dir(&mut self, tab: TabId, dir: String, cx: &mut Cx) {
+        let Some(repository) = self.tab(tab).and_then(|target| target.repository.clone()) else {
+            return;
+        };
+        Self::run_async(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let listed = diffui_core::list_ignored_dir(&repository, &dir)
+                        .map_err(|error| format!("{error:#}"));
+                    (dir, listed)
+                })
+                .await
+            },
+            cx,
+            move |this, listed, _| {
+                if let Ok((dir, listed)) = listed {
+                    this.ignored_dir_listed(tab, dir, listed);
+                }
+            },
+        );
+    }
+
+    fn ignored_dir_listed(
+        &mut self,
+        tab: TabId,
+        dir: String,
+        listed: Result<Vec<diffui_core::SourceEntry>, String>,
+    ) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
-        let Some(repository) = target.repository.clone() else {
-            return Task::none();
-        };
-        match diffui_core::list_ignored_dir(&repository, &dir) {
+        // Collapsed before its first listing landed: nothing wants it.
+        let source = &target.source;
+        if !source.expanded.contains(&dir) && !source.dir_children.contains_key(&dir) {
+            return;
+        }
+        match listed {
             Ok(entries) => {
                 target.source.dir_children.insert(dir, entries);
                 target.source.tree_epoch = target.source.tree_epoch.wrapping_add(1);
@@ -3590,21 +3376,18 @@ impl Diffui {
             // unlisted so the click can retry.
             Err(error) => {
                 target.source.expanded.remove(&dir);
-                target.source.tree_error = Some(format!("{error:#}"));
+                target.source.tree_error = Some(error);
             }
         }
-        Task::none()
     }
 
     /// Recompute find matches immediately (no debounce). Used by toggle
     /// presses where the user's intent is immediate.
-    pub(crate) fn refind_now(&mut self) -> Task<Message> {
+    pub(crate) fn refind_now(&mut self) {
         let target = self.active_mut();
-        if let Some(state) = target.find_mut() {
-            state.query_version = state.query_version.wrapping_add(1);
-        }
+        target.find_debounce.cancel();
         let Some(state) = target.find() else {
-            return Task::none();
+            return;
         };
         let (matches, error) = find::compute_matches(state, target.find_files());
         if let Some(state) = self.active_mut().find_mut() {
@@ -3617,7 +3400,6 @@ impl Diffui {
             };
             state.scroll_token = state.scroll_token.wrapping_add(1);
         }
-        Task::none()
     }
 
     /// Recompute `tab`'s find matches against the document it now holds.
@@ -3667,12 +3449,12 @@ impl Diffui {
     /// is deferred to here (too slow to run per keystroke on a 1M-commit repo):
     /// the first ⏎ runs the scan and shows results; once searched, ⏎ accepts the
     /// highlighted row like any other mode.
-    pub(crate) fn palette_submit(&mut self) -> Task<Message> {
+    pub(crate) fn palette_submit(&mut self, cx: &mut Cx) {
         if self.command_line().is_some() {
-            return self.command_line_submit();
+            return self.command_line_submit(cx);
         }
         let Some(mut state) = self.take_palette() else {
-            return Task::none();
+            return;
         };
         let trigger_search = state.top().is_some_and(|column| {
             matches!(column.source, ColumnSource::Root)
@@ -3681,14 +3463,12 @@ impl Diffui {
                     .is_some_and(|needle| !needle.trim().is_empty())
         });
         if trigger_search {
-            let depth = state.stack.len().saturating_sub(1);
             if let Some(column) = state.top_mut() {
                 column.searched = true;
                 column.dirty = false;
                 column.selected = 0;
-                column.scroll_y = 0.0;
-                // Invalidate the pending debounced recompute so it can't wipe
-                // the results we're about to compute.
+                // Back to the top for the new results. The pending debounced
+                // recompute finds the column clean and leaves them be.
                 column.query_version = column.query_version.wrapping_add(1);
                 // The palette is out of the mode stack here (taken above), so
                 // this borrows `self` cleanly while mutating the detached
@@ -3696,13 +3476,10 @@ impl Diffui {
                 palette::recompute_matches(column, self, true);
             }
             self.push_mode(Mode::Palette(state));
-            return widget::operation::scroll_to(
-                palette::results_scrollable_id(depth),
-                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-            );
+            return;
         }
         self.push_mode(Mode::Palette(state));
-        self.palette_accept_current()
+        self.palette_accept_current(cx)
     }
 
     /// Re-run the matcher now if the top column's rows are for an older query.
@@ -3727,32 +3504,30 @@ impl Diffui {
         if let Some(column) = state.top_mut() {
             column.dirty = false;
             column.selected = 0;
-            column.scroll_y = 0.0;
-            // Drop the debounced recompute still in flight; it would land on
-            // a closed palette or re-sort what we just settled.
+            // The debounced recompute still in flight finds the column clean
+            // and leaves what we just settled alone.
             column.query_version = column.query_version.wrapping_add(1);
             palette::recompute_matches(column, self, false);
         }
         self.push_mode(Mode::Palette(state));
     }
 
-    /// Execute the highlighted result in the rightmost column. Returns the
-    /// `Task` chain that performs the corresponding action plus any
-    /// followup state (closing the palette, focusing input, etc.).
-    pub(crate) fn palette_accept_current(&mut self) -> Task<Message> {
+    /// Execute the highlighted result in the rightmost column, with its
+    /// follow-up state (closing the palette, focusing input, etc.).
+    pub(crate) fn palette_accept_current(&mut self, cx: &mut Cx) {
         self.palette_recompute_if_dirty();
         let Some(state) = self.palette() else {
-            return Task::none();
+            return;
         };
         let Some(top) = state.top() else {
-            return Task::none();
+            return;
         };
         let Some(selected) = top.matches.get(top.selected) else {
-            return Task::none();
+            return;
         };
         // A greyed row says why it can't run; accepting it does nothing.
         if selected.disabled.is_some() {
-            return Task::none();
+            return;
         }
         let item = selected.item.clone();
         let target = match &top.source {
@@ -3768,16 +3543,16 @@ impl Diffui {
                 self.recents.push_command(id);
                 self.recents.save();
                 self.pop_mode(ModeKind::Palette);
-                self.run_command(id, CommandArg::None)
+                self.run_command(id, CommandArg::None, cx)
             }
             (None, ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Bookmark(_)) => {
                 self.pop_mode(ModeKind::Palette);
-                self.perform(Action::JumpToResult(item))
+                self.perform(Action::JumpToResult(item), cx)
             }
             (None, ResultRef::File(path)) => {
                 let path = path.clone();
                 self.pop_mode(ModeKind::Palette);
-                self.perform(Action::JumpToFile(path))
+                self.perform(Action::JumpToFile(path), cx)
             }
             // Actions column: the row is always a Command — run it against
             // the column's target.
@@ -3786,19 +3561,19 @@ impl Diffui {
                 self.recents.push_command(id);
                 self.recents.save();
                 self.pop_mode(ModeKind::Palette);
-                self.run_command(id, CommandArg::Result(target))
+                self.run_command(id, CommandArg::Result(target), cx)
             }
-            _ => Task::none(),
+            _ => {}
         }
     }
 
-    pub(crate) fn jump_to_revision_ref(&mut self, target: &ResultRef) -> Task<Message> {
+    pub(crate) fn jump_to_revision_ref(&mut self, target: &ResultRef) {
         let Some(selection) = revision_selection(target, self) else {
-            return Task::none();
+            return;
         };
 
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let state = self.active_mut();
         // An unsaved description edit blocks a jump exactly as it blocks a row
@@ -3810,7 +3585,7 @@ impl Diffui {
             && (editor.is_dirty() || editor.saving_activity.is_some())
         {
             editor.switch_blocked = true;
-            return Task::none();
+            return;
         }
         let state = self.active_mut();
 
@@ -3820,14 +3595,14 @@ impl Diffui {
         // the next render scrolls the sidebar row into view.
         if state.session.selected_revision == selection && !leaves_range {
             state.revision_reveal_token = state.revision_reveal_token.wrapping_add(1);
-            return Task::none();
+            return;
         }
 
         // A load is already in flight for the same revision; piggyback so the
         // eventual `DiffLoaded` bumps the token for us.
         if state.session.diff_pending() == Some(&selection) && !leaves_range {
             state.pending_revision_reveal = true;
-            return Task::none();
+            return;
         }
         // Deferred bump — see the comment on `pending_revision_reveal`.
         state.pending_revision_reveal = true;
@@ -3866,25 +3641,28 @@ impl Diffui {
             .retain(|dir| !path.starts_with(&format!("{dir}/")));
     }
 
-    /// Start a working-copy snapshot for `tab`. Every refresh path funnels
-    /// through here (watcher edits, focus regain, tab activation, the
-    /// post-mutation reload), so it's also where a working-copy source browse
-    /// re-syncs with the disk. Those loads are read-only and version-guarded,
-    /// so they ride alongside the snapshot without contending for jj's wc lock.
     /// Fold `tab`'s working copy into `@`. The projection decides whether to
-    /// run now or coalesce behind work already in flight; the browser re-lists
-    /// alongside it so a browsed working copy tracks the disk.
-    pub(crate) fn start_repository_snapshot(
-        &mut self,
-        tab: TabId,
-        origin: RefreshOrigin,
-    ) -> Task<Message> {
-        let source_refresh = self.refresh_source_if_working_copy(tab);
+    /// run now or coalesce behind work already in flight; a browsed working
+    /// copy re-lists when the snapshot lands (see [`Self::on_repo_event`]).
+    pub(crate) fn start_repository_snapshot(&mut self, tab: TabId, origin: RefreshOrigin) {
         let effects = match self.tab_mut(tab) {
             Some(target) => target.session.snapshot(origin),
             None => Vec::new(),
         };
-        Task::batch([source_refresh, self.run_effects(tab, effects)])
+        {
+            self.run_effects(tab, effects);
+        }
+    }
+
+    /// Switch every open tab to refresh `mode`. A tab whose actor isn't up
+    /// yet gets it again when it is.
+    pub(crate) fn set_refresh_mode(&mut self, mode: diffui_core::RefreshMode) {
+        self.config.refresh = mode;
+        for index in 0..self.tabs.len() {
+            let id = self.tabs[index].id;
+            let effects = self.tabs[index].state.session.set_refresh_mode(mode);
+            self.run_effects(id, effects);
+        }
     }
 
     pub(crate) fn sort_by_proximity<T>(
@@ -3903,7 +3681,7 @@ impl Diffui {
 
     /// Every known remote-tracking bookmark as `(branch, remote)`, ordered
     /// nearest-first to the working copy (alphabetical tiebreak). Shared by the
-    /// native fetch menu and the iced fallback so they list identically.
+    /// native fetch menu and the overlay fallback so they list identically.
     pub(crate) fn remote_branches_by_proximity(&self) -> Vec<(String, String)> {
         // (branch, remote, target-commit-hex) per known remote bookmark.
         let mut branches: Vec<(String, String, String)> = self
@@ -3929,10 +3707,6 @@ impl Diffui {
             .collect()
     }
 
-    /// (Re)start the initial load for the active tab's repository — a streaming
-    /// cold load for jj, a one-shot load for git. Resets the per-repo view
-    /// fields first, so a re-kick (after returning to a tab whose load was
-    /// abandoned while it sat in the background) starts from a clean slate.
     /// Hand out the next document identity (monotonic across every tab).
     pub(crate) fn allocate_document_id(&mut self) -> u64 {
         self.next_document_id = self.next_document_id.wrapping_add(1);
@@ -3943,17 +3717,17 @@ impl Diffui {
     /// flight. Each asks the actor for the file's full old/new sources — one
     /// command on a repository that is already open, where every highlight used
     /// to open a workspace of its own.
-    pub(crate) fn spawn_highlights(&mut self, document_id: u64) -> Task<Message> {
+    pub(crate) fn spawn_highlights(&mut self, document_id: u64) {
         const HIGHLIGHT_CONCURRENCY: usize = 2;
 
         let Some((tab, _)) = self.document_target_mut(document_id) else {
-            return Task::none();
+            return;
         };
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let Some(handle) = target.handle.clone() else {
-            return Task::none();
+            return;
         };
         let revision = target.session.selected_revision.clone();
         let base = target.session.document_base.clone();
@@ -3970,8 +3744,7 @@ impl Diffui {
             let job = target.session.next_job();
             target
                 .jobs
-                .file_pairs
-                .insert(job, (document_id, file_index));
+                .issue(job, Pending::FilePair(document_id, file_index));
             commands.push(diffui_core::Command::FilePair {
                 job,
                 revision: revision.clone(),
@@ -3983,7 +3756,6 @@ impl Diffui {
         for command in commands {
             handle.send(command);
         }
-        Task::none()
     }
 
     /// Start (or restart) the load for `tab` once its actor is up.
@@ -3992,15 +3764,24 @@ impl Diffui {
     /// screen to preserve. A tab that already has one gets a snapshot instead,
     /// whose op-fingerprint dedup makes it free when nothing changed and a full
     /// reload when an external operation actually landed.
-    pub(crate) fn start_tab_load(&mut self, tab: TabId) -> Task<Message> {
+    pub(crate) fn start_tab_load(&mut self, tab: TabId) {
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
+        if target.default_revset.is_none() {
+            target.default_revset = Some(
+                target
+                    .repository
+                    .as_ref()
+                    .map(default_revset)
+                    .unwrap_or_default(),
+            );
+        }
         if matches!(target.session.status, LoadStatus::Loaded) {
             return self.start_repository_snapshot(tab, RefreshOrigin::Focus);
         }
         if target.session.streaming() {
-            return Task::none();
+            return;
         }
         let label = target
             .repository
@@ -4009,7 +3790,7 @@ impl Diffui {
             .unwrap_or_else(|| "Load pull request".to_owned());
         let (activity_id, progress) = self.begin_activity(tab, label, true);
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         target.finish_load_activity(activity::ActivityStatus::Done, None);
         target.pending_load_activity = Some(activity_id);
@@ -4033,10 +3814,10 @@ impl Diffui {
 
     /// Toolbar "Refresh" and the revset input's Enter: re-walk the graph
     /// without clearing what's on screen, so the switch never flashes empty.
-    pub(crate) fn reload_graph(&mut self, tab: TabId, label: String) -> Task<Message> {
+    pub(crate) fn reload_graph(&mut self, tab: TabId, label: String) {
         let (activity_id, progress) = self.begin_activity(tab, label, true);
         let Some(target) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         target.finish_load_activity(activity::ActivityStatus::Done, None);
         target.pending_load_activity = Some(activity_id);
@@ -4096,11 +3877,7 @@ impl Diffui {
         &self,
         selection: &RevisionSelection,
     ) -> Option<diffui_core::DraftSource> {
-        let commits = &self.active().session.commits;
-        let row = match selection {
-            RevisionSelection::WorkingCopy => commits.working_copy(),
-            RevisionSelection::Commit(id) => commits.find_by_commit_id(id),
-        }?;
+        let row = self.active().session.commits.find(selection)?;
         Some(diffui_core::DraftSource {
             selection: selection.clone(),
             commit_id: row.commit_id().to_owned(),
@@ -4129,18 +3906,18 @@ impl Diffui {
         &mut self,
         target: RevisionSelection,
         placement_override: Option<mutations::PlacementKind>,
-    ) -> Task<Message> {
+    ) {
         if self.draft_blocks_target(&target) {
-            return Task::none();
+            return;
         }
         let Some(ui) = self.active().op_draft() else {
-            return Task::none();
+            return;
         };
         let previewed = placement_override.is_none_or(|placement| placement == ui.draft.placement)
             && ui.hover_spot.is_none();
         let placement = placement_override.unwrap_or(ui.draft.placement);
         let Some(op) = ui.draft.op_for(target, placement) else {
-            return Task::none();
+            return;
         };
         if previewed {
             self.hold_applied_preview();
@@ -4154,17 +3931,17 @@ impl Diffui {
     /// source, or un-stack one that's already in. The last source can't be
     /// removed — a sourceless draft means nothing; esc is the way out. The
     /// destination still arrives via the normal confirm.
-    pub(crate) fn draft_toggle_source(&mut self, selection: RevisionSelection) -> Task<Message> {
+    pub(crate) fn draft_toggle_source(&mut self, selection: RevisionSelection, cx: &mut Cx) {
         // A new change has no sources to stack.
         if self
             .active()
             .op_draft()
             .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::New)
         {
-            return Task::none();
+            return;
         }
         let Some(source) = self.draft_source_for(&selection) else {
-            return Task::none();
+            return;
         };
         // If the keyboard candidate just became a source it's no longer a
         // valid destination — drop it rather than leaving the markers on an
@@ -4177,7 +3954,7 @@ impl Diffui {
             .and_then(|index| self.selection_at_index(index))
             .is_some_and(|candidate| candidate == selection);
         let Some(ui) = self.active_mut().op_draft_mut() else {
-            return Task::none();
+            return;
         };
         if let Some(position) = ui
             .draft
@@ -4186,7 +3963,7 @@ impl Diffui {
             .position(|s| s.commit_id == source.commit_id)
         {
             if ui.draft.sources.len() == 1 {
-                return Task::none();
+                return;
             }
             ui.draft.sources.remove(position);
         } else {
@@ -4199,7 +3976,7 @@ impl Diffui {
         // change — clear the wash now rather than showing the old branch
         // until the next simulation lands.
         ui.moved_highlight.clear();
-        self.kick_draft_preview()
+        self.kick_draft_preview(cx)
     }
 
     /// Float an error toast (bottom-right) for a failed operation. The
@@ -4243,16 +4020,16 @@ impl Diffui {
     /// Kick the debounced rebase simulation for the draft's current
     /// destination (keyboard candidate + placement, or the live drag spot).
     /// Version-guarded: a newer candidate supersedes the in-flight preview.
-    pub(crate) fn kick_draft_preview(&mut self) -> Task<Message> {
+    pub(crate) fn kick_draft_preview(&mut self, cx: &mut Cx) {
         if self.active_mut().repository.is_none() {
-            return Task::none();
+            return;
         }
         if self
             .active()
             .op_draft()
             .is_some_and(|ui| ui.draft.kind == mutations::DraftKind::Parallelize)
         {
-            return self.kick_parallelize_preview();
+            return self.kick_parallelize_preview(cx);
         }
         // Destination from the drag spot when one is live, else the keyboard
         // candidate + placement. Resolved before borrowing the draft mutably.
@@ -4267,7 +4044,7 @@ impl Diffui {
                     .filter(|_| ui.draft.sources.len() >= 2)
                     .map(|source| source.selection.clone()),
             ),
-            None => return Task::none(),
+            None => return,
         };
         // A merge with enough selected parents previews that exact set. Feed
         // its final source through the request's destination slot so the
@@ -4303,9 +4080,10 @@ impl Diffui {
         let anchor_blocked = selected_merge_target.is_none()
             && destination
                 .as_ref()
-                .is_some_and(|destination| self.draft_blocks_target(destination.anchor()));
+                .and_then(mutations::Destination::anchor)
+                .is_some_and(|anchor| self.draft_blocks_target(anchor));
         let Some(ui) = self.active_mut().op_draft_mut() else {
-            return Task::none();
+            return;
         };
         // The Idle paths must also drop any parked request: they don't bump
         // the version, so a still-running debounce timer would otherwise
@@ -4314,13 +4092,13 @@ impl Diffui {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             ui.graph = None;
-            return Task::none();
+            return;
         };
         if anchor_blocked {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             ui.graph = None;
-            return Task::none();
+            return;
         }
         let mut sources: Vec<RevisionSelection> = ui
             .draft
@@ -4331,8 +4109,6 @@ impl Diffui {
         if selected_merge_target.is_some() {
             let _ = sources.pop();
         }
-        ui.preview_version = ui.preview_version.wrapping_add(1);
-        let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
         ui.preview_request = Some(Box::new(crate::PreviewRequest {
             kind: ui.draft.kind,
@@ -4340,12 +4116,22 @@ impl Diffui {
             destination,
             selection: ui.draft.selection.clone(),
         }));
-        // Debounce: only the version crosses the timer. `DraftPreviewKick`
-        // spawns the parked simulation iff the version is still current, so
-        // rapid j/j/j candidate hops expire without touching the backend.
-        Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
-            Message::Ui(UiEvent::DraftPreviewKick(version))
-        })
+        self.arm_draft_preview(cx);
+    }
+
+    /// Run the parked simulation once candidate hops pause, so rapid j/j/j
+    /// hops expire without touching the backend.
+    pub(crate) fn arm_draft_preview(&mut self, cx: &mut Cx) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        self.active_mut()
+            .preview_debounce
+            .arm(Duration::from_millis(250), cx, move |this, _| {
+                if this.is_active(tab) {
+                    this.run_parked_preview();
+                }
+            });
     }
 
     /// Send `pending` to the repository actor.
@@ -4356,15 +4142,16 @@ impl Diffui {
     /// pre-flight: an op whose known targets are marked immutable in the
     /// loaded graph raises the confirmation dialog instead of dispatching
     /// (unless the dialog's accept already armed the override).
-    pub(crate) fn run_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+    pub(crate) fn run_mutation(&mut self, pending: PendingMutation) {
         // Every mutation's row shows its jj command, with
         // `--ignore-immutable` once the confirmation turned the guards off.
-        let command = crate::plan::op_command(self, &pending.op, pending.allow_immutable);
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_command(pending.activity_id, command);
-        }
+        let Some(state) = self.tab_mut(pending.tab_id) else {
+            return;
+        };
+        let command = crate::plan::op_command(state, &pending.op, pending.allow_immutable);
+        state.activities.set_command(pending.activity_id, command);
         if !pending.allow_immutable {
-            let immutable = self.immutable_op_targets(&pending.op);
+            let immutable = state.immutable_op_targets(&pending.op);
             if !immutable.is_empty() {
                 return self.confirm_immutable(pending, &immutable, false);
             }
@@ -4377,7 +4164,7 @@ impl Diffui {
         // one visible, which is what the activity log shows.
         if self
             .tab_mut(tab)
-            .is_some_and(|state| state.jobs.mutation.is_some())
+            .is_some_and(|state| state.jobs.mutation().is_some())
         {
             if let Some(log) = self.activity_log_for(tab) {
                 log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
@@ -4385,20 +4172,20 @@ impl Diffui {
             if let Some(state) = self.tab_mut(tab) {
                 state.queued_mutations.push_back(pending);
             }
-            return Task::none();
+            return;
         }
         self.dispatch_mutation(pending)
     }
 
     /// Send `pending` now. The caller has already established that the tab's
     /// mutation slot is free.
-    fn dispatch_mutation(&mut self, pending: PendingMutation) -> Task<Message> {
+    fn dispatch_mutation(&mut self, pending: PendingMutation) {
         let tab = pending.tab_id;
         if let Some(log) = self.activity_log_for(tab) {
             log.set_status(pending.activity_id, activity::ActivityStatus::Running);
         }
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let (job, effects) = state
             .session
@@ -4406,43 +4193,39 @@ impl Diffui {
         // The projection owns the job; the frontend keeps its twin so the
         // activity row and an immutable retry can find their way back to the op
         // that started them.
-        state.jobs.mutation = Some((job, pending));
+        state.jobs.issue(job, Pending::Mutation(pending));
         self.run_effects(tab, effects)
     }
 
-    /// The short display labels of `op`'s rewrite targets that the loaded graph
-    /// marks immutable.
-    ///
-    /// The target set comes from [`diffui_core::rewritten_targets`], the same
-    /// list the actor's guard reads, so the dialog can't name a different set
-    /// from the one that will actually be refused. Only rows the UI directly
-    /// addresses are caught here — computed sets (a rebase's descendants, an
-    /// insert-after target's other children, a parent-squash's destination)
-    /// stay the backend guard's job, whose typed rejection re-raises the same
-    /// dialog after the fact.
-    fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
-        let session = &self.active().session;
-        let targets = diffui_core::rewritten_targets(
+    /// Open `label`'s activity row on `tab` for `op`, which a confirmation
+    /// will hold before it runs.
+    pub(crate) fn begin_mutation(
+        &mut self,
+        tab: TabId,
+        label: impl Into<Prose>,
+        op: mutations::MutationOp,
+    ) -> PendingMutation {
+        let (activity_id, _) = self.begin_activity(tab, label, false);
+        PendingMutation {
             op,
-            &session.selected_revision,
-            session.root_commit_id.as_deref(),
-        );
-        let mut labels: Vec<String> = Vec::new();
-        for selection in &targets {
-            let row = match selection {
-                RevisionSelection::WorkingCopy => session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex.as_str()),
-            };
-            if let Some(row) = row
-                && row.is_immutable()
-            {
-                let label = self.revision_short_label(selection);
-                if !labels.contains(&label) {
-                    labels.push(label);
-                }
-            }
+            tab_id: tab,
+            activity_id,
+            allow_immutable: false,
         }
-        labels
+    }
+
+    /// Hold `dialog`'s mutation behind it. Its row waits as queued meanwhile:
+    /// accepting runs it, cancelling resolves the row. Stacking rather than
+    /// replacing: a second guarded mutation raised while a dialog is open (a
+    /// background tab's op being refused) waits under it and surfaces when
+    /// that one resolves, instead of taking over the buttons the user was
+    /// about to press.
+    pub(crate) fn ask(&mut self, dialog: ConfirmDialog) {
+        let pending = &dialog.pending;
+        if let Some(log) = self.activity_log_for(pending.tab_id) {
+            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
+        }
+        self.push_mode(Mode::Confirm(dialog));
     }
 
     /// Park `pending` behind the immutable-rewrite confirmation dialog, its
@@ -4454,13 +4237,8 @@ impl Diffui {
         mut pending: PendingMutation,
         targets: &[String],
         after_rejection: bool,
-    ) -> Task<Message> {
+    ) {
         use mutations::MutationOp;
-        // Hold the activity visibly while the dialog decides; cancel resolves
-        // it (ConfirmCancel), accept re-dispatches it.
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
-            log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
-        }
         pending.allow_immutable = true;
 
         let (verb, confirm_label) = match &pending.op {
@@ -4492,57 +4270,29 @@ impl Diffui {
         };
         body = body.text(" (usually pushed or shared).");
         if matches!(pending.op, MutationOp::Edit { .. }) {
-            body = body.text(" Later working-copy changes amend it in place.");
+            body = body.text(" Your edits go into a new change on top of it.");
         }
-        // Stacking rather than replacing: a second guarded mutation raised
-        // while a dialog is open (a background tab's op being refused) waits
-        // under it and surfaces when that one resolves, instead of silently
-        // taking over the buttons the user was about to press.
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        self.ask(ConfirmDialog {
             title: format!("{verb} immutable {noun}?").into(),
             body,
             confirm_label: confirm_label.to_owned(),
+            look: Default::default(),
             pending,
-        }));
-        Task::none()
+        });
     }
 
-    /// [`Self::revision_short_label`] as an id in prose, or plain words when
-    /// the revision isn't in the graph.
-    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
-        let label = self.revision_short_label(selection);
-        let in_graph = match selection {
-            RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => self.active().session.commits.find_by_commit_id(hex),
-        };
-        match (in_graph, selection) {
-            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
-            _ => Prose::new().rev(label),
-        }
-    }
-
-    /// Short display name for a revision, matching the sidebar: unique
-    /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
-    /// copies, falling back to a commit-id prefix for rows not in the graph.
-    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
-        let commits = &self.active().session.commits;
-        let row = match selection {
-            RevisionSelection::WorkingCopy => commits.working_copy(),
-            RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex),
-        };
-        match (row, selection) {
-            (Some(row), _) => {
-                let len = row.shortest_change_id_len().unwrap_or(8).max(8);
-                let mut id: String = row.change_id().chars().take(len).collect();
-                if let Some(offset) = row.change_offset() {
-                    id.push('/');
-                    id.push_str(&offset.to_string());
-                }
-                id
-            }
-            (None, RevisionSelection::WorkingCopy) => "the working copy".to_owned(),
-            (None, RevisionSelection::Commit(hex)) => hex.chars().take(12).collect(),
-        }
+    /// The actor refused to undo a push until the user says so. Undoing one
+    /// rolls back only this repository's record of the remote; the remote
+    /// keeps the commits, which is what the copy has to say.
+    fn confirm_push_undo(&mut self, mut pending: PendingMutation, summary: &str) {
+        pending.allow_immutable = true;
+        self.ask(ConfirmDialog {
+            title: "Undo a push?".into(),
+            body: push_undo_body(summary),
+            confirm_label: "Undo anyway".to_owned(),
+            look: Default::default(),
+            pending,
+        });
     }
 
     /// The activity log for `tab_id`, or `None` if the tab has since closed.
@@ -4554,12 +4304,12 @@ impl Diffui {
     /// surfaced as an activity whose expanded output shows the remote messages.
     /// The actor runs it inside the same working-copy lock every other write
     /// takes, so it can no longer overlap a mutation.
-    pub(crate) fn start_fetch(&mut self, target: FetchTarget) -> Task<Message> {
+    pub(crate) fn start_fetch(&mut self, target: FetchTarget) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if !self.active().session.capabilities.fetch {
-            return Task::none();
+            return;
         }
         self.pop_mode(ModeKind::Menu);
         let label = match &target {
@@ -4575,27 +4325,27 @@ impl Diffui {
             log.set_command(activity_id, command);
         }
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let (job, effects) = state.session.fetch(target.clone());
-        state.jobs.fetch = Some((job, activity_id, target));
+        state.jobs.issue(job, Pending::Fetch(activity_id, target));
         self.run_effects(tab, effects)
     }
 
     /// Toolbar "Undo": revert the latest meaningful operation. Routed through
     /// the mutation path like everything else, so it gets the
     /// snapshot-before-mutate discipline and the same activity treatment.
-    pub(crate) fn start_undo(&mut self) -> Task<Message> {
+    pub(crate) fn start_undo(&mut self) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         self.start_mutation_op(mutations::MutationOp::Undo { operation_id: None })
     }
 
     /// Toolbar "Redo": re-apply what the latest undo took back (`jj redo`).
-    pub(crate) fn start_redo(&mut self) -> Task<Message> {
+    pub(crate) fn start_redo(&mut self) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         self.start_mutation_op(mutations::MutationOp::Redo)
     }
@@ -4608,8 +4358,8 @@ impl Diffui {
         let tab = self.active();
         let presets = revset_presets(tab.repository.as_ref().map(|r| r.vcs));
         let mut entries = Vec::with_capacity(presets.len() + 1);
-        if !tab.default_revset.is_empty() {
-            entries.push(("Default".to_owned(), tab.default_revset.clone()));
+        if !tab.default_revset().is_empty() {
+            entries.push(("Default".to_owned(), tab.default_revset().to_owned()));
         }
         entries.extend(presets);
         entries
@@ -4622,12 +4372,12 @@ impl Diffui {
     /// replaced in one shot when the new walk is ready, so switching revsets
     /// doesn't flash an empty sidebar. The selection is kept (it just won't be
     /// highlighted if it falls outside the new set).
-    pub(crate) fn evaluate_revset(&mut self) -> Task<Message> {
+    pub(crate) fn evaluate_revset(&mut self) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if !self.active().session.capabilities.graph {
-            return Task::none();
+            return;
         }
         self.pop_mode(ModeKind::Menu);
         // Persist the new filter (debounced) for this repo.
@@ -4639,451 +4389,6 @@ impl Diffui {
             format!("Evaluate revset: {shown}")
         };
         self.reload_graph(tab, label)
-    }
-
-    pub(crate) fn view(&self) -> Element<'_, Message> {
-        let theme = self.resolved_theme().spec();
-
-        // No repositories open: the welcome screen owns the whole window, with
-        // the open prompt inline rather than as a modal over it.
-        if self.tabs.is_empty() {
-            let welcome = stack![
-                empty_state(self, theme),
-                crate::shortcuts::build_overlay(self, theme),
-            ];
-            return container(welcome)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .style(move |_| app_shell_style(theme))
-                .into();
-        }
-
-        let tab_bar = tab_bar::build_tab_bar(self, theme);
-        let toolbar = toolbar::build_toolbar(self, theme);
-
-        // Body is always the sidebar + diff panes. All loading feedback lives in
-        // the toolbar now (progress line + activity indicator) — there's no
-        // full-window cold-load takeover and no diff-pane spinner. On a cold
-        // load the sidebar simply grows from empty as batches arrive; a revision
-        // switch keeps the prior diff until `DiffLoaded` replaces it.
-        // The source browser swaps in its own pair: a file-tree-only sidebar
-        // and the plain code pane.
-        let panels: Element<'_, Message> = match self.active().main_view {
-            MainView::Diff => {
-                let sidebar = if self.active().history_panel_collapsed {
-                    sidebar::build_collapsed_sidebar(self, theme)
-                } else {
-                    sidebar::build_sidebar(self, theme)
-                };
-                let diff_pane = diff_panel::build_diff_panel(self, theme);
-                if !self.active().session.document.files.is_empty() {
-                    let file_navigator = if self.active().files_panel_collapsed {
-                        diff_panel::build_collapsed_file_navigator(theme)
-                    } else {
-                        diff_panel::build_file_navigator(self, theme)
-                    };
-                    row![
-                        sidebar,
-                        vertical_divider(theme),
-                        file_navigator,
-                        vertical_divider(theme),
-                        diff_pane,
-                    ]
-                    .spacing(0)
-                    .height(Length::Fill)
-                    .into()
-                } else {
-                    row![sidebar, vertical_divider(theme), diff_pane]
-                        .spacing(0)
-                        .height(Length::Fill)
-                        .into()
-                }
-            }
-            MainView::Source => row![
-                source_panel::build_source_sidebar(self, theme),
-                vertical_divider(theme),
-                source_panel::build_source_panel(self, theme),
-            ]
-            .spacing(0)
-            .height(Length::Fill)
-            .into(),
-            MainView::History => row![
-                history_panel::build_history_sidebar(self, theme),
-                vertical_divider(theme),
-                history_panel::build_history_panel(self, theme),
-            ]
-            .spacing(0)
-            .height(Length::Fill)
-            .into(),
-        };
-        let history_width = if self.active().history_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
-        } else {
-            self.sidebar_width
-        };
-        let files_width = if self.active().session.document.files.is_empty() {
-            0.0
-        } else if self.active().files_panel_collapsed {
-            crate::theme::COLLAPSED_PANEL_WIDTH
-        } else {
-            self.file_nav_width
-        };
-        let history_resize_overlay: Element<'_, Message> = if self.active().history_panel_collapsed
-        {
-            iced::widget::Space::new().into()
-        } else {
-            ResizeHandle::new(
-                self.sidebar_width,
-                self.sidebar_min_width,
-                sidebar::RESIZE_HIT_PADDING,
-                |width| Message::Ui(UiEvent::SidebarWidthChanged(width)),
-            )
-            .right_reserve(
-                files_width
-                    + if files_width == 0.0 { 1.0 } else { 2.0 }
-                    + resize_handle::MIN_DIFF_PANE_WIDTH,
-            )
-            .into()
-        };
-        let files_resize_overlay: Element<'_, Message> = if self.active().main_view
-            != MainView::Diff
-            || self.active().session.document.files.is_empty()
-            || self.active().files_panel_collapsed
-        {
-            iced::widget::Space::new().into()
-        } else {
-            let handle_x = history_width + 1.0 + self.file_nav_width;
-            ResizeHandle::new(
-                handle_x,
-                history_width + 1.0 + diff_panel::MIN_FILE_NAV_WIDTH,
-                sidebar::RESIZE_HIT_PADDING,
-                |position| Message::Ui(UiEvent::ChangedFilesWidthChanged(position)),
-            )
-            .right_reserve(1.0 + resize_handle::MIN_DIFF_PANE_WIDTH)
-            .into()
-        };
-        let changed_files_peek: Element<'_, Message> = if self.active().main_view == MainView::Diff
-            && self.active().files_panel_collapsed
-            && self.changed_files_peek_open
-            && !self.active().session.document.files.is_empty()
-        {
-            let left = history_width + 2.0 + crate::theme::COLLAPSED_PANEL_WIDTH;
-            container(diff_panel::build_file_navigator_peek(self, theme))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(Padding {
-                    top: crate::field::PANEL_TOGGLE_INSET,
-                    right: 0.0,
-                    bottom: crate::field::PANEL_TOGGLE_INSET,
-                    left,
-                })
-                .align_x(alignment::Horizontal::Left)
-                .into()
-        } else {
-            iced::widget::Space::new().into()
-        };
-        let base_panels: Element<'_, Message> =
-            stack![panels, history_resize_overlay, files_resize_overlay,]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        let body: Element<'_, Message> = stack![base_panels, changed_files_peek]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-
-        let shell: Element<'_, Message> =
-            column![tab_bar, toolbar, horizontal_divider(theme), body]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        let shell = if self.mode(ModeKind::ActivityPopover).is_some()
-            || self.mode(ModeKind::Palette).is_some()
-            || self.mode(ModeKind::Menu).is_some()
-            || self.mode(ModeKind::OpenRepo).is_some()
-            || self.mode(ModeKind::Confirm).is_some()
-            || self.mode(ModeKind::NamePrompt).is_some()
-            || self.mode(ModeKind::Credential).is_some()
-            || self.mode(ModeKind::CliOutput).is_some()
-            || self.mode(ModeKind::Shortcuts).is_some()
-            || crate::changes::split_shown(self)
-        {
-            crate::pointer::suppress(shell)
-        } else {
-            shell
-        };
-
-        // Overlays float above the whole shell. Each returns an empty `Space`
-        // when inactive, so they can always be stacked.
-        let content: Element<'_, Message> = stack![
-            shell,
-            palette::build_overlay(self, theme),
-            activity::activity_popover(self, theme),
-            menu::build_overlay(self, theme),
-            tab_bar::build_open_repo_dialog(self, theme),
-            crate::bookmarks::build_name_prompt(self, theme),
-            crate::changes::split_modal(self, theme),
-            tab_bar::build_confirm_dialog(self, theme),
-            crate::cli_output::build_overlay(self, theme),
-            crate::credentials::build_overlay(self, theme),
-            crate::shortcuts::build_overlay(self, theme),
-            activity::toast_layer(self, theme),
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
-
-        container(content)
-            .padding(0)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .style(move |_| app_shell_style(theme))
-            .into()
-    }
-
-    pub(crate) fn theme(&self) -> Theme {
-        self.resolved_theme().iced_theme()
-    }
-
-    pub(crate) fn subscription(&self) -> Subscription<Message> {
-        // Key presses are published raw and resolved in `update`, against the
-        // mode stack and the keymap. Resolving here instead would mean handing
-        // the whole keymap and the open modes through `Subscription::with` —
-        // and that value becomes part of the subscription's identity, so every
-        // mode change would tear the listener down and build a new one.
-        //
-        // We *must* see Esc even when an iced text_input is focused —
-        // text_input captures Esc to clear focus, and `keyboard::listen()`
-        // only fires for `Status::Ignored` events, so we'd lose Esc to the
-        // input and force the user to press Esc twice (once to unfocus, once
-        // to close). `event::listen_with` ignores the capture status and gives
-        // us every event; the `consumed` flag it carries is what keeps the
-        // revset box's typing out of the plain-key bindings.
-        let keyboard = event::listen_with(|event, status, _window| match event {
-            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                Some(Message::Window(WindowEvent::KeyPressed {
-                    key,
-                    modifiers,
-                    consumed: !matches!(status, event::Status::Ignored),
-                }))
-            }
-            _ => None,
-        });
-
-        // Modifier tracking for pointer gestures (⌥-drop = move with
-        // descendants). Separate from the key listener: `ModifiersChanged`
-        // is its own event kind.
-        let modifier_events = event::listen_with(|event, _status, _window| match event {
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                Some(Message::Window(WindowEvent::ModifiersChanged(modifiers)))
-            }
-            _ => None,
-        });
-
-        let window_events = event::listen()
-            .filter_map(|event| match event {
-                Event::Window(window::Event::Focused) => Some(WindowEvent::FocusChanged(true)),
-                Event::Window(window::Event::Unfocused) => Some(WindowEvent::FocusChanged(false)),
-                Event::Window(window::Event::Opened { position, size, .. }) => {
-                    Some(WindowEvent::Opened(position, size))
-                }
-                Event::Window(window::Event::CloseRequested) => Some(WindowEvent::CloseRequested),
-                Event::Window(window::Event::Resized(size)) => Some(WindowEvent::Resized(size)),
-                Event::Window(window::Event::Moved(position)) => Some(WindowEvent::Moved(position)),
-                _ => None,
-            })
-            .map(Message::Window);
-        // The scale factor trackpad deltas are divided by (`wheel`). `Opened`
-        // carries the first one; it changes when the window changes display.
-        let scale_events = event::listen_with(|event, _status, _window| match event {
-            Event::Window(
-                window::Event::Opened { scale_factor, .. } | window::Event::Rescaled(scale_factor),
-            ) => Some(Message::Window(WindowEvent::Rescaled(scale_factor))),
-            _ => None,
-        });
-        // Watch the working tree for changes instead of polling. The
-        // subscription identity is keyed on the repo root, so the watcher
-        // One actor per open repository. Spawning it inside the subscription
-        // ties its life to the tab set: iced keeps the subscription while a tab
-        // names it and drops it when the last one closes, which shuts the actor
-        // — its thread, its workspace, its watcher — down with it.
-        let repositories = Subscription::batch(
-            self.tabs
-                .iter()
-                .map(|tab| Subscription::run_with(tab.open_spec(), open_repository)),
-        );
-
-        // Per-frame ticks during a palette push/pop animation. iced's
-        // `Animation::interpolate_with` is read-only — to actually drive the
-        // interpolation forward in time we need iced to keep re-rendering, and
-        // the handler is a no-op: the side effect is the render itself.
-        //
-        // Driven off the frames the window actually draws rather than a 16 ms
-        // wall clock, because a frame is exactly what is being asked for. A
-        // timer that runs faster than the compositor spends work on frames
-        // nobody sees, and one that runs slower stutters.
-        let palette_animating = self
-            .palette()
-            .map(|p| p.is_animating(std::time::Instant::now()))
-            .unwrap_or(false);
-        let palette_tick = if palette_animating {
-            window::frames().map(|_| Message::Palette(PaletteMessage::Tick))
-        } else {
-            Subscription::none()
-        };
-
-        // While anything is in flight — a load, a diff switch, or any running
-        // activity (fetch/undo/push) — tick so the toolbar progress line +
-        // spinner animate and reflect live progress.
-        let active = self.active();
-        let work_in_flight = active.session.loading_since.is_some()
-            || active.session.diff_in_flight()
-            || active.activities.any_running();
-        let loading_tick = if work_in_flight {
-            time::every(Duration::from_millis(120)).map(|_| Message::Ui(UiEvent::LoadingTick))
-        } else {
-            Subscription::none()
-        };
-
-        // Drives the debounced geometry save. Active only while a change is
-        // pending; the handler writes once the changes settle, then clears the
-        // dirty flag, which tears this subscription back down.
-        let window_state_tick = if self.geometry_dirty_since.is_some() {
-            time::every(WINDOW_STATE_DEBOUNCE).map(|_| Message::Window(WindowEvent::PersistState))
-        } else {
-            Subscription::none()
-        };
-
-        // Per-frame ticks while a right-click menu's row glow is up (so its pulse
-        // animates — the render is the effect; only the iced overlay glows, macOS
-        // animates natively) or while a submenu is open (so the trajectory apex
-        // eases toward the cursor / catches up when it idles). Frames, not a
-        // timer, for the same reason as the palette animation above.
-        let menu_ticking = self
-            .menu()
-            .is_some_and(|m| m.glow.is_some() || !m.open_path.is_empty());
-        let menu_tick = if menu_ticking {
-            window::frames().map(|_| Message::Menu(MenuMessage::Tick))
-        } else {
-            Subscription::none()
-        };
-
-        // macOS only: once iced applies our resolved theme it pins the window's
-        // NSAppearance, and winit then ignores OS appearance changes — so
-        // `theme_changes()` below goes silent on macOS after the first frame.
-        // While we're following the OS, poll the live application appearance so a
-        // system light/dark switch is picked up without a restart. Runs only in
-        // System mode; explicit themes don't care what the OS does.
-        //
-        // This one stays a timer. `window::frames()` only reports frames the
-        // window already draws, and each tick it delivers causes another — so
-        // an idle app in System mode would render at 60 Hz forever to answer a
-        // question the OS asks once a year.
-        let system_theme_poll =
-            if cfg!(target_os = "macos") && self.selected_theme == ThemePreference::System {
-                time::every(Duration::from_secs(1))
-                    .map(|_| Message::Window(WindowEvent::PollSystemTheme))
-            } else {
-                Subscription::none()
-            };
-
-        // Drives the custom double-click zoom: while an animation is in flight,
-        // every drawn frame steps the window toward its target. Tears itself
-        // down the moment the animation completes.
-        let zoom_tick = if self.zoom_anim.is_some() {
-            window::frames().map(|_| Message::Window(WindowEvent::ZoomAnimTick))
-        } else {
-            Subscription::none()
-        };
-
-        // Prunes expired error toasts; subscribed only while any are up.
-        let toast_tick = if self.toasts.is_empty() {
-            Subscription::none()
-        } else {
-            time::every(Duration::from_millis(500)).map(|_| Message::Ui(UiEvent::ToastTick))
-        };
-
-        Subscription::batch([
-            keyboard,
-            modifier_events,
-            window_events,
-            scale_events,
-            repositories,
-            palette_tick,
-            loading_tick,
-            menu_tick,
-            window_state_tick,
-            system_theme_poll,
-            zoom_tick,
-            toast_tick,
-            system::theme_changes()
-                .map(|mode| Message::Window(WindowEvent::SystemThemeChanged(mode))),
-            crate::app_menu::subscription(),
-            crate::credentials::subscription(),
-        ])
-    }
-
-    /// Re-center the native OS window controls (macOS traffic lights) on the tab
-    /// strip. macOS pins them to the native title bar, so we reach the window on
-    /// the main thread via `window::run` and nudge them through `chrome`. A
-    /// no-op where the strip doesn't stand in for the title bar.
-    pub(crate) fn reposition_window_controls(&self) -> Task<Message> {
-        let Some(bar_height) = chrome::title_bar_height() else {
-            return Task::none();
-        };
-        window::latest()
-            .then(move |maybe_id| {
-                maybe_id.map_or_else(Task::none, move |id| {
-                    window::run(id, move |window| {
-                        if let Ok(handle) = window.window_handle() {
-                            chrome::position_window_controls(handle.as_raw(), bar_height);
-                        }
-                    })
-                })
-            })
-            .discard()
-    }
-
-    /// Arm the native resize observer once the window exists, so the traffic
-    /// lights track resizes on AppKit's timeline rather than a frame behind via
-    /// the message loop. Called once on `WindowOpened`.
-    pub(crate) fn install_resize_observer(&self) -> Task<Message> {
-        let Some(bar_height) = chrome::title_bar_height() else {
-            return Task::none();
-        };
-        window::latest()
-            .then(move |maybe_id| {
-                maybe_id.map_or_else(Task::none, move |id| {
-                    window::run(id, move |window| {
-                        if let Ok(handle) = window.window_handle() {
-                            chrome::install_window_resize_observer(handle.as_raw(), bar_height);
-                        }
-                    })
-                })
-            })
-            .discard()
-    }
-
-    /// Adjust the native window to cooperate with our custom title-bar strip:
-    /// stop AppKit auto-dragging it from the strip (tabs included) and make the
-    /// double-click zoom snap instead of morph. Runs once on `WindowOpened`; a
-    /// no-op where the strip isn't the title bar. See
-    /// [`chrome::configure_custom_titlebar`].
-    pub(crate) fn configure_custom_titlebar(&self) -> Task<Message> {
-        if !chrome::drag_region() {
-            return Task::none();
-        }
-        window::latest()
-            .then(|maybe_id| {
-                maybe_id.map_or_else(Task::none, |id| {
-                    window::run(id, |window| {
-                        if let Ok(handle) = window.window_handle() {
-                            chrome::configure_custom_titlebar(handle.as_raw());
-                        }
-                    })
-                })
-            })
-            .discard()
     }
 
     /// Mark the persisted session (window geometry, sidebar width, open tabs)
@@ -5104,11 +4409,24 @@ impl Diffui {
 
     /// Snapshot the current geometry + sidebar width into the persisted form.
     pub(crate) fn current_window_state(&self) -> WindowState {
+        let mut layouts = self.repo_layouts.clone();
+        for tab in &self.tabs {
+            layouts.remember(tab);
+        }
+        // Closed repositories are remembered as long as the recents offer them.
+        layouts.retain(|root| {
+            self.recent_repos.iter().any(|recent| recent == root)
+                || self.tabs.iter().any(|tab| {
+                    tab.root()
+                        .is_some_and(|open| open.to_string_lossy() == root)
+                })
+        });
         WindowState {
             width: Some(self.window_size.width),
             height: Some(self.window_size.height),
             x: self.window_position.map(|p| p.x),
             y: self.window_position.map(|p| p.y),
+            display: self.window_display.clone(),
             sidebar_width: Some(self.sidebar_width),
             file_nav_width: Some(self.file_nav_width),
             diff_wrap: Some(self.diff_wrap),
@@ -5125,50 +4443,91 @@ impl Diffui {
                 .tabs
                 .get(self.active)
                 .and_then(|tab| Some(tab.root()?.to_string_lossy().into_owned())),
-            revsets: self.collect_revsets(),
-            history_panel_collapsed: self
-                .collect_panel_collapse_state(|state| state.history_panel_collapsed),
-            files_panel_collapsed: self
-                .collect_panel_collapse_state(|state| state.files_panel_collapsed),
+            revsets: layouts.revsets,
+            history_panel_collapsed: layouts.history_panel_collapsed,
+            files_panel_collapsed: layouts.files_panel_collapsed,
             recent_repos: self.recent_repos.clone(),
         }
     }
 
-    /// Gather each open tab's revset, keyed by repo root, dropping empties so
-    /// the persisted map stays tidy.
-    pub(crate) fn collect_revsets(&self) -> BTreeMap<String, String> {
-        let mut revsets = BTreeMap::new();
-        for tab in &self.tabs {
-            let Some(root) = tab.root() else {
-                continue;
-            };
-            if !tab.state.session.revset.is_empty() {
-                revsets.insert(
-                    root.to_string_lossy().into_owned(),
-                    tab.state.session.revset.clone(),
-                );
-            }
-        }
-        revsets
-    }
-
-    fn collect_panel_collapse_state(
-        &self,
-        collapsed: impl Fn(&TabState) -> bool,
-    ) -> BTreeMap<String, bool> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| {
-                Some((
-                    tab.root()?.to_string_lossy().into_owned(),
-                    collapsed(&tab.state),
-                ))
-            })
-            .collect()
-    }
-
     pub(crate) fn resolved_theme(&self) -> ResolvedTheme {
         self.selected_theme.active(self.system_theme)
+    }
+
+    /// What a pane draws in under `theme`: the configured UI and mono fonts.
+    pub(crate) fn look(&self, theme: crate::theme::ThemeSpec) -> crate::ui::Look {
+        crate::ui::Look::new(theme, self.config.ui_font, self.config.mono_font)
+    }
+}
+
+/// What undoing the push named `summary` does, for its confirm dialog.
+pub(crate) fn push_undo_body(summary: &str) -> Prose {
+    Prose::from(format!(
+        "Undoing \u{201c}{summary}\u{201d} rolls back only this repository's record of the \
+         remote. The remote keeps the pushed commits, so pushing these bookmarks again fails \
+         until you fetch, which can leave them conflicted."
+    ))
+}
+
+impl TabState {
+    /// The short display labels of `op`'s rewrite targets that the loaded graph
+    /// marks immutable.
+    ///
+    /// The target set comes from [`diffui_core::rewritten_targets`], the same
+    /// list the actor's guard reads, so the dialog can't name a different set
+    /// from the one that will actually be refused. Only rows the UI directly
+    /// addresses are caught here — computed sets (a rebase's descendants, an
+    /// insert-after target's other children, a parent-squash's destination)
+    /// stay the backend guard's job, whose typed rejection re-raises the same
+    /// dialog after the fact.
+    pub(crate) fn immutable_op_targets(&self, op: &mutations::MutationOp) -> Vec<String> {
+        let session = &self.session;
+        let targets = diffui_core::rewritten_targets(
+            op,
+            &session.selected_revision,
+            session.root_commit_id.as_deref(),
+        );
+        let mut labels: Vec<String> = Vec::new();
+        for selection in &targets {
+            if let Some(row) = session.commits.find(selection)
+                && row.is_immutable()
+            {
+                let label = self.revision_short_label(selection);
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
+    /// [`Self::revision_short_label`] as an id in prose, or plain words when
+    /// the revision isn't in the graph.
+    pub(crate) fn revision_prose(&self, selection: &RevisionSelection) -> Prose {
+        let label = self.revision_short_label(selection);
+        match (self.session.commits.find(selection), selection) {
+            (None, RevisionSelection::WorkingCopy) => Prose::from(label),
+            _ => Prose::new().rev(label),
+        }
+    }
+
+    /// Short display name for a revision, matching the sidebar: unique
+    /// change-id prefix (min 8 chars), `/N`-suffixed for divergent/hidden
+    /// copies, falling back to a commit-id prefix for rows not in the graph.
+    pub(crate) fn revision_short_label(&self, selection: &RevisionSelection) -> String {
+        match (self.session.commits.find(selection), selection) {
+            (Some(row), _) => {
+                let len = row.shortest_change_id_len().unwrap_or(8).max(8);
+                let mut id: String = row.change_id().chars().take(len).collect();
+                if let Some(offset) = row.change_offset() {
+                    id.push('/');
+                    id.push_str(&offset.to_string());
+                }
+                id
+            }
+            (None, RevisionSelection::WorkingCopy) => "the working copy".to_owned(),
+            (None, RevisionSelection::Commit(hex)) => hex.chars().take(12).collect(),
+        }
     }
 }
 
@@ -5177,106 +4536,106 @@ mod tests {
     use super::*;
     use crate::commands::Context;
     use crate::modes::{Mode, ModeKind};
-    use crate::palette::PaletteMessage;
     use crate::tabs::tests::{app, push_tab};
 
     #[test]
     fn dragging_history_to_its_minimum_collapses_and_keeps_its_width() {
-        let mut ui = app();
-        ui.sidebar_min_width = 220.0;
-        ui.sidebar_width = 340.0;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.sidebar_min_width = 220.0;
+            ui.sidebar_width = 340.0;
 
-        let _ = ui.update(Message::Ui(UiEvent::SidebarWidthChanged(220.0)));
+            ui.act(cx, |ui, _| ui.on_sidebar_width_changed(220.0));
 
-        assert!(ui.active().history_panel_collapsed);
-        assert_eq!(ui.sidebar_width, 340.0);
+            assert!(ui.active().history_panel_collapsed);
+            assert_eq!(ui.sidebar_width, 340.0);
+
+            // The same drag, back out past the minimum: the pane returns.
+            ui.act(cx, |ui, _| ui.on_sidebar_width_changed(300.0));
+            assert!(!ui.active().history_panel_collapsed);
+            assert_eq!(ui.sidebar_width, 300.0);
+        });
     }
 
     #[test]
     fn changed_files_resize_and_minimum_collapse_keep_the_last_width() {
-        let mut ui = app();
-        ui.sidebar_width = 340.0;
-        ui.file_nav_width = diff_panel::DEFAULT_FILE_NAV_WIDTH;
-        let prefix = ui.sidebar_width + 1.0;
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.sidebar_width = 340.0;
+            ui.file_nav_width = diff_panel::DEFAULT_FILE_NAV_WIDTH;
+            let prefix = ui.sidebar_width + 1.0;
 
-        let _ = ui.update(Message::Ui(UiEvent::ChangedFilesWidthChanged(
-            prefix + 280.0,
-        )));
-        assert_eq!(ui.file_nav_width, 280.0);
-        assert!(!ui.active().files_panel_collapsed);
+            ui.act(cx, |ui, _| {
+                ui.on_changed_files_width_changed(prefix + 280.0)
+            });
+            assert_eq!(ui.file_nav_width, 280.0);
+            assert!(!ui.active().files_panel_collapsed);
 
-        let _ = ui.update(Message::Ui(UiEvent::ChangedFilesWidthChanged(
-            prefix + diff_panel::MIN_FILE_NAV_WIDTH,
-        )));
-        assert!(ui.active().files_panel_collapsed);
-        assert_eq!(ui.file_nav_width, 280.0);
+            ui.act(cx, |ui, _| {
+                ui.on_changed_files_width_changed(prefix + diff_panel::MIN_FILE_NAV_WIDTH)
+            });
+            assert!(ui.active().files_panel_collapsed);
+            assert_eq!(ui.file_nav_width, 280.0);
+        });
     }
 
+    /// Closing a tab keeps its revset and panels for when it reopens from
+    /// the recents.
     #[test]
-    fn changed_files_peek_survives_trigger_exit_after_popup_entry() {
-        let mut ui = app();
+    fn a_closed_repository_keeps_its_layout() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            push_tab(&mut ui, "/tmp/second");
+            ui.recent_repos = vec!["/tmp/first".to_owned(), "/tmp/second".to_owned()];
+            let state = ui.tab_mut(first).unwrap();
+            state.session.revset = "mine()".to_owned();
+            state.files_panel_collapsed = true;
 
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered);
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesPopupEntered);
-        // The rail exit can arrive after the popup enter at their shared seam.
-        ui.changed_files_trigger_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
-        assert!(ui.changed_files_peek_open);
+            ui.close_tab(first, cx);
+            let saved = ui.current_window_state();
 
-        ui.changed_files_popup_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
-        assert!(!ui.changed_files_peek_open);
-    }
-
-    /// The rail is a corridor, not a trigger: crossing it on the way somewhere
-    /// else opens nothing, but it holds a peek the icon already opened.
-    #[test]
-    fn the_changed_files_rail_holds_a_peek_but_never_opens_one() {
-        let mut ui = app();
-
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesRailEntered);
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
-        assert!(!ui.changed_files_peek_open);
-
-        let _ = ui.on_ui_event(UiEvent::ChangedFilesTriggerEntered);
-        assert!(ui.changed_files_peek_open);
-        // Off the icon but still on the rail, heading for a file far down the
-        // tree. (The exit events themselves arm a tokio timer, which needs a
-        // runtime this test doesn't have.)
-        ui.changed_files_trigger_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
-        assert!(ui.changed_files_peek_open);
-
-        ui.changed_files_rail_hovered = false;
-        let _ = ui.on_ui_event(UiEvent::CloseChangedFilesPeek);
-        assert!(!ui.changed_files_peek_open);
+            assert_eq!(saved.open_repos, vec!["/tmp/second".to_owned()]);
+            assert_eq!(
+                saved.revsets.get("/tmp/first").map(String::as_str),
+                Some("mine()")
+            );
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&true));
+            let reopened = ui
+                .repo_layouts
+                .tab_state(crate::tabs::tests::repository("/tmp/first"));
+            assert_eq!(reopened.session.revset, "mine()");
+            assert!(reopened.files_panel_collapsed);
+        });
     }
 
     #[test]
     fn window_state_keeps_each_repositories_panel_visibility() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/first");
-        push_tab(&mut ui, "/tmp/second");
-        ui.tabs[0].state.history_panel_collapsed = true;
-        ui.tabs[1].state.files_panel_collapsed = true;
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/first");
+            push_tab(&mut ui, "/tmp/second");
+            ui.tabs[0].state.history_panel_collapsed = true;
+            ui.tabs[1].state.files_panel_collapsed = true;
 
-        let saved = ui.current_window_state();
+            let saved = ui.current_window_state();
 
-        assert_eq!(saved.history_panel_collapsed.get("/tmp/first"), Some(&true));
-        assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&false));
-        assert_eq!(
-            saved.history_panel_collapsed.get("/tmp/second"),
-            Some(&false)
-        );
-        assert_eq!(saved.files_panel_collapsed.get("/tmp/second"), Some(&true));
+            assert_eq!(saved.history_panel_collapsed.get("/tmp/first"), Some(&true));
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/first"), Some(&false));
+            assert_eq!(
+                saved.history_panel_collapsed.get("/tmp/second"),
+                Some(&false)
+            );
+            assert_eq!(saved.files_panel_collapsed.get("/tmp/second"), Some(&true));
+        });
     }
 
-    fn press(ui: &mut Diffui, chord: &str) {
+    fn press(ui: &mut Diffui, chord: &str, cx: &mut crate::Cx) {
         let chord = Chord::parse(chord).expect("a parsable chord");
         let id = ui
             .resolve_chord(ui.key_context(), &chord, false)
             .unwrap_or_else(|| panic!("{chord:?} is bound to nothing"));
-        let _ = ui.run_command(id, CommandArg::None);
+        ui.run_command(id, CommandArg::None, cx);
     }
 
     /// Matching is debounced, so between a keystroke and its recompute the
@@ -5285,35 +4644,37 @@ mod tests {
     /// highlighted.
     #[test]
     fn accepting_a_dirty_palette_runs_what_the_query_names() {
-        let mut ui = app();
-        // The palette only renders with a repository open, so it only stays
-        // open with one — see `prune_stale_modes`.
-        push_tab(&mut ui, "/tmp/repo");
-        let _ = ui.perform(Action::OpenPalette);
-        let stale = ui
-            .palette()
-            .and_then(|state| state.top())
-            .and_then(|column| column.matches.first())
-            .map(|m| m.item.clone())
-            .expect("the empty query lists the root commands");
-        assert!(
-            !matches!(&stale, ResultRef::Command(id) if *id == "theme.contrast"),
-            "the stale highlight must differ from the answer, or the test proves nothing"
-        );
-
-        let _ = ui.update(Message::Palette(PaletteMessage::QueryChanged(
-            ">high contrast".to_owned(),
-        )));
-        assert!(
-            ui.palette()
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            // The palette only renders with a repository open, so it only stays
+            // open with one — see `prune_stale_modes`.
+            push_tab(&mut ui, "/tmp/repo");
+            ui.perform(Action::OpenPalette, cx);
+            let stale = ui
+                .palette()
                 .and_then(|state| state.top())
-                .is_some_and(|column| column.dirty),
-            "the debounced recompute has not run yet"
-        );
+                .and_then(|column| column.matches.first())
+                .map(|m| m.item.clone())
+                .expect("the empty query lists the root commands");
+            assert!(
+                !matches!(&stale, ResultRef::Command(id) if *id == "theme.contrast"),
+                "the stale highlight must differ from the answer, or the test proves nothing"
+            );
 
-        let _ = ui.palette_accept_current();
-        assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
-        assert!(ui.palette().is_none(), "accepting closes the palette");
+            ui.act(cx, |ui, cx| {
+                ui.palette_on_query_changed(">high contrast".to_owned(), cx)
+            });
+            assert!(
+                ui.palette()
+                    .and_then(|state| state.top())
+                    .is_some_and(|column| column.dirty),
+                "the debounced recompute has not run yet"
+            );
+
+            ui.palette_accept_current(cx);
+            assert_eq!(ui.selected_theme, ThemePreference::HighContrast);
+            assert!(ui.palette().is_none(), "accepting closes the palette");
+        });
     }
 
     /// A replaced document leaves the find bar's matches indexing text that
@@ -5321,101 +4682,106 @@ mod tests {
     /// recompute them; they used to stay stale until the next keystroke.
     #[test]
     fn a_replaced_document_recomputes_find_matches() {
-        use crate::diff_view::FindMatch;
-        use crate::find::FindState;
-        use crate::modes::TabMode;
-        use diffui_core::{
-            DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
-        };
+        crate::tabs::tests::with_cx(|cx| {
+            use crate::diff_view::FindMatch;
+            use crate::find::FindState;
+            use crate::modes::TabMode;
+            use diffui_core::{
+                DiffDocument, DiffFile, DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind,
+            };
 
-        let document = |lines: &[&str]| DiffDocument {
-            files: vec![DiffFile {
-                path: "f.rs".to_owned(),
-                old_path: None,
-                status: DiffFileStatus::Modified,
-                additions: 0,
-                deletions: 0,
-                hunks: vec![DiffHunkView {
-                    header: "@@".to_owned(),
-                    lines: lines
-                        .iter()
-                        .map(|content| DiffLine {
-                            kind: DiffLineKind::Context,
-                            old_line: None,
-                            new_line: None,
-                            content: (*content).to_owned(),
-                            syntax: Vec::new(),
-                            emphasis: Vec::new(),
-                        })
-                        .collect(),
+            let document = |lines: &[&str]| DiffDocument {
+                files: vec![DiffFile {
+                    path: "f.rs".to_owned(),
+                    old_path: None,
+                    status: DiffFileStatus::Modified,
+                    additions: 0,
+                    deletions: 0,
+                    hunks: vec![DiffHunkView {
+                        header: "@@".to_owned(),
+                        lines: lines
+                            .iter()
+                            .map(|content| DiffLine {
+                                kind: DiffLineKind::Context,
+                                old_line: None,
+                                new_line: None,
+                                content: (*content).to_owned(),
+                                syntax: Vec::new(),
+                                emphasis: Vec::new(),
+                            })
+                            .collect(),
+                    }],
+                    collapsed: None,
+                    blob: None,
+                    mode_change: None,
                 }],
-                collapsed: None,
-                blob: None,
-            }],
-            total_additions: 0,
-            total_deletions: 0,
-            range: None,
-        };
+                total_additions: 0,
+                total_deletions: 0,
+                range: None,
+            };
 
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo");
-        ui.active_mut().push_mode(TabMode::Find(FindState {
-            query: "needle".to_owned(),
-            // Matches against the document being replaced: they point at a
-            // file that isn't even in the incoming one.
-            matches: vec![FindMatch {
-                file_index: 9,
-                hunk_index: 9,
-                line_index: 9,
-                byte_start: 0,
-                byte_end: 6,
-            }],
-            active: Some(0),
-            ..FindState::default()
-        }));
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            ui.active_mut().push_mode(TabMode::Find(FindState {
+                query: "needle".to_owned(),
+                // Matches against the document being replaced: they point at a
+                // file that isn't even in the incoming one.
+                matches: vec![FindMatch {
+                    file_index: 9,
+                    hunk_index: 9,
+                    line_index: 9,
+                    byte_start: 0,
+                    byte_end: 6,
+                }],
+                active: Some(0),
+                ..FindState::default()
+            }));
 
-        let revision = RevisionSelection::Commit("abc".to_owned());
-        let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
-        let job = match effects.first() {
-            Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
-            other => panic!("expected a diff load, got {other:?}"),
-        };
-        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
-        let _ = ui.update(Message::Repo(Box::new(diffui_core::Event::new(
-            repo,
-            diffui_core::Payload::DiffLoaded {
-                job,
-                revision,
-                document: document(&["no hits here", "a needle and a needle"]),
-                details: None,
-            },
-        ))));
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
+            let job = match effects.first() {
+                Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+                other => panic!("expected a diff load, got {other:?}"),
+            };
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::DiffLoaded {
+                            job,
+                            revision,
+                            document: document(&["no hits here", "a needle and a needle"]),
+                            details: None,
+                        },
+                    ),
+                    cx,
+                )
+            });
 
-        let state = ui.active().find().expect("the find bar is still open");
-        assert_eq!(
-            state
-                .matches
-                .iter()
-                .map(|m| (m.line_index, m.byte_start))
-                .collect::<Vec<_>>(),
-            vec![(1, 2), (1, 15)],
-            "matches must index the document that just landed"
-        );
-        assert_eq!(state.active, Some(0));
+            let state = ui.active().find().expect("the find bar is still open");
+            assert_eq!(
+                state
+                    .matches
+                    .iter()
+                    .map(|m| (m.line_index, m.byte_start))
+                    .collect::<Vec<_>>(),
+                vec![(1, 2), (1, 15)],
+                "matches must index the document that just landed"
+            );
+            assert_eq!(state.active, Some(0));
+        });
     }
 
     /// A backwards-move check that errors can't say the move is safe, so the
     /// move (and its push) doesn't run and no confirmation pretends it can.
     #[test]
     fn a_failed_backwards_check_refuses_the_move_and_push() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo");
-        let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
-        let state = ui.tab_mut(tab).unwrap();
-        let job = state.session.next_job();
-        state.jobs.bookmark_check = Some((
-            job,
-            PendingMutation {
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            let (activity_id, _) = ui.begin_activity(tab, "Move main + push", false);
+            let pending = PendingMutation {
                 op: mutations::MutationOp::MoveBookmark {
                     name: "main".to_owned(),
                     to: RevisionSelection::WorkingCopy,
@@ -5424,42 +4790,156 @@ mod tests {
                 tab_id: tab,
                 activity_id,
                 allow_immutable: false,
-            },
-        ));
+            };
 
-        let _ = ui.apply_bookmark_check(tab, Err("index unavailable".to_owned()));
+            ui.apply_bookmark_check(tab, pending, Err("index unavailable".to_owned()));
 
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_none());
-        assert!(state.jobs.mutation.is_none(), "nothing was sent");
-        assert!(state.queued_mutations.is_empty(), "nothing was queued");
-        assert!(ui.confirm().is_none());
-        assert!(!ui.active().activities.any_running());
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.mutation().is_none(), "nothing was sent");
+            assert!(state.queued_mutations.is_empty(), "nothing was queued");
+            assert!(ui.confirm().is_none());
+            assert!(!ui.active().activities.any_running());
+        });
+    }
+
+    /// A watcher edit that moves `@` re-lists a source view browsing it; one
+    /// that changes nothing doesn't.
+    #[test]
+    fn the_source_view_on_the_working_copy_follows_edits() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut relists = |known: &str, landed: &str| {
+                let mut ui = app();
+                let tab = push_tab(&mut ui, "/tmp/repo");
+                let repo = ui.tabs[0].repo_id().unwrap();
+                let state = ui.tab_mut(tab).unwrap();
+                state.session.capabilities.graph = true;
+                state.session.capabilities.browse = true;
+                state.session.repository_snapshot = Some(diffui_core::RepositorySnapshot {
+                    fingerprint: known.to_owned(),
+                    ..Default::default()
+                });
+                state.main_view = MainView::Source;
+                state.source.revision = Some(RevisionSelection::WorkingCopy);
+                let job = match state.session.snapshot(RefreshOrigin::Watcher).as_slice() {
+                    [diffui_core::Effect::Send(diffui_core::Command::Snapshot { job, .. })] => *job,
+                    other => panic!("a snapshot: {other:?}"),
+                };
+                ui.on_repo_event(
+                    diffui_core::Event::new(
+                        repo,
+                        diffui_core::Payload::SnapshotDone {
+                            job,
+                            origin: RefreshOrigin::Watcher,
+                            snapshot: diffui_core::RepositorySnapshot {
+                                fingerprint: landed.to_owned(),
+                                ..Default::default()
+                            },
+                            warnings: Vec::new(),
+                            disk: Default::default(),
+                        },
+                    ),
+                    cx,
+                );
+                ui.tab(tab)
+                    .unwrap()
+                    .jobs
+                    .find(|pending| matches!(pending, Pending::Tree(_)))
+                    .is_some()
+            };
+            assert!(relists("op-1", "op-2"), "the edit re-lists the tree");
+            assert!(!relists("op-1", "op-1"), "nothing moved, nothing re-listed");
+        });
+    }
+
+    /// Closing a tab takes its pending confirmation with it: the accept would
+    /// have nothing to run.
+    #[test]
+    fn a_confirmation_closes_with_its_tab() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            let (activity_id, _) = ui.begin_activity(second, "Abandon", false);
+            ui.push_mode(Mode::Confirm(crate::ConfirmDialog {
+                title: "Abandon?".into(),
+                body: Prose::new(),
+                confirm_label: "Abandon".to_owned(),
+                look: Default::default(),
+                pending: PendingMutation {
+                    op: mutations::MutationOp::Abandon {
+                        targets: vec![RevisionSelection::WorkingCopy],
+                    },
+                    tab_id: second,
+                    activity_id,
+                    allow_immutable: false,
+                },
+            }));
+
+            ui.act(cx, |ui, cx| ui.close_tab(second, cx));
+
+            assert!(ui.confirm().is_none());
+        });
+    }
+
+    /// A detail copy whose header read failed still copies: what the graph
+    /// knows, rather than nothing.
+    #[test]
+    fn a_failed_detail_copy_copies_what_the_graph_knows() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            let state = ui.tab_mut(tab).unwrap();
+            let job = state.session.next_job();
+            state.jobs.issue(
+                job,
+                Pending::DetailCopy(crate::DetailField::Author, "Ann <ann@x>".to_owned()),
+            );
+            let repo = ui.tabs[0].repo_id().unwrap();
+            ui.on_repo_event(
+                diffui_core::Event::new(
+                    repo,
+                    diffui_core::Payload::Failed {
+                        job,
+                        error: diffui_core::RepoError::Other("gone".to_owned()),
+                    },
+                ),
+                cx,
+            );
+            assert!(!ui.tab(tab).unwrap().jobs.owns(job));
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert_eq!(copied.as_deref(), Some("Ann <ann@x>"));
+        });
     }
 
     /// A typed `--allow-backwards` is the user's answer to the confirmation,
     /// so the move runs without the check; without it, the check comes first.
     #[test]
     fn allow_backwards_skips_the_backwards_check() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/repo");
-        ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
-        let op = || mutations::MutationOp::MoveBookmark {
-            name: "main".to_owned(),
-            to: RevisionSelection::Commit("abc".to_owned()),
-            push_remote: None,
-        };
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/repo");
+            ui.tab_mut(tab).unwrap().session.capabilities.mutate = true;
+            let op = || mutations::MutationOp::MoveBookmark {
+                name: "main".to_owned(),
+                to: RevisionSelection::Commit("abc".to_owned()),
+                push_remote: None,
+            };
 
-        let _ = ui.start_mutation(op(), false);
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_some());
-        assert!(state.jobs.mutation.is_none());
-        state.jobs.bookmark_check = None;
+            ui.start_mutation_on(tab, op(), false, false);
+            let check = |pending: &Pending| matches!(pending, Pending::BookmarkCheck(_));
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.find(check).is_some());
+            assert!(state.jobs.mutation().is_none());
+            state.jobs.take_where(check);
 
-        let _ = ui.start_mutation(op(), true);
-        let state = ui.tab_mut(tab).unwrap();
-        assert!(state.jobs.bookmark_check.is_none());
-        assert!(state.jobs.mutation.is_some(), "the move runs straight away");
+            ui.start_mutation_on(tab, op(), true, false);
+            let state = ui.tab_mut(tab).unwrap();
+            assert!(state.jobs.find(check).is_none());
+            assert!(
+                state.jobs.mutation().is_some(),
+                "the move runs straight away"
+            );
+        });
     }
 
     #[test]
@@ -5469,6 +4949,7 @@ mod tests {
             title: "Rewrite?".into(),
             body: Prose::new(),
             confirm_label: "Rewrite anyway".to_owned(),
+            look: Default::default(),
             pending: PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
                 tab_id: TabId(0),
@@ -5491,6 +4972,39 @@ mod tests {
             ui.resolve_chord(context, &esc, false),
             Some("confirm.cancel")
         );
+    }
+
+    /// Enter accepts a routine confirm (a push); one that destroys or
+    /// overrides something stays click-only.
+    #[test]
+    fn enter_accepts_only_a_routine_confirmation() {
+        for routine in [true, false] {
+            let mut ui = app();
+            ui.push_mode(Mode::Confirm(ConfirmDialog {
+                title: "Push?".into(),
+                body: Prose::new(),
+                confirm_label: "Push".to_owned(),
+                look: crate::ConfirmLook {
+                    routine,
+                    ..Default::default()
+                },
+                pending: PendingMutation {
+                    op: mutations::MutationOp::Undo { operation_id: None },
+                    tab_id: TabId(0),
+                    activity_id: activity::ActivityId(0),
+                    allow_immutable: false,
+                },
+            }));
+            let enter = Chord::parse("enter").expect("a parsable chord");
+            let id = ui.resolve_chord(Context::Confirm, &enter, false);
+            assert_eq!(id, Some("confirm.accept"));
+            let command = commands::command("confirm.accept").expect("a command");
+            assert_eq!(
+                (command.enabled)(&ui, &CommandArg::None).is_ok(),
+                routine,
+                "routine: {routine}"
+            );
+        }
     }
 
     /// The base context's plain keys belong to whatever has focus — the revset
@@ -5537,14 +5051,16 @@ mod tests {
 
     #[test]
     fn the_palette_chord_toggles_the_palette_from_inside_it() {
-        let mut ui = app();
-        push_tab(&mut ui, "/tmp/repo");
-        press(&mut ui, "cmd+k");
-        assert!(ui.palette().is_some());
-        assert_eq!(ui.key_context(), Context::Palette);
-        press(&mut ui, "cmd+k");
-        assert!(ui.palette().is_none());
-        assert_eq!(ui.key_context(), Context::Base);
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            push_tab(&mut ui, "/tmp/repo");
+            press(&mut ui, "cmd+k", cx);
+            assert!(ui.palette().is_some());
+            assert_eq!(ui.key_context(), Context::Palette);
+            press(&mut ui, "cmd+k", cx);
+            assert!(ui.palette().is_none());
+            assert_eq!(ui.key_context(), Context::Base);
+        });
     }
 
     /// A menu built before a graph reload names rows by commit id. `enabled`
@@ -5552,15 +5068,17 @@ mod tests {
     /// longer run its mutation.
     #[test]
     fn a_stale_menu_row_cannot_act_on_a_commit_the_graph_no_longer_has() {
-        let mut ui = app();
-        ui.push_mode(Mode::ActivityPopover);
-        let gone = RevisionSelection::Commit("deadbeef".to_owned());
-        let _ = ui.run_command("revision.abandon", CommandArg::Revision(gone));
-        // Nothing was queued and nothing was logged: the command refused
-        // before it could mint an activity.
-        assert!(ui.active().activities.is_empty());
-        assert!(ui.active().queued_mutations.is_empty());
-        // The popover is still up — the pick was a no-op, not a dismissal.
-        assert!(ui.mode(ModeKind::ActivityPopover).is_some());
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            ui.push_mode(Mode::ActivityPopover);
+            let gone = RevisionSelection::Commit("deadbeef".to_owned());
+            ui.run_command("revision.abandon", CommandArg::Revision(gone), cx);
+            // Nothing was queued and nothing was logged: the command refused
+            // before it could mint an activity.
+            assert!(ui.active().activities.is_empty());
+            assert!(ui.active().queued_mutations.is_empty());
+            // The popover is still up — the pick was a no-op, not a dismissal.
+            assert!(ui.mode(ModeKind::ActivityPopover).is_some());
+        });
     }
 }

@@ -98,14 +98,22 @@ impl RowBudget {
     /// Whether a file changing `changed` lines gets rows, and if it does,
     /// charge it to the budget.
     pub fn admit(&mut self, changed: usize) -> Result<(), DiffCollapse> {
-        if changed > self.limits.file_rows {
-            return Err(DiffCollapse::LargeFile);
-        }
-        if self.spent.saturating_add(changed) > self.limits.total_rows {
-            return Err(DiffCollapse::OverBudget);
+        if !self.fits(changed) {
+            return Err(if changed > self.limits.file_rows {
+                DiffCollapse::LargeFile
+            } else {
+                DiffCollapse::OverBudget
+            });
         }
         self.spent += changed;
         Ok(())
+    }
+
+    /// Whether a file changing `changed` lines would get rows, charging
+    /// nothing.
+    pub fn fits(&self, changed: usize) -> bool {
+        changed <= self.limits.file_rows
+            && self.spent.saturating_add(changed) <= self.limits.total_rows
     }
 
     /// Whether a file whose sides weigh `sides` bytes keeps them for a
@@ -149,7 +157,7 @@ pub(crate) fn count_changed_lines(before: &[u8], after: &[u8]) -> (usize, usize)
     (additions, deletions)
 }
 
-fn line_count(text: &[u8]) -> usize {
+pub(crate) fn line_count(text: &[u8]) -> usize {
     if text.is_empty() {
         return 0;
     }
@@ -372,6 +380,45 @@ mod tests {
         assert_eq!(count_changed_lines(b"", b"a\nb\nc"), (3, 0));
         assert_eq!(count_changed_lines(b"a\nb\n", b""), (0, 2));
         assert_eq!(count_changed_lines(b"a\nb\nc\n", b"a\nB\nc\nd\n"), (2, 1));
+    }
+
+    /// The diff loader charges a file that surely fits for the rows its hunks
+    /// hold instead of counting it first, so the two must agree, with word
+    /// refinement and without.
+    #[test]
+    fn hunk_rows_agree_with_the_line_count() {
+        let cases: [(&[u8], &[u8]); 4] = [
+            (b"a\nb\nc\n", b"a\nB\nc\nd\n"),
+            (b"", b"one\ntwo"),
+            (b"x\ny\nz\nw\n", b"x\nw\n"),
+            (
+                b"fn a() {}\nfn b() {}\n",
+                b"fn a() { 1 }\nfn b() {}\nfn c() {}\n",
+            ),
+        ];
+        for word_diff_bytes in [usize::MAX, 0] {
+            let limits = DiffLimits {
+                word_diff_bytes,
+                ..DiffLimits::default()
+            };
+            for (before, after) in cases {
+                let (mut additions, mut deletions) = (0, 0);
+                for hunk in hunks(before, after, 3, limits) {
+                    for (kind, _) in hunk.lines {
+                        match kind {
+                            DiffLineType::Added => additions += 1,
+                            DiffLineType::Removed => deletions += 1,
+                            DiffLineType::Context => {}
+                        }
+                    }
+                }
+                assert_eq!(
+                    (additions, deletions),
+                    count_changed_lines(before, after),
+                    "{before:?} -> {after:?}"
+                );
+            }
+        }
     }
 
     #[test]

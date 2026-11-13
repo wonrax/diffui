@@ -161,6 +161,7 @@ pub fn synthesize_source_file(path: &str, content: &str) -> DiffFile {
         deletions: 0,
         collapsed: None,
         blob: None,
+        mode_change: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn empty_source_file(path: &str) -> DiffFile {
         deletions: 0,
         collapsed: None,
         blob: None,
+        mode_change: None,
     }
 }
 
@@ -376,6 +378,63 @@ pub fn list_ignored_dir(repository: &Repository, dir: &str) -> Result<Vec<Source
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Read `path` under the working copy at `root` for the source browser, which
+/// lists untracked and ignored files too: a multi-GB build artifact is
+/// reported too large without being read, and a FIFO or a device, whose read
+/// would block the reading actor for good, likewise. A symlink shows its
+/// target, the way a commit's tree does.
+pub(crate) async fn read_working_copy_file(root: &Path, path: &str) -> Result<SourceFileData> {
+    // Paths come from our own tree listing, but reject traversal anyway: the
+    // read must stay inside the working copy.
+    if Path::new(path)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!("invalid path {path}");
+    }
+    match read_disk_capped(&root.join(path), MAX_SOURCE_FILE_BYTES)
+        .await
+        .with_context(|| format!("failed to read {path}"))?
+    {
+        Ok(bytes) => Ok(classify_disk_bytes(bytes)),
+        Err(byte_len) => Ok(SourceFileData {
+            content: None,
+            binary: false,
+            too_large: true,
+            byte_len: usize::try_from(byte_len).unwrap_or(usize::MAX),
+        }),
+    }
+}
+
+/// The bytes of the file at `path` when it is a regular file of at most `cap`
+/// bytes (a symlink: its target), else `Err` with its size, without reading it.
+pub(crate) async fn read_disk_capped(
+    path: &Path,
+    cap: usize,
+) -> std::io::Result<Result<Vec<u8>, u64>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.is_symlink() {
+        let target = tokio::fs::read_link(path).await?;
+        return Ok(Ok(target.into_os_string().into_encoded_bytes()));
+    }
+    if !metadata.is_file() || metadata.len() > cap as u64 {
+        return Ok(Err(metadata.len()));
+    }
+    // Capped again while reading: the file can grow between the stat and here.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    tokio::fs::File::open(path)
+        .await?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > cap {
+        return Ok(Err(bytes.len() as u64));
+    }
+    Ok(Ok(bytes))
 }
 
 /// Classify on-disk bytes: binary sniff over the first 8 KiB (NUL byte), and

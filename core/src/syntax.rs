@@ -350,6 +350,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         };
 
         let mut with_source = make_file();
@@ -403,6 +404,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         };
         apply_syntax_highlighting_with_sources(&mut file, None, Some(source));
 
@@ -443,6 +445,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         };
         apply_syntax_highlighting_with_sources(&mut file, None, Some(source));
         let comment = &file.hunks[0].lines[0].syntax;

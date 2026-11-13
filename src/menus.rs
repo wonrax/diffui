@@ -11,6 +11,7 @@
 //! [`crate::Action`].
 
 use super::*;
+use crate::Cx;
 use crate::commands::{self, CommandId};
 use crate::prose::Prose;
 
@@ -63,7 +64,7 @@ impl Diffui {
 
     /// Build the revision context menu's entry tree from the already-loaded
     /// bookmarks / commit graph (so it opens instantly, no repo read).
-    /// Shared by the macOS native popup and the iced overlay; author/committer/
+    /// Shared by the macOS native popup and the overlay; author/committer/
     /// description copies carry only an in-memory fallback, with the live value
     /// read on demand when picked.
     pub(crate) fn revision_menu_tree(&self, selection: &RevisionSelection) -> Vec<menu::MenuEntry> {
@@ -97,7 +98,7 @@ impl Diffui {
             RevisionSelection::Commit(hex) => Some(hex.clone()),
         };
         if marked.len() > 1 && clicked_id.as_deref().is_some_and(|id| marked.contains(&id)) {
-            return self.batch_menu_tree(crate::revops::marked_selections(self));
+            return self.batch_menu_tree(crate::revops::marked_selections(self.active()));
         }
 
         let on = || CommandArg::Revision(selection.clone());
@@ -159,13 +160,7 @@ impl Diffui {
 
         // Copy revision metadata — values come from the loaded graph row.
         let copy_fields = {
-            let row = match selection {
-                RevisionSelection::WorkingCopy => self.active().session.commits.working_copy(),
-                RevisionSelection::Commit(hex) => {
-                    self.active().session.commits.find_by_commit_id(hex)
-                }
-            };
-            row.map(|row| {
+            self.active().session.commits.find(selection).map(|row| {
                 (
                     row.change_id().to_owned(),
                     row.commit_id().to_owned(),
@@ -386,7 +381,7 @@ impl Diffui {
     }
 
     /// The toolbar fetch menu's entries: "Fetch all remotes" + one row per known
-    /// remote branch (`name@remote`), nearest-first. Non-macOS only — the iced
+    /// remote branch (`name@remote`), nearest-first. Non-macOS only — the
     /// overlay's builder; macOS builds its fetch menu natively in
     /// `open_toolbar_menu`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -423,7 +418,7 @@ impl Diffui {
     }
 
     /// The toolbar revset menu's entries: each `label` with its `expr` shown as
-    /// the right-aligned detail. Non-macOS only — the iced overlay's builder;
+    /// the right-aligned detail. Non-macOS only — the overlay's builder;
     /// macOS builds its revset menu natively in `open_toolbar_menu`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn revset_menu_entry_tree(&self) -> Vec<menu::MenuEntry> {
@@ -444,39 +439,45 @@ impl Diffui {
     /// The single funnel every non-keyboard producer goes through. `enabled` is
     /// evaluated *here*, not when the surface was built, so a menu that has been
     /// open across a graph reload can no longer act on a row that reload hid.
-    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg) -> Task<Message> {
+    pub(crate) fn run_command(&mut self, id: CommandId, arg: CommandArg, cx: &mut Cx) {
         let Some(command) = commands::command(id) else {
-            return Task::none();
+            return;
         };
         if (command.enabled)(self, &arg).is_err() {
-            return Task::none();
+            return;
         }
-        match (command.build)(self, arg) {
-            Some(action) => self.perform(action),
-            None => Task::none(),
+        if let Some(action) = (command.build)(self, arg) {
+            self.perform(action, cx)
         }
     }
 
-    /// Wrap `op` in an activity and send it to the repository actor. Every
-    /// mutation entry point — context menu, target-mode confirm, drag & drop —
-    /// funnels through here so labels and guards can't drift apart.
-    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
-        self.start_mutation(op, false)
+    /// [`Self::start_mutation_on`] the active tab: what a user's gesture
+    /// starts.
+    pub(crate) fn start_mutation_op(&mut self, op: mutations::MutationOp) {
+        if let Some(tab) = self.active_tab_id() {
+            self.start_mutation_on(tab, op, false, false);
+        }
     }
 
-    /// [`Self::start_mutation_op`], where `allow_backwards` is a typed
-    /// `--allow-backwards`: a bookmark move then runs without asking first.
-    pub(crate) fn start_mutation(
+    /// Wrap `op` in an activity and send it to `tab_id`'s repository actor.
+    /// Every mutation entry point — context menu, target-mode confirm, drag &
+    /// drop — funnels through here so labels and guards can't drift apart.
+    /// `allow_backwards` is a typed `--allow-backwards`: a bookmark move then
+    /// runs without asking first. `allow_immutable` is a typed
+    /// `--ignore-immutable`: the immutable-commit guard is off.
+    pub(crate) fn start_mutation_on(
         &mut self,
+        tab_id: TabId,
         op: mutations::MutationOp,
         allow_backwards: bool,
-    ) -> Task<Message> {
+        allow_immutable: bool,
+    ) {
         use mutations::MutationOp;
-        let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+        let Some(tab) = self.tab(tab_id) else {
+            return;
         };
-        if !self.active().session.capabilities.mutate {
-            return Task::none();
+        if !tab.session.capabilities.mutate {
+            return;
         }
         // Surface the mutation as an activity (push captures its remote output).
         let label: Prose = match &op {
@@ -572,15 +573,17 @@ impl Diffui {
         );
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
-        if crate::revops::consumes_marks(self, &op) {
-            self.active_mut().revision_multi_selection.clear();
+        if crate::revops::consumes_marks(tab, &op)
+            && let Some(tab) = self.tab_mut(tab_id)
+        {
+            tab.revision_multi_selection.clear();
         }
         let (activity_id, _) = self.begin_activity(tab_id, label, determinate);
         let pending = PendingMutation {
             op,
             tab_id,
             activity_id,
-            allow_immutable: false,
+            allow_immutable,
         };
         // jj CLI parity: `jj bookmark set` refuses a backwards/sideways move
         // without `--allow-backwards`. Check ancestry first — the result either
@@ -593,10 +596,10 @@ impl Diffui {
             }
             let (name, to) = (name.clone(), to.clone());
             let Some(state) = self.tab_mut(tab_id) else {
-                return Task::none();
+                return;
             };
             let (job, effects) = state.session.bookmark_check(name, to);
-            state.jobs.bookmark_check = Some((job, pending));
+            state.jobs.issue(job, Pending::BookmarkCheck(pending));
             return self.run_effects(tab_id, effects);
         }
         self.run_mutation_checking_wc_push(pending)
@@ -606,21 +609,21 @@ impl Diffui {
     /// today (reached from a single key or the palette); anything else runs
     /// straight away. The activity row is opened now and sits queued, so a
     /// cancel resolves it the same way the other confirmations do.
-    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) -> Task<Message> {
+    pub(crate) fn confirm_mutation_op(&mut self, op: mutations::MutationOp) {
         use mutations::MutationOp;
         let MutationOp::Abandon { targets } = &op else {
             return self.start_mutation_op(op);
         };
         let Some(tab_id) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         if !self.active().session.capabilities.mutate || targets.is_empty() {
-            return Task::none();
+            return;
         }
         let (title, label, body) = match targets.as_slice() {
             [target] => (
                 Prose::from("Abandon ")
-                    .then(self.revision_prose(target))
+                    .then(self.active().revision_prose(target))
                     .text("?"),
                 "Abandon".to_owned(),
                 "Its changes are dropped and its descendants move onto its parent. Undo \
@@ -633,23 +636,14 @@ impl Diffui {
                  Undo brings them back.",
             ),
         };
-        let body = Prose::from(body);
-        let (activity_id, _) = self.begin_activity(tab_id, label, false);
-        if let Some(log) = self.activity_log_for(tab_id) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        let pending = self.begin_mutation(tab_id, label, op);
+        self.ask(ConfirmDialog {
             title,
-            body,
+            body: Prose::from(body),
             confirm_label: "Abandon".to_owned(),
-            pending: PendingMutation {
-                op,
-                tab_id,
-                activity_id,
-                allow_immutable: false,
-            },
-        }));
-        Task::none()
+            look: Default::default(),
+            pending,
+        });
     }
 
     /// Context-menu tree for a file-tree row (`display_index` into the
@@ -784,99 +778,139 @@ impl Diffui {
         items
     }
 
-    /// macOS: pop the file context menu natively (blocking, glowing over the
-    /// row) and dispatch the pick. Mirrors `open_revision_context_menu`.
+    /// macOS: shows a native `NSMenu`, then runs `pick` on what was chosen, inside
+    /// `act`.
+    ///
+    /// An `NSMenu` runs a modal tracking loop on the main thread, and while it runs
+    /// AppKit keeps servicing the main queue (GPUI's foreground tasks, repository
+    /// events) and the display link. Each of those takes the `App` borrow, so the
+    /// loop must not start inside one: a listener or an `act` holds that borrow
+    /// and the first task to fire would panic with it already borrowed. This runs
+    /// it as a foreground task of its own, which holds nothing while it blocks, the
+    /// way kit's native menu does. The app stays live under the menu, and a pick
+    /// comes back through a fresh update.
+    #[cfg(target_os = "macos")]
+    fn popup(
+        items: Vec<macos_native::MenuItem>,
+        glow: Option<macos_native::GlowRect>,
+        cx: &mut Cx,
+        pick: impl FnOnce(&mut Diffui, u32, &mut Cx) + 'static,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let chosen = run_popup(&items, glow, &this, cx);
+            let _ = this.update(cx, |this, cx| {
+                if let Some(chosen) = chosen {
+                    this.act(cx, |this, cx| pick(this, chosen, cx));
+                }
+                // The tracking loop ate the mouse-up. Without a repaint, a dismissed
+                // menu leaves the window idle and deaf to the next right-click.
+                this.with_window(cx, |window, _| window.refresh());
+            });
+        })
+        .detach();
+    }
+
+    /// macOS: pop `tree` natively and run the picked row's command.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn popup_tree(
+        tree: &[menu::MenuEntry],
+        glow: Option<macos_native::GlowRect>,
+        cx: &mut Cx,
+    ) {
+        let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
+        let items = lower_menu_to_native(tree, &mut picks);
+        Self::popup(items, glow, cx, move |this, chosen, cx| {
+            if let Some((command, arg)) = picks.get(chosen as usize).cloned() {
+                this.run_command(command, arg, cx);
+            }
+        });
+    }
+
+    /// The system folder picker, then opening what was chosen. Its panel runs a
+    /// modal loop like a menu's, so it runs outside any update for the same reason
+    /// ([`Self::popup`]).
+    pub(crate) fn choose_repo_folder(&mut self, cx: &mut Cx) {
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |this, cx| {
+            let chosen = macos_native::choose_repository_folder();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(path) = chosen {
+                    this.act(cx, |this, cx| this.open_repository(&path, cx));
+                }
+                this.with_window(cx, |window, _| window.refresh());
+            });
+        })
+        .detach();
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
+    }
+
+    /// macOS: pop the file context menu natively, glowing over the row, and
+    /// dispatch the pick. Mirrors `open_revision_context_menu`.
     #[cfg(target_os = "macos")]
     pub(crate) fn open_file_context_menu(
         &mut self,
         display_index: usize,
-        row_rect: iced::Rectangle,
-        _cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        _cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.file_context_menu_tree(display_index);
         if tree.is_empty() {
-            return Task::none();
+            return;
         }
-        let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
-        let items = lower_menu_to_native(&tree, &mut picks);
-        let glow = macos_native::GlowRect {
-            x: row_rect.x,
-            y: row_rect.y,
-            width: row_rect.width,
-            height: row_rect.height,
-            radius: crate::revision_list::ROW_CARD_RADIUS,
-        };
-        let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
-            return Task::none();
-        };
-        let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
-            return Task::none();
-        };
-        self.run_command(command, arg)
+        Self::popup_tree(&tree, Some(row_glow(row_rect)), cx);
     }
 
-    /// Non-macOS: open the file context menu as the iced overlay at the
-    /// cursor, pulsing the row.
+    /// Non-macOS: open the file context menu as the overlay at the cursor, pulsing
+    /// the row.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn open_file_context_menu(
         &mut self,
         display_index: usize,
-        row_rect: iced::Rectangle,
-        cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.file_context_menu_tree(display_index);
         if tree.is_empty() {
-            return Task::none();
+            return;
         }
         let mut overlay = menu::OverlayMenu::new(
             tree,
             menu::AnchorSpec::At(cursor),
-            Some(iced::mouse::Button::Right),
+            Some(gpui_kit::MouseButton::Right),
         );
         overlay.glow = Some(row_rect);
         self.pop_mode(ModeKind::ActivityPopover);
         self.push_mode(Mode::Menu(overlay));
-        Task::none()
     }
 
-    /// macOS: lower the shared tree to a native `NSMenu`, pop it (blocking, with
-    /// a pulsing glow over `row_rect`), and dispatch the chosen action.
+    /// macOS: lower the shared tree to a native `NSMenu` and pop it, with a pulsing
+    /// glow over `row_rect`.
     #[cfg(target_os = "macos")]
     pub(crate) fn open_revision_context_menu(
         &mut self,
         _repository: Repository,
         selection: RevisionSelection,
-        row_rect: iced::Rectangle,
-        _cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        _cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.revision_menu_tree(&selection);
-        let mut picks: Vec<(CommandId, CommandArg)> = Vec::new();
-        let items = lower_menu_to_native(&tree, &mut picks);
-        let glow = macos_native::GlowRect {
-            x: row_rect.x,
-            y: row_rect.y,
-            width: row_rect.width,
-            height: row_rect.height,
-            radius: crate::revision_list::ROW_CARD_RADIUS,
-        };
-        let Some(chosen) = macos_native::popup_menu(&items, Some(glow)) else {
-            return Task::none();
-        };
-        let Some((command, arg)) = picks.get(chosen as usize).cloned() else {
-            return Task::none();
-        };
-        self.run_command(command, arg)
+        Self::popup_tree(&tree, Some(row_glow(row_rect)), cx);
     }
 
-    /// Non-macOS: open the iced overlay menu at the cursor, pulsing `row_rect`.
+    /// Non-macOS: open the overlay menu at the cursor, pulsing `row_rect`.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn open_revision_context_menu(
         &mut self,
         _repository: Repository,
         selection: RevisionSelection,
-        row_rect: iced::Rectangle,
-        cursor: iced::Point,
-    ) -> Task<Message> {
+        row_rect: Rectangle,
+        cursor: Point,
+        cx: &mut Cx,
+    ) {
         let tree = self.revision_menu_tree(&selection);
         // Opened by the right button: its release is the one that opened the
         // menu, so it neither picks a row nor dismisses (see
@@ -884,25 +918,23 @@ impl Diffui {
         let mut overlay = menu::OverlayMenu::new(
             tree,
             menu::AnchorSpec::At(cursor),
-            Some(iced::mouse::Button::Right),
+            Some(gpui_kit::MouseButton::Right),
         );
         overlay.glow = Some(row_rect);
         self.pop_mode(ModeKind::ActivityPopover);
         self.push_mode(Mode::Menu(overlay));
-        Task::none()
     }
 
     /// Open a toolbar dropdown (fetch branches / revset presets) as a native
-    /// `NSMenu` at the cursor — it auto-sizes to the longest label and never
-    /// word-wraps, unlike the iced overlay (kept as the non-macOS fallback).
-    /// The menu is modal/blocking like the revision context menu, so the chosen
-    /// action is dispatched directly on return.
+    /// `NSMenu` at the cursor: it auto-sizes to the longest label and never
+    /// word-wraps, unlike the overlay (kept as the non-macOS fallback).
     #[cfg(target_os = "macos")]
     pub(crate) fn open_toolbar_menu(
         &mut self,
         which: ToolbarMenu,
-        _anchor: iced::Rectangle,
-    ) -> Task<Message> {
+        _anchor: Rectangle,
+        cx: &mut Cx,
+    ) {
         use macos_native::MenuItem;
 
         match which {
@@ -924,13 +956,11 @@ impl Diffui {
                         targets.push(FetchTarget::RemoteBranch { remote, branch });
                     }
                 }
-                let Some(chosen) = macos_native::popup_menu(&items, None) else {
-                    return Task::none();
-                };
-                let Some(target) = targets.get(chosen as usize).cloned() else {
-                    return Task::none();
-                };
-                self.run_command("repo.fetch", CommandArg::Fetch(target))
+                Self::popup(items, None, cx, move |this, chosen, cx| {
+                    if let Some(target) = targets.get(chosen as usize).cloned() {
+                        this.run_command("repo.fetch", CommandArg::Fetch(target), cx);
+                    }
+                });
             }
             ToolbarMenu::RevsetPresets => {
                 let entries = self.revset_menu_entries();
@@ -941,36 +971,162 @@ impl Diffui {
                         MenuItem::entry(format!("{label}  \u{b7}  {expr}"), index as u32)
                     })
                     .collect();
-                let Some(chosen) = macos_native::popup_menu(&items, None) else {
-                    return Task::none();
-                };
-                let Some((_, expr)) = entries.get(chosen as usize) else {
-                    return Task::none();
-                };
-                self.run_command("repo.set-revset", CommandArg::Revset(expr.clone()))
+                Self::popup(items, None, cx, move |this, chosen, cx| {
+                    if let Some((_, expr)) = entries.get(chosen as usize) {
+                        this.run_command("repo.set-revset", CommandArg::Revset(expr.clone()), cx);
+                    }
+                });
             }
         }
     }
 
-    /// Non-macOS: open the iced overlay dropdown, anchored edge-to-edge below
-    /// the trigger's reported rect.
+    /// Non-macOS: open the overlay dropdown, anchored edge-to-edge below the
+    /// trigger's rect.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn open_toolbar_menu(
-        &mut self,
-        which: ToolbarMenu,
-        anchor: iced::Rectangle,
-    ) -> Task<Message> {
+    pub(crate) fn open_toolbar_menu(&mut self, which: ToolbarMenu, anchor: Rectangle, cx: &mut Cx) {
         let root = match which {
             ToolbarMenu::FetchBranches => self.fetch_menu_entries(),
             ToolbarMenu::RevsetPresets => self.revset_menu_entry_tree(),
         };
-        // `AnchorArea` fires on a left press, so that press's release is the
-        // opening one — swallowed rather than treated as a pick/dismiss.
+        // The caret opens on a left press, so that press's release is the opening
+        // one: swallowed rather than treated as a pick/dismiss.
         self.push_mode(Mode::Menu(menu::OverlayMenu::new(
             root,
             menu::AnchorSpec::Below(anchor),
-            Some(iced::mouse::Button::Left),
+            Some(gpui_kit::MouseButton::Left),
         )));
-        Task::none()
+    }
+}
+
+/// A glow tracing the revision or file row at `rect`.
+#[cfg(target_os = "macos")]
+fn row_glow(rect: Rectangle) -> macos_native::GlowRect {
+    macos_native::GlowRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        radius: crate::theme::list::radius(rect.height),
+    }
+}
+
+/// The tracking loop itself: blocks until the menu closes.
+#[cfg(all(target_os = "macos", not(test)))]
+fn run_popup(
+    items: &[macos_native::MenuItem],
+    glow: Option<macos_native::GlowRect>,
+    _this: &gpui_kit::WeakEntity<Diffui>,
+    _cx: &mut gpui_kit::AsyncApp,
+) -> Option<u32> {
+    macos_native::popup_menu(items, glow)
+}
+
+/// Tests can't track a real menu, so this stands in for the loop and does to the
+/// app what AppKit does during one: run updates on the same stack. If the popup
+/// were still inside the update that opened it, that would panic with the app
+/// already borrowed.
+#[cfg(all(target_os = "macos", test))]
+fn run_popup(
+    items: &[macos_native::MenuItem],
+    glow: Option<macos_native::GlowRect>,
+    this: &gpui_kit::WeakEntity<Diffui>,
+    cx: &mut gpui_kit::AsyncApp,
+) -> Option<u32> {
+    let _ = this.update(cx, |this, cx| this.act(cx, |_, _| {}));
+    tests::SCRIPT.with_borrow_mut(|script| {
+        script.shown.push((
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    macos_native::MenuItem::Entry { label, .. }
+                    | macos_native::MenuItem::Submenu { label, .. } => Some(label.clone()),
+                    macos_native::MenuItem::Separator => None,
+                })
+                .collect(),
+            glow.is_some(),
+        ));
+        script.pick.take()
+    })
+}
+
+#[cfg(all(target_os = "macos", test))]
+pub(crate) mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::harness::{Harness, fixture_repo};
+
+    #[derive(Default)]
+    pub(crate) struct Script {
+        /// What each popup showed (top-level labels) and whether it glowed.
+        pub(crate) shown: Vec<(Vec<String>, bool)>,
+        /// What the user "picks" in the next one.
+        pub(crate) pick: Option<u32>,
+    }
+
+    thread_local! {
+        pub(crate) static SCRIPT: RefCell<Script> = RefCell::default();
+    }
+
+    fn rect() -> Rectangle {
+        Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 28.0))
+    }
+
+    /// The menu doesn't open inside the update that asks for it, survives app
+    /// updates while it's up, and a pick comes back through `act`: a command that
+    /// reads state set by the pick sees it, and the mode stack was reconciled.
+    #[test]
+    fn a_toolbar_menu_opens_outside_the_update_and_its_pick_comes_back() {
+        let mut h = Harness::open(Some(&fixture_repo()));
+        h.wait_for_graph();
+        SCRIPT.with_borrow_mut(|script| *script = Script::default());
+
+        let opened_inline = h.act(|ui, cx| {
+            ui.open_toolbar_menu(ToolbarMenu::RevsetPresets, rect(), cx);
+            SCRIPT.with_borrow(|script| !script.shown.is_empty())
+        });
+        assert!(!opened_inline, "the loop must not run inside the update");
+        h.settle();
+        let shown = SCRIPT.with_borrow(|script| script.shown.clone());
+        assert_eq!(shown.len(), 1, "dismissed: shown once");
+        assert!(!shown[0].1, "a dropdown has no row glow");
+        let before = h.read(|ui| ui.active().session.revset.clone());
+
+        // Dismissed changed nothing; a pick runs the preset's command.
+        let presets = h.read(|ui| ui.revset_menu_entries());
+        let target = presets
+            .iter()
+            .position(|(_, expr)| *expr != before)
+            .expect("a preset other than the current revset");
+        SCRIPT.with_borrow_mut(|script| script.pick = Some(target as u32));
+        h.act(|ui, cx| ui.open_toolbar_menu(ToolbarMenu::RevsetPresets, rect(), cx));
+        h.settle();
+        assert_eq!(
+            h.read(|ui| ui.active().session.revset.clone()),
+            presets[target].1
+        );
+    }
+
+    /// The revision menu takes the same path, with the row's glow.
+    #[test]
+    fn a_revision_menu_pops_with_its_glow() {
+        let mut h = Harness::open(Some(&fixture_repo()));
+        h.wait_for_graph();
+        SCRIPT.with_borrow_mut(|script| *script = Script::default());
+        h.act(|ui, cx| {
+            let repository = ui.active().repository.clone().expect("a repository");
+            ui.open_revision_context_menu(
+                repository,
+                RevisionSelection::WorkingCopy,
+                rect(),
+                Point::ORIGIN,
+                cx,
+            );
+        });
+        h.settle();
+        let shown = SCRIPT.with_borrow(|script| script.shown.clone());
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].1, "the row glows while its menu is up");
+        assert!(shown[0].0.iter().any(|label| label == "Rebase"));
     }
 }

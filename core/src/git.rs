@@ -3,7 +3,6 @@ use std::{
     ffi::OsString,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,11 +10,12 @@ use jj_lib::graph::GraphEdge;
 use tokio::process::Command;
 
 use crate::FetchTarget;
-use crate::diff_parse::parse_unified_diff;
+use crate::diff_parse::{DiffStreamParser, parse_unified_diff};
 use crate::graph::assign_lanes;
+use crate::jj::large_diff::{self, DiffLimits, RowBudget};
 use crate::model::{
-    CommitSummary, DiffDocument, ParentBrief, RevisionDetails, RevisionSelection, SignatureInfo,
-    StreamRow,
+    CommitSummary, DiffDocument, DiffFile, DiffHunkView, ParentBrief, RevisionDetails,
+    RevisionSelection, SignatureInfo, StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus};
@@ -32,9 +32,13 @@ pub const GIT_WORKING_COPY_ID: &str = "wc";
 /// the bottom of; the cut-off rows show their parents as stubs.
 pub const DEFAULT_LOG_LIMIT: usize = 10_000;
 
+/// `revision`'s diff, within the jj backend's size caps (see
+/// [`large_diff`]): a file past them keeps its counts but no rows, unless it
+/// is one of the `expand`ed paths.
 pub async fn load_git_diff(
     repository: &Repository,
     revision: &RevisionSelection,
+    expand: &[String],
 ) -> Result<(DiffDocument, Option<RevisionDetails>)> {
     let base = match revision {
         RevisionSelection::WorkingCopy => working_copy_base(&repository.root).await?,
@@ -42,9 +46,68 @@ pub async fn load_git_diff(
     };
     let args = git_backend_command(repository, revision, &base);
     let output = run_command(&repository.root, "git", args).await?;
-    let document = parse_unified_diff(&output);
+    let document = parse_capped(&output, DiffLimits::default(), expand);
     let details = load_git_revision_details(repository, revision).await.ok();
     Ok((document, details))
+}
+
+/// One file of `revision`'s diff in full, for a file [`load_git_diff`]
+/// collapsed. `None` when the diff no longer has it.
+pub async fn load_git_file_diff(
+    repository: &Repository,
+    revision: &RevisionSelection,
+    path: &str,
+) -> Result<Option<DiffFile>> {
+    let base = match revision {
+        RevisionSelection::WorkingCopy => working_copy_base(&repository.root).await?,
+        RevisionSelection::Commit(_) => String::new(),
+    };
+    let scoped = Repository {
+        scope: PathBuf::from(format!(":(literal){path}")),
+        ..repository.clone()
+    };
+    let args = git_backend_command(&scoped, revision, &base);
+    let output = run_command(&repository.root, "git", args).await?;
+    Ok(parse_unified_diff(&output)
+        .files
+        .into_iter()
+        .find(|file| file.path == path))
+}
+
+/// [`parse_unified_diff`], collapsing each file past `limits` as it completes
+/// so its rows never pile up.
+fn parse_capped(output: &str, limits: DiffLimits, expand: &[String]) -> DiffDocument {
+    let mut budget = RowBudget::new(limits);
+    let mut files = Vec::new();
+    let mut keep = |mut file: DiffFile| {
+        let changed = file.additions + file.deletions;
+        if changed > 0
+            && !expand.contains(&file.path)
+            && let Err(reason) = budget.admit(changed)
+        {
+            file.hunks = vec![DiffHunkView {
+                header: large_diff::collapsed_header(reason, changed),
+                lines: Vec::new(),
+            }];
+            file.collapsed = Some(reason);
+        }
+        files.push(file);
+    };
+    let mut parser = DiffStreamParser::default();
+    for line in output.lines() {
+        if let Some(file) = parser.push_line(line) {
+            keep(file);
+        }
+    }
+    if let Some(file) = parser.finish() {
+        keep(file);
+    }
+    DiffDocument {
+        total_additions: files.iter().map(|file| file.additions).sum(),
+        total_deletions: files.iter().map(|file| file.deletions).sum(),
+        files,
+        range: None,
+    }
 }
 
 pub async fn load_git_commits(
@@ -62,7 +125,7 @@ pub async fn load_git_commits(
     // worktree tips, including detached HEADs outside the current ancestry.
     let mut args = git_args(&["log", "--topo-order", "--no-color"]);
     args.push(OsString::from(
-        "--pretty=format:%h%x09%H%x09%P%x09%an%x09%x09%s",
+        "--pretty=format:%h%x09%H%x09%P%x09%at%x09%an%x09%x09%s",
     ));
     // `None` on an unborn branch (a repository with no commits yet), where
     // `git log HEAD` fails outright.
@@ -105,6 +168,7 @@ pub async fn load_git_commits(
                 commit_id: GIT_WORKING_COPY_ID.to_owned(),
                 parents: head.into_iter().collect(),
                 author: String::new(),
+                author_timestamp: None,
                 is_empty: None,
                 description: "Working copy".to_owned(),
                 has_description: true,
@@ -293,7 +357,8 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
     // change, re-diffed per save. The size and mtime of each path status
     // lists move on a save just the same, for a stat per dirty path.
     let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
-    for path in status_paths(&output) {
+    let paths = status_paths(&output);
+    for path in &paths {
         path.hash(&mut fingerprint);
         path_stamp(&repository_root.join(path)).hash(&mut fingerprint);
     }
@@ -303,6 +368,7 @@ pub async fn load_git_repository_snapshot(repository_root: &Path) -> Result<Repo
         working_copy_empty: None,
         // Git has no op log — the external-op escalation never applies.
         parent_fingerprint: None,
+        working_copy_dirty: Some(!paths.is_empty()),
         ..RepositorySnapshot::default()
     })
 }
@@ -468,9 +534,30 @@ pub async fn fetch_git(repository: &Repository, target: &FetchTarget) -> Result<
         ],
     };
     let askpass = crate::askpass::Scope::new();
-    run_command_lines(&repository.root, "git", args, askpass.environment())
+    let mut env = askpass.environment();
+    env.extend(stall_limit_env());
+    run_command_lines(&repository.root, "git", args, env)
         .await
         .map_err(|error| askpass.explain(error))
+}
+
+/// The longest a `git fetch` may run before it's killed. Generous, because a
+/// first fetch of a big repository is legitimately slow; a transfer that
+/// stalls is caught much sooner by [`stall_limit_env`].
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// git's own stall detection for HTTP remotes: abort a transfer that moves
+/// less than 1 KB/s for a minute (`http.lowSpeedLimit` / `lowSpeedTime`).
+/// Left alone when the environment already sets either. SSH remotes have no
+/// equivalent short of overriding the user's ssh command, so they rely on
+/// [`FETCH_TIMEOUT`] alone.
+pub(crate) fn stall_limit_env() -> Vec<(OsString, OsString)> {
+    const LIMIT: &str = "GIT_HTTP_LOW_SPEED_LIMIT";
+    const TIME: &str = "GIT_HTTP_LOW_SPEED_TIME";
+    if std::env::var_os(LIMIT).is_some() || std::env::var_os(TIME).is_some() {
+        return Vec::new();
+    }
+    vec![(LIMIT.into(), "1000".into()), (TIME.into(), "60".into())]
 }
 
 /// Run a command and return its combined stdout+stderr split into non-empty
@@ -483,14 +570,16 @@ async fn run_command_lines(
     args: Vec<OsString>,
     env: std::collections::HashMap<OsString, OsString>,
 ) -> Result<Vec<String>> {
-    let output = Command::new(program)
-        .args(args)
-        .envs(env)
-        .current_dir(current_dir)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {program}"))?;
+    let output = crate::process::run(
+        Command::new(program)
+            .args(args)
+            .envs(env)
+            .current_dir(current_dir),
+        Some(FETCH_TIMEOUT),
+        None,
+    )
+    .await
+    .with_context(|| format!("failed to execute {program}"))?;
 
     let mut lines = Vec::new();
     for chunk in [&output.stdout, &output.stderr] {
@@ -517,13 +606,13 @@ async fn run_command_bytes(
     program: &str,
     args: Vec<OsString>,
 ) -> Result<Vec<u8>> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(current_dir)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("failed to execute {program}"))?;
+    let output = crate::process::run(
+        Command::new(program).args(args).current_dir(current_dir),
+        None,
+        None,
+    )
+    .await
+    .with_context(|| format!("failed to execute {program}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -583,13 +672,14 @@ pub async fn read_git_file_pair(
         RevisionSelection::WorkingCopy => {
             // The new side is the working tree itself; the old side is what
             // the diff compared against (`git diff HEAD`).
-            let new = tokio::fs::read(repository.root.join(path))
-                .await
-                .ok()
-                .and_then(|bytes| {
-                    (bytes.len() <= MAX_SOURCE_BYTES)
-                        .then(|| String::from_utf8_lossy(&bytes).into_owned())
-                });
+            let new = crate::source_browse::read_disk_capped(
+                &repository.root.join(path),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             let old = git_show_file(&repository.root, &format!("HEAD:{old_path}"))
                 .await
                 .and_then(cap);
@@ -713,16 +803,7 @@ pub async fn read_git_source_file(
 ) -> Result<crate::source_browse::SourceFileData> {
     match revision {
         RevisionSelection::WorkingCopy => {
-            if Path::new(path)
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                bail!("invalid path {path}");
-            }
-            let bytes = tokio::fs::read(repository.root.join(path))
-                .await
-                .with_context(|| format!("failed to read {path}"))?;
-            Ok(crate::source_browse::classify_disk_bytes(bytes))
+            crate::source_browse::read_working_copy_file(&repository.root, path).await
         }
         RevisionSelection::Commit(id) => {
             let bytes = run_command_bytes(
@@ -830,6 +911,7 @@ struct ParsedCommitRow {
     commit_id: String,
     parents: Vec<String>,
     author: String,
+    author_timestamp: Option<i64>,
     is_empty: Option<bool>,
     description: String,
     has_description: bool,
@@ -840,10 +922,17 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
     output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(5, '\t');
+            let mut parts = line.splitn(6, '\t');
             let change_id = parts.next()?.trim();
             let commit_id = parts.next()?.trim();
             let parents_field = parts.next().unwrap_or("");
+            // `%at`: Unix seconds.
+            let author_timestamp = parts
+                .next()?
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|seconds| seconds * 1000);
             let author = parts.next()?.trim();
             let remainder = parts.next().unwrap_or("");
             let (empty, description) =
@@ -867,6 +956,7 @@ fn parse_commit_log_rows(output: &str) -> Vec<ParsedCommitRow> {
                 commit_id: commit_id.to_owned(),
                 parents,
                 author: author.to_owned(),
+                author_timestamp,
                 is_empty: empty,
                 description: if description.is_empty() {
                     "(no description set)".to_owned()
@@ -912,6 +1002,7 @@ fn build_commit_summaries(rows: Vec<ParsedCommitRow>) -> Vec<StreamRow> {
                 shortest_change_id_len: None,
                 description: row.description,
                 author: row.author,
+                author_timestamp: row.author_timestamp,
                 has_description: row.has_description,
                 is_empty: row.is_empty,
                 has_conflict: false,
@@ -1074,12 +1165,14 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows_basic() {
-        let commits = parse_commit_log("abc\tdef\t\tme@example.com\tfalse\tadd commit sidebar\n");
+        let commits =
+            parse_commit_log("abc\tdef\t\t1700000000\tme@example.com\tfalse\tadd commit sidebar\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].change_id, "abc");
         assert_eq!(commits[0].commit_id, "def");
         assert_eq!(commits[0].author, "me@example.com");
+        assert_eq!(commits[0].author_timestamp, Some(1_700_000_000_000));
         assert_eq!(commits[0].description, "add commit sidebar");
         assert!(commits[0].has_description);
         assert_eq!(commits[0].is_empty, Some(false));
@@ -1087,7 +1180,7 @@ mod tests {
 
     #[test]
     fn parses_commit_log_rows_without_description() {
-        let commits = parse_commit_log("abc\tdef\t\tme@example.com\ttrue\t\n");
+        let commits = parse_commit_log("abc\tdef\t\t1700000000\tme@example.com\ttrue\t\n");
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].description, "(no description set)");
@@ -1098,7 +1191,7 @@ mod tests {
     #[test]
     fn commit_log_rows_select_full_revision_id() {
         let commits = parse_commit_log(
-            "abc\tdef123456789abcdef\t\tme@example.com\tfalse\tadd commit sidebar\n",
+            "abc\tdef123456789abcdef\t\t1700000000\tme@example.com\tfalse\tadd commit sidebar\n",
         );
 
         assert_eq!(commits[0].change_id, "abc");
@@ -1113,10 +1206,10 @@ mod tests {
         //   W - parent: A
         //   A - root, no parents
         let graph = parse_commit_log_graph(
-            "M\tM\tT W\tme@example.com\tfalse\tmerge\n\
-             T\tT\tA\tme@example.com\tfalse\ttrunk\n\
-             W\tW\tA\tme@example.com\tfalse\tside\n\
-             A\tA\t\tme@example.com\tfalse\troot\n",
+            "M\tM\tT W\t1700000000\tme@example.com\tfalse\tmerge\n\
+             T\tT\tA\t1700000000\tme@example.com\tfalse\ttrunk\n\
+             W\tW\tA\t1700000000\tme@example.com\tfalse\tside\n\
+             A\tA\t\t1700000000\tme@example.com\tfalse\troot\n",
         );
 
         assert_eq!(graph.len(), 4);
@@ -1132,7 +1225,8 @@ mod tests {
     #[test]
     fn git_log_marks_unknown_parents_as_missing() {
         // Single commit whose parent isn't in the listing — e.g. a shallow clone.
-        let graph = parse_commit_log_graph("abc\tabc\tdeadbeef\tme@example.com\tfalse\thead\n");
+        let graph =
+            parse_commit_log_graph("abc\tabc\tdeadbeef\t1700000000\tme@example.com\tfalse\thead\n");
 
         assert_eq!(graph.len(), 1);
         assert_eq!(graph.frame(0, usize::MAX).missing_parents, 1);

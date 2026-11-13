@@ -5,21 +5,23 @@
 //! format diffui writes. Its output streams into the tab's [`CliRun`] and the
 //! panel follows it live; the run's activity row reopens the panel later.
 
+use crate::cmdline::CmdAction;
+use crate::theme::{self, text_size};
+use crate::{Action, Cx, icons, input, typography, ui};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, ClickEvent, Window, div, px};
 use std::time::Instant;
 
+use diffui_core::JobId;
 use diffui_core::cli::tokenize::shell_quote;
 use diffui_core::cli::{CliInvocation, CliLine, CliStream};
-use diffui_core::{JobId, RepoError};
-use iced::advanced::text::Wrapping;
-use iced::widget::{Space, column, container, row, text};
-use iced::{Background, Border, Element, Length, Padding, Task};
 
 use crate::activity::{ActivityId, ActivityStatus};
-use crate::cmdline::CmdAction;
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, text_size};
-use crate::{Action, Diffui, Message, TabId, UiEvent, ui};
+use crate::ui::Look;
+use crate::{Diffui, TabId};
 
 /// Lines a run keeps; older ones fall off the front.
 const MAX_LINES: usize = 5_000;
@@ -102,15 +104,15 @@ pub(crate) struct OutputView {
 impl Diffui {
     /// Run `args` through the jj CLI in the active tab's workspace, and show
     /// the output as it comes.
-    pub(crate) fn start_cli_run(&mut self, args: Vec<String>) -> Task<Message> {
+    pub(crate) fn start_cli_run(&mut self, args: Vec<String>) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
         let program = match std::env::current_exe() {
             Ok(program) => program,
             Err(error) => {
                 self.push_error_toast("Can't run jj", &error.to_string());
-                return Task::none();
+                return;
             }
         };
         let command = std::iter::once("jj".to_owned())
@@ -137,7 +139,7 @@ impl Diffui {
             })
             .unwrap_or_default();
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let job = state.session.next_job();
         let invocation = CliInvocation {
@@ -146,9 +148,9 @@ impl Diffui {
             env,
         };
         let Some(handle) = state.handle.clone() else {
-            return Task::none();
+            return;
         };
-        state.jobs.cli.insert(job, activity);
+        state.jobs.issue(job, crate::Pending::Cli(activity));
         let runs = &mut state.cmdline.runs;
         if runs.len() >= MAX_RUNS
             && let Some(oldest) = runs.iter().position(|run| run.exit.is_some())
@@ -167,7 +169,6 @@ impl Diffui {
         });
         handle.send(diffui_core::Command::RunCli { job, invocation });
         self.open_cli_output(tab, activity);
-        Task::none()
     }
 
     pub(crate) fn open_cli_output(&mut self, tab: TabId, activity: ActivityId) {
@@ -210,15 +211,18 @@ impl Diffui {
     }
 
     /// The run ended: settle its row and its panel.
-    pub(crate) fn finish_cli_run(&mut self, tab: TabId, job: JobId, exit: Exit) -> Task<Message> {
+    pub(crate) fn finish_cli_run(
+        &mut self,
+        tab: TabId,
+        job: JobId,
+        activity: ActivityId,
+        exit: Exit,
+    ) {
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        let Some(activity) = state.jobs.cli.remove(&job) else {
-            return Task::none();
+            return;
         };
         let Some(run) = state.cmdline.runs.iter_mut().find(|run| run.job == job) else {
-            return Task::none();
+            return;
         };
         // A prompt the user declined reads as that, not as git's failure.
         let declined = run.scope.as_ref().is_some_and(|scope| scope.0.cancelled());
@@ -251,37 +255,26 @@ impl Diffui {
         });
         run.exit = Some(exit);
         state.activities.finish(activity, status, summary);
-        Task::none()
     }
 
-    pub(crate) fn fail_cli_run(
-        &mut self,
-        tab: TabId,
-        job: JobId,
-        error: RepoError,
-    ) -> Task<Message> {
-        self.finish_cli_run(tab, job, Exit::Failed(error.to_string()))
-    }
-
-    pub(crate) fn on_output_action(&mut self, action: OutputAction) -> Task<Message> {
+    pub(crate) fn on_output_action(&mut self, action: OutputAction, cx: &mut Cx) {
         match action {
             OutputAction::Open(activity) => {
                 if let Some(tab) = self.active_tab_id() {
                     self.open_cli_output(tab, activity);
                 }
-                Task::none()
             }
             OutputAction::Close => {
                 self.pop_mode(ModeKind::CliOutput);
-                Task::none()
             }
-            OutputAction::Copy => match self.shown_cli_run() {
-                Some(run) => iced::clipboard::write(run.transcript()).discard(),
-                None => Task::none(),
-            },
+            OutputAction::Copy => {
+                if let Some(run) = self.shown_cli_run() {
+                    crate::write_clipboard(run.transcript(), cx)
+                }
+            }
             OutputAction::Stop => {
                 let Some(&Mode::CliOutput(view)) = self.mode(ModeKind::CliOutput) else {
-                    return Task::none();
+                    return;
                 };
                 let job = self
                     .shown_cli_run()
@@ -293,113 +286,49 @@ impl Diffui {
                 {
                     handle.send(diffui_core::Command::Cancel { job });
                 }
-                Task::none()
             }
         }
     }
 }
 
-/// The output panel: the command, its output (stderr set apart), how it
-/// ended, and Copy.
-pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Message> {
+/// Wide enough for a `jj log` line without wrapping most of them.
+const OUTPUT_WIDTH: f32 = 680.0;
+
+/// The output panel: the command, its output (stderr set apart), how it ended,
+/// and Copy. The output is one read-only editor, so a drag selects across lines
+/// and ⌘C copies the sweep; with nothing selected ⌘C copies all of it.
+pub(crate) fn build_overlay(
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
     let Some(run) = ui.shown_cli_run() else {
-        return Space::new().into();
+        return div().into_any_element();
     };
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let send = |action| Message::Action(Action::CommandLine(CmdAction::Output(action)));
+    let font = look.font;
 
-    let title = row![
-        container(ui::dialog_title(
-            &Prose::new().code(run.command()),
-            font,
-            mono,
-            theme
-        ))
-        .width(Length::Fill),
-        ui::close_button(theme.muted_text, theme).on_press(send(OutputAction::Close)),
-    ]
-    .align_y(iced::alignment::Vertical::Center)
-    .spacing(theme::space::SM);
-
-    let mut lines = column![].spacing(1);
-    if run.dropped > 0 {
-        lines = lines.push(
-            text(format!("\u{2026} {} earlier lines", run.dropped))
-                .size(text_size::UI)
-                .font(mono)
-                .color(theme.subtle_text),
-        );
-    }
-    for line in &run.lines {
-        let color = match line.stream {
-            CliStream::Stdout => theme.text,
-            CliStream::Stderr => theme.muted_text,
-        };
-        let shown = if line.text.is_empty() {
-            " "
-        } else {
-            &line.text
-        };
-        let body = text(shown.to_owned())
-            .size(text_size::UI)
-            .font(mono)
-            .color(color)
-            .wrapping(Wrapping::WordOrGlyph);
-        // stderr carries a rule in the gutter, so the two streams read apart
-        // even where jj's informational stderr looks like output.
-        let marker = container(Space::new())
-            .width(Length::Fixed(2.0))
-            .height(Length::Fill)
-            .style(move |_| {
-                container::Style::default().background(match line.stream {
-                    CliStream::Stdout => iced::Color::TRANSPARENT,
-                    CliStream::Stderr => theme::mix(theme.border, theme.muted_text, 0.3),
-                })
-            });
-        lines = lines.push(
-            row![marker, container(body).width(Length::Fill)]
-                .spacing(theme::space::SM)
-                .height(Length::Shrink),
-        );
-    }
-    if run.lines.is_empty() && run.dropped == 0 {
-        lines = lines.push(
-            text(if run.exit.is_none() {
-                "Waiting for output\u{2026}"
-            } else {
-                "No output"
-            })
-            .size(text_size::UI)
-            .font(font)
-            .color(theme.subtle_text),
-        );
-    }
-    let output = container(
-        ui::scrollable(
-            container(lines).padding(Padding {
-                top: theme::space::SM,
-                right: crate::scrollbar::GUTTER,
-                bottom: theme::space::SM,
-                left: theme::space::SM,
-            }),
-            theme,
-        )
-        .anchor_bottom()
-        .width(Length::Fill)
-        .height(Length::Shrink),
-    )
-    .width(Length::Fill)
-    .height(Length::Fit.max(360.0))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(theme.panel_background)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: theme::radius::CONTROL.into(),
-        },
-        ..container::Style::default()
-    });
+    let content = if run.lines.is_empty() && run.dropped == 0 {
+        div()
+            .p(px(theme::space::SM))
+            .child(typography::line(
+                if run.exit.is_none() {
+                    "Waiting for output\u{2026}"
+                } else {
+                    "No output"
+                },
+                font,
+                text_size::BODY,
+                theme.subtle_text,
+            ))
+            .into_any_element()
+    } else {
+        output_text(run, look, window, cx)
+    };
+    let output = crate::field::field_well(false, theme)
+        .overflow_hidden()
+        .child(content);
 
     let (status, status_color) = match &run.exit {
         None => (
@@ -412,62 +341,120 @@ pub(crate) fn build_overlay(ui: &Diffui, theme: ThemeSpec) -> Element<'_, Messag
         Some(Exit::Cancelled) => ("Cancelled".to_owned(), theme.muted_text),
         Some(Exit::Failed(error)) => (format!("Didn't run: {error}"), theme.removed_text),
     };
-    let leading = text(status)
-        .size(text_size::UI)
-        .font(font)
-        .color(status_color)
-        .into();
-    let mut buttons: Vec<Element<'_, Message>> = vec![
-        ui::text_button(
-            Some((crate::icons::COPY, theme.muted_text)),
-            "Copy",
-            ui::Variant::Raised,
-            ui::Size::Standard,
-            font,
-            theme,
-        )
-        .on_press(send(OutputAction::Copy))
-        .into(),
+    let status = typography::centered(
+        typography::line(status, font, text_size::CAPTION, status_color),
+        font,
+        text_size::CAPTION,
+    );
+    let mut buttons: Vec<AnyElement> = vec![
+        look.button("cli-output-copy", "Copy")
+            .icon(icons::COPY, theme.muted_text)
+            .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
+            .into_any_element(),
     ];
     if run.exit.is_none() {
         buttons.push(
-            ui::text_button(
-                None,
-                "Stop",
-                ui::Variant::Raised,
-                ui::Size::Standard,
-                font,
-                theme,
-            )
-            .on_press(send(OutputAction::Stop))
-            .into(),
+            look.button("cli-output-stop", "Stop")
+                .on_click(send::<ClickEvent>(OutputAction::Stop, cx))
+                .into_any_element(),
         );
     } else {
         buttons.push(
-            ui::text_button(
-                None,
-                "Close",
-                ui::Variant::Primary,
-                ui::Size::Standard,
-                font,
-                theme,
-            )
-            .on_press(send(OutputAction::Close))
-            .into(),
+            look.button("cli-output-done", "Close")
+                .on_click(send::<ClickEvent>(OutputAction::Close, cx))
+                .into_any_element(),
         );
     }
-    let card = ui::dialog_card(
-        column![title, output, ui::button_row(Some(leading), buttons)].spacing(ui::DIALOG_SPACING),
-        OUTPUT_WIDTH,
-        theme,
-    );
+    let card = crate::overlay_kit::Dialog::new(&Prose::new().code(run.command()), look)
+        .width(OUTPUT_WIDTH)
+        .child(output)
+        .bound_hint(
+            ui,
+            crate::commands::Context::Output,
+            &["output.copy"],
+            "Copy",
+        )
+        .bound_hint(
+            ui,
+            crate::commands::Context::Output,
+            &["output.close"],
+            "Close",
+        )
+        .note(status)
+        .buttons(buttons)
+        .build();
+    let dismiss = send::<()>(OutputAction::Close, cx);
     ui::modal(
+        "cli-output-modal",
         card,
         crate::toolbar::modal_top(),
-        send(OutputAction::Close),
-        Message::Ui(UiEvent::ConfirmNoOp),
+        move |window, cx| dismiss(&(), window, cx),
     )
+    .into_any_element()
 }
 
-/// Wide enough for a `jj log` line without wrapping most of them.
-const OUTPUT_WIDTH: f32 = 680.0;
+fn send<E: 'static>(
+    action: OutputAction,
+    cx: &mut Cx,
+) -> impl Fn(&E, &mut Window, &mut gpui_kit::App) + 'static {
+    Diffui::on_action(Action::CommandLine(CmdAction::Output(action)), cx)
+}
+
+/// The lines as one text, each stream in its colour. stderr carries a rule in the
+/// gutter, so the two streams read apart even where jj's informational stderr
+/// looks like output.
+fn output_text(run: &CliRun, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, mono, .. } = look;
+    let mut text = String::new();
+    let mut colors = Vec::new();
+    let mut marks = Vec::new();
+    if run.dropped > 0 {
+        let line = format!("\u{2026} {} earlier lines", run.dropped);
+        colors.push((0..line.len(), theme.subtle_text));
+        text.push_str(&line);
+    }
+    let rule = theme::mix(theme.border, theme.muted_text, 0.3);
+    for line in &run.lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let range = text.len()..text.len() + line.text.len();
+        text.push_str(&line.text);
+        match line.stream {
+            CliStream::Stdout => colors.push((range, theme.text)),
+            CliStream::Stderr => {
+                colors.push((range.clone(), theme.muted_text));
+                marks.push((range, rule));
+            }
+        }
+    }
+    let inner =
+        OUTPUT_WIDTH - 2.0 * crate::overlay_kit::DIALOG_PAD - 2.0 - OUTPUT_INSET * 2.0 - RULE_ROOM;
+    let line_height = (text_size::BODY * typography::DEFAULT_LINE_HEIGHT).ceil();
+    let lines =
+        crate::measure::wrapped_line_count(&text, text_size::BODY, mono, line_height, inner);
+    let height = (lines as f32 * line_height + 2.0 * OUTPUT_INSET).min(OUTPUT_MAX_HEIGHT);
+    let look = input::StyledLook {
+        wrap: true,
+        follow: true,
+        mark_width: Some(RULE_WIDTH),
+        colors,
+        marks,
+        ..Default::default()
+    };
+    let spec = input::FieldSpec::new(OUTPUT_TEXT_ID, &text);
+    input::styled_text(spec, look, mono, text_size::BODY, window, cx)
+        .with_size(gpui_kit::component::Size::XSmall)
+        .line_height(px(line_height))
+        .h(px(height))
+        .py(px(OUTPUT_INSET))
+        .into_any_element()
+}
+
+const OUTPUT_TEXT_ID: &str = "cli-output-text";
+/// The panel grows with its output up to here, then scrolls.
+const OUTPUT_MAX_HEIGHT: f32 = 360.0;
+const OUTPUT_INSET: f32 = theme::space::SM;
+const RULE_WIDTH: f32 = 2.0;
+/// What the rule's strip takes from the text's width.
+const RULE_ROOM: f32 = 16.0;

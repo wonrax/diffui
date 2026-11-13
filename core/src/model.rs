@@ -1,5 +1,5 @@
 //! Domain data model for diffui: the diff document, the compact commit store,
-//! and the per-revision metadata the loaders produce. Pure data — no `iced`.
+//! and the per-revision metadata the loaders produce. Pure data, no UI.
 
 use std::{
     cell::RefCell,
@@ -235,6 +235,9 @@ pub struct DiffFile {
     /// preview caps, its bytes (see [`crate::media`]). Boxed: text files are
     /// the common case and carry none of it.
     pub blob: Option<Box<BlobChange>>,
+    /// The file's git mode before and after (`0o100644` to `0o100755`), when
+    /// it changed and the file exists on both sides.
+    pub mode_change: Option<(u32, u32)>,
 }
 
 /// The two sides of a file whose diff isn't (only) text.
@@ -299,6 +302,10 @@ pub struct CommitSummary {
     pub shortest_change_id_len: Option<usize>,
     pub description: String,
     pub author: String,
+    /// When the author made the commit, in milliseconds since the epoch.
+    /// `None` when the backend doesn't say (git's synthesized working copy,
+    /// the PR "All changes" row).
+    pub author_timestamp: Option<i64>,
     pub has_description: bool,
     pub is_empty: Option<bool>,
     /// Whether the commit's tree is in a conflicted state (jj only — git
@@ -382,6 +389,8 @@ pub struct CommitStore {
     spans: Vec<CommitSpans>,
     authors: Vec<Arc<str>>,
     author_idx: Vec<u32>,
+    /// Author timestamps in epoch millis; [`NO_TIMESTAMP`] when unknown.
+    author_millis: Vec<i64>,
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u16>,
     bookmarks: HashMap<usize, Vec<String>>,
@@ -413,6 +422,10 @@ pub struct CommitStore {
 /// after a load scanning.
 const INDEX_IDLE: Duration = Duration::from_millis(250);
 
+/// [`CommitStore::author_millis`]'s "no timestamp", so the column stays a
+/// plain `i64` per row rather than an `Option` twice the size.
+const NO_TIMESTAMP: i64 = i64::MIN;
+
 /// Row indices sorted by the id they carry, so `find_by_change_id` /
 /// `find_by_commit_id` binary-search rather than scan the whole store — the
 /// palette does one change-id lookup per displayed row per `view`, and the
@@ -426,8 +439,8 @@ const INDEX_IDLE: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Default)]
 struct IdOrder {
     /// Row count the lanes were built at; any other length means they're stale.
-    /// Only `push` changes it, and the one id that changes in place
-    /// ([`CommitStore::set_commit_id`]) clears it.
+    /// Only `push` changes it; the one id that changes in place
+    /// ([`CommitStore::set_commit_id`]) moves its row within the lane.
     built_at: Option<usize>,
     by_change_id: Vec<u32>,
     by_commit_id: Vec<u32>,
@@ -548,6 +561,14 @@ impl CommitStore {
         self.working_copy_row.map(|index| self.row(index))
     }
 
+    /// The row `selection` names, if it's in the loaded graph.
+    pub fn find(&self, selection: &RevisionSelection) -> Option<RowView<'_>> {
+        match selection {
+            RevisionSelection::WorkingCopy => self.working_copy(),
+            RevisionSelection::Commit(hex) => self.find_by_commit_id(hex),
+        }
+    }
+
     /// Row index of the working-copy (`@`) commit, if it's in the loaded graph.
     /// Used to refresh @'s "empty" chip from a working-copy snapshot without
     /// re-walking the graph.
@@ -609,13 +630,37 @@ impl CommitStore {
     /// without touching anything else in the graph, so patching the one row is
     /// all a re-walk would have changed. The old text stays in the arena (a few
     /// dozen bytes per save, gone at the next reload).
+    ///
+    /// The commit-id lane of [`IdOrder`] is patched in place rather than
+    /// dropped: this runs on every watcher snapshot, and a dropped order costs
+    /// the next lookup a sort of both lanes over the whole store.
     pub fn set_commit_id(&mut self, index: usize, commit_id: &str) {
         if index >= self.len() || self.row(index).commit_id() == commit_id {
             return;
         }
+        let mut order = std::mem::take(self.id_order.get_mut());
+        let built = order.built_at == Some(self.len());
+        if built {
+            let old = self.row(index).commit_id();
+            let start = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < old);
+            if let Some(offset) = order.by_commit_id[start..]
+                .iter()
+                .position(|&row| row as usize == index)
+            {
+                order.by_commit_id.remove(start + offset);
+            }
+        }
         let span = self.intern_text(commit_id);
         self.spans[index].commit_id = span;
-        self.id_order.get_mut().built_at = None;
+        if built {
+            let at = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < commit_id);
+            order.by_commit_id.insert(at, index as u32);
+        }
+        *self.id_order.get_mut() = order;
     }
 
     /// Set a row's empty status, used to fill in the merge/root commits left
@@ -661,6 +706,8 @@ impl CommitStore {
 
         let author = intern_author(&mut self.authors, author_interner, &commit.author);
         self.author_idx.push(author);
+        self.author_millis
+            .push(commit.author_timestamp.unwrap_or(NO_TIMESTAMP));
 
         self.shortest_change_id_len
             .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
@@ -745,6 +792,7 @@ impl CommitStore {
         total += self.authors.capacity() * size_of::<Arc<str>>();
         total += self.authors.iter().map(|name| name.len()).sum::<usize>();
         total += self.author_idx.capacity() * size_of::<u32>();
+        total += self.author_millis.capacity() * size_of::<i64>();
         total += self.shortest_change_id_len.capacity() * size_of::<u32>();
         total += self.flags.capacity() * size_of::<u16>();
         for names in self.bookmarks.values() {
@@ -787,6 +835,15 @@ impl<'a> RowView<'a> {
 
     pub fn author(&self) -> &'a str {
         &self.store.authors[self.store.author_idx[self.index] as usize]
+    }
+
+    /// When the author made the commit, in epoch millis (see
+    /// [`CommitSummary::author_timestamp`]).
+    pub fn author_timestamp(&self) -> Option<i64> {
+        match self.store.author_millis[self.index] {
+            NO_TIMESTAMP => None,
+            millis => Some(millis),
+        }
     }
 
     pub fn shortest_change_id_len(&self) -> Option<usize> {
@@ -875,6 +932,7 @@ impl CommitStoreBuilder {
         let mut store = CommitStore::default();
         store.spans.reserve(commits);
         store.author_idx.reserve(commits);
+        store.author_millis.reserve(commits);
         store.shortest_change_id_len.reserve(commits);
         store.flags.reserve(commits);
         Self {
@@ -1113,6 +1171,18 @@ pub struct BookmarksInfo {
     /// `trunk()`'s commit id (hex), unless it falls back to the root commit
     /// because no trunk bookmark exists. jj only.
     pub trunk: Option<String>,
+    /// What a plain `jj git push` to [`Self::default_push_remote`] would send,
+    /// bookmarks then tags, by name. jj only; empty when nothing would go.
+    pub tracked_push: Vec<PushCandidate>,
+}
+
+/// A bookmark or tag a plain push would send, and how many commits its local
+/// target is ahead of the remote's copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushCandidate {
+    pub name: String,
+    pub tag: bool,
+    pub ahead: usize,
 }
 
 impl BookmarksInfo {
@@ -1283,6 +1353,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         }
     }
 
@@ -1294,6 +1365,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -1338,6 +1410,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -1386,6 +1459,38 @@ mod tests {
         assert!(store.find_by_change_id("bc").is_none());
         assert!(store.find_by_commit_id("a0x").is_none());
         assert!(CommitStore::default().find_by_change_id("ac").is_none());
+    }
+
+    #[test]
+    fn a_rewritten_commit_id_moves_within_the_built_order() {
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        for (change_id, commit_id) in [("zc", "z0"), ("ac", "a0"), ("mc", "m0")] {
+            store.push(ids(change_id, commit_id), &mut interner);
+        }
+        store.id_order.get_mut().last_push = None;
+        assert!(store.find_by_commit_id("a0").is_some());
+
+        // A watcher snapshot gives `@` (row 1) a new id, sorting last now.
+        store.set_commit_id(1, "zz");
+        assert_eq!(
+            store.id_order.borrow().built_at,
+            Some(3),
+            "the order survives the patch"
+        );
+        assert!(store.find_by_commit_id("a0").is_none());
+        assert_eq!(
+            store.find_by_commit_id("zz").map(|row| row.change_id()),
+            Some("ac")
+        );
+        assert_eq!(
+            store.find_by_commit_id("m0").map(|row| row.change_id()),
+            Some("mc")
+        );
+        assert_eq!(
+            store.find_by_change_id("ac").map(|row| row.commit_id()),
+            Some("zz")
+        );
     }
 
     #[test]

@@ -1,43 +1,55 @@
-//! Virtualized sidebar list rendering revisions with their graph gutter.
+//! Virtualized list rendering revisions with their graph gutter, and the file
+//! trees that share its row language.
 //!
-//! Two reasons it's a single widget rather than a `column!` of buttons:
-//!   - Only on-screen rows pay layout / draw cost.
+//! Three reasons it's a custom element in its own entity rather than a column
+//! of divs:
+//!   - Only on-screen rows pay layout and paint cost. A row's view is built on
+//!     demand from the caller's closures, so a million-commit graph holds no
+//!     per-row state here.
 //!   - Revisions and the file rows under the selected revision live in the
-//!     same widget, so the graph gutter can run continuously through them.
+//!     same list, so the graph gutter can run continuously through them.
+//!   - Scrolling and hovering repaint this list without going through the
+//!     app's reconcile.
 //!
-//! The widget owns its scroll offset in tree state. Click on a row fires
-//! the `on_select_revision` / `on_select_file` callbacks the caller
-//! supplied. Visual styling (id chip colours, description colour, file
-//! status background) is computed by the caller and passed in per row, so
-//! this module stays decoupled from the rest of the app's theming logic.
+//! The entity owns its scroll offset and pointer state. The parent builds a
+//! [`RevisionListProps`] on every render and hands it to [`view`]. Visual
+//! styling (id chip colours, description colour, file status background) is
+//! computed by the caller and passed in per row, so this module stays decoupled
+//! from the rest of the app's theming logic.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
+use diffui_core::graph::LaneFrame;
 use diffui_core::graph_layout::GraphEdgeType;
-use iced::advanced::{
-    Layout, Shell, Widget, layout, mouse, overlay, renderer,
-    text::{self, Text},
-    widget::{Tree, tree},
-};
-use iced::{
-    Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Radians, Rectangle,
-    Shadow, Size, Theme, Vector, alignment, gradient,
+use gpui_kit::{
+    AnyElement, App, AvailableSpace, BorderStyle, Bounds, Context, CursorStyle, DispatchPhase,
+    Element, ElementId, Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollEvent, Style, Subscription, TextAlign, Window, div, fill,
+    linear_color_stop, linear_gradient, point, prelude::*, px, quad, relative, size,
 };
 
 use crate::chip::{self, Chip};
+use crate::ellipsis;
+use crate::geometry::{Point, Rectangle};
 use crate::graph_view::{
-    LANE_WIDTH, RevisionGraphStyle, draw_continuation_row, draw_revision_row, lane_strip_width,
+    self, GraphFrame, LaneGeometry, NodeKind, RevisionGraphStyle, lane_strip_width,
 };
 use crate::icons;
-use crate::measure::{self, LINE_HEIGHT_MULTIPLIER};
-use crate::scrollbar::{self, ScrollbarState, ScrollbarStyle};
-use crate::theme::chip_background;
-use crate::typography::TextBox;
+use crate::measure::LINE_HEIGHT_MULTIPLIER;
+use crate::scroll_resample::{self, Resampler};
+use crate::scrollbar;
+use crate::status_badge::{self, StatusBadge};
+use crate::theme::{Color, Font, Weight, chip_background, emphasis_font};
+use crate::typography::{self, TextBox};
 use crate::width_memo::WidthMemo;
-use diffui_core::graph::LaneFrame;
+use gpui_kit::component::scroll::ScrollableElement as _;
 
-pub const REVISION_ROW_HEIGHT: f32 = 46.0;
-pub const FILE_ROW_HEIGHT: f32 = 26.0;
+pub const REVISION_ROW_HEIGHT: f32 = crate::theme::list::height::REVISION;
+pub const FILE_ROW_HEIGHT: f32 = crate::theme::list::height::FILE;
 /// Selection/hover chrome is an inset rounded card, not an edge-to-edge
 /// band: rows separate by whitespace, and the card gives the active row a
 /// modern object-like read. Y-inset keeps consecutive cards from fusing
@@ -46,44 +58,74 @@ pub const FILE_ROW_HEIGHT: f32 = 26.0;
 /// spacing between rows.
 pub const ROW_CARD_INSET_X: f32 = 2.0 * ROW_CARD_INSET_Y;
 pub const ROW_CARD_INSET_Y: f32 = 1.0;
-/// Corner radius of a row's card — and of the highlight a context menu puts
-/// over it, which must sit exactly on the card.
-pub const ROW_CARD_RADIUS: f32 = crate::theme::radius::PUSH;
-/// Horizontal indent per tree depth level for file/directory rows.
-pub const FILE_TREE_INDENT: f32 = 14.0;
-/// Width of the collapse-chevron column in file/directory rows (empty for
-/// files). Indent guides center under it.
-const FILE_CHEVRON_COL: f32 = 14.0;
-/// Width of the file/folder icon column that follows the chevron column.
-const FILE_ICON_COL: f32 = 18.0;
-/// Glyph size of the file/folder icon.
-const FILE_ICON_SIZE: f32 = 12.0;
+/// Corner radius of a revision row's card. A context menu's highlight over a
+/// row takes [`crate::theme::list::radius`] of the row's height, which is this.
+const ROW_CARD_RADIUS: f32 = crate::theme::list::radius(REVISION_ROW_HEIGHT);
+/// The same for a file row's shorter card.
+const FILE_ROW_CARD_RADIUS: f32 = crate::theme::list::radius(FILE_ROW_HEIGHT);
+/// The column a directory's chevron and a file's status badge share, and the
+/// gap after it and before the pick box.
+const FILE_MARK_COL: f32 = crate::status_badge::SIZE;
+const FILE_MARK_GAP: f32 = 5.0;
+/// A file tree's indent per level: a child's chevron or badge starts where
+/// its parent's name does.
+pub const FILE_TREE_INDENT: f32 = FILE_MARK_COL + FILE_MARK_GAP;
+/// The pick box's column at the right edge.
+const FILE_CHECK_COL: f32 = 14.0;
+/// The gap between the two stat counts.
+const FILE_STAT_GAP: f32 = 4.0;
+/// The label standing in for counts ("binary").
+const FILE_TAG_SIZE: f32 = 10.5;
 const FILE_NAME_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
+
 pub const GUTTER_LEFT_PADDING: f32 = 8.0;
 pub const GUTTER_PADDING: f32 = 8.0;
-/// Right inset of row content: the scrollbar's gutter, so text stays clear
-/// of the bar the row cards run under.
-pub const CONTENT_PADDING: f32 = crate::scrollbar::GUTTER;
 pub const SMALL_TEXT_SIZE: f32 = crate::theme::text_size::BODY_LG;
 pub const CAPTION_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
 /// Gap between a revision row's description and its id line.
-pub const ROW_LINE_GAP: f32 = 4.0;
+pub const ROW_LINE_GAP: f32 = 7.0;
+/// The commit's age, right-aligned on a revision row's title line.
+pub const AGE_TEXT_SIZE: f32 = 11.5;
+/// The working-copy label on its row's id line: the list's one solid chip.
+const WORKING_COPY_LABEL: &str = "Working copy";
+const WORKING_COPY_TEXT_SIZE: f32 = crate::theme::text_size::CAPTION;
+/// The label's inset on either side of its text: a chip's.
+const WORKING_COPY_PAD_X: f32 = chip::PAD_X;
 /// Text size for the collapse/expand chevron on the selected revision row. The
-/// old `▾` triangle needed an oversize bump to stay legible (it shrank to ~5px
-/// of actual ink); the Lucide glyph fills its box, so a near-text size reads
-/// clearly as a chevron without dominating the row.
+/// Lucide glyph fills its box, so a near-text size reads clearly as a chevron
+/// without dominating the row.
 const CHEVRON_TEXT_SIZE: f32 = 15.0;
+
 pub const FILE_ROW_GAP: f32 = 6.0;
-pub const FILE_ROW_RIGHT_PAD: f32 = crate::scrollbar::GUTTER;
-const TOOLTIP_RADIUS: f32 = crate::theme::radius::SURFACE;
-// Wider horizontally than vertically: the SURFACE radius eats into the
-// card's left/right ends, so the text needs extra x inset to read centered.
-const TOOLTIP_PADDING_X: f32 = 9.0;
-const TOOLTIP_PADDING_Y: f32 = 6.0;
-const TOOLTIP_GAP: f32 = 8.0;
 /// How much of a ghost row's text shows through (see
 /// [`RevisionRowView::ghost`]).
 const GHOST_TEXT_ALPHA: f32 = 0.4;
+/// How far a press must travel before it becomes a drag.
+const DRAG_THRESHOLD: f32 = 6.0;
+/// How close to a boundary between two revision rows a drag reads as the gap
+/// between them.
+const GAP_ZONE: f64 = 7.0;
+
+/// The first lane's centre, from the list's left edge: far enough in for the
+/// working copy's halo to clear the row card's edge.
+const FIRST_LANE_X: f32 = 16.0;
+/// From the last lane's centre to where row text starts.
+const GUTTER_TRAIL: f32 = 14.0;
+/// Distance between neighbouring lanes of a revision graph.
+const LANE_SPACING: f32 = 13.0;
+/// Where a revision list's lanes sit.
+const REVISION_LANES: LaneGeometry = LaneGeometry {
+    first: FIRST_LANE_X,
+    spacing: LANE_SPACING,
+};
+/// The working-copy pin shown while its row is scrolled away.
+const PIN_HEIGHT: f32 = 28.0;
+const PIN_TEXT_SIZE: f32 = crate::theme::text_size::BODY;
+const PIN_PAD_LEFT: f32 = 12.0;
+const PIN_PAD_RIGHT: f32 = 10.0;
+const PIN_GAP: f32 = 8.0;
+const PIN_ICON_SIZE: f32 = 12.0;
+const PIN_MARGIN: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RevisionListStyle {
@@ -101,13 +143,56 @@ pub struct RevisionListStyle {
     pub muted_text: Color,
     pub subtle_text: Color,
     pub accent_text: Color,
+    /// A change id's shortest unique prefix, as jj prints it.
+    pub change_id: Color,
+    /// Text on an accent fill: the working-copy label.
+    pub accent_foreground: Color,
     pub primary_font: Font,
     pub mono_font: Font,
-    pub file_badge_width: f32,
-    pub tooltip_background: Color,
-    pub tooltip_text: Color,
-    pub tooltip_border: Color,
-    pub scrollbar: ScrollbarStyle,
+    /// The palette of what floats over the list: the hover tooltip and the
+    /// drag chip.
+    pub floating: crate::theme::ThemeSpec,
+}
+
+/// Key the widget reports back so the parent can map it to its own
+/// selection enum without leaking app types into this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowSelectionKey {
+    WorkingCopy,
+    Commit(String),
+}
+
+/// Where a revision drag would land, in commit-store indices. Reported to
+/// the app on hover changes and on drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropSpot {
+    /// Onto this revision (drop lands as its child).
+    OnRow(usize),
+    /// Into the gap between two adjacent revision rows: `above` is the newer
+    /// (child-side) row, `below` the older (parent-side) one — the moved
+    /// commits slot exactly between them.
+    Gap { above: usize, below: usize },
+}
+
+/// Target-mode decoration for a revision row, computed by the caller from
+/// the active draft (keyboard candidate + placement). The widget draws it;
+/// live *drag* indicators are widget-internal instead (they follow the
+/// cursor, not app state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftMarker {
+    /// The destination ring: the moved commits become children of this row
+    /// (rebase onto / squash into).
+    Ring,
+    /// Insert-after: the moved commits land just above this row.
+    LineAbove,
+    /// Insert-before: the moved commits land just below this row.
+    LineBelow,
+}
+
+#[derive(Debug, Clone)]
+pub enum Item {
+    Revision(RevisionRowView),
+    File(FileRowView),
 }
 
 #[derive(Debug, Clone)]
@@ -117,17 +202,19 @@ pub struct RevisionRowView {
     pub change_id_suffix: String,
     pub commit_id_short: String,
     pub author: String,
+    /// How long ago the author made the commit (`3h`, `2d`), or empty when
+    /// the backend doesn't say.
+    pub age: String,
     pub description: String,
     pub description_color: Color,
     /// Bookmark chips, in display order. May be partially hidden behind
     /// a synthetic `+N` overflow chip when there's not enough horizontal
-    /// room — see the layout logic in `draw_revision`. The lane color
-    /// these chips wear is also the color of the overflow chip.
+    /// room: see [`rail_layout`].
     pub bookmark_chips: Vec<Chip>,
     /// Status chips (e.g. `empty`, `conflict`). Always shown — they're
     /// load-bearing semantics and shouldn't compress.
     pub status_chips: Vec<Chip>,
-    /// Color for the `+N` overflow chip (= the row's lane color).
+    /// The colour of the row's own lane: its bookmark chips' glyphs.
     pub lane_color: Color,
     pub frame: LaneFrame,
     /// Warped lane → display-column maps for this row and the previous one
@@ -175,6 +262,8 @@ pub struct RevisionRowView {
     /// A previewed ghost: where a moved or abandoned commit used to be,
     /// drawn faded with a hollow node.
     pub ghost: bool,
+    /// What the row's node says: working copy, conflict, immutable, ...
+    pub node: NodeKind,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +273,6 @@ pub struct FileRowView {
     pub primary: String,
     pub raw_path: String,
     pub status_label: String,
-    pub status_background: Color,
     pub status_text: Color,
     pub additions: usize,
     pub deletions: usize,
@@ -198,11 +286,8 @@ pub struct FileRowView {
     /// [`RevisionRowView::columns`]); the continuation strokes inherit its
     /// packing so the strip doesn't jump at the revision/file boundary.
     pub columns: Rc<[Option<usize>]>,
-    pub additions_width: f32,
-    pub deletions_width: f32,
     pub primary_color: Color,
-    /// Tint of the file/folder icon ahead of the name (dimmer than the
-    /// name for regular rows; follows the row tone for untracked/ignored).
+    /// Tint of a directory's chevron (dimmer than its name).
     pub icon_color: Color,
     /// Tree indentation in px (depth × step), applied left of the badge.
     pub indent: f32,
@@ -221,50 +306,14 @@ pub struct FileRowView {
     /// lane that survives into the continuation. See
     /// [`RevisionRowView::lane_segments`].
     pub lane_segments: Rc<[Option<usize>]>,
-    /// Change-selection checkbox drawn in place of the file/folder icon, or
-    /// `None` for no checkbox (see [`RevisionList::on_file_check`]).
+    /// Change-selection checkbox drawn at the row's end, or
+    /// `None` for no checkbox (see [`RevisionListProps::on_file_check`]).
     pub check: Option<crate::diff_view::CheckState>,
-}
-
-/// Key the widget reports back so the parent can map it to its own
-/// selection enum without leaking app types into this module.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RowSelectionKey {
-    WorkingCopy,
-    Commit(String),
-}
-
-/// Where a revision drag would land, in commit-store indices. Reported to
-/// the app on hover changes and on drop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropSpot {
-    /// Onto this revision (drop lands as its child).
-    OnRow(usize),
-    /// Into the gap between two adjacent revision rows: `above` is the newer
-    /// (child-side) row, `below` the older (parent-side) one — the moved
-    /// commits slot exactly between them.
-    Gap { above: usize, below: usize },
-}
-
-/// Target-mode decoration for a revision row, computed by the caller from
-/// the active draft (keyboard candidate + placement). The widget draws it;
-/// live *drag* indicators are widget-internal instead (they follow the
-/// cursor, not app state).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DraftMarker {
-    /// The destination ring: the moved commits become children of this row
-    /// (rebase onto / squash into).
-    Ring,
-    /// Insert-after: the moved commits land just above this row.
-    LineAbove,
-    /// Insert-before: the moved commits land just below this row.
-    LineBelow,
-}
-
-#[derive(Debug, Clone)]
-pub enum Item {
-    Revision(RevisionRowView),
-    File(FileRowView),
+    /// What stands in for the counts of a file with none ("binary", "mode",
+    /// "empty").
+    pub tag: Option<String>,
+    /// The name is struck through (a deleted file).
+    pub struck: bool,
 }
 
 /// What a flat row index maps to: a commit (by index) or a file row under the
@@ -282,30 +331,54 @@ fn row_height_of(kind: RowKind) -> f32 {
     }
 }
 
+/// Times a list has painted. A frame benchmark reads this to know it timed real
+/// frames rather than cached ones.
+pub static PAINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Builds one revision row's view, by commit index.
+pub type BuildRevision = Rc<dyn Fn(usize, &App) -> RevisionRowView>;
+/// Builds one file row's view, by display index into the file tree.
+pub type BuildFile = Rc<dyn Fn(usize, &App) -> FileRowView>;
+/// Whether the gap below a commit row is a real parent edge.
+pub type GapEdge = Rc<dyn Fn(usize, &App) -> bool>;
+/// A list's way back to the app. `Diffui::listen` and `cx.listener` both make one.
+pub type Callback<T> = Rc<dyn Fn(&T, &mut Window, &mut App)>;
+
+/// Callbacks for the drag-to-rebase gesture.
+pub struct DragHooks {
+    /// The drag crossed its activation threshold on this commit row.
+    pub start: Callback<usize>,
+    /// The drop spot under the cursor changed (`None` = no valid spot).
+    pub hover: Callback<Option<DropSpot>>,
+    /// Released: on a spot, or `None` when let go outside any spot.
+    pub drop: Callback<Option<DropSpot>>,
+}
+
+/// Everything a list is told per render.
+///
 /// Virtualized at the *data* level: instead of holding an `Item` per commit
-/// (~600MB on a million-commit repo), the widget holds the commit count, the
+/// (~600MB on a million-commit repo), it holds the commit count, the
 /// expanded-files span, and closures that materialize a single row's display
-/// view on demand. Layout/hit-test use arithmetic; draw builds only the rows
-/// that are actually on screen.
-pub struct RevisionList<'a, Message> {
+/// view on demand. Layout and hit tests use arithmetic; paint builds only the
+/// rows that are actually on screen. The closures run during paint and event
+/// handling, never inside the parent's render, so they read the app through an
+/// entity handle they capture.
+pub struct RevisionListProps {
     commit_count: usize,
     /// `(flat index where file rows start, file count)`. For an expanded
     /// commit that's the commit's index + 1; a files-only list (the source
     /// tree) passes `(0, files)` with a zero `commit_count`. `None` when
     /// nothing is expanded.
     expanded: Option<(usize, usize)>,
-    build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
-    build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
+    style: RevisionListStyle,
+    build_revision: Option<BuildRevision>,
+    build_file: Option<BuildFile>,
     selected_row: Option<RowSelectionKey>,
     selected_file: Option<usize>,
     /// Flat row index of the selected row, for the reveal-on-token scroll.
     selected_flat: Option<usize>,
-    style: RevisionListStyle,
-    width: Length,
-    /// Bumped by the caller each time it wants the selected row scrolled
-    /// into view. The widget compares against `State::last_scroll_token`
-    /// and triggers a scroll on disagreement — analogous to the
-    /// `scroll_token` mechanism in `DiffView` for find matches.
+    /// Bumped by the caller each time it wants the selected row scrolled into
+    /// view.
     reveal_token: Option<u64>,
     /// Reveal an explicit file row (keyboard file navigation) instead of the
     /// selected revision: a bumped token plus the file's flat row. Kept separate
@@ -313,99 +386,83 @@ pub struct RevisionList<'a, Message> {
     /// selected revision.
     file_reveal_token: Option<u64>,
     reveal_file_flat: Option<usize>,
-    on_select_revision: fn(RowSelectionKey) -> Message,
+    on_select_revision: Option<Callback<RowSelectionKey>>,
     /// Receives the clicked file row's *display* index into the file tree
     /// (dir rows included), not a document file index.
-    on_select_file: fn(usize) -> Message,
-    /// Optional right-click handler for a revision row — opens the context
-    /// menu. Receives the row's selection key and its on-screen rectangle (in
-    /// window-content points), the latter used to anchor a native highlight.
-    on_context_menu: Option<fn(RowSelectionKey, Rectangle, Point) -> Message>,
-    /// Optional right-click handler for a file row — receives the row's
-    /// *display* index into the file tree (like `on_select_file`), its
-    /// on-screen rect, and the cursor point.
-    on_file_context_menu: Option<fn(usize, Rectangle, Point) -> Message>,
+    on_select_file: Option<Callback<usize>>,
+    /// Right-click on a revision row: opens the context menu. Receives the
+    /// row's selection key, its card's rectangle in window coordinates (what
+    /// anchors a native highlight) and the cursor.
+    on_context_menu: Option<Callback<(RowSelectionKey, Rectangle, Point)>>,
+    /// Right-click on a file row: the row's *display* index into the file tree
+    /// (like `on_select_file`), its rect, and the cursor.
+    on_file_context_menu: Option<Callback<(usize, Rectangle, Point)>>,
     /// A click on a file row's checkbox (its icon column), by display index.
-    on_file_check: Option<fn(usize) -> Message>,
+    on_file_check: Option<Callback<usize>>,
     /// Reports the scroll offset (content-space px) whenever it changes, so the
-    /// app can persist it per-tab. `None` ⇒ scroll position isn't tracked.
-    on_scroll: Option<fn(f64) -> Message>,
+    /// app can persist it per-tab.
+    on_scroll: Option<Callback<f64>>,
     /// One-shot scroll restore: when `restore_token` differs from the value the
-    /// widget last saw, the offset jumps to `restore_offset` (clamped). Used to
-    /// re-apply a tab's saved scroll on activation — the widget's `State` is
-    /// shared across tabs and would otherwise leak the prior tab's position.
-    /// Mirrors the `reveal_token` trigger pattern.
+    /// list last saw, the offset jumps to `restore_offset` (clamped). Used to
+    /// re-apply a tab's saved scroll on activation, since one list serves every
+    /// tab and would otherwise leak the prior tab's position.
     restore_offset: f64,
     restore_token: u64,
     /// Drag-to-rebase hooks; `None` disables dragging (git repos, PR tabs).
-    on_drag: Option<DragHooks<Message>>,
+    on_drag: Option<DragHooks>,
     /// Whether the gap *below* commit index `i` is a real parent edge (the
     /// next display row is a direct parent of row `i`). Adjacent rows in a
-    /// branched log are often unrelated — inserting "between" them would
-    /// silently rewire the upper row onto the dragged commit — so gap drop
+    /// branched log are often unrelated: inserting "between" them would
+    /// silently rewire the upper row onto the dragged commit, so gap drop
     /// spots only exist where this returns `true`. `None` disables gaps.
-    gap_edge: Option<Box<dyn Fn(usize) -> bool + 'a>>,
+    gap_edge: Option<GapEdge>,
     /// Target mode's plain-hover channel: the commit row under the cursor
     /// (no drag needed), `None` when the cursor leaves the rows. The app
-    /// arms it as the draft *candidate* — same as keyboard `j`/`k`, honoring
-    /// the armed `o`/`a`/`b` placement — so the op bar's "hover … to
-    /// preview" holds for mouse users. Drags keep their own spot channel
+    /// arms it as the draft *candidate*, same as keyboard `j`/`k`, honoring
+    /// the armed `o`/`a`/`b` placement, so the op bar's "hover … to preview"
+    /// holds for mouse users. Drags keep their own spot channel
     /// (`DragHooks::hover`); gaps stay a drag-only gesture.
-    on_target_hover: Option<fn(Option<usize>) -> Message>,
-    /// Which sidebar slot this list occupies — see [`ListSlot`].
-    slot: ListSlot,
-    /// Extra leading inset for the row cards — see
-    /// [`RevisionList::at_window_edge`].
+    on_target_hover: Option<Callback<Option<usize>>>,
+    /// Extra leading inset for the row cards: see
+    /// [`RevisionListProps::at_window_edge`].
     leading_edge: f32,
-    /// The drop spot to draw while dragging, when the caller knows better
-    /// than the cursor — see [`RevisionList::drop_indicator`].
+    /// The drop spot to draw while dragging, when the caller knows better than
+    /// the cursor: see [`RevisionListProps::drop_indicator`].
     drop_indicator: Option<Option<DropSpot>>,
     /// How many rows the caller currently marks. The drag ghost names the
-    /// count when a drag starts on one of them — see
-    /// [`RevisionList::multi_selection_count`].
+    /// count when a drag starts on one of them: see
+    /// [`RevisionListProps::multi_selection_count`].
     multi_selection_count: usize,
+    /// Flat row of the working copy, for the pin shown while it's scrolled
+    /// away.
+    working_copy_flat: Option<usize>,
+    /// Every file row shows its pick box, not only the hovered one.
+    file_picking: bool,
+    /// The colour the header above the list is: see
+    /// [`RevisionListProps::top_fade`].
+    top_fade: Option<Color>,
 }
 
-/// Callbacks for the drag-to-rebase gesture. All `fn` pointers, like the
-/// widget's other hooks.
-pub struct DragHooks<Message> {
-    /// The drag crossed its activation threshold on this commit row.
-    pub start: fn(usize) -> Message,
-    /// The drop spot under the cursor changed (`None` = no valid spot).
-    pub hover: fn(Option<DropSpot>) -> Message,
-    /// Released: on a spot, or `None` when let go outside any spot.
-    pub drop: fn(Option<DropSpot>) -> Message,
-}
-
-impl<'a, Message> RevisionList<'a, Message> {
-    #[allow(clippy::too_many_arguments)]
+impl RevisionListProps {
     pub fn new(
         commit_count: usize,
         expanded: Option<(usize, usize)>,
-        build_revision: Box<dyn Fn(usize) -> RevisionRowView + 'a>,
-        build_file: Box<dyn Fn(usize) -> FileRowView + 'a>,
-        selected_row: Option<RowSelectionKey>,
-        selected_file: Option<usize>,
-        selected_flat: Option<usize>,
         style: RevisionListStyle,
-        on_select_revision: fn(RowSelectionKey) -> Message,
-        on_select_file: fn(usize) -> Message,
     ) -> Self {
         Self {
             commit_count,
             expanded,
-            build_revision,
-            build_file,
-            selected_row,
-            selected_file,
-            selected_flat,
             style,
-            width: Length::Fill,
+            build_revision: None,
+            build_file: None,
+            selected_row: None,
+            selected_file: None,
+            selected_flat: None,
             reveal_token: None,
             file_reveal_token: None,
             reveal_file_flat: None,
-            on_select_revision,
-            on_select_file,
+            on_select_revision: None,
+            on_select_file: None,
             on_context_menu: None,
             on_file_context_menu: None,
             on_file_check: None,
@@ -415,11 +472,65 @@ impl<'a, Message> RevisionList<'a, Message> {
             on_drag: None,
             gap_edge: None,
             on_target_hover: None,
-            slot: ListSlot::Revisions,
             leading_edge: 0.0,
             drop_indicator: None,
             multi_selection_count: 0,
+            working_copy_flat: None,
+            file_picking: false,
+            top_fade: None,
         }
+    }
+
+    /// Show every file row's pick box while picks are being made.
+    pub fn file_picking(mut self, picking: bool) -> Self {
+        self.file_picking = picking;
+        self
+    }
+
+    /// Where the working copy's row is, so a pin can bring it back when it's
+    /// scrolled out of view.
+    /// Once the list has scrolled off its top, fade its top edge from
+    /// `ground` (the header above it) into nothing, so rows slide under the
+    /// header and the cut says there's more above. Under the working copy's
+    /// pin.
+    pub fn top_fade(mut self, ground: Color) -> Self {
+        self.top_fade = Some(ground);
+        self
+    }
+
+    pub fn working_copy(mut self, flat: Option<usize>) -> Self {
+        self.working_copy_flat = flat;
+        self
+    }
+
+    /// The revision rows: how to build one, which is selected, and where a
+    /// click on one goes.
+    pub fn revisions(
+        mut self,
+        build: BuildRevision,
+        selected_row: Option<RowSelectionKey>,
+        selected_flat: Option<usize>,
+        on_select: impl Fn(&RowSelectionKey, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.build_revision = Some(build);
+        self.selected_row = selected_row;
+        self.selected_flat = selected_flat;
+        self.on_select_revision = Some(Rc::new(on_select));
+        self
+    }
+
+    /// The file rows: how to build one, which document file is selected, and
+    /// where a click on one goes.
+    pub fn files(
+        mut self,
+        build: BuildFile,
+        selected_file: Option<usize>,
+        on_select: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.build_file = Some(build);
+        self.selected_file = selected_file;
+        self.on_select_file = Some(Rc::new(on_select));
+        self
     }
 
     /// Tell the list how many rows are marked, so a drag that starts on one
@@ -439,13 +550,6 @@ impl<'a, Message> RevisionList<'a, Message> {
         self
     }
 
-    /// Mark this list as the source browser's file tree, so it keeps its own
-    /// widget state rather than sharing the diff sidebar's — see [`ListSlot`].
-    pub fn source_tree_slot(mut self) -> Self {
-        self.slot = ListSlot::SourceTree;
-        self
-    }
-
     /// The list's leading edge is the window's: push the row cards in by the
     /// width the OS border covers, so their margin there matches the one
     /// against the divider on the other side.
@@ -454,72 +558,59 @@ impl<'a, Message> RevisionList<'a, Message> {
         self
     }
 
-    /// A row's selection/hover card: inset from the row on every side.
-    fn card_bounds(&self, row_bounds: Rectangle) -> Rectangle {
-        let left = ROW_CARD_INSET_X + self.leading_edge;
-        Rectangle {
-            x: row_bounds.x + left,
-            y: row_bounds.y + ROW_CARD_INSET_Y,
-            width: (row_bounds.width - left - ROW_CARD_INSET_X).max(0.0),
-            height: (row_bounds.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
-        }
-    }
-
     /// Report the hovered commit row while an op draft is picking a
-    /// destination — see the `on_target_hover` field.
-    pub fn on_target_hover(mut self, callback: fn(Option<usize>) -> Message) -> Self {
-        self.on_target_hover = Some(callback);
+    /// destination: see the `on_target_hover` field.
+    pub fn on_target_hover(
+        mut self,
+        callback: impl Fn(&Option<usize>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_target_hover = Some(Rc::new(callback));
         self
     }
 
     /// Enable drag-to-rebase on revision rows.
-    pub fn on_drag(mut self, hooks: DragHooks<Message>) -> Self {
+    pub fn on_drag(mut self, hooks: DragHooks) -> Self {
         self.on_drag = Some(hooks);
         self
     }
 
     /// Provide the parent-edge test that legitimizes insert-between gaps
     /// (see the `gap_edge` field). Without it, drops only land on rows.
-    pub fn gap_edges(mut self, edge: Box<dyn Fn(usize) -> bool + 'a>) -> Self {
-        self.gap_edge = Some(edge);
+    pub fn gap_edges(mut self, edge: impl Fn(usize, &App) -> bool + 'static) -> Self {
+        self.gap_edge = Some(Rc::new(edge));
         self
     }
 
-    pub fn width(mut self, width: Length) -> Self {
-        self.width = width;
-        self
-    }
-
-    /// Register a right-click handler for revision rows (the context menu). The
-    /// callback gets the row key and its on-screen rect (window-content points).
+    /// Register a right-click handler for revision rows (the context menu).
     pub fn on_context_menu(
         mut self,
-        callback: fn(RowSelectionKey, Rectangle, Point) -> Message,
+        callback: impl Fn(&(RowSelectionKey, Rectangle, Point), &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_context_menu = Some(callback);
+        self.on_context_menu = Some(Rc::new(callback));
         self
     }
 
-    /// Register a right-click handler for file rows. The callback gets the
-    /// row's display index into the file tree, its rect, and the cursor.
+    /// Register a right-click handler for file rows.
     pub fn on_file_context_menu(
         mut self,
-        callback: fn(usize, Rectangle, Point) -> Message,
+        callback: impl Fn(&(usize, Rectangle, Point), &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_file_context_menu = Some(callback);
+        self.on_file_context_menu = Some(Rc::new(callback));
         self
     }
 
     /// Register a click handler for file-row checkboxes (rows whose
     /// [`FileRowView::check`] is set). Gets the row's display index.
-    pub fn on_file_check(mut self, callback: fn(usize) -> Message) -> Self {
-        self.on_file_check = Some(callback);
+    pub fn on_file_check(
+        mut self,
+        callback: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_file_check = Some(Rc::new(callback));
         self
     }
 
-    /// Cause the widget to scroll the currently-selected row into view
-    /// the next time `token` changes. Calling with the same value twice
-    /// in a row is a no-op.
+    /// Scroll the currently-selected row into view the next time `token`
+    /// changes. Calling with the same value twice in a row is a no-op.
     pub fn reveal_selected(mut self, token: u64) -> Self {
         self.reveal_token = Some(token);
         self
@@ -527,7 +618,7 @@ impl<'a, Message> RevisionList<'a, Message> {
 
     /// Like [`Self::reveal_selected`], but scrolls an explicit file row into
     /// view (keyboard file navigation) the next time `token` changes. `flat` is
-    /// the file's flat row, or `None` when the file list isn't open — in which
+    /// the file's flat row, or `None` when the file list isn't open, in which
     /// case the token change schedules no scroll.
     pub fn reveal_file(mut self, token: u64, flat: Option<usize>) -> Self {
         self.file_reveal_token = Some(token);
@@ -537,8 +628,8 @@ impl<'a, Message> RevisionList<'a, Message> {
 
     /// Report scroll-offset changes (content-space px) so the caller can persist
     /// the position. See [`Self::restore_scroll`] for the inverse.
-    pub fn on_scroll(mut self, callback: fn(f64) -> Message) -> Self {
-        self.on_scroll = Some(callback);
+    pub fn on_scroll(mut self, callback: impl Fn(&f64, &mut Window, &mut App) + 'static) -> Self {
+        self.on_scroll = Some(Rc::new(callback));
         self
     }
 
@@ -562,45 +653,22 @@ impl<'a, Message> RevisionList<'a, Message> {
     }
 
     /// Materialize the display view for a single row. Builds only what the
-    /// caller asked for, so draw/hit-test pay only for on-screen rows.
-    fn item_at(&self, flat: usize) -> Item {
+    /// caller asked for, so paint and hit tests pay only for on-screen rows.
+    fn item_at(&self, flat: usize, cx: &App) -> Option<Item> {
         match self.row_kind(flat) {
-            RowKind::Revision(commit) => Item::Revision((self.build_revision)(commit)),
-            RowKind::File(file) => Item::File((self.build_file)(file)),
-        }
-    }
-
-    fn row_height(&self, item: &Item) -> f32 {
-        match item {
-            Item::Revision(_) => REVISION_ROW_HEIGHT,
-            Item::File(_) => FILE_ROW_HEIGHT,
+            RowKind::Revision(commit) => self
+                .build_revision
+                .as_ref()
+                .map(|build| Item::Revision(build(commit, cx))),
+            RowKind::File(file) => self
+                .build_file
+                .as_ref()
+                .map(|build| Item::File(build(file, cx))),
         }
     }
 
     fn content_height(&self) -> f64 {
         rows_content_height(self.commit_count, self.expanded)
-    }
-
-    fn item_gutter_width(&self, item: &Item) -> f32 {
-        // Warped width: the strip is as wide as the rightmost *display*
-        // column in use, not the rightmost original lane index.
-        let lanes = match item {
-            Item::Revision(row) => revision_strip_columns(
-                &row.columns,
-                &row.prev_columns,
-                &row.frame.before,
-                row.frame.lane_count(),
-            ),
-            Item::File(row) => row
-                .continuation
-                .iter()
-                .enumerate()
-                .filter(|(_, kind)| kind.is_some())
-                .filter_map(|(lane, _)| row.columns.get(lane).copied().flatten())
-                .max()
-                .map_or(row.continuation.len(), |max| max + 1),
-        };
-        GUTTER_LEFT_PADDING + lane_strip_width(lanes) + GUTTER_PADDING
     }
 
     fn row_at_offset(&self, offset: f64) -> Option<usize> {
@@ -627,26 +695,25 @@ impl<'a, Message> RevisionList<'a, Message> {
         match self.row_kind(flat) {
             RowKind::Revision(commit) => Some(commit),
             // The file block starts right after its revision's flat row, and
-            // revisions before it are 1:1 with flats — so the parent's commit
+            // revisions before it are 1:1 with flats, so the parent's commit
             // index is `start - 1`.
             RowKind::File(_) => self.expanded.and_then(|(start, _)| start.checked_sub(1)),
         }
     }
 
     /// Resolve a drag cursor position (content-space y) to a drop spot: the
-    /// row under it, or — within a few px of a boundary between two
-    /// revision rows — the gap between them. File rows resolve to their
-    /// parent revision; only genuine revision/revision boundaries that are
-    /// also real parent edges (`gap_edge`) read as gaps, so a drop can't
-    /// "insert between" two unrelated branches that merely render adjacently.
-    fn drop_spot_at(&self, local_y: f64) -> Option<DropSpot> {
-        const GAP_ZONE: f64 = 7.0;
+    /// row under it, or, within a few px of a boundary between two revision
+    /// rows, the gap between them. File rows resolve to their parent revision;
+    /// only genuine revision/revision boundaries that are also real parent
+    /// edges (`gap_edge`) read as gaps, so a drop can't "insert between" two
+    /// unrelated branches that merely render adjacently.
+    fn drop_spot_at(&self, local_y: f64, cx: &App) -> Option<DropSpot> {
         let flat = self.row_at_offset(local_y)?;
         let commit = self.drop_commit_of(flat)?;
         if !matches!(self.row_kind(flat), RowKind::Revision(_)) {
             return Some(DropSpot::OnRow(commit));
         }
-        let is_edge = |upper: usize| self.gap_edge.as_ref().is_some_and(|edge| edge(upper));
+        let is_edge = |upper: usize| self.gap_edge.as_ref().is_some_and(|edge| edge(upper, cx));
         let top = self.row_top(flat);
         let height = f64::from(row_height_of(self.row_kind(flat)));
         if local_y - top < GAP_ZONE
@@ -673,10 +740,115 @@ impl<'a, Message> RevisionList<'a, Message> {
         }
         Some(DropSpot::OnRow(commit))
     }
+
+    /// A row's selection/hover card: inset from the row on every side.
+    fn card_bounds(&self, row: Rectangle) -> Rectangle {
+        let left = ROW_CARD_INSET_X + self.leading_edge;
+        Rectangle {
+            x: row.x + left,
+            y: row.y + ROW_CARD_INSET_Y,
+            width: (row.width - left - ROW_CARD_INSET_X).max(0.0),
+            height: (row.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
+        }
+    }
+
+    /// Horizontal layout of a file row's content columns:
+    /// `[mark] name … [stats] [pick]`, the pick box keeping its column whether
+    /// it shows or not so the counts don't move under the cursor. Shared
+    /// between painting (which ellipsizes the name into `path_w`) and the
+    /// tooltip's "is the name actually truncated?" check, so the two can never
+    /// disagree.
+    fn file_row_columns(
+        &self,
+        row_x: f32,
+        row_width: f32,
+        gutter_total: f32,
+        file: &FileRowView,
+    ) -> FileRowColumns {
+        // No lanes run through this tree: the strip's own padding goes.
+        let mark_x = row_x + (gutter_total - GUTTER_PADDING).max(0.0) + file.indent;
+        let path_x = mark_x + FILE_MARK_COL + FILE_MARK_GAP;
+        let right = row_x + row_width - crate::theme::list::PAD_END;
+        let (check_center, stats_right) = match file.check {
+            Some(_) => (
+                Some(right - FILE_CHECK_COL / 2.0),
+                right - FILE_CHECK_COL - FILE_MARK_GAP,
+            ),
+            None => (None, right),
+        };
+        let stats = self.changes_stats_width(file);
+        let path_right = if stats > 0.0 {
+            stats_right - stats - FILE_ROW_GAP
+        } else {
+            stats_right
+        };
+        FileRowColumns {
+            path_x,
+            path_w: (path_right - path_x).max(1.0),
+            mark_x,
+            check_center,
+            stats_right,
+        }
+    }
+
+    /// The width of a file row's counts, or of the
+    /// tag standing in for them.
+    fn changes_stats_width(&self, file: &FileRowView) -> f32 {
+        if file.chevron.is_some() {
+            return 0.0;
+        }
+        let parts = changes_stats(file);
+        if parts.is_empty() {
+            return file.tag.as_deref().map_or(0.0, |tag| {
+                crate::measure::line_width(tag, FILE_TAG_SIZE, self.style.mono_font)
+            });
+        }
+        parts
+            .iter()
+            .map(|(text, _)| {
+                crate::measure::line_width(text, CAPTION_TEXT_SIZE, self.style.primary_font)
+            })
+            .sum::<f32>()
+            + FILE_STAT_GAP * (parts.len() - 1) as f32
+    }
+}
+
+/// A file's counts, each side only when it counts
+/// something, with its colour.
+fn changes_stats(file: &FileRowView) -> Vec<(String, Color)> {
+    let mut parts = Vec::with_capacity(2);
+    if file.additions > 0 {
+        parts.push((format!("+{}", file.additions), file.additions_text));
+    }
+    if file.deletions > 0 {
+        parts.push((format!("\u{2212}{}", file.deletions), file.deletions_text));
+    }
+    parts
+}
+
+/// How many lane columns `item` draws: as wide as its rightmost *display*
+/// column in use, not its rightmost original lane index.
+fn item_lanes(item: &Item) -> usize {
+    match item {
+        Item::Revision(row) => revision_strip_columns(
+            &row.columns,
+            &row.prev_columns,
+            &row.frame.before,
+            row.frame.lane_count(),
+        ),
+        Item::File(row) => row
+            .continuation
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| kind.is_some())
+            .filter_map(|(lane, _)| row.columns.get(lane).copied().flatten())
+            .max()
+            .map_or(row.continuation.len(), |max| max + 1),
+    }
 }
 
 // Pure row-geometry helpers, split out so they can be unit-tested without
-// constructing a full widget. `expanded` is `(flat index where file rows
+// constructing a full list. `expanded` is `(flat index where file rows
 // start, file count)`; revision rows fill the flats on either side.
 
 fn rows_total(commit_count: usize, expanded: Option<(usize, usize)>) -> usize {
@@ -695,8 +867,8 @@ fn row_kind_at(expanded: Option<(usize, usize)>, flat: usize) -> RowKind {
 
 // These work in `f64` content-space pixels deliberately. A ~1M-commit list is
 // ~50M px tall, which is past `f32`'s exact-integer ceiling (2^24 ≈ 16.7M), so
-// in `f32` the draw path's `flat * H` and the hit-test path's `y / H` rounded
-// to different multiples — a click near the bottom selected the neighbouring
+// in `f32` the paint path's `flat * H` and the hit-test path's `y / H` rounded
+// to different multiples: a click near the bottom selected the neighbouring
 // row. `f64` is exact for integers to 2^53 (~9e15), far beyond any real repo,
 // so the two paths agree again. Row heights stay `f32` constants (whole px).
 fn rows_content_height(commit_count: usize, expanded: Option<(usize, usize)>) -> f64 {
@@ -743,44 +915,80 @@ fn row_at_offset_in(
     (flat < rows_total(commit_count, expanded)).then_some(flat)
 }
 
+/// The offset that brings a row into view: a third of the way down the viewport
+/// when it has to move, which gives context above and below without pinning it
+/// to the top edge, and the current offset when it's already visible.
+fn reveal_offset(current: f64, row_top: f64, row_h: f64, view_h: f64, max: f64) -> f64 {
+    let preferred_top = (row_top - view_h * 0.33).max(0.0);
+    let must_top = (row_top + row_h - view_h).max(0.0);
+    let visible = current..current + view_h;
+    let target = if visible.contains(&row_top) && visible.contains(&(row_top + row_h)) {
+        current
+    } else if current > row_top {
+        preferred_top
+    } else {
+        must_top.max(preferred_top)
+    };
+    target.clamp(0.0, max)
+}
+
 /// Which half of a revision row the cursor is on, used to pick the
 /// right segment id when a lane is split (its incoming and outgoing
-/// halves carry different segment ids — see
+/// halves carry different segment ids: see
 /// [`RevisionRowView::lane_segments_before`]).
 ///
 /// File rows aren't split (their continuation is a single half), so
 /// this only matters for `Item::Revision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaneHalf {
-    /// Top half of the row — the strokes drawn into the disc.
+    /// Top half of the row: the strokes drawn into the disc.
     Before,
-    /// Bottom half of the row — the strokes drawn out of the disc.
+    /// Bottom half of the row: the strokes drawn out of the disc.
     After,
 }
 
-/// Which of the shell's two sidebars a list is. `view()` puts the diff
-/// sidebar and the source browser's file tree in the same slot, so iced sees
-/// one widget there and — with one tag — hands both the same [`State`]. The
-/// browser then inherited the diff list's reveal/restore tokens and jumped its
-/// scroll on the first frame after a switch. A distinct tag per slot makes iced
-/// rebuild the state instead, which is what keeps the counters apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListSlot {
-    Revisions,
-    SourceTree,
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    /// Commit-store index the drag started on.
+    source_commit: usize,
+    /// Press position: the activation threshold anchor.
+    origin: Point,
+    /// Whether the threshold was crossed (a plain click never activates).
+    active: bool,
+    /// The spot currently under the cursor, mirrored to the app on change.
+    spot: Option<DropSpot>,
+    /// How many marked rows this drag moves. 1 for a single-row drag;
+    /// captured at activation because the app clears the marks when the
+    /// draft's source wash takes over.
+    batch_count: usize,
+    /// Live cursor position for the ghost chip.
+    cursor: Point,
 }
 
-/// Tag marker for [`ListSlot::SourceTree`]; see [`ListSlot`]. The stored value
-/// is a plain [`State`] either way — only the tag differs.
-struct SourceTreeSlot;
+/// Calls to make once the list's lease has ended: the app's handlers may read
+/// the list's rows back, and they run outside any update of this entity.
+type Effect = Box<dyn FnOnce(&mut Window, &mut App)>;
+type Effects = Vec<Effect>;
 
-struct State {
+fn call<T: 'static>(callback: &Callback<T>, value: T) -> Effect {
+    let callback = callback.clone();
+    Box::new(move |window, cx| callback(&value, window, cx))
+}
+
+/// Something drawn over the rest of the window, and where.
+type Floating = (AnyElement, gpui_kit::Point<Pixels>);
+
+/// The list's entity: what it remembers across frames.
+pub struct RevisionList {
+    props: Rc<RevisionListProps>,
+    /// Painted bounds, in window coordinates.
+    bounds: Rectangle,
     /// Scroll position in `f64` content-space px (see the row-geometry helpers
-    /// for why `f64`). Cast to `f32` only at the scrollbar/render boundary,
+    /// for why `f64`). Cast to `f32` only at the scrollbar/paint boundary,
     /// where values are viewport-small and `f32` is exact.
     vertical_offset: f64,
     /// Item index of the file row currently hovered (only set for files,
-    /// not revisions). Drives the tooltip overlay.
+    /// not revisions). Drives the tooltip.
     hovered_file_item: Option<usize>,
     /// Item index of the revision row currently hovered. Drives the row's
     /// hover wash (files get theirs via `hovered_file_item`).
@@ -790,25 +998,27 @@ struct State {
     /// labels at that row. Drives the branch-name tooltip on the graph
     /// gutter.
     hovered_lane: Option<(usize, usize, LaneHalf)>,
-    /// Last cursor position observed inside the widget bounds, in screen
-    /// coordinates. Used to anchor the tooltip.
+    /// Last cursor position observed inside the list's bounds. Anchors the
+    /// tooltip.
     cursor_position: Option<Point>,
-    scrollbar: ScrollbarState,
+    over_scrollbar: bool,
+    /// What the bar over the list reads, and where a drag on it asks to go.
+    bar: scrollbar::Shared,
+    /// Wheel motion still to be drawn, spread evenly over frames.
+    wheel: Resampler,
     /// Most recent `reveal_token` we acted on. `None` until first reveal.
     last_reveal_token: Option<u64>,
     /// Most recent `file_reveal_token` we acted on. `None` until first reveal.
     last_file_reveal_token: Option<u64>,
-    /// Row to bring into view on the next `update()` pass — `None` when
-    /// no reveal is pending. Set in `diff()` (which sees prop changes
-    /// before layout); consumed in `update()` (which has bounds).
+    /// Row to bring into view once bounds are known: set when the props change,
+    /// consumed in prepaint.
     pending_reveal_row: Option<usize>,
     /// Most recent `restore_token` we acted on. A change schedules a one-shot
-    /// jump to the caller's `restore_offset`, consumed in `update()` (bounds
-    /// clamp). Starts at 0 to match the caller's initial token, so a cold load
-    /// doesn't trigger a spurious restore.
+    /// jump to the caller's `restore_offset`. Starts at 0 to match the caller's
+    /// initial token, so a cold load doesn't trigger a spurious restore.
     last_restore_token: u64,
-    /// Offset to jump to on the next `update()` pass, set when `restore_token`
-    /// changed. Consumed (and clamped) once bounds are known.
+    /// Offset to jump to once bounds are known, set when `restore_token`
+    /// changed.
     pending_set_offset: Option<f64>,
     /// In-flight drag-to-rebase gesture, armed on a revision-row press and
     /// activated past a small movement threshold.
@@ -821,38 +1031,99 @@ struct State {
     /// drags and when target mode ends so the next hover re-publishes.
     target_hover: Option<usize>,
     /// Shaped text widths, kept across frames. A row measures eight to fifteen
-    /// strings to lay itself out, and they are the same strings every frame —
+    /// strings to lay itself out, and they are the same strings every frame:
     /// see [`WidthMemo`].
     widths: WidthMemo,
+    /// File names cut to their column, kept across frames: see [`NameCuts`].
+    name_cuts: NameCuts,
+    _escape: Subscription,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DragState {
-    /// Commit-store index the drag started on.
-    source_commit: usize,
-    /// Press position (screen space) — the activation threshold anchor.
-    origin: Point,
-    /// Whether the threshold was crossed (a plain click never activates).
-    active: bool,
-    /// The spot currently under the cursor, mirrored to the app on change.
-    spot: Option<DropSpot>,
-    /// How many marked rows this drag moves. 1 for a single-row drag;
-    /// captured at activation because the app clears the marks when the
-    /// draft's source wash takes over.
-    batch_count: usize,
-    /// Live cursor position (screen space) for the ghost chip.
-    cursor: Point,
+/// File names cut in the middle to fit their column, one entry per name. A cut
+/// measures a couple of new strings for each char it keeps, which would flood
+/// the shared width memo as names scroll in; the column's width only changes on
+/// a resize, so the latest cut per name is the one asked for again.
+#[derive(Default)]
+struct NameCuts(RefCell<HashMap<String, NameCut>>);
+
+struct NameCut {
+    /// `(width, size, font)` the cut was made for.
+    key: (u32, u32, Font),
+    text: Rc<str>,
+    /// The cut's own width.
+    width: f32,
 }
 
-impl State {
-    fn new() -> Self {
+impl NameCuts {
+    /// Names kept before the memo is cleared: a screenful or two.
+    const CAPACITY: usize = 1024;
+
+    /// `name` cut in the middle to fit `width`, and how wide the cut is.
+    fn cut(&self, name: &str, width: f32, size: f32, font: Font) -> (Rc<str>, f32) {
+        let key = (width.to_bits(), size.to_bits(), font);
+        if let Some(cut) = self.0.borrow().get(name)
+            && cut.key == key
+        {
+            return (Rc::clone(&cut.text), cut.width);
+        }
+        let text: Rc<str> = ellipsis::cut_middle(name, width, size, font).into();
+        let drawn = crate::measure::line_width(&text, size, font);
+        let mut cuts = self.0.borrow_mut();
+        if cuts.len() >= Self::CAPACITY {
+            cuts.clear();
+        }
+        cuts.insert(
+            name.to_owned(),
+            NameCut {
+                key,
+                text: Rc::clone(&text),
+                width: drawn,
+            },
+        );
+        (text, drawn)
+    }
+}
+
+/// The list named `id`, drawing `props`. See [`RevisionListProps`].
+pub fn view(
+    id: &'static str,
+    props: RevisionListProps,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let list = window.use_keyed_state(id, cx, |_, cx| RevisionList::new(cx));
+    list.update(cx, |list, _| list.set_props(props));
+    list.into_any_element()
+}
+
+impl RevisionList {
+    fn new(cx: &mut Context<Self>) -> Self {
+        // Esc abandons an active drag visually; the app's own Esc handling (the
+        // draft cancel) rides the same keystroke through its own interceptor.
+        // Every interceptor sees every keystroke, whatever an earlier one did.
+        let list = cx.weak_entity();
+        let escape = cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.key != "escape" {
+                return;
+            }
+            let effects = list
+                .update(cx, |list, cx| list.cancel_drag(cx))
+                .unwrap_or_default();
+            for effect in effects {
+                effect(window, cx);
+            }
+        });
         Self {
+            props: Rc::new(RevisionListProps::new(0, None, placeholder_style())),
+            bounds: Rectangle::default(),
             vertical_offset: 0.0,
             hovered_file_item: None,
             hovered_revision_item: None,
             hovered_lane: None,
             cursor_position: None,
-            scrollbar: ScrollbarState::default(),
+            over_scrollbar: false,
+            bar: scrollbar::Shared::default(),
+            wheel: Resampler::default(),
             last_reveal_token: None,
             last_file_reveal_token: None,
             pending_reveal_row: None,
@@ -862,1020 +1133,980 @@ impl State {
             pending_click: None,
             target_hover: None,
             widths: WidthMemo::default(),
-        }
-    }
-}
-
-impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for RevisionList<'a, Message>
-where
-    Renderer: text::Renderer + iced::advanced::graphics::geometry::Renderer,
-{
-    fn tag(&self) -> tree::Tag {
-        match self.slot {
-            ListSlot::Revisions => tree::Tag::of::<State>(),
-            ListSlot::SourceTree => tree::Tag::of::<SourceTreeSlot>(),
+            name_cuts: NameCuts::default(),
+            _escape: escape,
         }
     }
 
-    fn state(&self) -> tree::State {
-        tree::State::new(State::new())
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size {
-            width: self.width,
-            height: Length::Fill,
+    /// Takes this render's props, noticing the tokens that schedule a scroll.
+    /// The scroll itself waits for prepaint, which knows the bounds it clamps
+    /// and centres against.
+    fn set_props(&mut self, props: RevisionListProps) {
+        if props.reveal_token != self.last_reveal_token {
+            self.last_reveal_token = props.reveal_token;
+            self.pending_reveal_row = props.selected_flat;
         }
-    }
-
-    fn diff(&mut self, tree: &mut Tree) {
-        let state = tree.state.downcast_mut::<State>();
-        if self.reveal_token != state.last_reveal_token {
-            state.last_reveal_token = self.reveal_token;
-            // Defer the actual scroll to `update()` — that's where bounds
-            // (needed to clamp + center) are available.
-            state.pending_reveal_row = self.selected_flat;
-        }
-        if self.file_reveal_token != state.last_file_reveal_token {
-            state.last_file_reveal_token = self.file_reveal_token;
+        if props.file_reveal_token != self.last_file_reveal_token {
+            self.last_file_reveal_token = props.file_reveal_token;
             // A file reveal targets an explicit row; skip when the file list is
             // closed (`None`). Scheduled after the revision reveal so a file
             // selection wins if both somehow change in one render.
-            if let Some(flat) = self.reveal_file_flat {
-                state.pending_reveal_row = Some(flat);
+            if let Some(flat) = props.reveal_file_flat {
+                self.pending_reveal_row = Some(flat);
             }
         }
-        if self.restore_token != state.last_restore_token {
-            state.last_restore_token = self.restore_token;
-            // Applied after the reveal in `update()`, so an exact restore wins
+        if props.restore_token != self.last_restore_token {
+            self.last_restore_token = props.restore_token;
+            // Applied after the reveal in prepaint, so an exact restore wins
             // over a re-centred selection when both land in the same render.
-            state.pending_set_offset = Some(self.restore_offset);
+            self.pending_set_offset = Some(props.restore_offset);
+        }
+        // No notify: this runs in the render that's about to draw the element, and a
+        // notify during a draw would dirty the view, and every view above it, for the
+        // next frame too.
+        self.props = Rc::new(props);
+    }
+
+    /// Where lane columns sit: a revision list's graph, or a files-only
+    /// list's strip.
+    fn lane_geometry(&self) -> LaneGeometry {
+        if self.props.build_revision.is_some() {
+            REVISION_LANES
+        } else {
+            LaneGeometry::strip(GUTTER_LEFT_PADDING)
         }
     }
 
-    fn layout(
-        &mut self,
-        _tree: &mut Tree,
-        _renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        layout::Node::new(limits.resolve(self.width, Length::Fill, Size::ZERO))
+    /// Where `item`'s text starts, from the list's left edge: just past its
+    /// own lanes.
+    fn gutter_width(&self, item: &Item) -> f32 {
+        let lanes = item_lanes(item);
+        if self.props.build_revision.is_some() {
+            revision_gutter_width(lanes)
+        } else {
+            GUTTER_LEFT_PADDING + lane_strip_width(lanes) + GUTTER_PADDING
+        }
     }
 
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        _renderer: &Renderer,
-        shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        let on_scroll = self.on_scroll;
-        let state = tree.state.downcast_mut::<State>();
-        // Offset on entry; compared on the way out so any change this pass
-        // (wheel, scrollbar, reveal, restore, clamp) is reported once via
-        // `on_scroll`. `fn` pointers are `Copy`, so this borrows nothing.
-        //
-        // The comparison is the whole mechanism, so nothing below may leave
-        // `update` without reaching it — see the `'event` block.
-        let prev_offset = state.vertical_offset;
-        let max_vertical = (self.content_height() - bounds.height as f64).max(0.0);
-        if state.vertical_offset > max_vertical {
-            state.vertical_offset = max_vertical;
-            shell.request_redraw();
+    /// The working-copy pin, when its row is out of view: its box, whether
+    /// the row is above the view, and the change id it names.
+    fn working_copy_pin(&self, cx: &App) -> Option<(Rectangle, bool, String)> {
+        // A drag owns the list: a pin would sit over the rows it aims at.
+        if self.drag.is_some_and(|drag| drag.active) {
+            return None;
         }
+        let flat = self.props.working_copy_flat?;
+        if flat >= self.props.row_count() {
+            return None;
+        }
+        let top = self.props.row_top(flat) - self.vertical_offset;
+        let bottom = top + f64::from(row_height_of(self.props.row_kind(flat)));
+        let height = f64::from(self.bounds.height);
+        let above = bottom < 8.0;
+        if !above && top <= height - 8.0 {
+            return None;
+        }
+        let Some(Item::Revision(row)) = self.props.item_at(flat, cx) else {
+            return None;
+        };
+        let id = format!("{}{}", row.change_id_prefix, row.change_id_suffix);
+        let style = &self.props.style;
+        let label_font = emphasis_font(style.primary_font, Weight::SEMIBOLD);
+        let mut width = PIN_PAD_LEFT
+            + self
+                .widths
+                .width(WORKING_COPY_LABEL, PIN_TEXT_SIZE, label_font)
+            + PIN_GAP
+            + PIN_ICON_SIZE
+            + PIN_PAD_RIGHT;
+        if !id.is_empty() {
+            width += self.widths.width(&id, CAPTION_TEXT_SIZE, style.mono_font) + PIN_GAP;
+        }
+        let y = if above {
+            self.bounds.y + PIN_MARGIN
+        } else {
+            self.bounds.y + self.bounds.height - PIN_MARGIN - PIN_HEIGHT
+        };
+        Some((
+            Rectangle {
+                x: self.bounds.x + ((self.bounds.width - width) / 2.0).max(0.0),
+                y,
+                width,
+                height: PIN_HEIGHT,
+            },
+            above,
+            id,
+        ))
+    }
 
-        if let Some(row_idx) = state.pending_reveal_row.take()
-            && row_idx < self.row_count()
+    fn max_offset(&self) -> f64 {
+        (self.props.content_height() - f64::from(self.bounds.height)).max(0.0)
+    }
+
+    /// Applies what waited for bounds: the clamp, a reveal, a restore. Returns
+    /// the offset to report when one of them moved it.
+    fn settle_offset(&mut self) -> Option<f64> {
+        let before = self.vertical_offset;
+        let max = self.max_offset();
+        self.vertical_offset = self.vertical_offset.min(max);
+        if let Some(flat) = self.pending_reveal_row.take()
+            && flat < self.props.row_count()
         {
-            // Scroll so the selected row sits roughly a third of the way
-            // down the viewport — gives the user context above and below
-            // without pinning to the top edge. Falls back to "just bring
-            // it into view" when the viewport is too small to spare a
-            // third for offset.
-            let row_top = self.row_top(row_idx);
-            let row_h = row_height_of(self.row_kind(row_idx)) as f64;
-            let view_h = bounds.height as f64;
-            let preferred_top = (row_top - view_h * 0.33).max(0.0);
-            let must_top = (row_top + row_h - view_h).max(0.0);
-            let must_bottom = row_top;
-            let target = if (state.vertical_offset..state.vertical_offset + view_h)
-                .contains(&row_top)
-                && (state.vertical_offset..state.vertical_offset + view_h)
-                    .contains(&(row_top + row_h))
-            {
-                // Already visible — leave the offset alone.
-                state.vertical_offset
-            } else if state.vertical_offset > must_bottom {
-                preferred_top
-            } else {
-                must_top.max(preferred_top)
-            };
-            let target = target.clamp(0.0, max_vertical);
-            if (target - state.vertical_offset).abs() > f64::EPSILON {
-                state.vertical_offset = target;
-                shell.request_redraw();
-            }
+            self.vertical_offset = reveal_offset(
+                self.vertical_offset,
+                self.props.row_top(flat),
+                f64::from(row_height_of(self.props.row_kind(flat))),
+                f64::from(self.bounds.height),
+                max,
+            );
         }
-
         // Tab restore: jump straight to the saved offset, overriding any reveal
         // scheduled above.
-        if let Some(offset) = state.pending_set_offset.take() {
-            let target = offset.clamp(0.0, max_vertical);
-            if (target - state.vertical_offset).abs() > f64::EPSILON {
-                state.vertical_offset = target;
-                shell.request_redraw();
-            }
+        if let Some(offset) = self.pending_set_offset.take() {
+            self.vertical_offset = offset.clamp(0.0, max);
         }
+        (self.vertical_offset != before).then_some(self.vertical_offset)
+    }
 
-        let recompute_hover = |state: &mut State, this: &Self| {
-            state.hovered_file_item = None;
-            state.hovered_revision_item = None;
-            state.hovered_lane = None;
-            let Some(pos) = state.cursor_position else {
-                return;
-            };
-            if !bounds.contains(pos) {
-                return;
+    fn cancel_drag(&mut self, cx: &mut Context<Self>) -> Effects {
+        let mut effects = Effects::new();
+        if let Some(drag) = self.drag.take() {
+            self.pending_click = None;
+            if drag.active
+                && let Some(hooks) = &self.props.on_drag
+            {
+                effects.push(call(&hooks.hover, None));
             }
-            let local_x = pos.x - bounds.x;
-            let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
-            let Some(row_idx) = this.row_at_offset(local_y) else {
-                return;
-            };
-            let item = this.item_at(row_idx);
-            let gutter_total = this.item_gutter_width(&item);
-            // Lane hit-test first: a cursor in the lane strip with a
-            // labeled lane wins over the content-area file tooltip.
-            if local_x >= GUTTER_LEFT_PADDING && local_x < gutter_total - GUTTER_PADDING {
-                let strip_x = local_x - GUTTER_LEFT_PADDING;
-                let display = (strip_x / LANE_WIDTH).floor() as usize;
-                // Pick the half from the cursor's vertical position
-                // within the row, so a click on the incoming stub of
-                // a split lane resolves to that branch's segment
-                // (not the unrelated new branch starting below).
-                let row_top = this.row_top(row_idx);
-                let row_h = this.row_height(&item);
-                let half = if local_y - row_top < f64::from(row_h) / 2.0 {
-                    LaneHalf::Before
-                } else {
-                    LaneHalf::After
-                };
-                // The cursor x is a *display* column under lane warping;
-                // everything downstream (labels, segments) keys on the
-                // original lane, so map it back first.
-                if let Some(lane) = item_display_to_lane(&item, display, half) {
-                    let labels = item_lane_labels(&item, lane);
-                    if !labels.is_empty() {
-                        state.hovered_lane = Some((row_idx, lane, half));
-                        return;
-                    }
-                }
-            }
-            match item {
-                Item::File(_) => state.hovered_file_item = Some(row_idx),
-                Item::Revision(_) => state.hovered_revision_item = Some(row_idx),
-            }
+            cx.notify();
+        }
+        effects
+    }
+
+    fn clear_hover(&mut self) -> bool {
+        self.hovered_file_item.take().is_some()
+            | self.hovered_revision_item.take().is_some()
+            | self.hovered_lane.take().is_some()
+    }
+
+    fn recompute_hover(&mut self, cx: &App) {
+        self.hovered_file_item = None;
+        self.hovered_revision_item = None;
+        self.hovered_lane = None;
+        let Some(pos) = self.cursor_position else {
+            return;
         };
-
-        // The scrollbar is purely visual (thumb position/size), so it stays in
-        // `f32`; a few px of thumb imprecision on a 50M-tall list is invisible,
-        // and any offset it produces is widened back to `f64` before storage.
-        let content_height = self.content_height() as f32;
-
-        // A labelled block, not bare arms: several of these paths bail early,
-        // and the offset they may already have changed above still has to reach
-        // the app. Left as `return`s, a reveal-then-click published nothing and
-        // the app's mirror went stale — the next restore then jumped the sidebar
-        // back to where it thought it was.
-        'event: {
-            match event {
-                Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                    if scrollbar::is_dragging(&state.scrollbar) {
-                        if let scrollbar::ScrollbarEvent::OffsetChanged(new_offset) =
-                            scrollbar::on_cursor_moved(
-                                &mut state.scrollbar,
-                                *position,
-                                bounds,
-                                content_height,
-                            )
-                        {
-                            state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
-                            shell.capture_event();
-                            shell.request_redraw();
-                        }
-                        state.cursor_position = None;
-                        let had_hover = state.hovered_file_item.take().is_some()
-                            || state.hovered_revision_item.take().is_some()
-                            || state.hovered_lane.take().is_some();
-                        if had_hover {
-                            shell.request_redraw();
-                        }
-                        break 'event;
-                    }
-                    // Drag-to-rebase tracking: past a small threshold the press
-                    // becomes a drag; from then on the widget owns the cursor
-                    // (no hover washes) and mirrors spot changes to the app.
-                    if self.on_drag.is_some()
-                        && let Some(drag) = state.drag.as_mut()
-                    {
-                        let offset = state.vertical_offset;
-                        drag.cursor = *position;
-                        if !drag.active {
-                            let dx = position.x - drag.origin.x;
-                            let dy = position.y - drag.origin.y;
-                            if (dx * dx + dy * dy).sqrt() >= 6.0 {
-                                drag.active = true;
-                                // A grab on a marked row carries the whole
-                                // batch; remember its size before the app
-                                // clears the marks for the draft.
-                                drag.batch_count = match self
-                                    .item_at(self.commit_flat(drag.source_commit))
-                                {
-                                    Item::Revision(rev)
-                                        if rev.multi_selected && self.multi_selection_count > 1 =>
-                                    {
-                                        self.multi_selection_count
-                                    }
-                                    _ => 1,
-                                };
-                                // The drag owns spot publishing from here; reset
-                                // the plain-hover dedupe so the first post-drag
-                                // hover re-publishes whatever it lands on.
-                                state.target_hover = None;
-                                if let Some(hooks) = &self.on_drag {
-                                    shell.publish((hooks.start)(drag.source_commit));
-                                }
-                            }
-                        }
-                        if drag.active {
-                            let spot = if bounds.contains(*position) {
-                                let local_y = (position.y - bounds.y) as f64 + offset;
-                                self.drop_spot_at(local_y)
-                            } else {
-                                None
-                            };
-                            if spot != drag.spot {
-                                drag.spot = spot;
-                                if let Some(hooks) = &self.on_drag {
-                                    shell.publish((hooks.hover)(spot));
-                                }
-                            }
-                            state.cursor_position = None;
-                            state.hovered_file_item = None;
-                            state.hovered_revision_item = None;
-                            state.hovered_lane = None;
-                            shell.capture_event();
-                            shell.request_redraw();
-                            break 'event;
-                        }
-                    }
-                    // Target mode without a live drag: mirror the hovered commit
-                    // row to the app so mouse users get the destination hint +
-                    // preview without dragging. File rows resolve to their
-                    // revision, matching drop semantics.
-                    if let Some(on_target_hover) = self.on_target_hover {
-                        let hovered = if bounds.contains(*position) {
-                            let local_y = (position.y - bounds.y) as f64 + state.vertical_offset;
-                            self.row_at_offset(local_y)
-                                .and_then(|flat| self.drop_commit_of(flat))
-                        } else {
-                            None
-                        };
-                        if state.target_hover != hovered {
-                            state.target_hover = hovered;
-                            shell.publish(on_target_hover(hovered));
-                        }
-                    } else {
-                        state.target_hover = None;
-                    }
-                    if bounds.contains(*position) {
-                        state.cursor_position = Some(*position);
-                    } else {
-                        state.cursor_position = None;
-                    }
-                    let prev_file = state.hovered_file_item;
-                    let prev_revision = state.hovered_revision_item;
-                    let prev_lane = state.hovered_lane;
-                    recompute_hover(state, self);
-                    if state.hovered_file_item != prev_file
-                        || state.hovered_revision_item != prev_revision
-                        || state.hovered_lane != prev_lane
-                    {
-                        shell.request_redraw();
-                    }
-                }
-                Event::Mouse(mouse::Event::CursorLeft) => {
-                    state.cursor_position = None;
-                    if state.target_hover.take().is_some()
-                        && let Some(on_target_hover) = self.on_target_hover
-                    {
-                        shell.publish(on_target_hover(None));
-                    }
-                    let had_hover = state.hovered_file_item.take().is_some()
-                        || state.hovered_revision_item.take().is_some()
-                        || state.hovered_lane.take().is_some();
-                    if had_hover {
-                        shell.request_redraw();
-                    }
-                }
-                Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                    if cursor.position_over(bounds).is_none() {
-                        break 'event;
-                    }
-                    let movement = crate::wheel::movement(*delta);
-                    if movement.y != 0.0 {
-                        state.vertical_offset =
-                            (state.vertical_offset + movement.y as f64).clamp(0.0, max_vertical);
-                        let prev = state.hovered_file_item;
-                        recompute_hover(state, self);
-                        shell.capture_event();
-                        shell.request_redraw();
-                        let _ = prev;
-                    }
-                }
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    let Some(cursor_pos) = cursor.position_over(bounds) else {
-                        break 'event;
-                    };
-                    match scrollbar::on_button_pressed(
-                        &mut state.scrollbar,
-                        cursor_pos,
-                        bounds,
-                        content_height,
-                        state.vertical_offset as f32,
-                    ) {
-                        scrollbar::ScrollbarEvent::OffsetChanged(new_offset) => {
-                            state.vertical_offset = (new_offset as f64).clamp(0.0, max_vertical);
-                            shell.capture_event();
-                            shell.request_redraw();
-                            break 'event;
-                        }
-                        scrollbar::ScrollbarEvent::Captured => {
-                            shell.capture_event();
-                            break 'event;
-                        }
-                        scrollbar::ScrollbarEvent::None => {}
-                    }
-                    let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
-                    if let Some(row_idx) = self.row_at_offset(local_y) {
-                        match self.row_kind(row_idx) {
-                            RowKind::Revision(commit) => {
-                                // Arm a potential drag; it only activates past the
-                                // movement threshold, so plain clicks stay clicks.
-                                if self.on_drag.is_some() {
-                                    state.drag = Some(DragState {
-                                        source_commit: commit,
-                                        origin: cursor_pos,
-                                        active: false,
-                                        spot: None,
-                                        batch_count: 1,
-                                        cursor: cursor_pos,
-                                    });
-                                }
-                                // The select fires on *release* (same row, no
-                                // drag): publishing on press meant starting a
-                                // drag on the selected row toggled its file list
-                                // before the drag ever armed.
-                                if let Item::Revision(rev) = self.item_at(row_idx)
-                                    && !rev.inert
-                                {
-                                    state.pending_click = Some((row_idx, rev.selection_key));
-                                }
-                                shell.capture_event();
-                            }
-                            // The callback wants the *display* row index into the
-                            // file tree (directories toggle their collapse state
-                            // by position), not `FileRowView::file_index` — which
-                            // is the document index and `usize::MAX` for dirs.
-                            // File rows never drag, so their click stays on press.
-                            RowKind::File(display_index) => {
-                                state.pending_click = None;
-                                let checked = self.on_file_check.filter(|_| {
-                                    let item = self.item_at(row_idx);
-                                    let gutter_total = self.item_gutter_width(&item);
-                                    let Item::File(file) = item else {
-                                        return false;
-                                    };
-                                    let icon_x =
-                                        bounds.x + gutter_total + file.indent + FILE_CHEVRON_COL;
-                                    file.check.is_some()
-                                        && cursor_pos.x >= icon_x - 2.0
-                                        && cursor_pos.x < icon_x + FILE_ICON_COL + 2.0
-                                });
-                                match checked {
-                                    Some(on_check) => shell.publish(on_check(display_index)),
-                                    None => shell.publish((self.on_select_file)(display_index)),
-                                }
-                                shell.capture_event();
-                            }
-                        }
-                    }
-                }
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    let pending_click = state.pending_click.take();
-                    if let Some(drag) = state.drag.take()
-                        && drag.active
-                    {
-                        state.target_hover = None;
-                        if let Some(hooks) = &self.on_drag {
-                            shell.publish((hooks.drop)(drag.spot));
-                        }
-                        shell.capture_event();
-                        shell.request_redraw();
-                    } else if let Some((pressed_flat, key)) = pending_click {
-                        // A click completes only when the release lands on the
-                        // row it pressed (button semantics) — releasing after
-                        // drifting off the row aborts instead of mis-selecting.
-                        let released_on_same_row = cursor
-                            .position_over(bounds)
-                            .and_then(|pos| {
-                                let local_y = (pos.y - bounds.y) as f64 + state.vertical_offset;
-                                self.row_at_offset(local_y)
-                            })
-                            .is_some_and(|flat| flat == pressed_flat);
-                        if released_on_same_row {
-                            shell.publish((self.on_select_revision)(key));
-                            shell.capture_event();
-                        }
-                    }
-                    if let scrollbar::ScrollbarEvent::Captured =
-                        scrollbar::on_button_released(&mut state.scrollbar)
-                    {
-                        shell.capture_event();
-                    }
-                }
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                    let Some(cursor_pos) = cursor.position_over(bounds) else {
-                        break 'event;
-                    };
-                    let local_y = (cursor_pos.y - bounds.y) as f64 + state.vertical_offset;
-                    let Some(row_idx) = self.row_at_offset(local_y) else {
-                        break 'event;
-                    };
-                    // The row card's on-screen rect (window-content points):
-                    // the highlight drawn while the menu is open lies exactly
-                    // over the hover/selection card, at ROW_CARD_RADIUS.
-                    let row_h = row_height_of(self.row_kind(row_idx));
-                    let screen_y =
-                        bounds.y + (self.row_top(row_idx) - state.vertical_offset) as f32;
-                    let row_rect = self.card_bounds(Rectangle {
-                        x: bounds.x,
-                        y: screen_y,
-                        width: bounds.width,
-                        height: row_h,
-                    });
-                    match self.row_kind(row_idx) {
-                        RowKind::Revision(_) => {
-                            let Some(callback) = self.on_context_menu else {
-                                break 'event;
-                            };
-                            if let Item::Revision(rev) = self.item_at(row_idx) {
-                                shell.publish(callback(rev.selection_key, row_rect, cursor_pos));
-                                shell.capture_event();
-                            }
-                        }
-                        RowKind::File(display_index) => {
-                            let Some(callback) = self.on_file_context_menu else {
-                                break 'event;
-                            };
-                            shell.publish(callback(display_index, row_rect, cursor_pos));
-                            shell.capture_event();
-                        }
-                    }
-                }
-                Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
-                    // Esc abandons an active drag visually; the app's own Esc
-                    // handling (the draft cancel) rides the same event through
-                    // the subscription.
-                    if matches!(
-                        key,
-                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
-                    ) && let Some(drag) = state.drag.take()
-                    {
-                        state.pending_click = None;
-                        if drag.active
-                            && let Some(hooks) = &self.on_drag
-                        {
-                            shell.publish((hooks.hover)(None));
-                        }
-                        shell.request_redraw();
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Report any offset change from this pass — wheel, scrollbar, reveal,
-        // restore, clamp — exactly once, whichever path produced it.
-        if state.vertical_offset != prev_offset
-            && let Some(cb) = on_scroll
-        {
-            shell.publish(cb(state.vertical_offset));
-        }
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'b>,
-        _renderer: &Renderer,
-        _viewport: &Rectangle,
-        translation: Vector,
-    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.tooltip(tree, layout, translation)
-            .map(|tooltip| overlay::Element::new(Box::new(tooltip)))
-            .into_iter()
-            .collect()
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        _viewport: &Rectangle,
-        _renderer: &Renderer,
-    ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<State>();
-        if state.drag.is_some_and(|drag| drag.active) {
-            return mouse::Interaction::Grabbing;
-        }
-        let bounds = layout.bounds();
-        let Some(point) = cursor.position_over(bounds) else {
-            return mouse::Interaction::None;
-        };
-        if scrollbar::is_dragging(&state.scrollbar)
-            || scrollbar::hits_container(bounds, point, self.content_height() as f32)
-        {
-            return mouse::Interaction::Idle;
-        }
-        mouse::Interaction::Pointer
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut Renderer,
-        _theme: &Theme,
-        _renderer_style: &renderer::Style,
-        layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        if bounds.intersection(viewport).is_none() {
+        if !self.bounds.contains(pos) {
             return;
         }
-        let state = tree.state.downcast_ref::<State>();
+        let local_x = pos.x - self.bounds.x;
+        let local_y = f64::from(pos.y - self.bounds.y) + self.vertical_offset;
+        let props = self.props.clone();
+        let Some(row_idx) = props.row_at_offset(local_y) else {
+            return;
+        };
+        let Some(item) = self.props.item_at(row_idx, cx) else {
+            return;
+        };
+        let geometry = self.lane_geometry();
+        let columns = item_lanes(&item);
+        // Lane hit-test first: a cursor in the lane strip with a
+        // labeled lane wins over the content-area file tooltip.
+        if let Some(display) = geometry.column_at(local_x, columns) {
+            // Pick the half from the cursor's vertical position within the
+            // row, so a click on the incoming stub of a split lane resolves to
+            // that branch's segment (not the unrelated new branch starting
+            // below).
+            let row_h = f64::from(row_height_of(props.row_kind(row_idx)));
+            let half = if local_y - props.row_top(row_idx) < row_h / 2.0 {
+                LaneHalf::Before
+            } else {
+                LaneHalf::After
+            };
+            // The cursor x is a *display* column under lane warping;
+            // everything downstream (labels, segments) keys on the
+            // original lane, so map it back first.
+            if let Some(lane) = item_display_to_lane(&item, display, half)
+                && !item_lane_labels(&item, lane).is_empty()
+            {
+                self.hovered_lane = Some((row_idx, lane, half));
+                return;
+            }
+        }
+        match item {
+            Item::File(_) => self.hovered_file_item = Some(row_idx),
+            Item::Revision(_) => self.hovered_revision_item = Some(row_idx),
+        }
+    }
 
-        let visible_top = state.vertical_offset;
-        let visible_bottom = visible_top + bounds.height as f64;
+    /// Runs a pointer handler, then reports the offset if it moved, whichever
+    /// path moved it, exactly once.
+    fn with_scroll_report(
+        &mut self,
+        handler: impl FnOnce(&mut Self, &mut Effects, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> Effects {
+        let before = self.vertical_offset;
+        let mut effects = Effects::new();
+        handler(self, &mut effects, cx);
+        if self.vertical_offset != before
+            && let Some(on_scroll) = &self.props.on_scroll
+        {
+            effects.push(call(on_scroll, self.vertical_offset));
+        }
+        effects
+    }
 
-        renderer.with_layer(bounds, |renderer| {
-            fill_background(renderer, bounds, self.style.background);
-
-            // Resolve the hovered (row, lane, half) → (segment id, lane)
-            // once so each drawn row can do a single segment lookup
-            // instead of re-resolving the hover row's segment. The half
-            // matters at split lanes: the same lane index at the hover
-            // row may carry two different segment ids in its top vs
-            // bottom half.
-            let emphasized_segment =
-                state
-                    .hovered_lane
-                    .and_then(|(hov_idx, hov_lane, hov_half)| {
-                        if hov_idx >= self.row_count() {
-                            return None;
-                        }
-                        let item = self.item_at(hov_idx);
-                        item_lane_segment(&item, hov_lane, hov_half).map(|seg| (seg, hov_lane))
-                    });
-
-            // Indent-guide emphasis: hovering a tree row brightens the guide
-            // of its parent level across the contiguous sibling run (rows at
-            // the same or deeper indent around it) — VSCode's "active indent
-            // guide". Resolved once here as (level, first flat, last flat).
-            let guide_emphasis = state.hovered_file_item.and_then(|hovered| {
-                // The walk is bounded: emphasis only matters for drawn rows,
-                // and a run longer than this already spans several screens.
-                const RUN_SCAN_CAP: usize = 400;
-                if hovered >= self.row_count() {
-                    return None;
-                }
-                let depth_of = |flat: usize| match self.item_at(flat) {
-                    Item::File(row) => Some((row.indent / FILE_TREE_INDENT).round() as usize),
-                    Item::Revision(_) => None,
+    fn on_mouse_move(
+        &mut self,
+        position: Point,
+        hovered: bool,
+        effects: &mut Effects,
+        cx: &mut Context<Self>,
+    ) {
+        let props = self.props.clone();
+        let bounds = self.bounds;
+        // Drag-to-rebase tracking: past a small threshold the press becomes a
+        // drag; from then on the list owns the cursor (no hover washes) and
+        // mirrors spot changes to the app.
+        if let Some(hooks) = &props.on_drag
+            && let Some(mut drag) = self.drag
+        {
+            drag.cursor = position;
+            if !drag.active && position.distance(drag.origin) >= DRAG_THRESHOLD {
+                drag.active = true;
+                // A grab on a marked row carries the whole batch; remember its
+                // size before the app clears the marks for the draft.
+                drag.batch_count = match props.item_at(props.commit_flat(drag.source_commit), cx) {
+                    Some(Item::Revision(rev))
+                        if rev.multi_selected && props.multi_selection_count > 1 =>
+                    {
+                        props.multi_selection_count
+                    }
+                    _ => 1,
                 };
-                let depth = depth_of(hovered)?;
-                let level = depth.checked_sub(1)?;
-                let mut start = hovered;
-                while start > 0
-                    && hovered - start < RUN_SCAN_CAP
-                    && depth_of(start - 1).is_some_and(|d| d >= depth)
-                {
-                    start -= 1;
+                // The drag owns spot publishing from here; reset the plain-hover
+                // dedupe so the first post-drag hover re-publishes whatever it
+                // lands on.
+                self.target_hover = None;
+                effects.push(call(&hooks.start, drag.source_commit));
+            }
+            if drag.active {
+                let spot = if bounds.contains(position) {
+                    let local_y = f64::from(position.y - bounds.y) + self.vertical_offset;
+                    props.drop_spot_at(local_y, cx)
+                } else {
+                    None
+                };
+                if spot != drag.spot {
+                    drag.spot = spot;
+                    effects.push(call(&hooks.hover, spot));
                 }
-                let mut end = hovered;
-                while end + 1 < self.row_count()
-                    && end - hovered < RUN_SCAN_CAP
-                    && depth_of(end + 1).is_some_and(|d| d >= depth)
-                {
-                    end += 1;
+                self.cursor_position = None;
+                self.clear_hover();
+                self.drag = Some(drag);
+                cx.notify();
+                return;
+            }
+            self.drag = Some(drag);
+        }
+        // Target mode without a live drag: mirror the hovered commit row to the
+        // app so mouse users get the destination hint + preview without
+        // dragging. File rows resolve to their revision, matching drop
+        // semantics.
+        let inside = hovered && bounds.contains(position);
+        if let Some(on_target_hover) = &props.on_target_hover {
+            let hover = if inside {
+                let local_y = f64::from(position.y - bounds.y) + self.vertical_offset;
+                props
+                    .row_at_offset(local_y)
+                    .and_then(|flat| props.drop_commit_of(flat))
+            } else {
+                None
+            };
+            if self.target_hover != hover {
+                self.target_hover = hover;
+                effects.push(call(on_target_hover, hover));
+            }
+        } else {
+            self.target_hover = None;
+        }
+        self.cursor_position = inside.then_some(position);
+        let before = (
+            self.hovered_file_item,
+            self.hovered_revision_item,
+            self.hovered_lane,
+        );
+        self.recompute_hover(cx);
+        // The cursor shape is set at paint, so crossing onto the bar repaints.
+        let over_scrollbar =
+            inside && scrollbar::hits_container(bounds, position, props.content_height() as f32);
+        if before
+            != (
+                self.hovered_file_item,
+                self.hovered_revision_item,
+                self.hovered_lane,
+            )
+            || over_scrollbar != self.over_scrollbar
+        {
+            self.over_scrollbar = over_scrollbar;
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_exit(&mut self, effects: &mut Effects, cx: &mut Context<Self>) {
+        self.cursor_position = None;
+        if self.target_hover.take().is_some()
+            && let Some(on_target_hover) = &self.props.on_target_hover
+        {
+            effects.push(call(on_target_hover, None));
+        }
+        if self.clear_hover() {
+            cx.notify();
+        }
+    }
+
+    fn on_wheel(&mut self, delta_y: f32, cx: &mut Context<Self>) {
+        if delta_y == 0.0 {
+            return;
+        }
+        // A positive delta moves the content down, towards the top of the list.
+        if scroll_resample::delay().is_zero() {
+            self.vertical_offset =
+                (self.vertical_offset - f64::from(delta_y)).clamp(0.0, self.max_offset());
+            self.recompute_hover(cx);
+        } else {
+            // Drawn over the next frames: see `scroll_resample`.
+            self.wheel.push(Instant::now(), -f64::from(delta_y));
+        }
+        cx.notify();
+    }
+
+    /// Returns whether the press was the list's.
+    fn on_left_press(
+        &mut self,
+        cursor: Point,
+        effects: &mut Effects,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let props = self.props.clone();
+        let bounds = self.bounds;
+        if let Some((pin, ..)) = self.working_copy_pin(cx)
+            && pin.contains(cursor)
+        {
+            self.pending_reveal_row = props.working_copy_flat;
+            cx.notify();
+            return true;
+        }
+        let local_y = f64::from(cursor.y - bounds.y) + self.vertical_offset;
+        let Some(row_idx) = props.row_at_offset(local_y) else {
+            return false;
+        };
+        match props.row_kind(row_idx) {
+            RowKind::Revision(commit) => {
+                // Arm a potential drag; it only activates past the movement
+                // threshold, so plain clicks stay clicks.
+                if props.on_drag.is_some() {
+                    self.drag = Some(DragState {
+                        source_commit: commit,
+                        origin: cursor,
+                        active: false,
+                        spot: None,
+                        batch_count: 1,
+                        cursor,
+                    });
                 }
-                Some((level, start, end))
-            });
+                // The select fires on *release* (same row, no drag): publishing
+                // on press meant starting a drag on the selected row toggled
+                // its file list before the drag ever armed.
+                if let Some(Item::Revision(rev)) = props.item_at(row_idx, cx)
+                    && !rev.inert
+                {
+                    self.pending_click = Some((row_idx, rev.selection_key));
+                }
+            }
+            // The callback wants the *display* row index into the file tree
+            // (directories toggle their collapse state by position), not
+            // `FileRowView::file_index`, which is the document index and
+            // `usize::MAX` for dirs. File rows never drag, so their click stays
+            // on press.
+            RowKind::File(display_index) => {
+                self.pending_click = None;
+                let on_check = props.on_file_check.as_ref().filter(|_| {
+                    let Some(item) = props.item_at(row_idx, cx) else {
+                        return false;
+                    };
+                    let gutter_total = self.gutter_width(&item);
+                    let Item::File(file) = item else {
+                        return false;
+                    };
+                    if file.check.is_none() {
+                        return false;
+                    }
+                    let columns =
+                        props.file_row_columns(bounds.x, bounds.width, gutter_total, &file);
+                    columns.check_center.is_some_and(|center| {
+                        (cursor.x - center).abs() <= FILE_CHECK_COL / 2.0 + 3.0
+                    })
+                });
+                if let Some(on_check) = on_check {
+                    effects.push(call(on_check, display_index));
+                } else if let Some(on_select) = &props.on_select_file {
+                    effects.push(call(on_select, display_index));
+                }
+            }
+        }
+        true
+    }
+
+    fn on_left_release(&mut self, cursor: Point, effects: &mut Effects, cx: &mut Context<Self>) {
+        let props = self.props.clone();
+        let pending_click = self.pending_click.take();
+        if let Some(drag) = self.drag.take()
+            && drag.active
+        {
+            self.target_hover = None;
+            if let Some(hooks) = &props.on_drag {
+                effects.push(call(&hooks.drop, drag.spot));
+            }
+            cx.notify();
+        } else if let Some((pressed_flat, key)) = pending_click {
+            // A click completes only when the release lands on the row it
+            // pressed (button semantics): releasing after drifting off the row
+            // aborts instead of mis-selecting.
+            let released_on_same_row = self.bounds.contains(cursor)
+                && props.row_at_offset(f64::from(cursor.y - self.bounds.y) + self.vertical_offset)
+                    == Some(pressed_flat);
+            if released_on_same_row && let Some(on_select) = &props.on_select_revision {
+                effects.push(call(on_select, key));
+            }
+        }
+    }
+
+    /// Returns whether the press was the list's.
+    fn on_right_press(
+        &mut self,
+        cursor: Point,
+        effects: &mut Effects,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let props = self.props.clone();
+        let local_y = f64::from(cursor.y - self.bounds.y) + self.vertical_offset;
+        let Some(row_idx) = props.row_at_offset(local_y) else {
+            return false;
+        };
+        // The row card's on-screen rect: the highlight drawn while the menu is
+        // open lies exactly over the hover/selection card, at ROW_CARD_RADIUS.
+        let row_rect = props.card_bounds(Rectangle {
+            x: self.bounds.x,
+            y: self.row_screen_y(row_idx),
+            width: self.bounds.width,
+            height: row_height_of(props.row_kind(row_idx)),
+        });
+        match props.row_kind(row_idx) {
+            RowKind::Revision(_) => {
+                let Some(callback) = &props.on_context_menu else {
+                    return false;
+                };
+                let Some(Item::Revision(rev)) = props.item_at(row_idx, cx) else {
+                    return false;
+                };
+                effects.push(call(callback, (rev.selection_key, row_rect, cursor)));
+            }
+            RowKind::File(display_index) => {
+                let Some(callback) = &props.on_file_context_menu else {
+                    return false;
+                };
+                effects.push(call(callback, (display_index, row_rect, cursor)));
+            }
+        }
+        true
+    }
+
+    /// Where a row's top lands in the window. `row_top - offset` is
+    /// viewport-relative (small) and exact in `f64`; only after that subtraction
+    /// cancels the large magnitude is it safe to narrow to `f32`.
+    fn row_screen_y(&self, flat: usize) -> f32 {
+        self.bounds.y + (self.props.row_top(flat) - self.vertical_offset) as f32
+    }
+
+    /// The hover tooltip due this frame, if any: a lane's labels, or the full
+    /// path of a file row whose name is ellipsized. Text, the row's box in the
+    /// window and where to put it relative to that.
+    fn tooltip(&self, window: &Window, cx: &App) -> Option<Floating> {
+        let cursor = self.cursor_position?;
+        let props = &self.props;
+        let style = &props.style;
+        let bounds = self.bounds;
+
+        // Lane tooltip wins over the file path tooltip when both could fire at
+        // the same time: the cursor is in the gutter, which is mutually
+        // exclusive with the content area anyway.
+        let (text, target) = if let Some((item_idx, lane, _half)) = self.hovered_lane {
+            if item_idx >= props.row_count() {
+                return None;
+            }
+            let item = self.props.item_at(item_idx, cx)?;
+            let labels = item_lane_labels(&item, lane);
+            if labels.is_empty() {
+                return None;
+            }
+            (
+                labels.join(", "),
+                // The stroke under the cursor, on its row.
+                Rectangle {
+                    x: cursor.x,
+                    y: self.row_screen_y(item_idx),
+                    width: 0.0,
+                    height: row_height_of(props.row_kind(item_idx)),
+                },
+            )
+        } else {
+            let item_idx = self.hovered_file_item?;
+            if item_idx >= props.row_count() {
+                return None;
+            }
+            let item = props.item_at(item_idx, cx)?;
+            let gutter_total = self.gutter_width(&item);
+            let Item::File(file) = item else {
+                return None;
+            };
+            // Only show the path tooltip when the name is actually
+            // ellipsized: same column math as painting it.
+            let columns = props.file_row_columns(bounds.x, bounds.width, gutter_total, &file);
+            let path_w = columns.path_w;
+            let name_width =
+                self.widths
+                    .width(&file.primary, FILE_NAME_TEXT_SIZE, style.primary_font);
+            if name_width <= path_w {
+                return None;
+            }
+            (
+                file.raw_path,
+                Rectangle {
+                    x: columns.path_x,
+                    y: self.row_screen_y(item_idx),
+                    width: path_w,
+                    height: FILE_ROW_HEIGHT,
+                },
+            )
+        };
+
+        let look = crate::ui::Look::new(style.floating, style.primary_font, style.mono_font);
+        let (card, at) = crate::ui::placed_tooltip(text, target, look, window);
+        Some((card.into_any_element(), at))
+    }
+
+    /// The chip trailing the cursor during a drag: the dragged revision's
+    /// change id, or the size of the marked batch it carries.
+    fn drag_ghost(&self, cx: &App) -> Option<Floating> {
+        let drag = self.drag.filter(|drag| drag.active)?;
+        let props = &self.props;
+        let style = &props.style;
+        let source_flat = props.commit_flat(drag.source_commit);
+        if source_flat >= props.row_count() {
+            return None;
+        }
+        let Some(Item::Revision(rev)) = props.item_at(source_flat, cx) else {
+            return None;
+        };
+        let label = if drag.batch_count > 1 {
+            format!("{} revisions", drag.batch_count)
+        } else {
+            format!("{}{}", rev.change_id_prefix, rev.change_id_suffix)
+        };
+        Some((
+            div()
+                .px(px(8.0))
+                .py(px(4.0))
+                .map(|label| {
+                    crate::theme::squircle(
+                        label,
+                        crate::theme::radius::CONTROL,
+                        Some(style.floating.panel_background_elevated),
+                        Some(Color {
+                            a: 0.6,
+                            ..style.accent
+                        }),
+                    )
+                })
+                .shadow(vec![
+                    crate::theme::Elevation::Tooltip.shadow(style.floating),
+                ])
+                .font(style.mono_font.gpui())
+                .text_size(px(CAPTION_TEXT_SIZE))
+                .text_color(style.accent)
+                .whitespace_nowrap()
+                .child(label)
+                .into_any_element(),
+            point(px(drag.cursor.x + 14.0), px(drag.cursor.y + 16.0)),
+        ))
+    }
+
+    fn paint(&self, window: &mut Window, cx: &mut Context<Self>) {
+        PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bounds = self.bounds;
+        let props = self.props.clone();
+        let style = &props.style;
+        window.paint_quad(fill(bounds.bounds(), style.background));
+
+        // Resolve the hovered (row, lane, half) -> (segment id, lane) once so
+        // each drawn row can do a single segment lookup instead of re-resolving
+        // the hover row's segment. The half matters at split lanes: the same
+        // lane index at the hover row may carry two different segment ids in
+        // its top vs bottom half.
+        let emphasized_segment = self.hovered_lane.and_then(|(row, lane, half)| {
+            if row >= props.row_count() {
+                return None;
+            }
+            let item = self.props.item_at(row, cx)?;
+            item_lane_segment(&item, lane, half).map(|segment| (segment, lane))
+        });
+
+        // Indent-guide emphasis: hovering a tree row brightens the guide of its
+        // parent level across the contiguous sibling run (rows at the same or
+        // deeper indent around it), VSCode's "active indent guide". Resolved
+        // once here as (level, first flat, last flat).
+        let guide_emphasis = self.hovered_file_item.and_then(|hovered| {
+            // The walk is bounded: emphasis only matters for drawn rows, and a
+            // run longer than this already spans several screens.
+            const RUN_SCAN_CAP: usize = 400;
+            if hovered >= props.row_count() {
+                return None;
+            }
+            let depth_of = |flat: usize| match props.item_at(flat, cx) {
+                Some(Item::File(row)) => Some((row.indent / FILE_TREE_INDENT).round() as usize),
+                _ => None,
+            };
+            let depth = depth_of(hovered)?;
+            let level = depth.checked_sub(1)?;
+            let mut start = hovered;
+            while start > 0
+                && hovered - start < RUN_SCAN_CAP
+                && depth_of(start - 1).is_some_and(|d| d >= depth)
+            {
+                start -= 1;
+            }
+            let mut end = hovered;
+            while end + 1 < props.row_count()
+                && end - hovered < RUN_SCAN_CAP
+                && depth_of(end + 1).is_some_and(|d| d >= depth)
+            {
+                end += 1;
+            }
+            Some((level, start, end))
+        });
+
+        let mask = gpui_kit::ContentMask {
+            bounds: bounds.bounds(),
+        };
+        window.with_content_mask(Some(mask), |window| {
+            let mut graph = GraphFrame::default();
+            let mut markers: Vec<(Rectangle, f32, DraftMarker)> = Vec::new();
 
             // Walk only the rows that intersect the viewport, materializing
-            // each one's view on demand — off-screen rows cost nothing.
-            let count = self.row_count();
-            let first = self.row_at_offset(visible_top).unwrap_or(0);
-            let mut flat = first;
-            let mut row_top_local = self.row_top(first);
+            // each one's view on demand: off-screen rows cost nothing.
+            let count = props.row_count();
+            let visible_top = self.vertical_offset;
+            let visible_bottom = visible_top + f64::from(bounds.height);
+            let scale = window.scale_factor();
+            let mut flat = props.row_at_offset(visible_top).unwrap_or(0);
+            let mut row_top_local = props.row_top(flat);
             while flat < count && row_top_local < visible_bottom {
-                let row_h = row_height_of(self.row_kind(flat));
-                // `row_top_local - visible_top` is viewport-relative (small) and
-                // exact in `f64`; only here, after the subtraction cancels the
-                // large magnitude, is it safe to narrow to `f32` for rendering.
+                let row_h = row_height_of(props.row_kind(flat));
+                // Whole device pixels: quads and glyphs snap on their own, paths
+                // don't, and a fractional trackpad offset would otherwise shear
+                // the discs off their lines.
                 let screen_y = bounds.y + (row_top_local - visible_top) as f32;
-                let row_bounds = Rectangle {
+                let screen_y = (screen_y * scale).round() / scale;
+                let row = Rectangle {
                     x: bounds.x,
                     y: screen_y,
                     width: bounds.width,
                     height: row_h,
                 };
-                let item = self.item_at(flat);
-                let gutter_total = self.item_gutter_width(&item);
-                let emphasized_lane_before = emphasized_segment.and_then(|(seg, lane)| {
-                    let this_seg = item_lane_segment(&item, lane, LaneHalf::Before)?;
-                    (this_seg == seg).then_some(lane)
-                });
-                let emphasized_lane_after = emphasized_segment.and_then(|(seg, lane)| {
-                    let this_seg = item_lane_segment(&item, lane, LaneHalf::After)?;
-                    (this_seg == seg).then_some(lane)
-                });
-
-                match item {
-                    Item::Revision(rev) => {
-                        self.draw_revision(
-                            renderer,
-                            &state.widths,
-                            row_bounds,
-                            &rev,
-                            gutter_total,
-                            emphasized_lane_before,
-                            emphasized_lane_after,
-                            state.hovered_revision_item == Some(flat),
-                        );
-                    }
-                    Item::File(f) => {
-                        // File rows are continuation-only — they sit
-                        // under the parent revision's `after` snapshot,
-                        // so the after-half emphasis is what applies.
-                        let emphasized_guide = guide_emphasis
-                            .filter(|&(_, start, end)| flat >= start && flat <= end)
-                            .map(|(level, ..)| level);
-                        self.draw_file(
-                            renderer,
-                            &state.widths,
-                            row_bounds,
-                            &f,
-                            gutter_total,
-                            emphasized_lane_after,
-                            emphasized_guide,
-                            state.hovered_file_item == Some(flat),
-                        );
+                if let Some(item) = self.props.item_at(flat, cx) {
+                    let gutter_total = self.gutter_width(&item);
+                    let emphasized = |half| {
+                        emphasized_segment.and_then(|(segment, lane)| {
+                            let here = item_lane_segment(&item, lane, half)?;
+                            (here == segment).then_some(lane)
+                        })
+                    };
+                    let before = emphasized(LaneHalf::Before);
+                    let after = emphasized(LaneHalf::After);
+                    match &item {
+                        Item::Revision(rev) => {
+                            self.paint_revision(
+                                row,
+                                rev,
+                                gutter_total,
+                                before,
+                                after,
+                                self.hovered_revision_item == Some(flat),
+                                &mut graph,
+                                window,
+                                cx,
+                            );
+                            if let Some(marker) = rev.draft_marker {
+                                markers.push((row, gutter_total, marker));
+                            }
+                        }
+                        Item::File(file) => {
+                            // File rows are continuation-only: they sit under
+                            // the parent revision's `after` snapshot, so the
+                            // after-half emphasis is what applies.
+                            let guide = guide_emphasis
+                                .filter(|&(_, start, end)| flat >= start && flat <= end)
+                                .map(|(level, ..)| level);
+                            self.paint_file(
+                                row,
+                                file,
+                                gutter_total,
+                                after,
+                                guide,
+                                self.hovered_file_item == Some(flat),
+                                &mut graph,
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 }
-
-                row_top_local += row_h as f64;
+                row_top_local += f64::from(row_h);
                 flat += 1;
             }
 
-            let geom = scrollbar::geometry(
-                bounds,
-                self.content_height() as f32,
-                state.vertical_offset as f32,
-            );
-            scrollbar::draw(renderer, &geom, &self.style.scrollbar);
+            // The graph sits on top of any row chrome.
+            graph.paint(window);
 
-            // Live drag-to-rebase indicators: the drop decoration under the
-            // cursor plus a ghost chip naming what's being moved.
-            if let Some(drag) = state.drag.filter(|drag| drag.active) {
-                let row_rect = |commit: usize| -> Option<Rectangle> {
-                    let flat = self.commit_flat(commit);
-                    if flat >= self.row_count() {
-                        return None;
+            // Target-mode destination decorations, on top of everything: the
+            // ring (lands as a child of this row) or the insertion line
+            // above/below (insert-after / insert-before).
+            for (row, gutter_total, marker) in markers {
+                match marker {
+                    DraftMarker::Ring => stroke_rounded(
+                        props.card_bounds(row),
+                        style.accent,
+                        1.5,
+                        ROW_CARD_RADIUS,
+                        window,
+                    ),
+                    DraftMarker::LineAbove => {
+                        paint_insertion_line(row, gutter_total, true, style.accent, window)
                     }
-                    let top = self.row_top(flat);
-                    Some(Rectangle {
+                    DraftMarker::LineBelow => {
+                        paint_insertion_line(row, gutter_total, false, style.accent, window)
+                    }
+                }
+            }
+
+            // Live drag-to-rebase indicator: the drop decoration under the
+            // cursor. The ghost chip is deferred: it follows the cursor out of
+            // the list.
+            if let Some(drag) = self.drag.filter(|drag| drag.active) {
+                let row_rect = |commit: usize| -> Option<Rectangle> {
+                    let flat = props.commit_flat(commit);
+                    (flat < props.row_count()).then(|| Rectangle {
                         x: bounds.x,
-                        y: bounds.y + (top - visible_top) as f32,
+                        y: self.row_screen_y(flat),
                         width: bounds.width,
                         height: REVISION_ROW_HEIGHT,
                     })
                 };
-                match self.drop_indicator.unwrap_or(drag.spot) {
+                match props.drop_indicator.unwrap_or(drag.spot) {
                     Some(DropSpot::OnRow(commit)) => {
                         if let Some(rect) = row_rect(commit) {
-                            let card = Rectangle {
-                                x: rect.x + ROW_CARD_INSET_X,
-                                y: rect.y + ROW_CARD_INSET_Y,
-                                width: (rect.width - ROW_CARD_INSET_X * 2.0).max(0.0),
-                                height: (rect.height - ROW_CARD_INSET_Y * 2.0).max(0.0),
-                            };
-                            stroke_rounded(renderer, card, self.style.accent, 1.5, ROW_CARD_RADIUS);
+                            stroke_rounded(
+                                props.card_bounds(rect),
+                                style.accent,
+                                1.5,
+                                ROW_CARD_RADIUS,
+                                window,
+                            );
                         }
                     }
                     Some(DropSpot::Gap { below, .. }) => {
-                        // The gap line sits on the *top* edge of the
-                        // parent-side (lower) row.
-                        if let Some(rect) = row_rect(below) {
-                            let item = self.item_at(self.commit_flat(below));
-                            let gutter = self.item_gutter_width(&item);
-                            draw_insertion_line(renderer, rect, gutter, true, self.style.accent);
+                        // The gap line sits on the *top* edge of the parent-side
+                        // (lower) row.
+                        if let Some(rect) = row_rect(below)
+                            && let Some(item) = props.item_at(props.commit_flat(below), cx)
+                        {
+                            paint_insertion_line(
+                                rect,
+                                self.gutter_width(&item),
+                                true,
+                                style.accent,
+                                window,
+                            );
                         }
                     }
                     None => {}
                 }
-                // Ghost chip: the dragged revision's change id — or the size
-                // of the marked batch it carries — trailing the cursor.
-                // Materialized per frame only while dragging.
-                let source_flat = self.commit_flat(drag.source_commit);
-                if source_flat < self.row_count()
-                    && let Item::Revision(rev) = self.item_at(source_flat)
-                {
-                    let label = if drag.batch_count > 1 {
-                        format!("{} revisions", drag.batch_count)
-                    } else {
-                        format!("{}{}", rev.change_id_prefix, rev.change_id_suffix)
-                    };
-                    let text_bounds =
-                        measure::line_bounds(&label, CAPTION_TEXT_SIZE, self.style.mono_font);
-                    let pad_x = 8.0;
-                    let pad_y = 4.0;
-                    let chip = Rectangle {
-                        x: drag.cursor.x + 14.0,
-                        y: drag.cursor.y + 16.0,
-                        width: text_bounds.width + pad_x * 2.0,
-                        height: text_bounds.height + pad_y * 2.0,
-                    };
-                    // The chip gets its own layer: within one layer iced
-                    // draws every quad first and every text run after, so
-                    // the rows' *text* would paint straight over the chip's
-                    // background. A nested layer composites above both.
-                    // Inflated so the shadow isn't clipped at the layer edge.
-                    let chip_layer = Rectangle {
-                        x: chip.x - 20.0,
-                        y: chip.y - 20.0,
-                        width: chip.width + 40.0,
-                        height: chip.height + 40.0,
-                    };
-                    renderer.with_layer(chip_layer, |renderer| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: chip,
-                                border: Border {
-                                    color: Color {
-                                        a: 0.6,
-                                        ..self.style.accent
-                                    },
-                                    width: 1.0,
-                                    radius: crate::theme::radius::CONTROL.into(),
-                                },
-                                shadow: crate::theme::floating_shadow(3.0, 10.0),
-                                snap: true,
-                            },
-                            Background::Color(self.style.tooltip_background),
-                        );
-                        fill_text_centered_y(
-                            renderer,
-                            &label,
-                            chip.x + pad_x,
-                            chip.y + chip.height / 2.0,
-                            text_bounds.width.max(1.0),
-                            CAPTION_TEXT_SIZE,
-                            self.style.accent,
-                            self.style.mono_font,
-                            chip_layer,
-                            text::Alignment::Left,
-                        );
-                    });
-                }
             }
+            if let Some(ground) = self.props.top_fade.filter(|_| self.vertical_offset > 0.0) {
+                window.paint_quad(fill(
+                    Rectangle {
+                        height: crate::theme::list::TOP_FADE.min(self.bounds.height),
+                        ..self.bounds
+                    }
+                    .bounds(),
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(ground, 0.0),
+                        linear_color_stop(Color { a: 0.0, ..ground }, 1.0),
+                    ),
+                ));
+            }
+            self.paint_working_copy_pin(window, cx);
         });
     }
-}
 
-impl<'a, Message> RevisionList<'a, Message> {
-    /// The hover tooltip due this frame, if any: a lane's labels, or the full
-    /// path of a file row whose name is ellipsized.
-    fn tooltip(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        translation: Vector,
-    ) -> Option<TooltipOverlay> {
-        let state = tree.state.downcast_ref::<State>();
-        let cursor_pos = state.cursor_position?;
-        let bounds = layout.bounds();
-
-        // Lane tooltip wins over the file path tooltip when both could
-        // fire at the same time — the cursor is in the gutter, which
-        // is mutually exclusive with the content area anyway.
-        if let Some((item_idx, lane, _half)) = state.hovered_lane {
-            if item_idx >= self.row_count() {
-                return None;
-            }
-            let item = self.item_at(item_idx);
-            let labels = item_lane_labels(&item, lane);
-            if labels.is_empty() {
-                return None;
-            }
-            let text = labels.join(", ");
-            let row_top = self.row_top(item_idx) - state.vertical_offset;
-            let row_screen_y = bounds.y + row_top as f32;
-            let row_height = self.row_height(&item);
-            let gutter_total = self.item_gutter_width(&item);
-            let text_size = measure::line_bounds(&text, CAPTION_TEXT_SIZE, self.style.primary_font);
-            return Some(TooltipOverlay {
-                text,
-                cursor: cursor_pos + translation,
-                // Anchor just past the gutter so the tip sits next to
-                // the stroke rather than at the far right edge.
-                row_anchor_x: bounds.x + gutter_total + translation.x,
-                row_anchor_y: row_screen_y + translation.y,
-                row_height,
-                style: self.style,
-                text_size,
-            });
-        }
-
-        let item_idx = state.hovered_file_item?;
-        if item_idx >= self.row_count() {
-            return None;
-        }
-        let item = self.item_at(item_idx);
-        let gutter_total = self.item_gutter_width(&item);
-        let Item::File(file) = item else {
-            return None;
+    /// The pill that brings the working copy back when its row is out of
+    /// view: accent, "Working copy", its change id and an arrow its way.
+    fn paint_working_copy_pin(&self, window: &mut Window, cx: &mut App) {
+        let Some((pin, above, id)) = self.working_copy_pin(cx) else {
+            return;
         };
-
-        // Only show the path tooltip when the name is actually ellipsized —
-        // same column math as `draw_file`'s `fill_text_truncated` call.
-        let path_w = self
-            .file_row_columns(bounds.x, bounds.width, gutter_total, &file)
-            .path_w;
-        let name_width =
-            measure::line_bounds(&file.primary, CAPTION_TEXT_SIZE, self.style.primary_font).width;
-        if name_width <= path_w {
-            return None;
+        let style = &self.props.style;
+        fill_rounded(pin, style.accent, PIN_HEIGHT / 2.0, window);
+        let mid = pin.y + PIN_HEIGHT / 2.0;
+        let label_font = emphasis_font(style.primary_font, Weight::SEMIBOLD);
+        let mut x = pin.x + PIN_PAD_LEFT;
+        paint_centered(
+            WORKING_COPY_LABEL,
+            x,
+            mid,
+            PIN_TEXT_SIZE,
+            label_font,
+            style.accent_foreground,
+            window,
+            cx,
+        );
+        x += self
+            .widths
+            .width(WORKING_COPY_LABEL, PIN_TEXT_SIZE, label_font)
+            + PIN_GAP;
+        if !id.is_empty() {
+            // On the label's baseline.
+            let baseline =
+                TextBox::new(label_font, PIN_TEXT_SIZE, PIN_TEXT_SIZE).baseline_for_center(mid);
+            paint_centered(
+                &id,
+                x,
+                TextBox::new(style.mono_font, CAPTION_TEXT_SIZE, CAPTION_TEXT_SIZE)
+                    .center_for_baseline(baseline),
+                CAPTION_TEXT_SIZE,
+                style.mono_font,
+                Color {
+                    a: 0.8,
+                    ..style.accent_foreground
+                },
+                window,
+                cx,
+            );
+            x += self.widths.width(&id, CAPTION_TEXT_SIZE, style.mono_font) + PIN_GAP;
         }
-        let row_top = self.row_top(item_idx) - state.vertical_offset;
-        let row_screen_y = bounds.y + row_top as f32;
-        let row_height = FILE_ROW_HEIGHT;
-
-        let text_size =
-            measure::line_bounds(&file.raw_path, CAPTION_TEXT_SIZE, self.style.primary_font);
-
-        Some(TooltipOverlay {
-            text: file.raw_path,
-            cursor: cursor_pos + translation,
-            row_anchor_x: bounds.x + bounds.width + translation.x,
-            row_anchor_y: row_screen_y + translation.y,
-            row_height,
-            style: self.style,
-            text_size,
-        })
-    }
-
-    /// Horizontal layout of a file row's content columns:
-    /// [indent][chevron][icon] name … [+N] [-N] [status chip] pad.
-    /// Shared between `draw_file` (which end-ellipsizes the name into
-    /// `path_w`) and the overlay's "is the name actually truncated?" check,
-    /// so the two can never disagree.
-    fn file_row_columns(
-        &self,
-        row_x: f32,
-        row_width: f32,
-        gutter_total: f32,
-        f: &FileRowView,
-    ) -> FileRowColumns {
-        let chip_col = self.style.file_badge_width;
-        let chip_left = row_x + row_width - CONTENT_PADDING - chip_col;
-        let chip_gap = if chip_col > 0.0 { FILE_ROW_GAP } else { 0.0 };
-        let minus_x = chip_left - chip_gap - f.deletions_width;
-        let plus_x = minus_x - FILE_ROW_GAP - f.additions_width;
-        let path_x =
-            row_x + gutter_total + f.indent + FILE_CHEVRON_COL + FILE_ICON_COL + FILE_ROW_GAP;
-        let path_right = if f.chevron.is_some() {
-            row_x + row_width - FILE_ROW_RIGHT_PAD
-        } else {
-            plus_x - FILE_ROW_GAP
-        };
-        FileRowColumns {
-            chip_left,
-            minus_x,
-            plus_x,
-            path_x,
-            path_w: (path_right - path_x).max(1.0),
-        }
+        paint_glyph(
+            if above {
+                icons::ARROW_UP
+            } else {
+                icons::ARROW_DOWN
+            },
+            x + PIN_ICON_SIZE / 2.0,
+            mid,
+            PIN_ICON_SIZE,
+            style.accent_foreground,
+            window,
+            cx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_revision<R>(
+    fn paint_revision(
         &self,
-        renderer: &mut R,
-        widths: &WidthMemo,
-        row_bounds: Rectangle,
+        row: Rectangle,
         rev: &RevisionRowView,
         gutter_total: f32,
         emphasized_lane_before: Option<usize>,
         emphasized_lane_after: Option<usize>,
         hovered: bool,
-    ) where
-        R: text::Renderer + iced::advanced::graphics::geometry::Renderer,
-    {
-        let selected = !rev.inert
-            && self
-                .selected_row
-                .as_ref()
-                .map(|key| key == &rev.selection_key)
-                .unwrap_or(false);
+        graph: &mut GraphFrame,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let props = &self.props;
+        let style = &props.style;
+        let widths = &self.widths;
+        let selected = !rev.inert && props.selected_row.as_ref() == Some(&rev.selection_key);
         let hovered = hovered && !rev.inert;
         let is_working_copy = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
 
         // Row chrome is an inset rounded card rather than an edge-to-edge
         // band, so selection/hover read as objects sitting in the pane
-        // (rows separate by whitespace — there is no per-row hairline).
-        // The graph is drawn last in this method so its lines & node still
-        // sit visually above any chrome.
-        let card_bounds = self.card_bounds(row_bounds);
-        // Working-copy rows get a left→right gradient with a fixed light
-        // accent on the left fading into the row's base color on the
-        // right (panel background normally, the selected gray when
-        // selected). The left tint is pre-mixed opaque so the orange
-        // reads identically whether or not the row is selected.
+        // (rows separate by whitespace: there is no per-row hairline).
+        let card = props.card_bounds(row);
+        // Working-copy rows get a left-to-right gradient with a fixed light
+        // accent on the left fading into the row's base color on the right
+        // (panel background normally, the selected gray when selected). The
+        // left tint is pre-mixed opaque so the orange reads identically whether
+        // or not the row is selected.
         if is_working_copy {
             let right = if selected {
-                self.style.selected_background
+                style.selected_background
             } else {
-                self.style.background
+                style.background
             };
-            let left = mix_color(self.style.accent, self.style.background, 0.20);
-            let gradient = gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
-                .add_stop(0.0, left)
-                .add_stop(1.0, right);
-            fill_gradient_rounded(renderer, card_bounds, gradient, ROW_CARD_RADIUS);
-        } else if selected {
+            let left = crate::theme::mix(style.background, style.accent, 0.20);
             fill_rounded(
-                renderer,
-                card_bounds,
-                self.style.selected_background,
+                card,
+                linear_gradient(
+                    90.0,
+                    linear_color_stop(left, 0.0),
+                    linear_color_stop(right, 1.0),
+                ),
                 ROW_CARD_RADIUS,
+                window,
             );
+        } else if selected {
+            fill_rounded(card, style.selected_background, ROW_CARD_RADIUS, window);
         } else if hovered {
             fill_rounded(
-                renderer,
-                card_bounds,
+                card,
                 Color {
                     a: 0.06,
-                    ..self.style.muted_text
+                    ..style.muted_text
                 },
                 ROW_CARD_RADIUS,
+                window,
             );
         }
-        // Marked rows — a draft's sources or the multi-selection — wear an
-        // accent wash + hairline so they read as "part of the pending set".
+        // Marked rows, a draft's sources or the multi-selection, wear an accent
+        // wash + hairline so they read as "part of the pending set".
         if rev.draft_source || rev.multi_selected {
             fill_rounded(
-                renderer,
-                card_bounds,
+                card,
                 Color {
                     a: 0.08,
-                    ..self.style.accent
+                    ..style.accent
                 },
                 ROW_CARD_RADIUS,
+                window,
             );
             stroke_rounded(
-                renderer,
-                card_bounds,
+                card,
                 Color {
                     a: 0.45,
-                    ..self.style.accent
+                    ..style.accent
                 },
                 1.0,
                 ROW_CARD_RADIUS,
+                window,
             );
         }
 
-        let content_left = row_bounds.x + gutter_total;
-        let content_right_pad = CONTENT_PADDING;
-        let row_clip = row_bounds;
-        let content_width = (row_bounds.width - gutter_total - content_right_pad).max(1.0);
+        let content_left = row.x + gutter_total;
+        let content_right_pad = crate::theme::list::PAD_END;
+        let content_width = (row.width - gutter_total - content_right_pad).max(1.0);
 
         // Two-line stack: human-readable description first, identifiers and
         // status second. History is scanned by intent; ids remain close by for
@@ -1884,130 +2115,68 @@ impl<'a, Message> RevisionList<'a, Message> {
         // line-box so the gap stays visually tight.
         let id_size = CAPTION_TEXT_SIZE;
         let desc_size = SMALL_TEXT_SIZE;
-        let line_gap = ROW_LINE_GAP;
-        let stack_height = id_size + line_gap + desc_size;
-        let stack_top = row_bounds.y + ((row_bounds.height - stack_height) / 2.0).max(0.0);
+        let stack_height = id_size + ROW_LINE_GAP + desc_size;
+        let stack_top = row.y + ((row.height - stack_height) / 2.0).max(0.0);
         let desc_mid_y = stack_top + desc_size / 2.0;
-        let title_mid_y = stack_top + desc_size + line_gap + id_size / 2.0;
+        let title_mid_y = stack_top + desc_size + ROW_LINE_GAP + id_size / 2.0;
 
-        let prefix_w = widths.width(&rev.change_id_prefix, id_size, self.style.mono_font);
-        let suffix_w = widths.width(&rev.change_id_suffix, id_size, self.style.mono_font);
-        let commit_w = widths.width(&rev.commit_id_short, id_size, self.style.mono_font);
+        let mono = style.mono_font;
+        let primary = style.primary_font;
+        let prefix_w = widths.width(&rev.change_id_prefix, id_size, mono);
+        let suffix_w = widths.width(&rev.change_id_suffix, id_size, mono);
+        let commit_w = widths.width(&rev.commit_id_short, id_size, mono);
 
         // === Measurements ===
         let id_gap = 8.0;
         let chip_gap = 6.0;
-        let at_marker = matches!(rev.selection_key, RowSelectionKey::WorkingCopy);
-        let at_gap = 4.0;
-        let at_w = if at_marker {
-            widths.width("@", id_size, self.style.mono_font)
+        let label_font = emphasis_font(primary, Weight::SEMIBOLD);
+        let label_w = if is_working_copy {
+            label_width(widths, label_font)
         } else {
             0.0
         };
-        let author_full_w = widths.width(&rev.author, id_size, self.style.primary_font);
-        let ellipsis_w = widths.width("…", id_size, self.style.mono_font);
+        let has_change_id = prefix_w + suffix_w > 0.0;
+        let label_gap = if is_working_copy && has_change_id {
+            id_gap
+        } else {
+            0.0
+        };
+        let author_full_w = widths.width(&rev.author, id_size, primary);
+        let ellipsis_w = widths.width("…", id_size, mono);
 
         let bm_widths: Vec<f32> = rev
             .bookmark_chips
             .iter()
-            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
+            .map(|c| chip::chip_width(widths, c))
             .collect();
         let status_widths: Vec<f32> = rev
             .status_chips
             .iter()
-            .map(|c| chip::width_memoized(widths, &c.label, c.icon, c.font))
+            .map(|c| chip::chip_width(widths, c))
             .collect();
         let status_total: f32 = status_widths.iter().sum::<f32>()
             + chip_gap * status_widths.len().saturating_sub(1) as f32;
 
         // === Layout budget ===
-        let content_right = row_bounds.x + row_bounds.width - content_right_pad;
+        let content_right = row.x + row.width - content_right_pad;
         let total_width = (content_right - content_left).max(0.0);
-
-        // Always-shown widths consume from the budget first.
-        let id_w = prefix_w + suffix_w;
-        let mandatory_left = at_w + (if at_marker { at_gap } else { 0.0 }) + id_w;
-        let mandatory_right_gap = if !status_widths.is_empty() {
-            chip_gap
-        } else {
-            0.0
-        };
-        let mandatory = mandatory_left + status_total + mandatory_right_gap;
-        let mut budget = (total_width - mandatory).max(0.0);
-
-        // === Priority: commit_id > bookmark chips > author ===
-        // 1. commit_id (with leading id_gap).
-        let has_commit_id = !rev.commit_id_short.is_empty();
-        let show_commit_id = has_commit_id && commit_w + id_gap <= budget;
-        if show_commit_id {
-            budget -= commit_w + id_gap;
-        }
-
-        // 2. Bookmarks: fit greedily, reserving space for a `+N` overflow
-        //    chip when not all fit. The chip rail's leading gap separates
-        //    it from the left-side text.
-        let mut visible_bookmarks: usize = 0;
-        let mut overflow_count: usize = 0;
-        let mut overflow_w: f32 = 0.0;
-        if !rev.bookmark_chips.is_empty() {
-            let all_w: f32 =
-                bm_widths.iter().sum::<f32>() + chip_gap * bm_widths.len().saturating_sub(1) as f32;
-            let bm_block_w = if chip_gap + all_w <= budget {
-                visible_bookmarks = rev.bookmark_chips.len();
-                all_w
-            } else {
-                let mut acc = 0.0;
-                for (i, &w) in bm_widths.iter().enumerate() {
-                    let gap = if i == 0 { 0.0 } else { chip_gap };
-                    let candidate = acc + gap + w;
-                    let remaining = rev.bookmark_chips.len() - i - 1;
-                    let need_overflow = remaining > 0;
-                    let overflow_label = format!("+{}", remaining.max(1));
-                    let overflow_chip_w = chip::width_memoized(
-                        widths,
-                        &overflow_label,
-                        None,
-                        self.style.primary_font,
-                    );
-                    let plus_overflow = if need_overflow {
-                        chip_gap + overflow_chip_w
-                    } else {
-                        0.0
-                    };
-                    if chip_gap + candidate + plus_overflow <= budget {
-                        visible_bookmarks = i + 1;
-                        acc = candidate;
-                    } else {
-                        break;
-                    }
-                }
-                if visible_bookmarks < rev.bookmark_chips.len() {
-                    overflow_count = rev.bookmark_chips.len() - visible_bookmarks;
-                    let label = format!("+{overflow_count}");
-                    overflow_w =
-                        chip::width_memoized(widths, &label, None, self.style.primary_font);
-                }
-                acc + if overflow_count > 0 {
-                    chip_gap + overflow_w
-                } else {
-                    0.0
-                }
-            };
-            // Subtract the chip rail's leading gap once, plus the block.
-            budget -= chip_gap + bm_block_w;
-        }
-
-        // 3. Author squeezes into whatever's left (with a leading id_gap).
-        let author_max_w = (budget - id_gap).max(0.0);
-        let (show_author, author_draw_w) = if !rev.author.is_empty() && author_max_w >= ellipsis_w {
-            (true, author_max_w.min(author_full_w))
-        } else {
-            (false, 0.0)
-        };
-
-        // Ellipsis indicator when commit_id or author got dropped entirely.
-        let need_ellipsis =
-            (has_commit_id && !show_commit_id) || (!show_author && !rev.author.is_empty());
+        let layout = rail_layout(
+            RailInput {
+                total_width,
+                mandatory_left: label_w + label_gap + prefix_w + suffix_w,
+                status_total,
+                has_status: !status_widths.is_empty(),
+                commit_w,
+                has_commit_id: !rev.commit_id_short.is_empty(),
+                author_full_w,
+                has_author: !rev.author.is_empty(),
+                ellipsis_w,
+                id_gap,
+                chip_gap,
+            },
+            &bm_widths,
+            |overflow| chip::width_memoized(widths, &format!("+{overflow}"), None, primary),
+        );
 
         // === Color selection ===
         // A ghost's text recedes; its lanes (other branches passing through)
@@ -2022,189 +2191,137 @@ impl<'a, Message> RevisionList<'a, Message> {
                 color
             }
         };
-        let (col_at, col_id_prefix, col_id_suffix, col_commit, col_author, col_ellipsis) = (
-            fade(self.style.accent),
-            fade(self.style.accent_text),
-            fade(self.style.subtle_text),
-            fade(self.style.muted_text),
-            fade(self.style.subtle_text),
-            fade(self.style.subtle_text),
-        );
 
-        // === Draw left-side flowing content ===
+        // === Left-side flowing content ===
         // One baseline for the whole meta line: the ids' caps are centred on
         // the line, and the author (another font) and the chips join them on
         // that baseline rather than centring their own boxes.
-        let meta_baseline = TextBox::new(
-            self.style.mono_font,
-            id_size,
-            id_size * LINE_HEIGHT_MULTIPLIER,
-        )
-        .baseline_for_center(title_mid_y);
+        let meta_baseline = TextBox::new(mono, id_size, id_size * LINE_HEIGHT_MULTIPLIER)
+            .baseline_for_center(title_mid_y);
         let on_meta_line = |font: Font, size: f32| {
             TextBox::new(font, size, size * LINE_HEIGHT_MULTIPLIER)
                 .center_for_baseline(meta_baseline)
         };
         let mut x_cursor = content_left;
-        if at_marker {
-            fill_text_centered_y(
-                renderer,
-                "@",
+        if is_working_copy {
+            paint_working_copy_label(
                 x_cursor,
-                title_mid_y,
-                at_w.max(1.0),
-                id_size,
-                col_at,
-                self.style.mono_font,
-                row_clip,
-                text::Alignment::Left,
+                meta_baseline,
+                label_font,
+                style,
+                widths,
+                window,
+                cx,
             );
-            x_cursor += at_w + at_gap;
+            x_cursor += label_w + label_gap;
         }
-        fill_text_centered_y(
-            renderer,
+        paint_centered(
             &rev.change_id_prefix,
             x_cursor,
             title_mid_y,
-            prefix_w.max(1.0),
             id_size,
-            col_id_prefix,
-            self.style.mono_font,
-            row_clip,
-            text::Alignment::Left,
+            mono,
+            fade(style.change_id),
+            window,
+            cx,
         );
         x_cursor += prefix_w;
-        fill_text_centered_y(
-            renderer,
+        paint_centered(
             &rev.change_id_suffix,
             x_cursor,
             title_mid_y,
-            suffix_w.max(1.0),
             id_size,
-            col_id_suffix,
-            self.style.mono_font,
-            row_clip,
-            text::Alignment::Left,
+            mono,
+            fade(style.subtle_text),
+            window,
+            cx,
         );
         x_cursor += suffix_w;
 
-        if show_commit_id {
+        if layout.show_commit_id {
             x_cursor += id_gap;
-            fill_text_centered_y(
-                renderer,
+            paint_centered(
                 &rev.commit_id_short,
                 x_cursor,
                 title_mid_y,
-                commit_w.max(1.0),
                 id_size,
-                col_commit,
-                self.style.mono_font,
-                row_clip,
-                text::Alignment::Left,
+                mono,
+                fade(style.subtle_text),
+                window,
+                cx,
             );
             x_cursor += commit_w;
         }
 
-        if show_author {
+        if layout.author_width > 0.0 {
             x_cursor += id_gap;
-            fill_text_truncated(
-                renderer,
-                &rev.author,
+            let author = ellipsis::cut_end(&rev.author, layout.author_width, id_size, primary);
+            paint_centered(
+                &author,
                 x_cursor,
-                on_meta_line(self.style.primary_font, id_size),
-                author_draw_w,
+                on_meta_line(primary, id_size),
                 id_size,
-                col_author,
-                self.style.primary_font,
-                row_clip,
+                primary,
+                fade(style.subtle_text),
+                window,
+                cx,
             );
-        } else if need_ellipsis {
+        } else if layout.need_ellipsis {
             // Single `…` after the last left-side glyph signals that
             // commit_id and/or author got hidden for lack of room.
             x_cursor += id_gap;
-            fill_text_centered_y(
-                renderer,
+            paint_centered(
                 "…",
                 x_cursor,
                 title_mid_y,
-                ellipsis_w.max(1.0),
                 id_size,
-                col_ellipsis,
-                self.style.mono_font,
-                row_clip,
-                text::Alignment::Left,
+                mono,
+                fade(style.subtle_text),
+                window,
+                cx,
             );
         }
 
-        // === Draw right-anchored chip rail ===
+        // === Right-anchored chip rail ===
         // Compose the rail left-to-right starting from its left edge: any
         // bookmarks, then the `+N` overflow chip (if any), then status
         // chips. The leading edge is computed from the cumulative width.
-        let rail_w: f32 = {
-            let mut w = 0.0;
-            for (i, &bw) in bm_widths.iter().enumerate().take(visible_bookmarks) {
-                if i > 0 {
-                    w += chip_gap;
-                }
-                w += bw;
-            }
-            if overflow_count > 0 {
-                if w > 0.0 {
-                    w += chip_gap;
-                }
-                w += overflow_w;
-            }
-            if !status_widths.is_empty() {
-                if w > 0.0 {
-                    w += chip_gap;
-                }
-                w += status_total;
-            }
-            w
-        };
-        let mut chip_x = content_right - rail_w;
-        let overflow_color = rev.lane_color;
-        for (c, bw) in rev
+        let mut chip_x = content_right - layout.rail_width(&bm_widths, status_total);
+        for (c, width) in rev
             .bookmark_chips
             .iter()
-            .zip(bm_widths.iter())
-            .take(visible_bookmarks)
+            .zip(&bm_widths)
+            .take(layout.visible_bookmarks)
         {
             let center = chip::center_for_baseline(c, meta_baseline);
-            chip::draw_memoized(renderer, c, widths, chip_x, center, row_clip);
-            chip_x += bw + chip_gap;
+            chip::paint(c, widths, chip_x, center, window, cx);
+            chip_x += width + chip_gap;
         }
-        if overflow_count > 0 {
+        if layout.overflow_count > 0 {
             let overflow_chip = Chip {
-                label: format!("+{overflow_count}"),
-                font: self.style.primary_font,
-                background: chip_background(overflow_color),
-                text_color: overflow_color,
+                label: format!("+{}", layout.overflow_count),
+                font: primary,
+                background: chip_background(style.muted_text),
+                text_color: style.subtle_text,
                 border_color: None,
                 border_dashed: false,
                 icon: None,
+                icon_color: None,
+                suffix: None,
             };
-            chip::draw_memoized(
-                renderer,
-                &overflow_chip,
-                widths,
-                chip_x,
-                chip::center_for_baseline(&overflow_chip, meta_baseline),
-                row_clip,
-            );
-            chip_x += overflow_w + chip_gap;
+            let center = chip::center_for_baseline(&overflow_chip, meta_baseline);
+            chip::paint(&overflow_chip, widths, chip_x, center, window, cx);
+            chip_x += layout.overflow_width + chip_gap;
         }
-        for (i, c) in rev.status_chips.iter().enumerate() {
+        for (c, width) in rev.status_chips.iter().zip(&status_widths) {
             let center = chip::center_for_baseline(c, meta_baseline);
-            chip::draw_memoized(renderer, c, widths, chip_x, center, row_clip);
-            chip_x += status_widths[i] + chip_gap;
+            chip::paint(c, widths, chip_x, center, window, cx);
+            chip_x += width + chip_gap;
         }
 
         // Reserve room on the right of the description for the collapse/
         // expand chevron when this is the selected row. The chevron sizes
-        // up past the description so the affordance reads at a glance —
-        // at the description's own size it shrinks to ~5px on the y axis
-        // and disappears against the row chrome.
+        // up past the description so the affordance reads at a glance.
         let chevron_glyph = rev.collapse_chevron.map(|expanded| {
             if expanded {
                 icons::CHEVRON_DOWN
@@ -2212,351 +2329,496 @@ impl<'a, Message> RevisionList<'a, Message> {
                 icons::CHEVRON_RIGHT
             }
         });
-        let chevron_size = CHEVRON_TEXT_SIZE;
-        let chevron_width = chevron_glyph
-            .map(|glyph| widths.width(glyph, chevron_size, icons::ICON_FONT))
-            .unwrap_or(0.0);
+        let chevron_width = chevron_glyph.map_or(0.0, |glyph| {
+            widths.width(glyph, CHEVRON_TEXT_SIZE, icons::ICON_FONT)
+        });
         let chevron_gap = if chevron_glyph.is_some() { 6.0 } else { 0.0 };
-        let description_width = (content_width - chevron_width - chevron_gap).max(1.0);
+        let age_w = if rev.age.is_empty() {
+            0.0
+        } else {
+            widths.width(&rev.age, AGE_TEXT_SIZE, primary)
+        };
+        let age_gap = if age_w > 0.0 { id_gap } else { 0.0 };
+        let description_width =
+            (content_width - chevron_width - chevron_gap - age_w - age_gap).max(1.0);
 
-        fill_text_truncated(
-            renderer,
-            &rev.description,
+        // The working copy is the row to find at a glance: its title carries
+        // a little more weight.
+        let title_font = if is_working_copy {
+            emphasis_font(primary, Weight::MEDIUM)
+        } else {
+            primary
+        };
+        let description =
+            ellipsis::cut_end(&rev.description, description_width, desc_size, title_font);
+        paint_centered(
+            &description,
             content_left,
             desc_mid_y,
-            description_width,
             desc_size,
+            title_font,
             fade(rev.description_color),
-            self.style.primary_font,
-            row_clip,
+            window,
+            cx,
         );
-
-        if let Some(glyph) = chevron_glyph {
-            let chevron_x = row_bounds.x + row_bounds.width - content_right_pad - chevron_width;
-            fill_text_centered_y(
-                renderer,
-                glyph,
-                chevron_x,
-                desc_mid_y,
-                chevron_width.max(1.0),
-                chevron_size,
-                self.style.subtle_text,
-                icons::ICON_FONT,
-                row_clip,
-                text::Alignment::Left,
+        if age_w > 0.0 {
+            // On the title's baseline, not centred on its own smaller box.
+            let title_baseline =
+                TextBox::new(title_font, desc_size, desc_size * LINE_HEIGHT_MULTIPLIER)
+                    .baseline_for_center(desc_mid_y);
+            paint_centered(
+                &rev.age,
+                content_right - chevron_width - chevron_gap - age_w,
+                TextBox::new(
+                    primary,
+                    AGE_TEXT_SIZE,
+                    AGE_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
+                )
+                .center_for_baseline(title_baseline),
+                AGE_TEXT_SIZE,
+                primary,
+                fade(style.subtle_text),
+                window,
+                cx,
             );
         }
 
-        // Graph painted last so node + lines sit on top of any row chrome.
-        let gutter_bounds = Rectangle {
-            x: row_bounds.x + GUTTER_LEFT_PADDING,
-            y: row_bounds.y,
-            width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
-            height: row_bounds.height,
-        };
-        // Working-copy node sits on the gradient's faded right side, so
-        // the saturated accent reads cleanly without a contrast swap.
-        let node_override = if is_working_copy {
-            Some(self.style.accent)
-        } else {
-            None
-        };
-        draw_revision_row(
-            renderer,
-            gutter_bounds,
-            &rev.frame,
-            &rev.columns,
-            &rev.prev_columns,
-            &self.style.graph,
-            node_override,
-            rev.ghost.then_some(self.style.background),
-            emphasized_lane_before,
-            emphasized_lane_after,
-        );
-
-        // Target-mode destination decoration, on top of everything: the ring
-        // (lands as a child of this row) or the insertion line above/below
-        // (insert-after / insert-before).
-        if let Some(marker) = rev.draft_marker {
-            match marker {
-                DraftMarker::Ring => {
-                    stroke_rounded(
-                        renderer,
-                        card_bounds,
-                        self.style.accent,
-                        1.5,
-                        ROW_CARD_RADIUS,
-                    );
-                }
-                DraftMarker::LineAbove => {
-                    draw_insertion_line(
-                        renderer,
-                        row_bounds,
-                        gutter_total,
-                        true,
-                        self.style.accent,
-                    );
-                }
-                DraftMarker::LineBelow => {
-                    draw_insertion_line(
-                        renderer,
-                        row_bounds,
-                        gutter_total,
-                        false,
-                        self.style.accent,
-                    );
-                }
-            }
+        if let Some(glyph) = chevron_glyph {
+            paint_centered(
+                glyph,
+                row.x + row.width - content_right_pad - chevron_width,
+                desc_mid_y,
+                CHEVRON_TEXT_SIZE,
+                icons::ICON_FONT,
+                style.subtle_text,
+                window,
+                cx,
+            );
         }
+
+        graph_view::revision_row(
+            graph,
+            row.x,
+            row.y,
+            row.height,
+            &graph_view::RevisionRow {
+                frame_data: &rev.frame,
+                columns: &rev.columns,
+                prev_columns: &rev.prev_columns,
+                geometry: &self.lane_geometry(),
+                node: rev.node,
+                emphasized_lane_before,
+                emphasized_lane_after,
+            },
+            &style.graph,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_file<R>(
+    fn paint_file(
         &self,
-        renderer: &mut R,
-        widths: &WidthMemo,
-        row_bounds: Rectangle,
-        f: &FileRowView,
+        row: Rectangle,
+        file: &FileRowView,
         gutter_total: f32,
         emphasized_lane: Option<usize>,
         emphasized_guide: Option<usize>,
         hovered: bool,
-    ) where
-        R: text::Renderer + iced::advanced::graphics::geometry::Renderer,
-    {
-        let selected = self
-            .selected_file
-            .map(|idx| idx == f.file_index)
-            .unwrap_or(false);
+        graph: &mut GraphFrame,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let props = &self.props;
+        let style = &props.style;
+        let selected = props.selected_file == Some(file.file_index);
 
         // Same inset rounded card as revision rows, so every selectable row
         // shares one selection language.
-        let card_bounds = self.card_bounds(row_bounds);
+        let card = props.card_bounds(row);
         if selected {
             fill_rounded(
-                renderer,
-                card_bounds,
-                self.style.selected_background,
-                ROW_CARD_RADIUS,
+                card,
+                style.selected_background,
+                FILE_ROW_CARD_RADIUS,
+                window,
             );
         } else if hovered {
-            // Soft hover wash — weaker than selection so the two never
-            // compete when the cursor crosses the selected row.
+            // Soft hover wash, weaker than selection so the two never compete
+            // when the cursor crosses the selected row.
             fill_rounded(
-                renderer,
-                card_bounds,
+                card,
                 Color {
                     a: 0.06,
-                    ..self.style.muted_text
+                    ..style.muted_text
                 },
-                ROW_CARD_RADIUS,
+                FILE_ROW_CARD_RADIUS,
+                window,
             );
         }
         // Deliberately no per-row separator: the indent guides supply the
         // vertical structure, and both line sets together read as a grid.
 
-        let content_x = row_bounds.x + gutter_total + f.indent;
-        let row_clip = row_bounds;
-        let row_mid_y = row_bounds.y + row_bounds.height / 2.0;
-
         // Indent guides: one hairline per ancestor level, aligned under the
         // parent rows' chevron column. The hovered row's sibling run wears a
-        // brighter guide at its parent level (see `guide_emphasis` in draw).
-        let depth = (f.indent / FILE_TREE_INDENT).round() as usize;
-        if depth > 0 {
-            let guide_offset = FILE_CHEVRON_COL / 2.0;
-            for level in 0..depth {
-                let x =
-                    row_bounds.x + gutter_total + level as f32 * FILE_TREE_INDENT + guide_offset;
-                let color = if emphasized_guide == Some(level) {
-                    Color {
-                        a: 0.8,
-                        ..self.style.subtle_text
-                    }
-                } else {
-                    self.style.border
-                };
-                fill_background(
-                    renderer,
-                    Rectangle {
-                        x: x.round(),
-                        y: row_bounds.y,
-                        width: 1.0,
-                        height: row_bounds.height,
-                    },
-                    color,
-                );
-            }
-        }
-
-        // Left columns: [chevron (dirs)] [file/folder icon] name…
-        if let Some(collapsed) = f.chevron {
-            let glyph = if collapsed {
-                icons::CHEVRON_RIGHT
+        // brighter guide at its parent level.
+        let step = FILE_TREE_INDENT;
+        let depth = (file.indent / step).round() as usize;
+        let columns = props.file_row_columns(row.x, row.width, gutter_total, file);
+        let guide_x = columns.mark_x - file.indent + FILE_MARK_COL / 2.0;
+        for level in 0..depth {
+            let x = guide_x + level as f32 * step;
+            let color = if emphasized_guide == Some(level) {
+                Color {
+                    a: 0.8,
+                    ..style.subtle_text
+                }
             } else {
-                icons::CHEVRON_DOWN
+                style.border
             };
-            fill_text_centered_y(
-                renderer,
-                glyph,
-                content_x + FILE_CHEVRON_COL / 2.0,
-                row_mid_y,
-                FILE_CHEVRON_COL,
-                CAPTION_TEXT_SIZE,
-                f.primary_color,
-                icons::ICON_FONT,
-                row_clip,
-                text::Alignment::Center,
-            );
+            window.paint_quad(fill(
+                Rectangle {
+                    x: x.round(),
+                    y: row.y,
+                    width: 1.0,
+                    height: row.height,
+                }
+                .bounds(),
+                color,
+            ));
         }
-        let icon_glyph = match f.chevron {
-            Some(true) => icons::FOLDER,
-            Some(false) => icons::FOLDER_OPEN,
-            None => icons::FILE,
-        };
-        if let Some(check) = f.check {
-            draw_file_check(
-                renderer,
-                content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
-                row_mid_y,
-                check,
-                self.style.control,
-                self.style.muted_text,
-                self.style.background,
-                row_clip,
-            );
+
+        self.paint_file_content(
+            row,
+            file,
+            &columns,
+            hovered || props.file_picking,
+            window,
+            cx,
+        );
+        graph_view::continuation_row(
+            graph,
+            row.x,
+            row.y,
+            row.height,
+            &file.continuation,
+            &file.columns,
+            &self.lane_geometry(),
+            &style.graph,
+            emphasized_lane,
+        );
+    }
+
+    /// The content of a file row: `[chevron or badge]
+    /// name … [counts or tag] [pick]`. The name sets the baseline the badge,
+    /// the counts and the tag sit on; the chevron and the box centre on the row.
+    fn paint_file_content(
+        &self,
+        row: Rectangle,
+        file: &FileRowView,
+        columns: &FileRowColumns,
+        show_check: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let style = &self.props.style;
+        let row_mid_y = row.y + row.height / 2.0;
+        let directory = file.chevron.is_some();
+        let font = if directory {
+            crate::theme::emphasis_font(style.primary_font, gpui_kit::FontWeight::MEDIUM)
         } else {
-            fill_text_centered_y(
-                renderer,
-                icon_glyph,
-                content_x + FILE_CHEVRON_COL + FILE_ICON_COL / 2.0,
-                row_mid_y,
-                FILE_ICON_COL,
-                FILE_ICON_SIZE,
-                f.icon_color,
-                icons::ICON_FONT,
-                row_clip,
-                text::Alignment::Center,
-            );
-        }
-
-        // Layout: [indent][chevron][icon] name … [+N] [-N] [status chip] pad
-        // — the status chip is the rightmost column so badges align down the
-        // tree; directory rows have neither stats nor chip, so their name
-        // runs to the right edge. The chip column clears the scrollbar band
-        // with the same right padding the revision rows' bookmark rail uses.
-        let FileRowColumns {
-            chip_left,
-            minus_x,
-            plus_x,
-            path_x,
-            path_w,
-        } = self.file_row_columns(row_bounds.x, row_bounds.width, gutter_total, f);
-        let chip_col = self.style.file_badge_width;
-
-        // Cut in the middle, so a name wider than `path_w` keeps both its
-        // start and its extension (and a compacted `a/b/c` chain its leaf)
-        // without bleeding into the +N / -N columns; the full path is on the
-        // hover tooltip.
-        // The name's caps are centred on the row; the stats and the status
-        // chip (other sizes and fonts) join it on its baseline.
+            style.primary_font
+        };
         let name_baseline = TextBox::new(
-            self.style.primary_font,
+            font,
             FILE_NAME_TEXT_SIZE,
             FILE_NAME_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
         )
         .baseline_for_center(row_mid_y);
-        let stats_center = TextBox::new(
-            self.style.primary_font,
-            CAPTION_TEXT_SIZE,
-            CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER,
-        )
-        .center_for_baseline(name_baseline);
-        fill_text_ellipsized(
-            renderer,
-            &f.primary,
-            path_x,
-            row_mid_y,
-            path_w,
-            FILE_NAME_TEXT_SIZE,
-            f.primary_color,
-            self.style.primary_font,
-            row_clip,
-            text::Ellipsis::Middle,
-        );
 
-        // Status chip, right-aligned in the rightmost column (single-letter
-        // labels center within it so mixed labels still line up). An empty
-        // label draws nothing.
-        if f.chevron.is_none() && !f.status_label.is_empty() {
-            let status_chip = Chip {
-                label: f.status_label.clone(),
-                font: self.style.mono_font,
-                background: f.status_background,
-                text_color: f.status_text,
-                border_color: None,
-                border_dashed: false,
-                icon: None,
-            };
-            let chip_w = chip::width_memoized(widths, &f.status_label, None, self.style.mono_font);
-            chip::draw_memoized(
-                renderer,
-                &status_chip,
-                widths,
-                chip_left + ((chip_col - chip_w) / 2.0).max(0.0),
-                chip::center_for_baseline(&status_chip, name_baseline),
-                row_clip,
+        if let Some(collapsed) = file.chevron {
+            paint_glyph(
+                if collapsed {
+                    icons::CHEVRON_RIGHT
+                } else {
+                    icons::CHEVRON_DOWN
+                },
+                columns.mark_x + FILE_MARK_COL / 2.0,
+                row_mid_y,
+                CAPTION_TEXT_SIZE,
+                file.icon_color,
+                window,
+                cx,
+            );
+        } else if !file.status_label.is_empty() {
+            status_badge::paint(
+                &StatusBadge {
+                    letter: &file.status_label,
+                    ink: file.status_text,
+                },
+                style.mono_font,
+                status_badge::rect(columns.mark_x, row_mid_y),
+                window,
+                cx,
             );
         }
 
-        // Directory rows carry no stats; zero-width stat columns (the source
-        // tree) skip them too.
-        if f.chevron.is_none() && f.additions_width > 0.0 {
-            let plus = format!("+{}", f.additions);
-            let minus = format!("\u{2212}{}", f.deletions);
-            // Right-aligned, so the digits of rows stacked above each other
-            // line up like a table column. The anchor is the right edge.
-            fill_text_centered_y(
-                renderer,
-                &plus,
-                plus_x + f.additions_width,
-                stats_center,
-                f.additions_width,
-                CAPTION_TEXT_SIZE,
-                f.additions_text,
-                self.style.primary_font,
-                row_clip,
-                text::Alignment::Right,
+        let (name, name_width) =
+            self.name_cuts
+                .cut(&file.primary, columns.path_w, FILE_NAME_TEXT_SIZE, font);
+        if name_width <= columns.path_w + 1.0 {
+            paint_centered(
+                &name,
+                columns.path_x,
+                row_mid_y,
+                FILE_NAME_TEXT_SIZE,
+                font,
+                file.primary_color,
+                window,
+                cx,
             );
-            fill_text_centered_y(
-                renderer,
-                &minus,
-                minus_x + f.deletions_width,
-                stats_center,
-                f.deletions_width,
-                CAPTION_TEXT_SIZE,
-                f.deletions_text,
-                self.style.primary_font,
-                row_clip,
-                text::Alignment::Right,
-            );
+            if file.struck {
+                // Through the middle of the lowercase letters, as a strikethrough
+                // sits.
+                let x_height = 0.52 * FILE_NAME_TEXT_SIZE;
+                window.paint_quad(fill(
+                    Rectangle {
+                        x: columns.path_x,
+                        y: (name_baseline - x_height / 2.0).round(),
+                        width: name_width,
+                        height: 1.0,
+                    }
+                    .bounds(),
+                    style.subtle_text,
+                ));
+            }
         }
 
-        // Graph last — same z-order rationale as draw_revision.
-        let gutter_bounds = Rectangle {
-            x: row_bounds.x + GUTTER_LEFT_PADDING,
-            y: row_bounds.y,
-            width: gutter_total - GUTTER_LEFT_PADDING - GUTTER_PADDING,
-            height: row_bounds.height,
+        if !directory {
+            let parts = changes_stats(file);
+            let mut right = columns.stats_right;
+            let line_height = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER;
+            let stats = TextBox::new(style.primary_font, CAPTION_TEXT_SIZE, line_height);
+            for (text, color) in parts.iter().rev() {
+                typography::paint_line(
+                    text,
+                    right,
+                    name_baseline - stats.baseline(),
+                    CAPTION_TEXT_SIZE,
+                    line_height,
+                    style.primary_font,
+                    *color,
+                    TextAlign::Right,
+                    window,
+                    cx,
+                );
+                right -= crate::measure::line_width(text, CAPTION_TEXT_SIZE, style.primary_font)
+                    + FILE_STAT_GAP;
+            }
+            if parts.is_empty()
+                && let Some(tag) = &file.tag
+            {
+                let line_height = FILE_TAG_SIZE * LINE_HEIGHT_MULTIPLIER;
+                let tag_box = TextBox::new(style.mono_font, FILE_TAG_SIZE, line_height);
+                typography::paint_line(
+                    tag,
+                    columns.stats_right,
+                    name_baseline - tag_box.baseline(),
+                    FILE_TAG_SIZE,
+                    line_height,
+                    style.mono_font,
+                    style.subtle_text,
+                    TextAlign::Right,
+                    window,
+                    cx,
+                );
+            }
+        }
+
+        if let (Some(check), Some(center)) = (file.check, columns.check_center)
+            && (show_check || check != crate::diff_view::CheckState::Off)
+        {
+            paint_file_check(center, row_mid_y, check, style, window, cx);
+        }
+    }
+}
+
+/// A list before its first props arrive: nothing draws with it, since
+/// [`view`] sets the real ones in the same breath.
+fn placeholder_style() -> RevisionListStyle {
+    let color = crate::theme::BLACK;
+    RevisionListStyle {
+        graph: RevisionGraphStyle {
+            lanes: [color; 4],
+            missing_color: color,
+            neutral: color,
+            surface: color,
+            accent: color,
+            accent_foreground: color,
+            conflict: color,
+        },
+        background: color,
+        selected_background: color,
+        accent: color,
+        control: color,
+        border: color,
+        muted_text: color,
+        subtle_text: color,
+        accent_text: color,
+        change_id: color,
+        accent_foreground: color,
+        primary_font: Font::DEFAULT,
+        mono_font: Font::MONOSPACE,
+        floating: crate::theme::ResolvedTheme::Dark.spec(),
+    }
+}
+
+/// The widths a revision row's meta line divides up.
+struct RailInput {
+    total_width: f32,
+    /// The working-copy label, its gap and the change id.
+    mandatory_left: f32,
+    status_total: f32,
+    has_status: bool,
+    commit_w: f32,
+    has_commit_id: bool,
+    author_full_w: f32,
+    has_author: bool,
+    ellipsis_w: f32,
+    id_gap: f32,
+    chip_gap: f32,
+}
+
+/// What of a revision row's meta line fits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RailLayout {
+    show_commit_id: bool,
+    visible_bookmarks: usize,
+    overflow_count: usize,
+    overflow_width: f32,
+    /// How wide the author draws, 0 when it's dropped.
+    author_width: f32,
+    need_ellipsis: bool,
+    chip_gap: f32,
+}
+
+impl RailLayout {
+    fn rail_width(&self, bookmarks: &[f32], status_total: f32) -> f32 {
+        let mut width = 0.0;
+        let mut add = |piece: f32| {
+            if width > 0.0 {
+                width += self.chip_gap;
+            }
+            width += piece;
         };
-        draw_continuation_row(
-            renderer,
-            gutter_bounds,
-            &f.continuation,
-            &f.columns,
-            &self.style.graph,
-            emphasized_lane,
-        );
+        for bookmark in bookmarks.iter().take(self.visible_bookmarks) {
+            add(*bookmark);
+        }
+        if self.overflow_count > 0 {
+            add(self.overflow_width);
+        }
+        if status_total > 0.0 {
+            add(status_total);
+        }
+        width
+    }
+}
+
+/// Priority when the row is short of room: commit id, then bookmark chips (with
+/// a `+N` chip for the rest), then the author. Status chips and the change id
+/// are load-bearing and never compress.
+fn rail_layout(
+    input: RailInput,
+    bookmarks: &[f32],
+    overflow_width: impl Fn(usize) -> f32,
+) -> RailLayout {
+    let RailInput {
+        total_width,
+        mandatory_left,
+        status_total,
+        has_status,
+        commit_w,
+        has_commit_id,
+        author_full_w,
+        has_author,
+        ellipsis_w,
+        id_gap,
+        chip_gap,
+    } = input;
+    // Always-shown widths consume from the budget first.
+    let mandatory = mandatory_left + status_total + if has_status { chip_gap } else { 0.0 };
+    let mut budget = (total_width - mandatory).max(0.0);
+
+    // 1. commit_id (with leading id_gap).
+    let mut show_commit_id = has_commit_id && commit_w + id_gap <= budget;
+    if show_commit_id {
+        budget -= commit_w + id_gap;
+    }
+
+    // 2. Bookmarks: fit greedily, reserving space for a `+N` overflow chip
+    //    when not all fit. The chip rail's leading gap separates it from the
+    //    left-side text.
+    let mut visible_bookmarks = 0;
+    let mut overflow_count = 0;
+    let mut overflow_w = 0.0;
+    if !bookmarks.is_empty() {
+        let all_w: f32 =
+            bookmarks.iter().sum::<f32>() + chip_gap * bookmarks.len().saturating_sub(1) as f32;
+        let block_w = if chip_gap + all_w <= budget {
+            visible_bookmarks = bookmarks.len();
+            all_w
+        } else {
+            let mut acc = 0.0;
+            for (index, width) in bookmarks.iter().enumerate() {
+                let gap = if index == 0 { 0.0 } else { chip_gap };
+                let candidate = acc + gap + width;
+                let remaining = bookmarks.len() - index - 1;
+                let plus_overflow = if remaining > 0 {
+                    chip_gap + overflow_width(remaining)
+                } else {
+                    0.0
+                };
+                if chip_gap + candidate + plus_overflow <= budget {
+                    visible_bookmarks = index + 1;
+                    acc = candidate;
+                } else {
+                    break;
+                }
+            }
+            if visible_bookmarks < bookmarks.len() {
+                overflow_count = bookmarks.len() - visible_bookmarks;
+                overflow_w = overflow_width(overflow_count);
+            }
+            acc + if overflow_count > 0 {
+                chip_gap + overflow_w
+            } else {
+                0.0
+            }
+        };
+        // Subtract the chip rail's leading gap once, plus the block.
+        budget -= chip_gap + block_w;
+        // Even a lone `+N` may not fit beside the commit id. The chip says more
+        // refs exist; the id gives way rather than running under it.
+        if budget < 0.0 && show_commit_id {
+            show_commit_id = false;
+        }
+    }
+
+    // 3. Author squeezes into whatever's left (with a leading id_gap).
+    let author_max_w = (budget - id_gap).max(0.0);
+    let author_width = if has_author && author_max_w >= ellipsis_w {
+        author_max_w.min(author_full_w)
+    } else {
+        0.0
+    };
+
+    RailLayout {
+        show_commit_id,
+        visible_bookmarks,
+        overflow_count,
+        overflow_width: overflow_w,
+        author_width,
+        // Ellipsis indicator when commit_id or author got dropped entirely.
+        need_ellipsis: (has_commit_id && !show_commit_id) || (author_width == 0.0 && has_author),
+        chip_gap,
     }
 }
 
@@ -2602,7 +2864,7 @@ fn item_display_to_lane(item: &Item, display: usize, half: LaneHalf) -> Option<u
 
 /// Bookmark labels for `lane` at this item's row, or an empty slice
 /// when the lane has none. Both revision and file rows carry their own
-/// snapshot of the lane-label state — see [`RevisionRowView::lane_labels`]
+/// snapshot of the lane-label state: see [`RevisionRowView::lane_labels`]
 /// and [`FileRowView::lane_labels`].
 fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
     match item {
@@ -2621,7 +2883,7 @@ fn item_lane_labels(item: &Item, lane: usize) -> &[String] {
 
 /// Segment id for `lane` at this item's row in the given half. `None`
 /// means the lane is dead at this row in that half (no stroke drawn)
-/// or the column is out of range. File rows aren't split — both halves
+/// or the column is out of range. File rows aren't split: both halves
 /// query the same `lane_segments`.
 fn item_lane_segment(item: &Item, lane: usize, half: LaneHalf) -> Option<usize> {
     let slot = match item {
@@ -2634,80 +2896,115 @@ fn item_lane_segment(item: &Item, lane: usize, half: LaneHalf) -> Option<usize> 
     slot.copied().flatten()
 }
 
-fn fill_background<R: renderer::Renderer>(renderer: &mut R, rect: Rectangle, color: Color) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border::default(),
-            shadow: Shadow::default(),
-            snap: true,
+/// Where a revision row's text starts, from the list's left edge, for a row
+/// drawing `lanes` lane columns.
+pub fn revision_gutter_width(lanes: usize) -> f32 {
+    REVISION_LANES.x(0.0, lanes.max(1) - 1) + GUTTER_TRAIL
+}
+
+/// Width of the working copy's "Working copy" label in `font`.
+pub fn working_copy_label_width(font: Font) -> f32 {
+    label_width(&WidthMemo::default(), emphasis_font(font, Weight::SEMIBOLD))
+}
+
+/// Width of the working-copy label: text and padding.
+fn label_width(widths: &WidthMemo, font: Font) -> f32 {
+    widths.width(WORKING_COPY_LABEL, WORKING_COPY_TEXT_SIZE, font) + 2.0 * WORKING_COPY_PAD_X
+}
+
+/// The working copy's "Working copy" label at `x`, its text on `baseline`: an
+/// accent box, chip-high.
+fn paint_working_copy_label(
+    x: f32,
+    baseline: f32,
+    font: Font,
+    style: &RevisionListStyle,
+    widths: &WidthMemo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let height = chip::height();
+    let center = TextBox::new(font, WORKING_COPY_TEXT_SIZE, height).center_for_baseline(baseline);
+    let top = (center - height / 2.0).round();
+    fill_rounded(
+        Rectangle {
+            x,
+            y: top,
+            width: label_width(widths, font),
+            height,
         },
-        color,
+        style.accent,
+        crate::theme::radius::XS,
+        window,
+    );
+    paint_centered(
+        WORKING_COPY_LABEL,
+        x + WORKING_COPY_PAD_X,
+        center,
+        WORKING_COPY_TEXT_SIZE,
+        font,
+        style.accent_foreground,
+        window,
+        cx,
     );
 }
 
-fn fill_rounded<R: renderer::Renderer>(
-    renderer: &mut R,
+fn fill_rounded(
     rect: Rectangle,
-    color: Color,
+    color: impl Into<gpui_kit::Background>,
     radius: f32,
+    window: &mut Window,
 ) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                radius: radius.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        color,
-    );
+    if radius >= crate::squircle::MIN_RADIUS
+        && let Some(path) =
+            crate::squircle::fill_path(rect.bounds(), crate::squircle::Corners::all(radius))
+    {
+        window.paint_path(path, color);
+        return;
+    }
+    window.paint_quad(fill(rect.bounds(), color).corner_radii(px(radius)));
 }
 
-/// Border-only rounded rect — the target ring for draft/drag destinations.
-fn stroke_rounded<R: renderer::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    color: Color,
-    width: f32,
-    radius: f32,
-) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                color,
-                width,
-                radius: radius.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Color::TRANSPARENT,
-    );
+/// Border-only rounded rect: the target ring for draft/drag destinations.
+fn stroke_rounded(rect: Rectangle, color: Color, width: f32, radius: f32, window: &mut Window) {
+    if radius >= crate::squircle::MIN_RADIUS
+        && let Some(path) = crate::squircle::stroke_path(
+            rect.bounds(),
+            crate::squircle::Corners::all(radius),
+            width,
+        )
+    {
+        window.paint_path(path, color);
+        return;
+    }
+    window.paint_quad(quad(
+        rect.bounds(),
+        px(radius),
+        gpui_kit::transparent_black(),
+        px(width),
+        color,
+        BorderStyle::Solid,
+    ));
 }
 
 /// The insert-here caret: a 2px accent line across a row boundary (top or
-/// bottom edge of `row_bounds`) with a small dot at its left end, spanning
-/// from the graph gutter to the row's right padding.
-fn draw_insertion_line<R: renderer::Renderer>(
-    renderer: &mut R,
-    row_bounds: Rectangle,
+/// bottom edge of `row`) with a small dot at its left end, spanning from the
+/// graph gutter to the row's right padding.
+fn paint_insertion_line(
+    row: Rectangle,
     gutter_total: f32,
     at_top: bool,
     color: Color,
+    window: &mut Window,
 ) {
     let y = if at_top {
-        row_bounds.y - 1.0
+        row.y - 1.0
     } else {
-        row_bounds.y + row_bounds.height - 1.0
+        row.y + row.height - 1.0
     };
-    let x = row_bounds.x + gutter_total.min(row_bounds.width);
-    let width = (row_bounds.x + row_bounds.width - CONTENT_PADDING - x).max(0.0);
+    let x = row.x + gutter_total.min(row.width);
+    let width = (row.x + row.width - crate::theme::list::PAD_END - x).max(0.0);
     fill_rounded(
-        renderer,
         Rectangle {
             x,
             y,
@@ -2716,9 +3013,9 @@ fn draw_insertion_line<R: renderer::Renderer>(
         },
         color,
         1.0,
+        window,
     );
     fill_rounded(
-        renderer,
         Rectangle {
             x: x - 6.0,
             y: y - 2.0,
@@ -2727,275 +3024,75 @@ fn draw_insertion_line<R: renderer::Renderer>(
         },
         color,
         3.0,
+        window,
     );
 }
 
-/// Blend `fg` onto `bg` as if drawing `fg` (with its alpha replaced by
-/// `weight`) over an opaque `bg`. Returns an opaque color.
-fn mix_color(fg: Color, bg: Color, weight: f32) -> Color {
-    let w = weight.clamp(0.0, 1.0);
-    Color {
-        r: fg.r * w + bg.r * (1.0 - w),
-        g: fg.g * w + bg.g * (1.0 - w),
-        b: fg.b * w + bg.b * (1.0 - w),
-        a: 1.0,
-    }
-}
-
-fn fill_gradient_rounded<R: renderer::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    gradient: gradient::Linear,
-    radius: f32,
-) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                radius: radius.into(),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        gradient,
-    );
-}
-
-/// Truncating text run, vertically centered on `center_y`. Used for
-/// description/detail rows where text might overflow horizontally and we
-/// want an end-ellipsis. Centering goes through `align_y: Center` so all
-/// rows in this widget share the same y-positioning model.
+/// Text optically centred on `center_y`: its cap box (cap top to baseline), not
+/// its line box, is what's centred. See [`crate::typography`]. Runs that must
+/// share a baseline with another font or size pass
+/// [`TextBox::center_for_baseline`] of that baseline.
 #[allow(clippy::too_many_arguments)]
-fn fill_text_truncated<R: text::Renderer>(
-    renderer: &mut R,
+fn paint_centered(
     content: &str,
     x: f32,
     center_y: f32,
-    width: f32,
     size: f32,
-    color: Color,
     font: Font,
-    clip: Rectangle,
+    color: Color,
+    window: &mut Window,
+    cx: &mut App,
 ) {
-    fill_text_ellipsized(
-        renderer,
+    let line_height = size * LINE_HEIGHT_MULTIPLIER;
+    let shift = TextBox::new(font, size, line_height).trim_shift();
+    typography::paint_line(
         content,
         x,
-        center_y,
-        width,
+        center_y + shift - line_height / 2.0,
         size,
-        color,
+        line_height,
         font,
-        clip,
-        text::Ellipsis::End,
+        color,
+        TextAlign::Left,
+        window,
+        cx,
     );
 }
 
-/// [`fill_text_truncated`] with the cut placed by `ellipsis`.
-#[allow(clippy::too_many_arguments)]
-fn fill_text_ellipsized<R: text::Renderer>(
-    renderer: &mut R,
-    content: &str,
-    x: f32,
+/// A Lucide glyph centered on `(center_x, center_y)`.
+fn paint_glyph(
+    glyph: &str,
+    center_x: f32,
     center_y: f32,
-    width: f32,
     size: f32,
     color: Color,
-    font: Font,
-    clip: Rectangle,
-    ellipsis: text::Ellipsis,
+    window: &mut Window,
+    cx: &mut App,
 ) {
-    if content.is_empty() {
-        return;
-    }
-    let height = size * LINE_HEIGHT_MULTIPLIER;
-    renderer.fill_text(
-        Text {
-            content: content.to_owned(),
-            bounds: Size::new(width.max(1.0), height.max(1.0)),
-            size: Pixels(size),
-            line_height: text::LineHeight::Absolute(Pixels(height)),
-            font,
-            align_x: text::Alignment::Left,
-            align_y: alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::None,
-            ellipsis,
-            hint_factor: None,
-        },
-        // Optically centred: the caps, not the line box, sit on `center_y`.
-        Point::new(x, center_y + TextBox::new(font, size, height).trim_shift()),
+    typography::paint_line(
+        glyph,
+        center_x,
+        center_y - size / 2.0,
+        size,
+        size,
+        icons::ICON_FONT,
         color,
-        clip,
+        TextAlign::Center,
+        window,
+        cx,
     );
-}
-
-/// Fill text optically centred on `center_y`: its cap box (cap top to
-/// baseline), not its line box, is what's centred — see
-/// [`crate::typography`]. Runs that must share a baseline with another font
-/// or size pass [`TextBox::center_for_baseline`] of that baseline. We push
-/// this through `fill_text` (the `Cached` text path) rather than
-/// `fill_paragraph` because Cached text is the only path where iced applies
-/// `align_y` placement, and it owns its `String` so we don't have to manage
-/// paragraph lifetimes.
-#[allow(clippy::too_many_arguments)]
-fn fill_text_centered_y<R: text::Renderer>(
-    renderer: &mut R,
-    content: &str,
-    x: f32,
-    center_y: f32,
-    width: f32,
-    size: f32,
-    color: Color,
-    font: Font,
-    clip: Rectangle,
-    align_x: text::Alignment,
-) {
-    if content.is_empty() {
-        return;
-    }
-    let height = size * LINE_HEIGHT_MULTIPLIER;
-    renderer.fill_text(
-        Text {
-            content: content.to_owned(),
-            bounds: Size::new(width.max(1.0), height.max(1.0)),
-            size: Pixels(size),
-            line_height: text::LineHeight::Absolute(Pixels(height)),
-            font,
-            align_x,
-            align_y: alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::None,
-            hint_factor: None,
-        },
-        Point::new(x, center_y + TextBox::new(font, size, height).trim_shift()),
-        color,
-        clip,
-    );
-}
-
-struct FileRowColumns {
-    chip_left: f32,
-    minus_x: f32,
-    plus_x: f32,
-    path_x: f32,
-    path_w: f32,
-}
-
-struct TooltipOverlay {
-    text: String,
-    cursor: Point,
-    row_anchor_x: f32,
-    row_anchor_y: f32,
-    row_height: f32,
-    style: RevisionListStyle,
-    /// Pre-measured text size (via [`measure::line_bounds`] in `overlay()`),
-    /// so layout uses true glyph extents instead of a `chars * size * 0.55`
-    /// guess that left a gap on the right.
-    text_size: Size,
-}
-
-impl TooltipOverlay {
-    fn box_size(&self) -> Size {
-        Size::new(
-            self.text_size.width + TOOLTIP_PADDING_X * 2.0,
-            self.text_size.height + TOOLTIP_PADDING_Y * 2.0,
-        )
-    }
-}
-
-impl<Message, Renderer> overlay::Overlay<Message, Theme, Renderer> for TooltipOverlay
-where
-    Renderer: text::Renderer,
-{
-    fn layout(&mut self, _renderer: &Renderer, viewport: Size) -> layout::Node {
-        let size = self.box_size();
-        // Anchor to the right of the sidebar at the row's vertical center,
-        // shifted by tooltip_gap. Snap into the viewport if it would clip.
-        let mut x = self.row_anchor_x + TOOLTIP_GAP;
-        let mut y = self.row_anchor_y + (self.row_height - size.height) / 2.0;
-        if x + size.width > viewport.width {
-            // Fall back to following the cursor on the left.
-            x = (self.cursor.x - size.width - TOOLTIP_GAP).max(4.0);
-        }
-        if y + size.height > viewport.height {
-            y = (viewport.height - size.height - 4.0).max(0.0);
-        }
-        if y < 0.0 {
-            y = 4.0;
-        }
-        layout::Node::new(size).move_to(Point::new(x, y))
-    }
-
-    fn draw(
-        &self,
-        renderer: &mut Renderer,
-        _theme: &Theme,
-        _style: &renderer::Style,
-        layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-    ) {
-        let bounds = layout.bounds();
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: Border {
-                    color: self.style.tooltip_border,
-                    width: 1.0,
-                    radius: iced::border::Radius::from(TOOLTIP_RADIUS),
-                },
-                // Same soft lift every other floating surface carries
-                // (`theme::popover_style` at tooltip scale) — shadowless,
-                // the card sank into the busy rows behind it.
-                shadow: crate::theme::floating_shadow(3.0, 10.0),
-                snap: true,
-            },
-            Background::Color(self.style.tooltip_background),
-        );
-        // Use fill_text (Cached) — owns its String, so we don't have to keep
-        // a Paragraph alive past the end of this draw call. align_y: Center
-        // does the vertical math against the box.
-        fill_text_centered_y(
-            renderer,
-            &self.text,
-            bounds.x + TOOLTIP_PADDING_X,
-            bounds.y + bounds.height / 2.0,
-            bounds.width - TOOLTIP_PADDING_X * 2.0,
-            CAPTION_TEXT_SIZE,
-            self.style.tooltip_text,
-            self.style.primary_font,
-            bounds,
-            text::Alignment::Left,
-        );
-    }
-}
-
-impl<'a, Message: 'a, Renderer> From<RevisionList<'a, Message>>
-    for Element<'a, Message, Theme, Renderer>
-where
-    Renderer: text::Renderer + iced::advanced::graphics::geometry::Renderer + 'a,
-{
-    fn from(widget: RevisionList<'a, Message>) -> Self {
-        Element::new(widget)
-    }
 }
 
 /// A file-tree change-selection checkbox centered at `(center_x, mid_y)`.
-#[allow(clippy::too_many_arguments)]
-fn draw_file_check<R>(
-    renderer: &mut R,
+fn paint_file_check(
     center_x: f32,
     mid_y: f32,
     check: crate::diff_view::CheckState,
-    fill: Color,
-    muted: Color,
-    glyph_color: Color,
-    clip: Rectangle,
-) where
-    R: text::Renderer,
-{
+    style: &RevisionListStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::diff_view::CheckState;
     const SIDE: f32 = 12.0;
     let rect = Rectangle {
         x: center_x - SIDE / 2.0,
@@ -3003,7 +3100,279 @@ fn draw_file_check<R>(
         width: SIDE,
         height: SIDE,
     };
-    crate::diff_view::draw_checkbox(renderer, rect, check, fill, muted, glyph_color, clip);
+    let radius = 3.0;
+    let glyph = match check {
+        CheckState::Off => {
+            stroke_rounded(rect, style.muted_text, 1.0, radius, window);
+            return;
+        }
+        CheckState::Partial => icons::MINUS,
+        CheckState::On => icons::CHECK,
+    };
+    fill_rounded(rect, style.control, radius, window);
+    paint_glyph(
+        glyph,
+        center_x,
+        mid_y,
+        SIDE - 2.0,
+        style.background,
+        window,
+        cx,
+    );
+}
+
+struct FileRowColumns {
+    path_x: f32,
+    path_w: f32,
+    /// Left edge of the chevron column (the badge's, in the changes layout).
+    mark_x: f32,
+    /// The changes layout's pick box, centred here.
+    check_center: Option<f32>,
+    /// The changes layout's counts end here.
+    stats_right: f32,
+}
+
+impl Render for RevisionList {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(ElementId::NamedInteger(
+                "revision-list".into(),
+                cx.entity_id().as_u64(),
+            ))
+            .relative()
+            .size_full()
+            .child(ListElement { list: cx.entity() })
+            .vertical_scrollbar(&self.bar)
+    }
+}
+
+/// Paints [`RevisionList`]. Fills what it's given.
+struct ListElement {
+    list: Entity<RevisionList>,
+}
+
+impl IntoElement for ListElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ListElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let style = Style {
+            size: size(relative(1.0).into(), relative(1.0).into()),
+            ..Style::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Hitbox {
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let (moved, on_scroll, tooltip, ghost) = self.list.update(cx, |list, cx| {
+            list.bounds = bounds.into();
+            let mut moved = list.settle_offset();
+            if moved.is_some() {
+                // A jump: the wheel's leftover motion would drag the list off it.
+                list.wheel.reset();
+            }
+            if let Some(offset) = list.bar.take_requested() {
+                list.vertical_offset = f64::from(offset).clamp(0.0, list.max_offset());
+                list.wheel.reset();
+                moved = Some(list.vertical_offset);
+            }
+            let step = list.wheel.take(Instant::now());
+            if step != 0.0 {
+                crate::frame_log::value("sy", step);
+            }
+            if step != 0.0 {
+                let before = list.vertical_offset;
+                list.vertical_offset = (before + step).clamp(0.0, list.max_offset());
+                if list.vertical_offset != before {
+                    moved = Some(list.vertical_offset);
+                    // Rows slid under a still cursor: its hover moves with them.
+                    list.recompute_hover(cx);
+                }
+            }
+            if list.wheel.pending() {
+                window.request_animation_frame();
+            }
+            list.bar.publish(
+                list.bounds,
+                list.props.content_height() as f32,
+                list.vertical_offset as f32,
+            );
+            (
+                moved,
+                list.props.on_scroll.clone(),
+                list.tooltip(window, cx),
+                list.drag_ghost(cx),
+            )
+        });
+        // Outside the draw: the app's handler isn't allowed to run in here.
+        if let (Some(offset), Some(on_scroll)) = (moved, on_scroll) {
+            window.defer(cx, move |window, cx| on_scroll(&offset, window, cx));
+        }
+        // Both float over the rest of the window and aren't clipped to the list.
+        for (mut floating, at) in [tooltip, ghost].into_iter().flatten() {
+            floating.layout_as_root(AvailableSpace::min_size(), window, cx);
+            window.defer_draw(floating, at, 1, None);
+        }
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        hitbox: &mut Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let cursor = self.list.update(cx, |list, cx| {
+            crate::frame_log::time("list.paint", || list.paint(window, cx));
+            if list.drag.is_some_and(|drag| drag.active) {
+                CursorStyle::ClosedHand
+            } else if scrollbar::hits_container(
+                list.bounds,
+                window.mouse_position().into(),
+                list.props.content_height() as f32,
+            ) {
+                CursorStyle::Arrow
+            } else {
+                CursorStyle::PointingHand
+            }
+        });
+        window.set_cursor_style(cursor, hitbox);
+
+        let run = |effects: Effects, window: &mut Window, cx: &mut App| {
+            for effect in effects {
+                effect(window, cx);
+            }
+        };
+
+        let list = self.list.clone();
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let position: Point = event.position.into();
+            let hovered = hit.is_hovered(window);
+            let effects = list.update(cx, |list, cx| {
+                list.with_scroll_report(
+                    |list, effects, cx| list.on_mouse_move(position, hovered, effects, cx),
+                    cx,
+                )
+            });
+            run(effects, window, cx);
+        });
+
+        let list = self.list.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let effects = list.update(cx, |list, cx| {
+                list.with_scroll_report(|list, effects, cx| list.on_mouse_exit(effects, cx), cx)
+            });
+            run(effects, window, cx);
+        });
+
+        let list = self.list.clone();
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || !hit.should_handle_scroll(window) {
+                return;
+            }
+            let delta_y = f32::from(crate::wheel::points(event.delta).y);
+            crate::frame_log::value("wy", f64::from(delta_y));
+            let effects = list.update(cx, |list, cx| {
+                list.with_scroll_report(|list, _, cx| list.on_wheel(delta_y, cx), cx)
+            });
+            cx.stop_propagation();
+            run(effects, window, cx);
+        });
+
+        let list = self.list.clone();
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || !hit.is_hovered(window) {
+                return;
+            }
+            let cursor: Point = event.position.into();
+            let mut handled = false;
+            let effects = match event.button {
+                MouseButton::Left => list.update(cx, |list, cx| {
+                    list.with_scroll_report(
+                        |list, effects, cx| handled = list.on_left_press(cursor, effects, cx),
+                        cx,
+                    )
+                }),
+                MouseButton::Right => list.update(cx, |list, cx| {
+                    list.with_scroll_report(
+                        |list, effects, cx| handled = list.on_right_press(cursor, effects, cx),
+                        cx,
+                    )
+                }),
+                _ => return,
+            };
+            if handled {
+                if event.button == MouseButton::Left {
+                    // Moves and the release reach us wherever the cursor goes.
+                    window.capture_pointer(hit.id);
+                    // A press on the list takes the keyboard back from a field,
+                    // so the keymap sees the next key.
+                    window.blur(cx);
+                }
+                cx.stop_propagation();
+            }
+            run(effects, window, cx);
+        });
+
+        let list = self.list.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                return;
+            }
+            let cursor: Point = event.position.into();
+            let effects = list.update(cx, |list, cx| {
+                list.with_scroll_report(
+                    |list, effects, cx| list.on_left_release(cursor, effects, cx),
+                    cx,
+                )
+            });
+            run(effects, window, cx);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3121,7 +3490,7 @@ mod tests {
     #[test]
     fn row_geometry_exact_at_large_indices() {
         // Regression: in `f32`, integers stop being exact past 2^24 ≈ 16.7M,
-        // and a ~1M-commit list is ~50M px tall. There, draw's `flat * H` and
+        // and a ~1M-commit list is ~50M px tall. There, paint's `flat * H` and
         // hit-test's `y / H` rounded to different rows, so a click near the
         // bottom selected the neighbour. `f64` keeps both exact, so the
         // round-trip `row_at_offset(row_top(flat)) == flat` holds everywhere.
@@ -3142,5 +3511,98 @@ mod tests {
                 "end of {flat}"
             );
         }
+    }
+
+    #[test]
+    fn a_reveal_leaves_a_visible_row_alone_and_centres_a_hidden_one() {
+        let row = f64::from(REVISION_ROW_HEIGHT);
+        // In view: nothing moves.
+        assert_eq!(reveal_offset(100.0, 200.0, row, 400.0, 10_000.0), 100.0);
+        // Below the fold: it lands a third of the way down.
+        assert_eq!(
+            reveal_offset(0.0, 5_000.0, row, 400.0, 10_000.0),
+            5_000.0 - 400.0 * 0.33
+        );
+        // Above: the same, not pinned to the top edge.
+        assert_eq!(
+            reveal_offset(9_000.0, 5_000.0, row, 400.0, 10_000.0),
+            5_000.0 - 400.0 * 0.33
+        );
+        // Clamped to what the list can scroll to.
+        assert_eq!(reveal_offset(0.0, 5_000.0, row, 400.0, 1_000.0), 1_000.0);
+    }
+
+    fn rail(total_width: f32, bookmarks: &[f32]) -> RailLayout {
+        rail_layout(
+            RailInput {
+                total_width,
+                mandatory_left: 60.0,
+                status_total: 40.0,
+                has_status: true,
+                commit_w: 50.0,
+                has_commit_id: true,
+                author_full_w: 80.0,
+                has_author: true,
+                ellipsis_w: 8.0,
+                id_gap: 8.0,
+                chip_gap: 6.0,
+            },
+            bookmarks,
+            |_| 20.0,
+        )
+    }
+
+    #[test]
+    fn a_short_row_sheds_the_author_then_bookmarks_then_the_commit_id() {
+        // Room for everything.
+        let wide = rail(400.0, &[50.0, 50.0]);
+        assert!(wide.show_commit_id);
+        assert_eq!(wide.visible_bookmarks, 2);
+        assert_eq!(wide.overflow_count, 0);
+        assert_eq!(wide.author_width, 80.0);
+        assert!(!wide.need_ellipsis);
+
+        // The author is squeezed first, and ellipsises rather than vanishing.
+        let squeezed = rail(300.0, &[50.0, 50.0]);
+        assert_eq!(squeezed.visible_bookmarks, 2);
+        assert!(squeezed.author_width > 0.0 && squeezed.author_width < 80.0);
+
+        // Then a bookmark goes behind `+N`.
+        let overflowed = rail(250.0, &[50.0, 50.0]);
+        assert_eq!(overflowed.visible_bookmarks, 1);
+        assert_eq!(overflowed.overflow_count, 1);
+        assert_eq!(overflowed.author_width, 0.0);
+        assert!(overflowed.need_ellipsis);
+
+        // The commit id goes last, and status chips never do.
+        let tight = rail(120.0, &[50.0, 50.0]);
+        assert!(!tight.show_commit_id);
+        assert_eq!(tight.visible_bookmarks, 0);
+        assert_eq!(tight.overflow_count, 2);
+    }
+
+    #[test]
+    fn a_lone_overflow_chip_never_runs_over_the_commit_id() {
+        // The id fits on its own, but not with the `+2` beside it.
+        let layout = rail(170.0, &[50.0, 50.0]);
+        assert_eq!(layout.visible_bookmarks, 0);
+        assert_eq!(layout.overflow_count, 2);
+        assert!(!layout.show_commit_id);
+        assert_eq!(
+            layout.author_width, 0.0,
+            "the author is lower priority still"
+        );
+        assert!(layout.need_ellipsis);
+    }
+
+    #[test]
+    fn the_rail_width_counts_only_what_shows() {
+        let layout = rail(250.0, &[50.0, 50.0]);
+        // One bookmark, the `+1`, the status block, two gaps.
+        assert_eq!(
+            layout.rail_width(&[50.0, 50.0], 40.0),
+            50.0 + 20.0 + 40.0 + 12.0
+        );
+        assert_eq!(rail(400.0, &[]).rail_width(&[], 0.0), 0.0);
     }
 }

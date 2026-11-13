@@ -22,10 +22,9 @@
 //! matches its uppercase form (so `cmd+k` fires with caps lock on); an
 //! uppercase one matches only the shifted key.
 
-use std::collections::BTreeMap;
-
-use iced::keyboard::{self, key::Named};
+use crate::keys::{self as keyboard, Named};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 use crate::commands::{CommandId, Context, REGISTRY, command};
 
@@ -49,7 +48,7 @@ impl Mods {
         .normalized()
     }
 
-    /// Off macOS, `cmd` *is* ctrl — iced's `Modifiers::COMMAND` is the ctrl
+    /// Off macOS, `cmd` *is* ctrl — `Modifiers::COMMAND` is the ctrl
     /// bit there, so a raw Ctrl press sets both flags and would never match a
     /// chord that set only one. Fold them into `command` so `cmd+k` and
     /// `ctrl+k` name one chord off macOS and stay two on it.
@@ -245,6 +244,13 @@ fn named_key(name: &str) -> Option<Named> {
     })
 }
 
+/// How the named key `name` (`"enter"`, `"backspace"`) is spelled in a hint,
+/// for a key a text input answers itself, which no binding names. Empty for a
+/// name that isn't a key.
+pub(crate) fn key_label(name: &str) -> &'static str {
+    named_key(name).map_or("", named_label)
+}
+
 /// How a named key is spelled in a shortcut hint. Every key
 /// [`named_key`] accepts has one: a binding the user is allowed to write is a
 /// binding the menus and the palette have to be able to show, and an empty
@@ -304,7 +310,6 @@ fn named_label(named: Named) -> &'static str {
         Named::F10 => "F10",
         Named::F11 => "F11",
         Named::F12 => "F12",
-        _ => "",
     }
 }
 

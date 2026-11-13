@@ -6,11 +6,10 @@
 //! as `Batch`-shaped work, and the commit list arrives as graph rows.
 
 use tokio::sync::mpsc;
-use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
-use super::{Envelope, Jobs, catch_panic, route_commands};
+use super::{Envelope, Jobs, route_commands, run_job};
 use crate::github::{self, PrSpec};
 use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
 
@@ -31,6 +30,10 @@ pub(super) fn spawn(
     let (work_tx, mut work) = mpsc::unbounded_channel();
     tokio::spawn(route_commands(commands, work_tx, jobs.clone()));
     tokio::spawn(async move {
+        // The PR header, read once: the details pane and the diff's totals
+        // both start from it. A graph load (opening or refreshing the tab)
+        // reads it afresh.
+        let mut info: Option<github::PrInfo> = None;
         while let Some(envelope) = work.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
@@ -38,25 +41,16 @@ pub(super) fn spawn(
                 Envelope::Watch(_) => {}
                 Envelope::Run { command, .. } => {
                     let Some(job) = command.job() else { continue };
-                    let cancel = match jobs.lock() {
-                        Ok(mut jobs) => jobs.begin(job),
-                        Err(_) => CancelFlag::default(),
-                    };
                     let span = tracing::info_span!("pr_command", repo = %id, job = job.0);
-                    let work = run(&id, &spec, command, &cancel, &events);
-                    if let Err(message) = catch_panic(work).instrument(span.clone()).await {
-                        span.in_scope(|| tracing::error!("command panicked: {message}"));
-                        let _ = events.send(Event::new(
-                            id.clone(),
-                            Payload::Failed {
-                                job,
-                                error: RepoError::Crashed(message),
-                            },
-                        ));
-                    }
-                    if let Ok(mut jobs) = jobs.lock() {
-                        jobs.finish(job);
-                    }
+                    let emit = |payload| {
+                        let _ = events.send(Event::new(id.clone(), payload));
+                    };
+                    let (id, spec, events, info) = (&id, &spec, &events, &mut info);
+                    run_job(&jobs, job, span, emit, |ticket| async move {
+                        run(id, spec, info, *command, ticket.flag(), events).await;
+                        Ok(())
+                    })
+                    .await;
                 }
             }
             if events.is_closed() {
@@ -69,6 +63,7 @@ pub(super) fn spawn(
 async fn run(
     id: &RepoId,
     spec: &PrSpec,
+    info: &mut Option<github::PrInfo>,
     command: Command,
     cancel: &CancelFlag,
     events: &mpsc::UnboundedSender<Event>,
@@ -81,6 +76,7 @@ async fn run(
         // one row per commit. It arrives whole, in a single batch.
         Command::LoadGraph { job, .. } => match github::fetch_pr_commits(spec).await {
             Ok(commits) => {
+                *info = None;
                 emit(Payload::Batch {
                     job,
                     rows: github::pr_commit_rows(&commits),
@@ -101,18 +97,18 @@ async fn run(
             base: DiffBase::Parents,
             ..
         } => {
-            stream_diff(spec, job, revision, cancel, &emit).await;
+            stream_diff(spec, info, job, revision, cancel, &emit).await;
         }
         // A comparison needs two local trees; `Capabilities::compare` is off.
         Command::LoadDiff { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),
-        Command::RevisionDetails { job, revision } => match github::fetch_pr_info(spec).await {
+        Command::RevisionDetails { job, revision } => match pr_info(spec, info).await {
             Ok(info) => emit(Payload::DetailsLoaded {
                 job,
                 revision,
-                details: github::pr_revision_details(&info),
+                details: github::pr_revision_details(info),
             }),
             Err(error) => emit(Payload::Failed {
                 job,
@@ -141,24 +137,37 @@ async fn run(
             job,
             error: RepoError::Unsupported,
         }),
-        Command::Cancel { .. } => unreachable!("cancels are handled before dispatch"),
+        Command::Cancel { .. } | Command::SetRefreshMode { .. } => {
+            unreachable!("jobless commands are handled before dispatch")
+        }
     }
 }
 
-/// Stream the whole-PR diff (or one commit's) back as batches.
-///
-/// The `gh` child process is spawned with `kill_on_drop`, so cancelling here
-/// actually stops the download instead of leaving it to run to completion
-/// against a tab the user has already navigated away from.
+/// The PR header, read once and kept in `info`.
+async fn pr_info<'a>(
+    spec: &PrSpec,
+    info: &'a mut Option<github::PrInfo>,
+) -> anyhow::Result<&'a github::PrInfo> {
+    if info.is_none() {
+        *info = Some(github::fetch_pr_info(spec).await?);
+    }
+    Ok(info.as_ref().expect("just filled"))
+}
+
+/// Stream the whole-PR diff (or one commit's) back as batches. A cancel kills
+/// the `gh` download rather than leaving it to run to completion against a
+/// tab the user has already navigated away from.
 async fn stream_diff(
     spec: &PrSpec,
+    info: &mut Option<github::PrInfo>,
     job: JobId,
     revision: RevisionSelection,
     cancel: &CancelFlag,
     emit: &impl Fn(Payload),
 ) {
     if let RevisionSelection::Commit(oid) = &revision {
-        match github::load_pr_commit_diff(spec, oid).await {
+        match github::load_pr_commit_diff(spec, oid, cancel).await {
+            _ if cancel.is_cancelled() => emit(Payload::Cancelled { job }),
             Ok((document, details)) => emit(Payload::DiffLoaded {
                 job,
                 revision,
@@ -176,22 +185,15 @@ async fn stream_diff(
     // The PR header's own counts, read first: the files-API fallback zeroes
     // per-file counts for oversized blobs, so summing the parsed files
     // undercounts (react#36173: 73k summed against 123k real).
-    let header = github::fetch_pr_info(spec).await.ok();
+    let header = pr_info(spec, info)
+        .await
+        .ok()
+        .map(|info| (info.additions, info.deletions));
     let mut batch: Vec<DiffFile> = Vec::new();
     let mut batch_lines = 0usize;
-    let mut totals = header
-        .as_ref()
-        .map(|info| (info.additions, info.deletions))
-        .unwrap_or((0, 0));
     let summed = header.is_none();
-    let mut cancelled = false;
-    let result = github::stream_pr_diff(spec, |file| {
-        // One flag check per file: a PR download that outlives its tab used to
-        // run to completion, and a big one takes minutes.
-        if cancelled || cancel.is_cancelled() {
-            cancelled = true;
-            return;
-        }
+    let mut totals = header.unwrap_or((0, 0));
+    let result = github::stream_pr_diff(spec, cancel, |file| {
         if summed {
             totals.0 += file.additions;
             totals.1 += file.deletions;
@@ -219,11 +221,8 @@ async fn stream_diff(
     })
     .await;
 
-    if cancelled {
-        emit(Payload::Cancelled { job });
-        return;
-    }
     match result {
+        _ if cancel.is_cancelled() => emit(Payload::Cancelled { job }),
         Ok(()) => emit(Payload::DiffLoaded {
             job,
             revision,

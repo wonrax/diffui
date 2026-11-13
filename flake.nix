@@ -64,15 +64,16 @@
                 let
                   base = baseNameOf path;
                 in
-                base != "target" && base != "result" && base != ".direnv";
+                !builtins.elem base [
+                  "target"
+                  "result"
+                  ".direnv"
+                  ".jj"
+                ];
             };
 
             cargoLock = {
               lockFile = ./Cargo.lock;
-              # iced is pulled from git in Cargo.toml; let nix fetch by the
-              # commits already pinned in Cargo.lock instead of forcing us to
-              # maintain an outputHashes table.
-              allowBuiltinFetchGit = true;
             };
 
             nativeBuildInputs = [
@@ -144,7 +145,7 @@
           # on PATH too, so the bare name resolves.
           #
           # `startupWMClass` must match the Wayland `app_id` / X11 `WM_CLASS`
-          # the window actually reports, which is set in `src/chrome.rs`. That's
+          # the window actually reports, which is set in `src/root.rs`. That's
           # what lets a compositor tie a live window back to this entry, so the
           # taskbar and alt-tab pick up the name and icon from here rather than
           # showing an anonymous window.
@@ -256,6 +257,10 @@
             buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             RUST_BACKTRACE = "1";
+            # The jj the app's tests build their fixture repo with
+            # (`fixtures/make-fixture.sh`): it has to match the app's jj-lib.
+            # Only named here, not put on PATH, so the shell's `jj` stays yours.
+            JJ = "${pkgs.jujutsu}/bin/jj";
             WABT_DIR = pkgs.wabt;
             SIMDE_DIR = pkgs.simde;
 
@@ -289,10 +294,7 @@
                 fi
                 unset apple_ld
               ''
-              + ''
-                export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
-                export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
-              '';
+;
           };
 
           formatter = pkgs.nixfmt;

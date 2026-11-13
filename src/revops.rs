@@ -8,15 +8,12 @@
 //! [`Diffui::start_draft_with`], so labels, guards and previews stay shared
 //! with the original ops.
 
-use std::time::Duration;
+use crate::Cx;
 
-use diffui_core::{DraftKind, PlacementKind, RevisionSelection};
-use iced::Task;
-
-use crate::message::{Message, UiEvent};
 use crate::modes::{ModeKind, TabMode};
-use crate::{Diffui, PreviewRequest};
+use crate::{Diffui, PreviewRequest, TabState};
 use crate::{DraftPreviewState, DraftUi, mutations};
+use diffui_core::{DraftKind, PlacementKind, RevisionSelection};
 
 impl Diffui {
     /// Enter target mode for `kind` over `sources`, optionally with a
@@ -30,10 +27,11 @@ impl Diffui {
         kind: DraftKind,
         sources: Vec<RevisionSelection>,
         armed: Option<(RevisionSelection, PlacementKind)>,
-    ) -> Task<Message> {
+        cx: &mut Cx,
+    ) {
         // jj-only, like every mutation.
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         let sources: Vec<diffui_core::DraftSource> = sources
             .iter()
@@ -48,7 +46,7 @@ impl Diffui {
                 kept
             });
         if sources.is_empty() && kind != DraftKind::New {
-            return Task::none();
+            return;
         }
         // Target mode's plain keys and a half-written description can't both
         // own the keyboard. An unsaved edit wins and says so, the same way it
@@ -56,7 +54,7 @@ impl Diffui {
         if let Some(editor) = self.active_mut().description_editor_mut() {
             if editor.is_dirty() || editor.saving_activity.is_some() {
                 editor.switch_blocked = true;
-                return Task::none();
+                return;
             }
             self.active_mut().pop_mode(ModeKind::Description);
         }
@@ -81,21 +79,21 @@ impl Diffui {
         target.push_mode(TabMode::Draft(DraftUi::new(draft)));
         self.pop_mode(ModeKind::ActivityPopover);
         self.pop_mode(ModeKind::Menu);
-        self.kick_draft_preview()
+        self.kick_draft_preview(cx)
     }
 
     /// The parallelize draft's preview depends on its sources alone, so it
     /// skips the destination plumbing [`Diffui::kick_draft_preview`] does for
-    /// the other kinds. Debounced and version-guarded the same way.
-    pub(crate) fn kick_parallelize_preview(&mut self) -> Task<Message> {
+    /// the other kinds. Debounced the same way.
+    pub(crate) fn kick_parallelize_preview(&mut self, cx: &mut Cx) {
         let Some(ui) = self.active_mut().op_draft_mut() else {
-            return Task::none();
+            return;
         };
         if ui.draft.sources.len() < 2 {
             ui.preview = DraftPreviewState::Idle;
             ui.preview_request = None;
             ui.moved_highlight.clear();
-            return Task::none();
+            return;
         }
         let sources: Vec<RevisionSelection> = ui
             .draft
@@ -103,8 +101,6 @@ impl Diffui {
             .iter()
             .map(|source| source.selection.clone())
             .collect();
-        ui.preview_version = ui.preview_version.wrapping_add(1);
-        let version = ui.preview_version;
         ui.preview = DraftPreviewState::Loading;
         // The request is destination-shaped for rebases; parallelize ignores
         // the slot (see `parked_preview_request`).
@@ -114,9 +110,7 @@ impl Diffui {
             sources,
             selection: None,
         }));
-        Task::perform(tokio::time::sleep(Duration::from_millis(250)), move |()| {
-            Message::Ui(UiEvent::DraftPreviewKick(version))
-        })
+        self.arm_draft_preview(cx);
     }
 }
 
@@ -152,17 +146,16 @@ pub(crate) enum RevopsAction {
 }
 
 impl Diffui {
-    pub(crate) fn perform_revops(&mut self, action: RevopsAction) -> Task<Message> {
+    pub(crate) fn perform_revops(&mut self, action: RevopsAction, cx: &mut Cx) {
         match action {
-            RevopsAction::BeginCommit => self.begin_commit(),
+            RevopsAction::BeginCommit => self.begin_commit(cx),
             RevopsAction::StartDraft {
                 kind,
                 sources,
                 armed,
-            } => self.start_draft_with(kind, sources, armed),
+            } => self.start_draft_with(kind, sources, armed, cx),
             RevopsAction::ToggleMark(selection) => {
                 self.toggle_mark(&selection);
-                Task::none()
             }
         }
     }
@@ -187,25 +180,25 @@ impl Diffui {
     /// saving describes `@` and starts a new empty change on top in one
     /// operation. Browses to `@` first when it isn't on screen; the editor
     /// then opens when its diff lands (`open_pending_description_edit`).
-    fn begin_commit(&mut self) -> Task<Message> {
+    fn begin_commit(&mut self, cx: &mut Cx) {
         if !self.active().session.capabilities.mutate {
-            return Task::none();
+            return;
         }
         let target = RevisionSelection::WorkingCopy;
         if self.active().session.selected_revision == target {
-            let task = self.open_description_editor();
+            self.open_description_editor(cx);
             if let Some(editor) = self.active_mut().description_editor_mut()
                 && editor.target == target
             {
                 editor.commit = true;
             }
-            return task;
+            return;
         }
         if let Some(editor) = self.active_mut().description_editor_mut()
             && (editor.is_dirty() || editor.saving_activity.is_some())
         {
             editor.switch_blocked = true;
-            return Task::none();
+            return;
         }
         let tab = self.active_mut();
         tab.pending_description_edit = Some(target.clone());
@@ -236,7 +229,7 @@ pub(crate) fn description_save_op(
 /// Whether a mutation consumes the sidebar's marked rows: a batch op run on
 /// more than one revision, or on exactly the marked set (a one-row batch
 /// from a `selection.*` command).
-pub(crate) fn consumes_marks(ui: &Diffui, op: &mutations::MutationOp) -> bool {
+pub(crate) fn consumes_marks(tab: &TabState, op: &mutations::MutationOp) -> bool {
     use mutations::MutationOp;
     let targets = match op {
         MutationOp::Abandon { targets }
@@ -249,7 +242,7 @@ pub(crate) fn consumes_marks(ui: &Diffui, op: &mutations::MutationOp) -> bool {
         _ => return false,
     };
     targets.len() > 1 || {
-        let marked = marked_selections(ui);
+        let marked = marked_selections(tab);
         !marked.is_empty() && marked == *targets
     }
 }
@@ -262,11 +255,10 @@ use crate::commands::{Availability, CommandArg, can_mutate, require, target_revi
 /// The sidebar's marked rows still in the loaded graph, in mark order, with
 /// the working-copy row addressed as [`RevisionSelection::WorkingCopy`] so a
 /// mutation never acts on a pre-snapshot `@`.
-pub(crate) fn marked_selections(ui: &Diffui) -> Vec<RevisionSelection> {
-    let commits = &ui.active().session.commits;
+pub(crate) fn marked_selections(tab: &TabState) -> Vec<RevisionSelection> {
+    let commits = &tab.session.commits;
     let working_copy = commits.working_copy().map(|row| row.commit_id().to_owned());
-    ui.active()
-        .revision_multi_selection
+    tab.revision_multi_selection
         .iter()
         .filter(|id| commits.find_by_commit_id(id).is_some())
         .map(|id| diffui_core::canonical_selection(id, working_copy.as_deref()))
@@ -278,7 +270,7 @@ pub(crate) fn marked_selections(ui: &Diffui) -> Vec<RevisionSelection> {
 pub(crate) fn batch(ui: &Diffui, arg: &CommandArg) -> Vec<RevisionSelection> {
     match arg {
         CommandArg::Revisions(targets) => targets.clone(),
-        _ => marked_selections(ui),
+        _ => marked_selections(ui.active()),
     }
 }
 
@@ -296,7 +288,7 @@ pub(crate) fn drag_sources(ui: &Diffui, index: usize) -> Vec<RevisionSelection> 
     let Some(source_id) = ui.draft_source_for(&source).map(|source| source.commit_id) else {
         return vec![source];
     };
-    let marked = marked_selections(ui);
+    let marked = marked_selections(ui.active());
     if marked.len() > 1
         && marked.iter().any(|selection| {
             ui.draft_source_for(selection)
@@ -336,11 +328,7 @@ pub(crate) fn batch_draft(ui: &Diffui, arg: &CommandArg, kind: DraftKind) -> Opt
 
 /// The loaded row a command's target names.
 fn target_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowView<'a>> {
-    let commits = &ui.active().session.commits;
-    match target_revision(ui, arg)? {
-        RevisionSelection::WorkingCopy => commits.working_copy(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(&hex),
-    }
+    ui.active().session.commits.find(&target_revision(ui, arg)?)
 }
 
 /// "Commit…" is offered for the working copy only — `jj commit` has no `-r`.
@@ -583,6 +571,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -598,7 +587,7 @@ mod tests {
     }
 
     /// A jj-capable app over `@` = "w", then "a", "b", "c".
-    fn loaded(rows: Vec<CommitSummary>) -> Diffui {
+    fn loaded(rows: Vec<CommitSummary>, _cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
         push_tab(&mut ui, "/tmp/revops");
         let tab = ui.active_mut();
@@ -636,131 +625,146 @@ mod tests {
 
     #[test]
     fn marks_address_the_working_copy_as_such_and_skip_vanished_rows() {
-        let mut ui = loaded(graph());
-        ui.active_mut().revision_multi_selection =
-            vec!["w".repeat(8), "gone".to_owned(), "b".repeat(8)];
-        assert_eq!(
-            marked_selections(&ui),
-            vec![
-                RevisionSelection::WorkingCopy,
-                RevisionSelection::Commit("b".repeat(8)),
-            ]
-        );
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = loaded(graph(), cx);
+            ui.active_mut().revision_multi_selection =
+                vec!["w".repeat(8), "gone".to_owned(), "b".repeat(8)];
+            assert_eq!(
+                marked_selections(ui.active()),
+                vec![
+                    RevisionSelection::WorkingCopy,
+                    RevisionSelection::Commit("b".repeat(8)),
+                ]
+            );
+        });
     }
 
     #[test]
     fn dragging_a_marked_row_carries_the_whole_batch() {
-        let mut ui = loaded(graph());
-        let a = RevisionSelection::Commit("a".repeat(8));
-        let b = RevisionSelection::Commit("b".repeat(8));
-        let c = RevisionSelection::Commit("c".repeat(8));
-        ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "c".repeat(8)];
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = loaded(graph(), cx);
+            let a = RevisionSelection::Commit("a".repeat(8));
+            let b = RevisionSelection::Commit("b".repeat(8));
+            let c = RevisionSelection::Commit("c".repeat(8));
+            ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "c".repeat(8)];
 
-        assert_eq!(drag_sources(&ui, 1), vec![a, c]);
-        // Picking up an unmarked row stays a single-revision drag.
-        assert_eq!(drag_sources(&ui, 2), vec![b]);
+            assert_eq!(drag_sources(&ui, 1), vec![a, c]);
+            // Picking up an unmarked row stays a single-revision drag.
+            assert_eq!(drag_sources(&ui, 2), vec![b]);
+        });
     }
 
     #[test]
     fn the_batch_menu_offers_set_verbs_by_size() {
-        let ui = loaded(graph());
-        let two = ui.batch_menu_tree(vec![
-            RevisionSelection::Commit("a".repeat(8)),
-            RevisionSelection::Commit("b".repeat(8)),
-        ]);
-        let two = labels(&two);
-        for expected in [
-            "Rebase 2 revisions",
-            "Whole branches onto\u{2026}",
-            "Whole branches onto trunk",
-            "Squash 2 revisions into\u{2026}",
-            "Duplicate 2 revisions",
-            "New change on all 2 (merge)",
-            "Parallelize 2 revisions\u{2026}",
-            "Abandon 2 revisions",
-        ] {
-            assert!(
-                two.iter().any(|label| label == expected),
-                "{expected} in {two:?}"
-            );
-        }
-        let one = labels(&ui.batch_menu_tree(vec![RevisionSelection::Commit("a".repeat(8))]));
-        assert!(!one.iter().any(|label| label.starts_with("Parallelize")));
-        assert!(!one.iter().any(|label| label.starts_with("New change on")));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = loaded(graph(), cx);
+            let two = ui.batch_menu_tree(vec![
+                RevisionSelection::Commit("a".repeat(8)),
+                RevisionSelection::Commit("b".repeat(8)),
+            ]);
+            let two = labels(&two);
+            for expected in [
+                "Rebase 2 revisions",
+                "Whole branches onto\u{2026}",
+                "Whole branches onto trunk",
+                "Squash 2 revisions into\u{2026}",
+                "Duplicate 2 revisions",
+                "New change on all 2 (merge)",
+                "Parallelize 2 revisions\u{2026}",
+                "Abandon 2 revisions",
+            ] {
+                assert!(
+                    two.iter().any(|label| label == expected),
+                    "{expected} in {two:?}"
+                );
+            }
+            let one = labels(&ui.batch_menu_tree(vec![RevisionSelection::Commit("a".repeat(8))]));
+            assert!(!one.iter().any(|label| label.starts_with("Parallelize")));
+            assert!(!one.iter().any(|label| label.starts_with("New change on")));
+        });
     }
 
     #[test]
     fn parallelize_from_the_marks_enters_a_two_source_draft() {
-        // Entering the draft kicks the debounced preview, whose timer needs a
-        // runtime to be created in.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("a test runtime");
-        let _context = runtime.enter();
-        let mut ui = loaded(graph());
-        ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "b".repeat(8)];
-        let _ = ui.run_command("selection.parallelize", CommandArg::None);
-        let draft = &ui.active().op_draft().expect("target mode is on").draft;
-        assert_eq!(draft.kind, DraftKind::Parallelize);
-        assert_eq!(draft.sources.len(), 2);
-        assert!(
-            ui.active().revision_multi_selection.is_empty(),
-            "the draft wash replaces the marks"
-        );
-        assert!(matches!(
-            draft.op_from_sources(),
-            Some(mutations::MutationOp::Parallelize { .. })
-        ));
+        crate::tabs::tests::with_cx(|cx| {
+            // Entering the draft kicks the debounced preview, whose timer needs a
+            // runtime to be created in.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a test runtime");
+            let _context = runtime.enter();
+            let mut ui = loaded(graph(), cx);
+            ui.active_mut().revision_multi_selection = vec!["a".repeat(8), "b".repeat(8)];
+            ui.run_command("selection.parallelize", CommandArg::None, cx);
+            let draft = &ui.active().op_draft().expect("target mode is on").draft;
+            assert_eq!(draft.kind, DraftKind::Parallelize);
+            assert_eq!(draft.sources.len(), 2);
+            assert!(
+                ui.active().revision_multi_selection.is_empty(),
+                "the draft wash replaces the marks"
+            );
+            assert!(matches!(
+                draft.op_from_sources(),
+                Some(mutations::MutationOp::Parallelize { .. })
+            ));
+        });
     }
 
     #[test]
     fn insert_new_change_somewhere_else_arms_the_clicked_row() {
-        // An armed draft kicks the debounced preview, whose timer needs a
-        // runtime to be created in.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("a test runtime");
-        let _context = runtime.enter();
-        let mut ui = loaded(graph());
-        let b = RevisionSelection::Commit("b".repeat(8));
-        let _ = ui.run_command("revision.new.start", CommandArg::Revision(b));
-        let draft = &ui.active().op_draft().expect("target mode is on").draft;
-        assert_eq!(draft.kind, DraftKind::New);
-        assert!(draft.sources.is_empty());
-        assert_eq!(draft.candidate, Some(2), "armed on b's row");
+        crate::tabs::tests::with_cx(|cx| {
+            // An armed draft kicks the debounced preview, whose timer needs a
+            // runtime to be created in.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a test runtime");
+            let _context = runtime.enter();
+            let mut ui = loaded(graph(), cx);
+            let b = RevisionSelection::Commit("b".repeat(8));
+            ui.run_command("revision.new.start", CommandArg::Revision(b), cx);
+            let draft = &ui.active().op_draft().expect("target mode is on").draft;
+            assert_eq!(draft.kind, DraftKind::New);
+            assert!(draft.sources.is_empty());
+            assert_eq!(draft.candidate, Some(2), "armed on b's row");
+        });
     }
 
     #[test]
     fn divergent_rows_get_the_resolution_submenu() {
-        let mut rows = graph();
-        rows[1].is_divergent = true;
-        rows[2].is_divergent = true;
-        rows[2].change_id = rows[1].change_id.clone();
-        let ui = loaded(rows);
-        let divergent = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("a".repeat(8))));
-        assert!(
-            divergent
-                .iter()
-                .any(|label| label == "Keep this copy, abandon the other one"),
-            "{divergent:?}"
-        );
-        let plain = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("c".repeat(8))));
-        assert!(!plain.iter().any(|label| label == "Divergent change"));
+        crate::tabs::tests::with_cx(|cx| {
+            let mut rows = graph();
+            rows[1].is_divergent = true;
+            rows[2].is_divergent = true;
+            rows[2].change_id = rows[1].change_id.clone();
+            let ui = loaded(rows, cx);
+            let divergent =
+                labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("a".repeat(8))));
+            assert!(
+                divergent
+                    .iter()
+                    .any(|label| label == "Keep this copy, abandon the other one"),
+                "{divergent:?}"
+            );
+            let plain = labels(&ui.revops_surgery_rows(&RevisionSelection::Commit("c".repeat(8))));
+            assert!(!plain.iter().any(|label| label == "Divergent change"));
+        });
     }
 
     #[test]
     fn commit_is_offered_on_the_working_copy_only() {
-        let ui = loaded(graph());
-        assert!(can_commit(&ui, &CommandArg::None).is_ok());
-        assert!(can_commit(&ui, &CommandArg::Revision(RevisionSelection::WorkingCopy)).is_ok());
-        assert_eq!(
-            can_commit(
-                &ui,
-                &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
-            ),
-            Err("Only the working copy commits")
-        );
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = loaded(graph(), cx);
+            assert!(can_commit(&ui, &CommandArg::None).is_ok());
+            assert!(can_commit(&ui, &CommandArg::Revision(RevisionSelection::WorkingCopy)).is_ok());
+            assert_eq!(
+                can_commit(
+                    &ui,
+                    &CommandArg::Revision(RevisionSelection::Commit("a".repeat(8)))
+                ),
+                Err("Only the working copy commits")
+            );
+        });
     }
 }

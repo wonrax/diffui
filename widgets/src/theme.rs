@@ -1,44 +1,109 @@
-use iced::{
-    Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, border,
-    font::{Family, Weight},
-    theme,
-    widget::{button, container, scrollable, text, text_input},
-};
+//! diffui's palette and shared geometry tokens.
+//!
+//! [`ThemeSpec`] is the source of truth for every colour on screen. kit's own
+//! theme is derived from it ([`apply_to_kit`]), so kit components drawn with
+//! their stock variants read as diffui's: there is one palette, not two.
+
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{App, BoxShadow, Hsla, Rgba, Styled, WindowAppearance, point, px};
 
 use crate::diff_view::Palette;
 use crate::scrollbar;
 
-/// Apply a `Medium` (or other emphasized) weight to a font *only* when
-/// the font is a specific named family the OS can actually look up.
-///
-/// On macOS, asking the platform font matcher for a generic family
-/// (`Family::SansSerif`, `Family::Monospace`) at a non-default weight
-/// frequently returns nothing — the matcher resolves the generic to the
-/// platform UI font but doesn't enumerate weights under it, so the
-/// renderer falls back to `.notdef` glyphs (the empty-box "tofu").
-/// Specific named families (`Family::Name("Cascadia Code")` etc.) round-
-/// trip through fontdb's family→weight index correctly, so weight
-/// overrides are safe there.
-///
-/// Use this for any label that wants to emphasize itself with a
-/// heavier weight; pass-through to the platform default when the family
-/// is generic and trust the OS's UI typography defaults.
-pub fn emphasis_font(base: Font, weight: Weight) -> Font {
-    match base.family {
-        Family::Name(_) => Font { weight, ..base },
-        // Generic families: don't override weight — the platform will
-        // pick a sensible default and we'd otherwise risk tofu.
-        _ => base,
+/// A palette colour. Plain sRGB channels in 0..=1, so tokens can be mixed and
+/// re-alpha'd with struct update (`Color { a: 0.2, ..theme.accent }`). It goes
+/// straight into `.bg()`, `.text_color()` and `.border_color()`.
+pub type Color = Rgba;
+
+const fn rgb(r: f32, g: f32, b: f32) -> Color {
+    Rgba { r, g, b, a: 1.0 }
+}
+
+const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
+    Rgba { r, g, b, a }
+}
+
+pub const BLACK: Color = rgb(0.0, 0.0, 0.0);
+pub const WHITE: Color = rgb(1.0, 1.0, 1.0);
+pub const TRANSPARENT: Color = rgba(0.0, 0.0, 0.0, 0.0);
+
+/// Font weight, with GPUI's named constants (`Weight::MEDIUM`, …).
+pub type Weight = gpui_kit::FontWeight;
+
+/// A font, by value. GPUI's own `Font` holds shared strings and has to be
+/// cloned at every use; this is `Copy`, so a theme or a config can hand it
+/// around like a colour, and [`Font::gpui`] makes the real one where it's drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Font {
+    pub family: &'static str,
+    pub weight: Weight,
+}
+
+impl Font {
+    /// The platform UI font.
+    pub const DEFAULT: Self = Self::new(".SystemUIFont");
+    /// The platform's monospaced font.
+    pub const MONOSPACE: Self = Self::new("Menlo");
+
+    pub const fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            weight: Weight::NORMAL,
+        }
+    }
+
+    pub fn gpui(self) -> gpui_kit::Font {
+        gpui_kit::Font {
+            weight: self.weight,
+            ..gpui_kit::font(self.family)
+        }
     }
 }
 
-/// Geometry of [`crate::ui::scrollable`]'s bar. Mirrors `crate::scrollbar`
-/// (a 12px footprint, 2px clear of every edge → an 8px pill) so the iced
-/// scroll views read as the same widget as the hand-drawn ones in
-/// `RevisionList` and `DiffView`.
-pub const SCROLLBAR_WIDTH: f32 = 8.0;
-pub const SCROLLBAR_MARGIN: f32 = 2.0;
-pub const COLLAPSED_PANEL_WIDTH: f32 = 36.0;
+/// `base` at `weight`. CoreText resolves weights of the system font too.
+pub fn emphasis_font(base: Font, weight: Weight) -> Font {
+    Font { weight, ..base }
+}
+
+/// Insets of a box. Used where padding is computed rather than a fixed token
+/// ([`crate::typography`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Padding {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl Padding {
+    pub const ZERO: Self = Self {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
+
+    /// Applies this padding to an element.
+    pub fn apply<E: Styled>(self, element: E) -> E {
+        element
+            .pt(px(self.top))
+            .pr(px(self.right))
+            .pb(px(self.bottom))
+            .pl(px(self.left))
+    }
+}
+
+/// `[vertical, horizontal]`.
+impl From<[f32; 2]> for Padding {
+    fn from([y, x]: [f32; 2]) -> Self {
+        Self {
+            top: y,
+            right: x,
+            bottom: y,
+            left: x,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemePreference {
@@ -49,15 +114,31 @@ pub enum ThemePreference {
 }
 
 impl ThemePreference {
-    pub fn active(self, system_theme: theme::Mode) -> ResolvedTheme {
+    pub fn active(self, system_theme: SystemAppearance) -> ResolvedTheme {
         match self {
             Self::System => match system_theme {
-                theme::Mode::Light => ResolvedTheme::Light,
-                theme::Mode::Dark | theme::Mode::None => ResolvedTheme::Dark,
+                SystemAppearance::Light => ResolvedTheme::Light,
+                SystemAppearance::Dark => ResolvedTheme::Dark,
             },
             Self::Dark => ResolvedTheme::Dark,
             Self::Light => ResolvedTheme::Light,
             Self::HighContrast => ResolvedTheme::HighContrast,
+        }
+    }
+}
+
+/// What the OS is showing, which is what [`ThemePreference::System`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemAppearance {
+    Light,
+    Dark,
+}
+
+impl From<WindowAppearance> for SystemAppearance {
+    fn from(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
         }
     }
 }
@@ -72,124 +153,135 @@ pub enum ResolvedTheme {
 impl ResolvedTheme {
     pub fn spec(self) -> ThemeSpec {
         match self {
-            // Dark-first warm ink with a coral accent. Tokens mirror the
-            // Diffui v2 design system: `bg-canvas`, `bg-pane`, `bg-elev`,
-            // `bg-active`, `ink-100..300`, and a vivid coral accent. The trunk lane
-            // is intentionally decoupled from the accent — the accent is
-            // reserved for the working copy, selection, and focus, while
-            // the graph rides on a violet base so coral doesn't fight the
-            // green/red diff signals.
+            // Cool, slightly blue-biased neutrals with a cobalt accent. The
+            // accent marks selection, focus, the working copy and primary
+            // actions; everything else that carries colour means something
+            // (add/delete/modify/rename, a graph lane). Panes and the code
+            // surface sit a step above the chrome so hairlines, not fills,
+            // separate them.
             Self::Dark => ThemeSpec {
-                background: Color::from_rgb(0.043, 0.051, 0.071),
-                panel_background: Color::from_rgb(0.067, 0.078, 0.106),
-                panel_background_elevated: Color::from_rgb(0.094, 0.110, 0.145),
-                selected_file: Color::from_rgb(0.160, 0.178, 0.255),
-                text: Color::from_rgb(0.902, 0.910, 0.933),
-                muted_text: Color::from_rgb(0.690, 0.710, 0.761),
-                subtle_text: Color::from_rgb(0.563, 0.584, 0.643),
-                accent: Color::from_rgb(1.000, 0.400, 0.245),
-                added_line: Color::from_rgba(0.263, 0.843, 0.463, 0.11),
-                removed_line: Color::from_rgba(1.000, 0.408, 0.349, 0.10),
-                added_text: Color::from_rgb(0.263, 0.843, 0.463),
-                removed_text: Color::from_rgb(1.000, 0.408, 0.349),
-                modified_token: Color::from_rgb(1.000, 0.706, 0.220),
-                info: Color::from_rgb(0.310, 0.655, 1.000),
-                // A step *lighter* than the elevated code surface so the
-                // strip reads as a raised header rather than a hole cut
-                // into the scroll body.
-                file_header: Color::from_rgb(0.122, 0.141, 0.184),
-                hunk_header: Color::from_rgba(0.310, 0.655, 1.000, 0.12),
-                conflict_marker: Color::from_rgb(1.000, 0.408, 0.443),
-                border: Color::from_rgb(0.137, 0.153, 0.196),
-                note_background: Color::from_rgba(1.000, 0.706, 0.220, 0.17),
-                note_text: Color::from_rgb(1.000, 0.706, 0.220),
-                lane_base: Color::from_rgb(0.690, 0.510, 1.000),
-                syntax_keyword: Color::from_rgb(0.760, 0.610, 1.000),
-                syntax_type: Color::from_rgb(0.260, 0.840, 0.755),
-                syntax_function: Color::from_rgb(0.480, 0.725, 1.000),
-                syntax_literal: Color::from_rgb(1.000, 0.706, 0.220),
-                syntax_property: Color::from_rgb(0.460, 0.820, 0.930),
+                background: rgb(0.086, 0.094, 0.114),
+                panel_background: rgb(0.067, 0.075, 0.090),
+                panel_background_elevated: rgb(0.090, 0.102, 0.122),
+                selected_file: rgb(0.137, 0.165, 0.243),
+                text: rgb(0.910, 0.918, 0.933),
+                muted_text: rgb(0.714, 0.737, 0.776),
+                subtle_text: rgb(0.561, 0.588, 0.635),
+                accent: rgb(0.525, 0.627, 0.980),
+                added_line: rgba(0.365, 0.769, 0.545, 0.10),
+                removed_line: rgba(0.957, 0.494, 0.514, 0.10),
+                added_text: rgb(0.365, 0.769, 0.545),
+                removed_text: rgb(0.957, 0.494, 0.514),
+                modified_token: rgb(0.902, 0.659, 0.322),
+                renamed: rgb(0.710, 0.592, 0.949),
+                info: rgb(0.525, 0.627, 0.980),
+                // One step above the code surface: the sticky file header
+                // reads as a raised strip as the body scrolls under it.
+                file_header: rgb(0.106, 0.118, 0.141),
+                hunk_header: rgba(0.525, 0.627, 0.980, 0.12),
+                conflict_marker: rgb(0.957, 0.494, 0.514),
+                border: rgb(0.137, 0.149, 0.176),
+                note_background: rgba(0.902, 0.659, 0.322, 0.13),
+                note_text: rgb(0.902, 0.659, 0.322),
+                change_id: rgb(0.949, 0.490, 0.733),
+                lane_base: rgb(0.494, 0.608, 0.965),
+                lanes: [
+                    rgb(0.494, 0.608, 0.965),
+                    rgb(0.310, 0.753, 0.682),
+                    rgb(0.890, 0.635, 0.298),
+                    rgb(0.878, 0.486, 0.725),
+                ],
+                syntax_keyword: rgb(0.760, 0.610, 1.000),
+                syntax_type: rgb(0.260, 0.840, 0.755),
+                syntax_function: rgb(0.480, 0.725, 1.000),
+                syntax_literal: rgb(1.000, 0.706, 0.220),
+                syntax_property: rgb(0.460, 0.820, 0.930),
             },
-            // Neutral whites — panes are pure white, canvas is a faint
-            // gray so the panes still read as elevated. Coral accent stays
-            // for selection / working-copy signalling.
-            //
             // Every ink here is derived for a white ground rather than
             // mirrored from the dark spec: a colour that reads well against
-            // near-black is nowhere near AA against near-white, and mirroring
-            // is what left the captions, the diff inks and the chips between
-            // 2.6:1 and 3.9:1. Hues are the dark theme's; only lightness
-            // moved, down to whatever clears 4.5:1 against the *darkest*
-            // surface each ink lands on — usually the selected row, not the
-            // white pane. `every_pairing_meets_wcag_aa` holds the line.
+            // near-black is nowhere near AA against near-white. Lightness is
+            // set to clear 4.5:1 against the *darkest* surface each ink lands
+            // on, usually the selected row or the accent wash, not the white
+            // pane. `every_pairing_meets_wcag_aa` holds the line.
             Self::Light => ThemeSpec {
-                background: Color::from_rgb(0.957, 0.957, 0.961),
-                panel_background: Color::from_rgb(1.000, 1.000, 1.000),
-                panel_background_elevated: Color::from_rgb(0.976, 0.976, 0.980),
-                selected_file: Color::from_rgb(0.923, 0.910, 0.957),
-                text: Color::from_rgb(0.106, 0.114, 0.133),
-                muted_text: Color::from_rgb(0.314, 0.337, 0.380),
-                subtle_text: Color::from_rgb(0.392, 0.410, 0.451),
-                accent: Color::from_rgb(0.690, 0.160, 0.055),
-                added_line: Color::from_rgba(0.020, 0.410, 0.190, 0.10),
-                removed_line: Color::from_rgba(0.670, 0.130, 0.105, 0.09),
-                added_text: Color::from_rgb(0.020, 0.410, 0.190),
-                removed_text: Color::from_rgb(0.670, 0.130, 0.105),
-                modified_token: Color::from_rgb(0.490, 0.290, 0.000),
-                info: Color::from_rgb(0.050, 0.310, 0.700),
-                // Same role as in the dark theme: distinct from the white
-                // code surface so file headers stand out as the scroll
-                // body slides past, but not so dark that it overpowers
-                // the body content.
-                file_header: Color::from_rgb(0.949, 0.953, 0.961),
-                hunk_header: Color::from_rgba(0.050, 0.310, 0.700, 0.09),
-                conflict_marker: Color::from_rgb(0.690, 0.115, 0.150),
-                border: Color::from_rgb(0.882, 0.886, 0.898),
-                note_background: Color::from_rgba(0.490, 0.290, 0.000, 0.17),
-                note_text: Color::from_rgb(0.490, 0.290, 0.000),
-                lane_base: Color::from_rgb(0.430, 0.235, 0.890),
-                syntax_keyword: Color::from_rgb(0.420, 0.145, 0.850),
-                syntax_type: Color::from_rgb(0.000, 0.405, 0.350),
-                syntax_function: Color::from_rgb(0.070, 0.315, 0.690),
-                syntax_literal: Color::from_rgb(0.490, 0.290, 0.000),
-                syntax_property: Color::from_rgb(0.000, 0.365, 0.540),
+                background: rgb(0.953, 0.957, 0.965),
+                panel_background: rgb(1.000, 1.000, 1.000),
+                panel_background_elevated: rgb(1.000, 1.000, 1.000),
+                selected_file: rgb(0.914, 0.933, 0.988),
+                text: rgb(0.082, 0.090, 0.110),
+                muted_text: rgb(0.267, 0.290, 0.337),
+                subtle_text: rgb(0.388, 0.416, 0.467),
+                accent: rgb(0.184, 0.310, 0.769),
+                added_line: rgba(0.094, 0.478, 0.235, 0.08),
+                removed_line: rgba(0.749, 0.161, 0.188, 0.07),
+                added_text: rgb(0.075, 0.420, 0.200),
+                removed_text: rgb(0.700, 0.140, 0.170),
+                modified_token: rgb(0.560, 0.320, 0.000),
+                renamed: rgb(0.439, 0.255, 0.761),
+                info: rgb(0.184, 0.310, 0.769),
+                file_header: rgb(0.969, 0.973, 0.980),
+                hunk_header: rgba(0.184, 0.310, 0.769, 0.07),
+                conflict_marker: rgb(0.700, 0.140, 0.170),
+                border: rgb(0.894, 0.902, 0.922),
+                note_background: rgba(0.560, 0.320, 0.000, 0.12),
+                note_text: rgb(0.560, 0.320, 0.000),
+                change_id: rgb(0.690, 0.141, 0.424),
+                lane_base: rgb(0.290, 0.424, 0.831),
+                lanes: [
+                    rgb(0.290, 0.424, 0.831),
+                    rgb(0.137, 0.537, 0.486),
+                    rgb(0.737, 0.455, 0.078),
+                    rgb(0.682, 0.290, 0.545),
+                ],
+                syntax_keyword: rgb(0.420, 0.145, 0.850),
+                syntax_type: rgb(0.000, 0.405, 0.350),
+                syntax_function: rgb(0.070, 0.315, 0.690),
+                syntax_literal: rgb(0.490, 0.290, 0.000),
+                syntax_property: rgb(0.000, 0.365, 0.540),
             },
             Self::HighContrast => ThemeSpec {
-                background: Color::BLACK,
-                panel_background: Color::from_rgb(0.030, 0.030, 0.030),
-                panel_background_elevated: Color::from_rgb(0.070, 0.070, 0.070),
-                selected_file: Color::from_rgb(0.000, 0.180, 0.240),
-                text: Color::WHITE,
-                muted_text: Color::from_rgb(0.780, 0.820, 0.840),
-                subtle_text: Color::from_rgb(0.620, 0.660, 0.690),
-                accent: Color::from_rgb(1.000, 0.478, 0.349),
-                added_line: Color::from_rgb(0.000, 0.235, 0.080),
-                removed_line: Color::from_rgb(0.300, 0.000, 0.045),
-                added_text: Color::from_rgb(0.500, 1.000, 0.600),
-                removed_text: Color::from_rgb(1.000, 0.520, 0.560),
-                modified_token: Color::from_rgb(1.000, 0.920, 0.000),
-                info: Color::from_rgb(0.380, 0.770, 1.000),
-                file_header: Color::from_rgb(0.120, 0.120, 0.120),
-                hunk_header: Color::from_rgb(0.000, 0.220, 0.310),
-                conflict_marker: Color::from_rgb(1.000, 0.445, 0.445),
-                border: Color::from_rgb(0.570, 0.620, 0.660),
-                note_background: Color::from_rgb(0.260, 0.210, 0.000),
-                note_text: Color::from_rgb(1.000, 0.940, 0.500),
-                lane_base: Color::from_rgb(0.760, 0.620, 1.000),
-                syntax_keyword: Color::from_rgb(0.870, 0.740, 1.000),
-                syntax_type: Color::from_rgb(0.400, 1.000, 0.920),
-                syntax_function: Color::from_rgb(0.600, 0.840, 1.000),
-                syntax_literal: Color::from_rgb(1.000, 0.880, 0.420),
-                syntax_property: Color::from_rgb(0.720, 0.920, 1.000),
+                background: BLACK,
+                panel_background: rgb(0.030, 0.030, 0.030),
+                panel_background_elevated: rgb(0.070, 0.070, 0.070),
+                selected_file: rgb(0.050, 0.110, 0.300),
+                text: WHITE,
+                muted_text: rgb(0.780, 0.820, 0.840),
+                subtle_text: rgb(0.620, 0.660, 0.690),
+                accent: rgb(0.580, 0.700, 1.000),
+                added_line: rgb(0.000, 0.235, 0.080),
+                removed_line: rgb(0.300, 0.000, 0.045),
+                added_text: rgb(0.500, 1.000, 0.600),
+                removed_text: rgb(1.000, 0.520, 0.560),
+                modified_token: rgb(1.000, 0.920, 0.000),
+                renamed: rgb(0.830, 0.730, 1.000),
+                info: rgb(0.580, 0.700, 1.000),
+                file_header: rgb(0.120, 0.120, 0.120),
+                hunk_header: rgb(0.000, 0.150, 0.330),
+                conflict_marker: rgb(1.000, 0.445, 0.445),
+                border: rgb(0.570, 0.620, 0.660),
+                note_background: rgb(0.260, 0.210, 0.000),
+                note_text: rgb(1.000, 0.940, 0.500),
+                change_id: rgb(1.000, 0.560, 0.820),
+                lane_base: rgb(0.580, 0.700, 1.000),
+                lanes: [
+                    rgb(0.580, 0.700, 1.000),
+                    rgb(0.400, 0.950, 0.850),
+                    rgb(1.000, 0.800, 0.400),
+                    rgb(1.000, 0.600, 0.850),
+                ],
+                syntax_keyword: rgb(0.870, 0.740, 1.000),
+                syntax_type: rgb(0.400, 1.000, 0.920),
+                syntax_function: rgb(0.600, 0.840, 1.000),
+                syntax_literal: rgb(1.000, 0.880, 0.420),
+                syntax_property: rgb(0.720, 0.920, 1.000),
             },
         }
     }
 
-    pub fn iced_theme(self) -> Theme {
+    fn kit_mode(self) -> ThemeMode {
         match self {
-            Self::Dark => Theme::Dark,
-            Self::Light => Theme::Light,
-            Self::HighContrast => Theme::Dark,
+            Self::Light => ThemeMode::Light,
+            Self::Dark | Self::HighContrast => ThemeMode::Dark,
         }
     }
 }
@@ -209,10 +301,11 @@ pub struct ThemeSpec {
     pub added_text: Color,
     pub removed_text: Color,
     pub modified_token: Color,
-    /// Informational blue. Used for the `M` (Modified) file-status chip
-    /// and the diff-view hunk header — wherever the design system uses
-    /// `--info`. Separate from `accent` so the accent (coral) stays
-    /// reserved for selection, working copy, and primary actions.
+    /// A renamed or copied file's status letter.
+    pub renamed: Color,
+    /// Informational ink: primary buttons, the hunk header's tint, file and
+    /// command icons. The accent's hue, kept as its own token so a theme can
+    /// split them.
     pub info: Color,
     pub file_header: Color,
     pub hunk_header: Color,
@@ -220,12 +313,16 @@ pub struct ThemeSpec {
     pub border: Color,
     pub note_background: Color,
     pub note_text: Color,
-    /// Base color for lane 0 of the revision graph. Subsequent lanes
-    /// derive their hue from this via `RevisionGraphStyle::lane_color`'s
-    /// HSL rotation. Decoupled from `accent` so the trunk (violet in the
-    /// design) doesn't fight diff add/del greens and reds, and so the
-    /// coral accent stays reserved for the working copy and selection.
+    /// The highlighted shortest-unique prefix of a change id (jj prints it
+    /// in magenta, so jj users already read it as "the id part").
+    pub change_id: Color,
+    /// Lane 0 of the revision graph, and the colour bookmark names take in
+    /// prose. Always `lanes[0]`.
     pub lane_base: Color,
+    /// The revision graph's lane colours, cycled by lane index. Four muted
+    /// hues of like lightness: enough to tell adjacent branches apart
+    /// without turning the gutter into a rainbow.
+    pub lanes: [Color; 4],
     /// Dedicated syntax ramp. Deliberately decoupled from the diff
     /// semantics (`added_text`, `removed_text`, `conflict_marker`) so
     /// code coloring never echoes add/del/conflict signals — a keyword
@@ -280,105 +377,16 @@ pub fn diff_palette(theme: ThemeSpec) -> Palette {
             a: 0.20,
             ..theme.accent
         },
-        scrollbar: scrollbar_style(theme),
+        accent: theme.accent,
     }
 }
 
-pub fn scrollbar_style(theme: ThemeSpec) -> scrollbar::ScrollbarStyle {
-    scrollbar::ScrollbarStyle {
-        // Soft pill behind the thumb, lighter than the thumb so the two
-        // read as distinct without looking heavy on light themes.
-        track_color: Color {
-            a: 0.18,
-            ..theme.muted_text
-        },
-        thumb_color: Color {
-            a: 0.55,
-            ..theme.muted_text
-        },
+/// The scrollbar thumb, kit's and so every bar's.
+pub fn scrollbar_thumb(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.55,
+        ..theme.muted_text
     }
-}
-
-/// Style closure for `iced::widget::scrollable`. Reuses the
-/// `scrollbar_style` colors and a fully-rounded pill border so the iced
-/// scrollbar visually matches the hand-drawn one in `RevisionList` /
-/// `DiffView`. Status is ignored — the custom widgets don't react to hover
-/// either, and matching that keeps the two indistinguishable side by side.
-pub fn iced_scrollable_style(theme: ThemeSpec, _status: scrollable::Status) -> scrollable::Style {
-    let colors = scrollbar_style(theme);
-    let pill = border::rounded(SCROLLBAR_WIDTH / 2.0);
-    let rail = scrollable::Rail {
-        background: Some(Background::Color(colors.track_color)),
-        border: pill,
-        scroller: scrollable::Scroller {
-            background: Background::Color(colors.thumb_color),
-            border: pill,
-        },
-    };
-    scrollable::Style {
-        container: container::Style::default(),
-        vertical_rail: rail,
-        horizontal_rail: rail,
-        gap: None,
-        auto_scroll: scrollable::AutoScroll {
-            background: Background::Color(Color::TRANSPARENT),
-            border: Border::default(),
-            shadow: Shadow::default(),
-            icon: theme.muted_text,
-        },
-    }
-}
-
-pub fn app_shell_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.background)
-        .color(theme.text)
-}
-
-pub fn vertical_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fixed(1.0))
-        .height(Length::Fill)
-        .style(move |_| {
-            container::Style::default()
-                .background(theme.border)
-                .border(Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                })
-        })
-        .into()
-}
-
-pub fn horizontal_divider<Message: 'static>(theme: ThemeSpec) -> Element<'static, Message> {
-    container(text(""))
-        .width(Length::Fill)
-        .height(Length::Fixed(1.0))
-        .style(move |_| {
-            container::Style::default()
-                .background(theme.border)
-                .border(Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: 0.0.into(),
-                })
-        })
-        .into()
-}
-
-pub fn sidebar_panel_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default().background(theme.panel_background)
-}
-
-pub fn diff_panel_style(theme: ThemeSpec) -> container::Style {
-    container::Style::default()
-        .background(theme.panel_background)
-        .border(Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 0.0.into(),
-        })
 }
 
 /// Translucent chip background derived from the chip's text color. This way
@@ -391,17 +399,16 @@ pub fn chip_background(color: Color) -> Color {
     Color { a: 0.18, ..color }
 }
 
-/// Saturated color for a file's status letter chip. Mapping follows the
-/// design system: A→green (added_text), M→blue (info), D→red (removed_text),
-/// R→amber (modified_token). The chip's background is derived from this
-/// color via `chip_background` so the glyph and the tint share a hue.
+/// Ink for a file's status letter: A green, M amber, D red, R violet. The
+/// badge's tint is derived from it via `chip_background`, so the letter and
+/// its fill share a hue.
 pub fn file_status_color(status: diffui_core::DiffFileStatus, theme: ThemeSpec) -> Color {
     use diffui_core::DiffFileStatus;
     match status {
         DiffFileStatus::Added => theme.added_text,
         DiffFileStatus::Deleted => theme.removed_text,
-        DiffFileStatus::Modified => theme.info,
-        DiffFileStatus::Renamed => theme.modified_token,
+        DiffFileStatus::Modified => theme.modified_token,
+        DiffFileStatus::Renamed => theme.renamed,
         DiffFileStatus::Conflicted => theme.conflict_marker,
     }
 }
@@ -415,9 +422,9 @@ pub mod text_size {
     /// Secondary metadata beside a body run: shortcut hints, timestamps,
     /// result summaries.
     pub const CAPTION: f32 = 11.0;
-    /// Chrome controls: buttons, tabs, menu rows, footer, dialog body.
-    pub const UI: f32 = 12.0;
-    /// Primary content runs: ids, chips, list rows, inputs.
+    /// Chrome controls and content runs: buttons, tabs, menu and list rows,
+    /// inputs, ids, dialog body. macOS's regular control size
+    /// (`NSFont.systemFontSize`).
     pub const BODY: f32 = 13.0;
     /// Emphasized content: revision descriptions, empty states.
     pub const BODY_LG: f32 = 14.0;
@@ -434,80 +441,129 @@ pub mod space {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 6.0;
     pub const MD: f32 = 8.0;
+    /// A row's and a button's text inset.
+    pub const MD_LG: f32 = 10.0;
     pub const LG: f32 = 12.0;
     pub const XL: f32 = 16.0;
+    /// A dialog's inset around its content.
+    pub const XL_XXL: f32 = 20.0;
     pub const XXL: f32 = 24.0;
 }
+
+/// The 1px line that divides panes, bars and sections. Layout that sums
+/// heights counts it with this.
+pub const HAIRLINE: f32 = 1.0;
 
 /// App-wide control geometry. Fixed heights keep adjacent controls aligned
 /// even when their labels use different fonts.
 pub mod control {
+    /// Close and clear buttons, small toggles inside a row.
+    pub const SMALL: f32 = 22.0;
     pub const COMPACT: f32 = 28.0;
     pub const STANDARD: f32 = 32.0;
 }
 
-/// Centers a control's content in its fixed height. Text inside should be
-/// optically centred itself ([`crate::typography::centered`], which
-/// [`crate::ui::label`] does), so this centres boxes and nothing more.
-pub fn centered_control_content<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+/// Glyph sizes. Lucide's 24px grid carries about 2px of padding, so a glyph
+/// reads a step smaller than text of the same size.
+pub mod icon {
+    /// Chevrons, carets and glyphs inside small controls.
+    pub const SM: f32 = 12.0;
+    /// A glyph leading a label or filling an icon button.
+    pub const MD: f32 = 14.0;
+    /// Empty states and standalone marks.
+    pub const LG: f32 = 16.0;
 }
 
-/// [`centered_control_content`] for a control whose outer button/container
-/// has an explicit width: it fills the width too, so icon-only controls
-/// center horizontally.
-pub fn centered_control_content_fill<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into()
-}
+/// Height of every pane header: the side panes' field rows, the History
+/// lists' title rows and the commit bar over the diff. The toolbar's height
+/// too, so the panes' first lines meet the chrome on one rhythm.
+pub const PANE_HEADER_HEIGHT: f32 = 40.0;
 
-/// Corner radii shared across the chrome. Chips keep their own tighter
-/// rounding ([`crate::chip::RADIUS`]).
+/// Corner radii. One scale for the whole app: pick the step by the size of
+/// the thing being rounded, so a 20px chip and a 400px card read as the same
+/// family. The named roles below are the steps the chrome reaches for.
 pub mod radius {
-    /// Inputs, hover washes, list/menu rows.
-    pub const CONTROL: f32 = 7.0;
-    /// Every button-shaped control (ghost, raised, primary, dialog) and
-    /// the toolbar's segmented well — one rounding for everything that
-    /// reads as a button.
-    pub const BUTTON: f32 = 7.0;
-    /// Inset row cards (revision/file selection).
-    pub const PUSH: f32 = 8.0;
-    /// Floating cards: popovers, modals, and tooltips.
-    pub const SURFACE: f32 = 12.0;
+    pub const XS: f32 = 6.0;
+    pub const SM: f32 = 10.0;
+    pub const MD: f32 = 12.0;
+    pub const LG: f32 = 16.0;
+    pub const XL: f32 = 20.0;
+
+    /// Chips, badges, keycaps, small icon buttons, short list rows.
+    pub const CHIP: f32 = XS;
+    /// Buttons, inputs, hover washes, list and menu rows, segmented wells.
+    pub const CONTROL: f32 = SM;
+    /// Revision and history rows, inner cards and dropdowns.
+    pub const CARD: f32 = MD;
+    /// Floating cards anchored to a trigger: popovers, menus.
+    pub const POPOVER: f32 = LG;
+    /// Modals: dialogs, the palette.
+    pub const MODAL: f32 = XL;
+
+    /// The radius of a box `inset` px inside one rounded by `outer`, so the
+    /// two corners stay concentric.
+    pub const fn inner(outer: f32, inset: f32) -> f32 {
+        let radius = outer - inset;
+        if radius > 0.0 { radius } else { 0.0 }
+    }
 }
 
-/// Ghost button: invisible at rest, translucent wash on hover/press. The
-/// wash is [`chip_background`] of `muted_text` so it reads the same on
-/// panel and elevated backgrounds. For icon-only and small-label controls
-/// embedded in framed surfaces (tab strip, find card, popover footers) —
-/// standalone actions use [`raised_button_style`] so they stay visible at
-/// rest.
-pub fn ghost_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    button::Style {
-        background: match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                Some(Background::Color(chip_background(theme.muted_text)))
-            }
-            _ => None,
-        },
-        text_color: theme.text,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+/// Lists: every row shell, scroll list and bespoke list (the revision list,
+/// the file trees, the diff) reads its geometry and washes from here.
+pub mod list {
+    use super::{Color, ThemeSpec, space};
+
+    /// A modal list's inset from its card (the palette, the open-repo dialog,
+    /// the activity popover).
+    pub const INSET: f32 = space::SM;
+    /// A dropdown's or a menu's list inset from its card.
+    pub const INSET_TIGHT: f32 = space::XS;
+    /// A row's text inset from its wash, in a modal list.
+    pub const PAD_X: f32 = space::MD_LG;
+    /// The same in a dropdown or a menu.
+    pub const PAD_X_TIGHT: f32 = space::MD;
+    /// A row's text inset from a list's right edge where the scrollbar runs
+    /// over the rows: the bar's footprint.
+    pub const PAD_END: f32 = crate::scrollbar::GUTTER;
+    /// How far the fade under a pane's header reaches into its list.
+    pub const TOP_FADE: f32 = 28.0;
+
+    /// Row heights in use: one step per kind of row.
+    pub mod height {
+        /// File tree rows.
+        pub const FILE: f32 = 26.0;
+        /// Menu rows, dropdown completions, op log snapshot runs.
+        pub const MENU: f32 = 28.0;
+        /// An operation's changed commits.
+        pub const CHANGE: f32 = 32.0;
+        /// Palette and command line results.
+        pub const RESULT: f32 = 34.0;
+        /// Open-repo recents and folders.
+        pub const DIALOG: f32 = 36.0;
+        /// Revisions and operations: two lines.
+        pub const REVISION: f32 = 46.0;
+    }
+
+    /// The corner of a row `height` tall: rounder rows for taller ones, never
+    /// a capsule.
+    pub const fn radius(height: f32) -> f32 {
+        if height < 28.0 {
+            super::radius::XS
+        } else if height <= 36.0 {
+            super::radius::SM
+        } else {
+            super::radius::MD
+        }
+    }
+
+    /// A row under the cursor.
+    pub fn row_hover(theme: ThemeSpec) -> Color {
+        super::hover_wash(theme)
+    }
+
+    /// The selected or highlighted row.
+    pub fn row_selected(theme: ThemeSpec) -> Color {
+        theme.selected_file
     }
 }
 
@@ -523,190 +579,349 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// Fill for [`raised_button_style`] at rest: a flat step from the toolbar
-/// surface toward the selection tone, so the button separates from the
-/// (also elevated) bar it sits on. Lighter on dark themes, darker on
-/// light — both the conventional direction.
 fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
     mix(theme.panel_background_elevated, theme.selected_file, t)
 }
 
-/// Fill for recessed wells (the toolbar's Diff/Source switcher): the
-/// window canvas pushed a step darker, so the well clearly sinks below
-/// both the canvas and the elevated bar it sits on — recessed surfaces
-/// deepen in both dark and light themes.
-pub fn well_fill(theme: ThemeSpec) -> Color {
-    mix(theme.background, Color::BLACK, 0.06)
+/// The window chrome's one fill: the tab strip, the toolbar and the status
+/// bar. The window canvas a step darker, so the panes read as raised above it.
+pub fn chrome_fill(theme: ThemeSpec) -> Color {
+    mix(theme.background, BLACK, 0.06)
 }
 
-/// The standard button: a flat fill one step above its surface, a crisp
-/// 1px border. Hover and press states deepen the fill without moving the
-/// control or adding elevation.
-pub fn raised_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    let fill = match status {
-        button::Status::Pressed => raised_fill(theme, 0.9),
-        button::Status::Hovered => raised_fill(theme, 0.65),
-        _ => raised_fill(theme, 0.35),
-    };
-    button::Style {
-        background: Some(Background::Color(fill)),
-        text_color: theme.text,
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+/// The wash a quiet control takes under the cursor, and a row's hover: a
+/// faint veil of the text colour, so it reads on the chrome, the panes and
+/// the cards alike.
+pub fn hover_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.06,
+        ..theme.text
     }
 }
 
-/// Primary call-to-action: informational blue fill with an inverted label.
-/// Keeping actions blue leaves coral
-/// for selection and working-copy state, away from destructive red.
-pub fn primary_button_style(theme: ThemeSpec, status: button::Status) -> button::Style {
-    if matches!(status, button::Status::Disabled) {
-        return button::Style {
-            background: Some(Background::Color(raised_fill(theme, 0.2))),
-            text_color: theme.subtle_text,
-            border: Border {
-                width: 1.0,
-                color: theme.border,
-                radius: radius::BUTTON.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        };
+/// A recessed well inside a surface (the segmented controls' track, a
+/// progress track) and a neutral badge's fill: a step under
+/// [`press_wash`], so a pressed control in it still reads.
+pub fn well_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.08,
+        ..theme.text
     }
-    let fill = match status {
-        button::Status::Hovered => mix(theme.info, theme.text, 0.08),
-        button::Status::Pressed => mix(theme.info, theme.background, 0.12),
-        _ => theme.info,
-    };
-    button::Style {
-        background: Some(Background::Color(fill)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+}
+
+/// [`hover_wash`] while pressed, or while what it opens is open.
+pub fn press_wash(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.10,
+        ..theme.text
+    }
+}
+
+/// Colours of a button in each state. Geometry lives in [`crate::ui`].
+#[derive(Debug, Clone)]
+pub struct ButtonStyle {
+    pub rest: Option<Color>,
+    pub hover: Color,
+    pub active: Color,
+    pub label: Color,
+    /// The button's 1px edge, inside its box and following its squircle. An
+    /// edge never takes room, so a button keeps its size when it changes
+    /// style (a Save that turns primary once there's something to save).
+    pub ring: Option<Color>,
+    /// The soft drop under a button that stands off its surface.
+    pub lift: Option<BoxShadow>,
+}
+
+/// Ghost button: invisible at rest, [`hover_wash`] on hover and
+/// [`press_wash`] on press, its label a step quieter than body text. For
+/// controls on the chrome and in bars and cards; standalone actions use
+/// [`raised_button_style`] so they stay visible at rest.
+pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: None,
+        hover: hover_wash(theme),
+        active: press_wash(theme),
+        label: theme.muted_text,
+        ring: None,
+        lift: None,
+    }
+}
+
+/// The standard button: the panes' raised surface with a firm hairline ring
+/// and a faint lift. Hover and press deepen the fill without moving it.
+pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(theme.panel_background_elevated),
+        hover: mix(theme.panel_background_elevated, theme.text, 0.035),
+        active: mix(theme.panel_background_elevated, theme.text, 0.07),
+        label: theme.text,
+        ring: Some(firm_ring(theme)),
+        lift: Some(lift(0.05, 1.0)),
+    }
+}
+
+/// A faint drop one pixel under a control.
+fn lift(alpha: f32, blur: f32) -> BoxShadow {
+    BoxShadow {
+        color: Hsla::from(Color { a: alpha, ..BLACK }),
+        offset: point(px(0.0), px(1.0)),
+        blur_radius: px(blur),
+        spread_radius: px(0.0),
+        inset: false,
+    }
+}
+
+/// The hairline of a raised control, a step firmer than the panes' borders.
+pub fn firm_ring(theme: ThemeSpec) -> Color {
+    mix(theme.border, theme.subtle_text, 0.25)
+}
+
+/// Primary call-to-action: the accent, with an inverted label, a darker inner
+/// ring and a faint lift, well away from the destructive red.
+pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(theme.accent),
+        hover: mix(theme.accent, theme.text, 0.10),
+        active: mix(theme.accent, theme.text, 0.18),
+        label: theme.background,
+        ring: Some(Color { a: 0.10, ..BLACK }),
+        lift: Some(lift(0.08, 1.0)),
+    }
+}
+
+/// The primary button while it can't be pressed: grey instead of the accent.
+/// The button fades the label itself ([`crate::ui::Button::disabled`]).
+pub fn disabled_button_style(theme: ThemeSpec) -> ButtonStyle {
+    let fill = raised_fill(theme, 0.2);
+    ButtonStyle {
+        rest: Some(fill),
+        hover: fill,
+        active: fill,
+        label: theme.text,
+        ring: Some(theme.border),
+        lift: None,
+    }
+}
+
+/// A 1px edge drawn inside a box. Unlike a border it takes no room, so a
+/// control that gains or loses its edge with its state keeps its size.
+pub fn inset_ring(color: Color) -> BoxShadow {
+    BoxShadow {
+        color: Hsla::from(color),
+        offset: point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(1.0),
+        inset: true,
     }
 }
 
 /// Destructive call-to-action for confirm dialogs: flat red fill so the
 /// dangerous choice is unmistakable next to the neutral cancel button.
-pub fn destructive_button_style(theme: ThemeSpec) -> button::Style {
-    button::Style {
-        background: Some(Background::Color(theme.removed_text)),
-        text_color: theme.background,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: radius::BUTTON.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
+pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
+    ButtonStyle {
+        rest: Some(theme.removed_text),
+        hover: mix(theme.removed_text, theme.text, 0.10),
+        active: mix(theme.removed_text, theme.text, 0.18),
+        label: theme.background,
+        ring: Some(Color { a: 0.10, ..BLACK }),
+        lift: Some(lift(0.08, 1.0)),
     }
 }
 
-/// Floating card anchored to a trigger with nothing dimming the content
-/// behind it (dropdown menus, the activity popover). The heavy drop shadow
-/// is what separates it from the busy panel underneath.
-pub fn popover_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::SURFACE.into(),
-        },
-        shadow: floating_shadow(8.0, 16.0),
-        ..container::Style::default()
+/// The soft drop under a control raised out of its track (the active tab, the
+/// active segment). Its edge is the squircle's ring, in [`firm_ring`].
+pub fn raised_lift() -> BoxShadow {
+    lift(0.10, 2.0)
+}
+
+/// Gives `element` a squircle of `radius`: filled with `fill`, and edged in
+/// `border` 1px inside its box where a border would be (the element keeps a
+/// transparent border for its layout). Call it before adding children: the
+/// squircle is the first.
+pub fn squircle<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    radius: f32,
+    fill: Option<Color>,
+    border: Option<Color>,
+) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    let mut shape = Fill::new(Corners::all(radius));
+    if let Some(fill) = fill {
+        shape = shape.background(fill);
+    }
+    let element = element.rounded(px(radius));
+    match border {
+        Some(border) => element
+            .border_1()
+            .border_color(TRANSPARENT)
+            .child(background(shape.border(1.0, border), 1.0)),
+        None => element.child(background(shape, 0.0)),
     }
 }
 
-/// The drop shadow every floating surface shares — same tint and alpha
-/// everywhere, geometry scaled to the surface (popovers are bigger than
-/// tooltips).
-pub fn floating_shadow(offset_y: f32, blur_radius: f32) -> Shadow {
-    Shadow {
-        color: Color {
-            a: 0.05,
-            ..Color::BLACK
-        },
-        offset: Vector::new(0.0, offset_y),
-        blur_radius,
+/// Raises `element` out of its track (the active tab, the active segment): the
+/// panes' surface in a squircle of `radius` with a [`firm_ring`] edge, and a
+/// soft drop. Call it before adding children: the squircle is the first.
+pub fn raised<E: Styled + gpui_kit::ParentElement>(element: E, radius: f32, theme: ThemeSpec) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    element
+        .rounded(px(radius))
+        .shadow(vec![raised_lift()])
+        .child(background(
+            Fill::new(Corners::all(radius))
+                .background(theme.panel_background_elevated)
+                .border(1.0, firm_ring(theme)),
+            0.0,
+        ))
+}
+
+/// How far a floating surface stands off what's under it. Each step owns its
+/// corner, edge and drop shadow, so every surface at a step reads the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elevation {
+    /// Hover labels.
+    Tooltip,
+    /// Cards anchored to a trigger with nothing dimming what's behind them:
+    /// menus, popovers, the find bar, toasts.
+    Popover,
+    /// Cards over the scrim: dialogs, the palette.
+    Modal,
+}
+
+impl Elevation {
+    pub fn radius(self) -> f32 {
+        match self {
+            Elevation::Tooltip => radius::XS,
+            Elevation::Popover => radius::POPOVER,
+            Elevation::Modal => radius::MODAL,
+        }
+    }
+
+    /// The drop under a surface at this step. Black on a dark canvas needs
+    /// far more alpha than on a light one to show at all.
+    pub fn shadow(self, theme: ThemeSpec) -> BoxShadow {
+        let dark = is_dark(theme);
+        let (offset_y, blur, light_alpha, dark_alpha) = match self {
+            Elevation::Tooltip => (2.0, 8.0, 0.14, 0.40),
+            Elevation::Popover => (8.0, 24.0, 0.20, 0.55),
+            Elevation::Modal => (12.0, 32.0, 0.28, 0.70),
+        };
+        BoxShadow {
+            color: Hsla::from(Color {
+                a: if dark { dark_alpha } else { light_alpha },
+                ..BLACK
+            }),
+            offset: point(px(0.0), px(offset_y)),
+            blur_radius: px(blur),
+            spread_radius: px(0.0),
+            inset: false,
+        }
     }
 }
 
-/// Centered card over a scrim (confirm dialog, open-repo dialog, command
-/// palette). The scrim already darkens what's behind the modal, so a heavy
-/// shadow would just look like double dimming — soft, just enough to
-/// suggest the card is lifted.
-pub fn modal_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::SURFACE.into(),
-        },
-        shadow: floating_shadow(4.0, 12.0),
-        ..container::Style::default()
-    }
+/// Whether `theme` draws light ink on a dark canvas.
+fn is_dark(theme: ThemeSpec) -> bool {
+    let canvas = theme.background;
+    canvas.r + canvas.g + canvas.b < 1.5
+}
+
+/// A floating surface at `elevation`: the raised fill and the border's edge in
+/// a squircle, and the step's drop shadow. Add its content after this: its
+/// squircle is the card's first child.
+pub fn surface<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    elevation: Elevation,
+    theme: ThemeSpec,
+) -> E {
+    surface_with(element, elevation, elevation.radius(), theme.border, theme)
+}
+
+/// [`surface`] with its own corner and edge: the palette rings the column that
+/// has the keyboard, the revset dropdown is a compact card with a firmer edge.
+pub fn surface_with<E: Styled + gpui_kit::ParentElement>(
+    element: E,
+    elevation: Elevation,
+    radius: f32,
+    edge: Color,
+    theme: ThemeSpec,
+) -> E {
+    use crate::squircle::{Corners, Fill, background};
+    // The transparent border keeps the card's layout and lets an
+    // overflow-hidden card clip to its whole box, edge included. The shadow
+    // keeps the circular corner GPUI shadows have, which the blur hides.
+    element
+        .border_1()
+        .border_color(TRANSPARENT)
+        .rounded(px(radius))
+        .shadow(vec![elevation.shadow(theme)])
+        .child(background(
+            Fill::new(Corners::all(radius))
+                .background(theme.panel_background_elevated)
+                .border(1.0, edge),
+            1.0,
+        ))
 }
 
 /// Dimming layer behind modal surfaces. One alpha everywhere so stacked
-/// takeovers (confirm dialog, open-repo dialog, command palette) feel
-/// equally deep.
-pub fn scrim_style() -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.40,
-            ..Color::BLACK
-        })),
-        ..container::Style::default()
+/// takeovers (confirm dialog, open-repo dialog, command palette) feel equally
+/// deep.
+pub const SCRIM: Color = rgba(0.0, 0.0, 0.0, 0.40);
+
+/// Text-selection tint in an input.
+pub fn input_selection(theme: ThemeSpec) -> Color {
+    Color {
+        a: 0.25,
+        ..theme.accent
     }
 }
 
-/// Text-input field: a 1px outline carrying the input identity colors
-/// (placeholder / value / selection). Structural variants — the palette's
-/// borderless embedded input — override background and border but keep the
-/// colors, so every input hints and selects identically.
-pub fn input_style(theme: ThemeSpec) -> text_input::Style {
-    text_input::Style {
-        background: Background::Color(theme.panel_background),
-        border: Border {
-            width: 1.0,
-            color: theme.border,
-            radius: radius::CONTROL.into(),
-        },
-        placeholder: theme.subtle_text,
-        value: theme.text,
-        selection: Color {
-            a: 0.25,
-            ..theme.accent
-        },
-    }
-}
-
-/// Hover tooltip card. The revision list's custom-drawn tooltip overlay
-/// mirrors these colors through `RevisionListStyle` and its radius through
-/// [`radius::SURFACE`].
-pub fn tooltip_style(theme: ThemeSpec) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.panel_background_elevated)),
-        text_color: Some(theme.text),
-        border: Border {
-            color: theme.border,
-            width: 1.0,
-            radius: radius::SURFACE.into(),
-        },
-        ..container::Style::default()
-    }
+/// Makes kit's theme speak diffui's palette, so a stock kit component (a
+/// button variant, an input, a scrollbar, a popover) looks native here. Call
+/// after any change to the resolved theme.
+pub fn apply_to_kit(resolved: ResolvedTheme, cx: &mut App) {
+    let spec = resolved.spec();
+    Theme::change(resolved.kit_mode(), None, cx);
+    let hsla = |color: Color| Hsla::from(color);
+    Theme::update(cx, |theme| {
+        let raised = raised_button_style(spec);
+        let primary = primary_button_style(spec);
+        let ghost = ghost_button_style(spec);
+        let thumb = scrollbar_thumb(spec);
+        let c = &mut theme.colors;
+        c.background = hsla(spec.background);
+        c.foreground = hsla(spec.text);
+        c.border = hsla(spec.border);
+        c.input = hsla(spec.border);
+        c.ring = hsla(spec.info);
+        c.muted = hsla(spec.panel_background_elevated);
+        c.muted_foreground = hsla(spec.muted_text);
+        c.popover = hsla(spec.panel_background_elevated);
+        c.popover_foreground = hsla(spec.text);
+        c.accent = hsla(ghost.hover);
+        c.accent_foreground = hsla(spec.text);
+        c.selection = hsla(input_selection(spec));
+        c.caret = hsla(spec.text);
+        c.primary = hsla(primary.rest.unwrap_or(spec.info));
+        c.primary_hover = hsla(primary.hover);
+        c.primary_active = hsla(primary.active);
+        c.primary_foreground = hsla(primary.label);
+        c.secondary = hsla(raised.rest.unwrap_or(spec.panel_background_elevated));
+        c.secondary_hover = hsla(raised.hover);
+        c.secondary_active = hsla(raised.active);
+        c.secondary_foreground = hsla(raised.label);
+        let destructive = destructive_button_style(spec);
+        c.danger = hsla(spec.removed_text);
+        c.danger_hover = hsla(destructive.hover);
+        c.danger_active = hsla(destructive.active);
+        c.danger_foreground = hsla(spec.background);
+        c.scrollbar = hsla(TRANSPARENT);
+        c.scrollbar_thumb = hsla(thumb);
+        c.scrollbar_thumb_hover = hsla(thumb);
+        c.list_hover = hsla(ghost.hover);
+        c.list_active = hsla(spec.selected_file);
+        c.tab_bar = hsla(spec.background);
+    });
+    scrollbar::place_kit_bars(cx);
 }
 
 #[cfg(test)]
@@ -817,8 +1032,8 @@ mod tests {
         for (label, color) in [
             ("added chip", spec.added_text),
             ("removed chip", spec.removed_text),
-            ("modified chip", spec.info),
-            ("renamed chip", spec.modified_token),
+            ("modified chip", spec.modified_token),
+            ("renamed chip", spec.renamed),
             ("conflicted chip", spec.conflict_marker),
             ("accent chip", spec.accent),
         ] {
@@ -851,9 +1066,27 @@ mod tests {
             }
         }
         // The graph's lanes are strokes, not glyphs to read.
-        for base in [spec.panel_background, spec.selected_file] {
-            pairs.push(("lane", spec.lane_base, base, GLYPH));
+        for lane in spec.lanes {
+            for base in [spec.panel_background, spec.selected_file] {
+                pairs.push(("lane", lane, base, GLYPH));
+            }
         }
+        for background in [spec.panel_background, spec.selected_file] {
+            pairs.push(("change id prefix", spec.change_id, background, TEXT));
+        }
+        // The revision rows' neutral ref chips, their `+N`, and the working
+        // copy's label: pane-coloured text on the accent.
+        for base in [spec.panel_background, spec.selected_file] {
+            let fill = over(chip_background(spec.muted_text), base);
+            pairs.push(("ref chip", spec.muted_text, fill, TEXT));
+            pairs.push(("overflow chip", spec.subtle_text, fill, GLYPH));
+        }
+        pairs.push((
+            "working copy label",
+            spec.panel_background,
+            spec.accent,
+            TEXT,
+        ));
         pairs
     }
 

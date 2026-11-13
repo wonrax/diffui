@@ -33,80 +33,64 @@ use crate::{DetailField, Diffui, MainView, mutations};
 /// in the persisted palette recents without a hand-written mapping table.
 pub(crate) type CommandId = &'static str;
 
-/// Where a command's keys are live. The mode stack decides which context the
-/// keyboard is in; a command only resolves in the contexts it lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum Context {
+/// Declares [`Context`] once: each variant with the name it goes by in
+/// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
+macro_rules! contexts {
+    ($( $(#[$meta:meta])* $Variant:ident = $name:literal, )*) => {
+        /// Where a command's keys are live. The mode stack decides which
+        /// context the keyboard is in; a command only resolves in the
+        /// contexts it lists.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub(crate) enum Context {
+            $( $(#[$meta])* $Variant, )*
+        }
+
+        impl Context {
+            /// Every context, for iteration in tests and config parsing.
+            pub(crate) const ALL: &'static [Context] = &[$( Context::$Variant, )*];
+
+            /// The name this context goes by in `config.toml`'s
+            /// `[keys.<name>]`.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $( Context::$Variant => $name, )*
+                }
+            }
+        }
+    };
+}
+
+contexts! {
     /// No overlay: the graph, the diff, the tabs.
-    Base,
-    Palette,
-    Find,
-    Confirm,
-    Description,
+    Base = "base",
+    Palette = "palette",
+    Find = "find",
+    Confirm = "confirm",
+    Description = "description",
     /// Target mode — picking a rebase/squash/merge destination.
-    Draft,
-    Menu,
-    OpenRepo,
-    ActivityPopover,
+    Draft = "draft",
+    Menu = "menu",
+    OpenRepo = "open-repo",
+    ActivityPopover = "activity",
     /// The bookmark-name prompt.
-    Prompt,
+    Prompt = "prompt",
     /// The keyboard-shortcut cheat sheet.
-    Shortcuts,
+    Shortcuts = "shortcuts",
+    /// The settings dialog.
+    Settings = "settings",
     /// Line-select mode in the diff pane.
-    Lines,
+    Lines = "lines",
     /// The split prompt's two description editors.
-    Split,
+    Split = "split",
     /// The credential prompt git or ssh raised.
-    Credential,
+    Credential = "credential",
     /// A jj CLI run's output panel.
-    Output,
+    Output = "output",
     /// The conflict marker editor.
-    ConflictEdit,
+    ConflictEdit = "conflict-edit",
 }
 
 impl Context {
-    /// Every context, for iteration in tests and config parsing.
-    pub(crate) const ALL: &'static [Context] = &[
-        Context::Base,
-        Context::Palette,
-        Context::Find,
-        Context::Confirm,
-        Context::Description,
-        Context::Draft,
-        Context::Menu,
-        Context::OpenRepo,
-        Context::ActivityPopover,
-        Context::Prompt,
-        Context::Shortcuts,
-        Context::Lines,
-        Context::Split,
-        Context::Credential,
-        Context::Output,
-        Context::ConflictEdit,
-    ];
-
-    /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Context::Base => "base",
-            Context::Palette => "palette",
-            Context::Find => "find",
-            Context::Confirm => "confirm",
-            Context::Description => "description",
-            Context::Draft => "draft",
-            Context::Menu => "menu",
-            Context::OpenRepo => "open-repo",
-            Context::ActivityPopover => "activity",
-            Context::Prompt => "prompt",
-            Context::Shortcuts => "shortcuts",
-            Context::Lines => "lines",
-            Context::Split => "split",
-            Context::Credential => "credential",
-            Context::Output => "output",
-            Context::ConflictEdit => "conflict-edit",
-        }
-    }
-
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Context::ALL
             .iter()
@@ -298,6 +282,18 @@ fn lines_action(message: crate::changes::LineMsg) -> Action {
     Action::Changes(crate::changes::ChangesMsg::Lines(message))
 }
 
+/// A font menu row's family, `None` being the platform's `default`.
+fn font_arg(arg: CommandArg, default: crate::theme::Font) -> Option<Option<String>> {
+    let CommandArg::Text(family) = arg else {
+        return None;
+    };
+    Some((family != default.family).then_some(family))
+}
+
+fn font_unlocked(ui: &Diffui, key: crate::config::Key) -> Availability {
+    require(!ui.config.locked.contains(key), "Set in config.toml")
+}
+
 fn always(_: &Diffui, _: &CommandArg) -> Availability {
     Ok(())
 }
@@ -319,11 +315,7 @@ pub(crate) mod reason {
 /// Whether the row a command names is still in the loaded graph. A menu built
 /// before a reload can otherwise act on a commit the reload hid.
 fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
-    let commits = &ui.active().session.commits;
-    match selection {
-        RevisionSelection::WorkingCopy => commits.working_copy().is_some(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex).is_some(),
-    }
+    ui.active().session.commits.find(selection).is_some()
 }
 
 /// A mutation is offered when the backend supports one (jj only) and every
@@ -610,10 +602,7 @@ fn result_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowVi
                 .revision()
                 .cloned()
                 .unwrap_or_else(|| ui.active().session.selected_revision.clone());
-            match selection {
-                RevisionSelection::WorkingCopy => commits.working_copy(),
-                RevisionSelection::Commit(hex) => commits.find_by_commit_id(&hex),
-            }
+            commits.find(&selection)
         }
     }
 }
@@ -736,6 +725,28 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "refresh.auto",
+        label: "Refresh: Automatic",
+        hint: "Snapshot edits and update a stale working copy as they happen",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::SetRefreshMode(diffui_core::RefreshMode::Auto)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "refresh.manual",
+        label: "Refresh: Manual",
+        hint: "Leave snapshots and stale updates to the Refresh button",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::SetRefreshMode(diffui_core::RefreshMode::Manual)),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "file.copy-diff",
         label: "Copy current file diff",
         hint: "Copy the selected file's diff text",
@@ -784,6 +795,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |_ui, _arg| Some(Action::Redo),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.update-stale",
+        label: "Update stale working copy",
+        hint: "Put the latest working copy on disk (jj workspace update-stale)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, _arg| Some(Action::UpdateStaleWorkingCopy),
         palette: PaletteScope::Root,
     },
     Command {
@@ -1086,8 +1108,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
-            target_revision(ui, &arg)
-                .map(|from| Action::Mutate(mutations::MutationOp::Absorb { from }))
+            target_revision(ui, &arg).map(|from| {
+                Action::Mutate(mutations::MutationOp::Absorb {
+                    from,
+                    paths: Vec::new(),
+                })
+            })
         },
         palette: PaletteScope::RevisionVerb,
     },
@@ -1182,17 +1208,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &["esc"],
         mac_chords: &[],
         enabled: always,
-        // Esc backs out of whatever is on: the marks first, then a
-        // comparison.
+        // Esc backs out of whatever is on: the picks first, then the
+        // marks, then a comparison.
         build: |ui, _arg| {
-            Some(
-                if ui.active().revision_multi_selection.is_empty() && crate::compare::comparing(ui)
-                {
-                    Action::Compare(CompareAction::Exit)
-                } else {
-                    Action::ClearMultiSelection
-                },
-            )
+            Some(if crate::changes::has_selection(ui) {
+                Action::Changes(crate::changes::ChangesMsg::Clear)
+            } else if ui.active().revision_multi_selection.is_empty()
+                && crate::compare::comparing(ui)
+            {
+                Action::Compare(CompareAction::Exit)
+            } else {
+                Action::ClearMultiSelection
+            })
         },
         palette: PaletteScope::Hidden,
     },
@@ -1936,6 +1963,24 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "palette.leave-command-line",
+        label: "Back to commands",
+        hint: "Leave the empty command line for the palette's search",
+        contexts: &[Context::Palette],
+        chords: &["backspace"],
+        mac_chords: &[],
+        enabled: always,
+        // Only an empty line: Backspace anywhere else edits it.
+        build: |ui, _arg| {
+            let empty = ui
+                .palette()
+                .and_then(|state| state.top())
+                .is_some_and(|column| column.query == crate::cmdline::PREFIX);
+            (ui.command_line().is_some() && empty).then_some(Action::CommandLine(CmdAction::Leave))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "palette.back",
         label: "Back",
         hint: "Pop the rightmost palette column",
@@ -2065,6 +2110,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "repo.remove-recent",
+        label: "Remove from recents",
+        hint: "Forget the highlighted recent repository",
+        contexts: &[Context::OpenRepo],
+        chords: &["ctrl+backspace"],
+        mac_chords: &["cmd+backspace"],
+        enabled: always,
+        build: |ui, _arg| ui.open_repo_selected_recent().map(Action::RemoveRecentRepo),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "repo.complete-folder",
         label: "Complete folder",
         hint: "Complete the path into the highlighted folder",
@@ -2079,12 +2135,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         id: "confirm.accept",
         label: "Confirm",
         hint: "Run the mutation the dialog is holding",
-        // Deliberately chordless: the dialog gates an operation the jj CLI
-        // itself refuses, so it takes a click rather than a stray Enter.
+        // Enter for a routine confirm (a push). One that destroys or
+        // overrides something the jj CLI refuses takes a click, not a stray
+        // Enter.
         contexts: &[Context::Confirm],
-        chords: &[],
+        chords: &["enter"],
         mac_chords: &[],
-        enabled: always,
+        enabled: |ui, _arg| {
+            require(
+                ui.confirm().is_some_and(|dialog| dialog.look.routine),
+                "Click to confirm a destructive change",
+            )
+        },
         build: |_ui, _arg| Some(Action::ConfirmAccept),
         palette: PaletteScope::Hidden,
     },
@@ -2231,6 +2293,40 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleSplit),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.toggle-revisions",
+        label: "Toggle the revisions sidebar",
+        hint: "Show or hide the revision list beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+1"],
+        // ⌥ composes 1 into `¡` on a US layout, and the key event can carry that.
+        mac_chords: &["alt+cmd+1", "alt+cmd+\u{a1}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleHistoryPanel),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.toggle-changed-files",
+        label: "Toggle the changed files",
+        hint: "Show or hide the changed-file tree beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+2"],
+        // ⌥2 composes into `™` on a US layout.
+        mac_chords: &["alt+cmd+2", "alt+cmd+\u{2122}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleFilesPanel),
         palette: PaletteScope::Root,
     },
     Command {
@@ -2845,15 +2941,76 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
-        id: "app.open-config",
-        label: "Open settings file",
-        hint: "Edit config.toml (fonts, theme, keys, revset presets)",
+        id: "app.settings",
+        label: "Settings\u{2026}",
+        hint: "Theme, refresh, fonts and code text",
         contexts: &[Context::Base],
         chords: &["cmd+,"],
         mac_chords: &[],
         enabled: always,
-        build: |_ui, _arg| Some(Action::OpenConfigFile),
+        build: |_ui, _arg| Some(Action::OpenSettings),
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.reveal-config",
+        label: if cfg!(target_os = "macos") {
+            "Reveal config.toml in Finder"
+        } else {
+            "Reveal config.toml"
+        },
+        hint: "Keys and revset presets are set there, and it wins over Settings",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.config_files.exists(crate::config::ConfigFile::Config),
+                "No config.toml",
+            )
+        },
+        build: |_ui, _arg| Some(Action::RevealConfigFile(crate::config::ConfigFile::Config)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "settings.close",
+        label: "Close settings",
+        hint: "Dismiss the settings",
+        contexts: &[Context::Settings],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CloseSettings),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.ui-font",
+        label: "Set UI font",
+        hint: "The family chrome and lists are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::UiFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::UiFont(
+                font_arg(arg, crate::theme::Font::DEFAULT)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.mono-font",
+        label: "Set mono font",
+        hint: "The family code and ids are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::MonoFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::MonoFont(
+                font_arg(arg, crate::theme::Font::MONOSPACE)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
     },
     Command {
         id: "shortcuts.close",

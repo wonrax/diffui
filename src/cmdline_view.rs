@@ -3,94 +3,29 @@
 //! error, pointed at), the completion list in the palette's own rows, and a
 //! footer that says what Enter will do.
 
+use crate::root::PaneSet;
+use crate::theme::{self, Color, Weight, text_size};
+use crate::typography::{self, Aligned};
+use crate::{Cx, input, palette, ui};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, MouseButton, MouseMoveEvent, Window, div, px};
 use std::ops::Range;
 
 use diffui_core::cli::{CommandKind, tokenize};
 use diffui_core::completion::{Completion, CompletionKind};
-use iced::advanced::text::{Ellipsis, Wrapping};
-use iced::widget::{column, container, mouse_area, text};
-use iced::{Background, Border, Color, Element, Length, Padding};
 
-use crate::cmdline::{CommandLine, PlanState};
+use crate::Diffui;
+use crate::cmdline::{COMMAND_INPUT_ID, CommandLine, PREFIX, PlanState};
 use crate::icons;
-use crate::palette::{self, CONTENT_X, GLYPH_GAP, INPUT_HEIGHT, PaletteMessage, RESULTS_INSET};
-use crate::theme::{self, ThemeSpec, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Diffui, Message};
+use crate::palette::{CONTENT_X, GLYPH_GAP, INPUT_BAND, RESULTS_INSET};
+use crate::theme::ThemeSpec;
+use crate::ui::Look;
 
 /// The strip under the input: the revset arguments, or the error.
 pub(crate) const ARGS_HEIGHT: f32 = 30.0;
-
-/// The command line's input: a one-line editor in the code font, its words
-/// coloured by a highlighter over the editor's own layout, so the text, the
-/// caret and the selection can never drift apart.
-pub(crate) fn input<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    query: &'a str,
-    command: &'a CommandLine,
-    focused: bool,
-) -> Element<'a, Message> {
-    use iced::widget::text_editor;
-    let mono = ui.config.mono_font;
-    let line_height = text_size::TITLE * typography::DEFAULT_LINE_HEIGHT;
-    // The box the search input's line sits in: the line centred in the band,
-    // its caps optically centred on the line.
-    let padding = typography::trimmed_padding(
-        Padding::from([
-            (INPUT_HEIGHT - line_height) / 2.0,
-            CONTENT_X - RESULTS_INSET,
-        ]),
-        mono,
-        text_size::TITLE,
-    );
-    let mut editor = text_editor(&command.editor.0)
-        .id(iced::widget::Id::new(crate::cmdline::COMMAND_INPUT_ID))
-        .font(mono)
-        .size(text_size::TITLE)
-        .padding(padding)
-        .height(Length::Fixed(INPUT_HEIGHT))
-        .wrapping(Wrapping::None)
-        .key_binding(|press| {
-            use iced::keyboard::{Key, key::Named};
-            let press = crate::ui::cocoa_key_press(press, false);
-            match press.key.as_ref() {
-                // Enter runs (or takes a candidate); the palette's own keys
-                // move through the list and history.
-                Key::Named(Named::Enter) => Some(text_editor::Binding::Custom(Message::Palette(
-                    PaletteMessage::Accept,
-                ))),
-                Key::Named(Named::ArrowUp | Named::ArrowDown | Named::Tab | Named::Escape) => None,
-                _ => text_editor::Binding::from_key_press(press),
-            }
-        })
-        .style(move |_, _| {
-            let input = theme::input_style(theme);
-            text_editor::Style {
-                background: Background::Color(Color::TRANSPARENT),
-                border: Border::default(),
-                placeholder: input.placeholder,
-                value: input.value,
-                selection: input.selection,
-            }
-        })
-        .highlight_with::<RoleParser>(
-            painted_roles(ui, query, command),
-            move |role: Role, _: &iced::Theme| iced::advanced::text::highlighter::Style {
-                color: Some(role_color(role, theme)),
-                style: None,
-            },
-        );
-    if focused {
-        editor = editor.on_action(|action| Message::Palette(PaletteMessage::CommandEdit(action)));
-    }
-    container(editor)
-        .padding(RESULTS_INSET)
-        .height(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
-        .width(Length::Fill)
-        .center_y(Length::Fixed(INPUT_HEIGHT + 2.0 * RESULTS_INSET))
-        .into()
-}
+/// How far kit's editor sets its text in from its left edge, gutter included.
+const EDITOR_MARGIN: f32 = 11.0;
 
 /// What a stretch of the line is, for its colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,53 +83,6 @@ fn painted_roles(ui: &Diffui, line: &str, command: &CommandLine) -> Vec<(Range<u
             Some((start..end, role))
         })
         .collect()
-}
-
-/// Feeds the editor's highlighter the roles worked out for its one line.
-pub(crate) struct RoleParser {
-    roles: Vec<(Range<usize>, Role)>,
-    line: usize,
-}
-
-impl iced::advanced::text::Parser for RoleParser {
-    type Settings = Vec<(Range<usize>, Role)>;
-    type Output = Role;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Role)>;
-
-    fn new(settings: &Self::Settings) -> Self {
-        Self {
-            roles: settings.clone(),
-            line: 0,
-        }
-    }
-
-    fn update(&mut self, settings: &Self::Settings) {
-        self.roles = settings.clone();
-        self.line = 0;
-    }
-
-    fn change_line(&mut self, line: usize) {
-        self.line = self.line.min(line);
-    }
-
-    fn parse_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        let first = self.line == 0;
-        self.line += 1;
-        let roles = if first {
-            self.roles
-                .iter()
-                .filter(|(range, _)| range.end <= line.len())
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        roles.into_iter()
-    }
-
-    fn current_line(&self) -> usize {
-        self.line
-    }
 }
 
 /// The spans the line colours as revset arguments.
@@ -270,211 +158,6 @@ fn error_span(ui: &Diffui, line: &str, command: &CommandLine) -> Option<Range<us
     }
 }
 
-/// The strip under the input: each revset argument with its count, or the
-/// error. Nothing when there's neither.
-pub(crate) fn args_strip<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    line: &str,
-    command: &'a CommandLine,
-) -> Option<Element<'a, Message>> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let plan = ui.plan(command);
-    let blocked = match &plan.state {
-        PlanState::Blocked { reason, span } if command.error_visible(line, span.as_ref()) => {
-            Some(reason.clone())
-        }
-        _ => None,
-    };
-    let content: Element<'a, Message> = if let Some(reason) = blocked {
-        typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, 12.0, theme.removed_text),
-                    12.0,
-                ),
-                Aligned::gap(theme::space::SM),
-                sentence(
-                    &crate::prose::Prose::from_backticks(&reason),
-                    font,
-                    mono,
-                    theme.removed_text,
-                    theme,
-                ),
-            ],
-            0.0,
-        )
-    } else {
-        let slots = command.slots();
-        if slots.is_empty() {
-            return None;
-        }
-        let focused = command.focused_slot();
-        let mut parts: Vec<Aligned<'a, Message>> = Vec::new();
-        for (index, slot) in slots.iter().enumerate().take(4) {
-            if index > 0 {
-                parts.push(Aligned::gap(theme::space::LG));
-            }
-            let is_focused = Some(index) == focused;
-            let flag = crate::cmdline::typed_flag(line, slot);
-            if !flag.is_empty() {
-                parts.push(Aligned::text(
-                    text(flag)
-                        .size(text_size::UI)
-                        .font(mono)
-                        .color(theme.subtle_text),
-                    mono,
-                    text_size::UI,
-                ));
-                parts.push(Aligned::gap(theme::space::XS));
-            }
-            let shown: String = if slot.revset.chars().count() > 18 {
-                let head: String = slot.revset.chars().take(17).collect();
-                format!("{head}\u{2026}")
-            } else {
-                slot.revset.clone()
-            };
-            parts.push(Aligned::text(
-                text(shown)
-                    .size(text_size::UI)
-                    .font(mono)
-                    .color(if is_focused {
-                        theme.accent
-                    } else {
-                        theme.muted_text
-                    })
-                    .wrapping(Wrapping::None),
-                mono,
-                text_size::UI,
-            ));
-            parts.push(Aligned::gap(theme::space::SM));
-            let (label, color) = match command.resolution(&slot.revset).map(|r| &r.result) {
-                Some(Ok(found)) => (found.count_label(), theme.accent),
-                Some(Err(_)) => ("no match".to_owned(), theme.removed_text),
-                None => ("\u{2026}".to_owned(), theme.subtle_text),
-            };
-            parts.push(Aligned::chip(
-                text(label).size(text_size::CAPTION).font(font).color(color),
-                font,
-                text_size::CAPTION,
-                Padding::from([1.0, 6.0]),
-                move |_| crate::chip::container_style(color),
-            ));
-        }
-        typography::baseline_row(parts, 0.0)
-    };
-    Some(
-        container(content)
-            .padding(Padding {
-                top: 0.0,
-                right: CONTENT_X,
-                bottom: 0.0,
-                left: CONTENT_X,
-            })
-            .width(Length::Fill)
-            .height(Length::Fixed(ARGS_HEIGHT))
-            .center_y(Length::Fixed(ARGS_HEIGHT))
-            .clip(true)
-            .into(),
-    )
-}
-
-/// The candidates, in the palette's row style. With none, recent commands.
-pub(crate) fn results<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    line: &str,
-    command: &'a CommandLine,
-) -> Element<'a, Message> {
-    if command.completions.is_empty() {
-        let label = if line.trim_end() != "jj" {
-            "No suggestions here"
-        } else if ui.recents.cli.is_empty() {
-            "Type a jj command, as in a terminal"
-        } else {
-            "Type a jj command, or \u{2191} for recent ones"
-        };
-        return container(
-            text(label)
-                .size(text_size::BODY)
-                .color(theme.subtle_text)
-                .font(ui.config.ui_font),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .padding([24, 16])
-        .style(move |_| container::Style {
-            background: Some(Background::Color(theme.panel_background_elevated)),
-            ..container::Style::default()
-        })
-        .into();
-    }
-    let mut list = column![].spacing(0);
-    for (index, completion) in command.completions.iter().enumerate() {
-        let selected = index == command.selected;
-        list = list.push(
-            mouse_area(palette::row_shell(
-                completion_row(ui, theme, completion),
-                selected,
-                theme,
-            ))
-            .on_press(Message::Palette(PaletteMessage::AcceptIndex(0, index)))
-            .on_enter(Message::Palette(PaletteMessage::SelectIndex(0, index))),
-        );
-    }
-    crate::ui::scrollable(list.padding(RESULTS_INSET), theme)
-        .id(palette::results_scrollable_id(0))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-}
-
-/// One candidate: a glyph for its kind, the text it inserts, and its help.
-pub(crate) fn completion_row<'a>(
-    ui: &Diffui,
-    theme: ThemeSpec,
-    completion: &Completion,
-) -> Element<'a, Message> {
-    let mono = ui.config.mono_font;
-    let font = ui.config.ui_font;
-    let (glyph, glyph_color) = completion_glyph(completion.kind, theme);
-    let label_color = match completion.kind {
-        CompletionKind::Revision => theme.accent,
-        CompletionKind::Bookmark | CompletionKind::RemoteBookmark => theme.lane_base,
-        _ => theme.text,
-    };
-    typography::baseline_row(
-        [
-            palette::glyph_icon(glyph, glyph_color),
-            Aligned::gap(GLYPH_GAP),
-            Aligned::text(
-                text(completion.label.clone())
-                    .size(text_size::BODY)
-                    .font(mono)
-                    .color(label_color)
-                    .wrapping(Wrapping::None),
-                mono,
-                text_size::BODY,
-            ),
-            Aligned::gap(theme::space::MD),
-            Aligned::text(
-                text(completion.detail.clone())
-                    .size(text_size::CAPTION)
-                    .font(font)
-                    .color(theme.subtle_text)
-                    .width(Length::Fill)
-                    .wrapping(Wrapping::None)
-                    .ellipsis(Ellipsis::End),
-                font,
-                text_size::CAPTION,
-            ),
-        ],
-        0.0,
-    )
-}
-
 pub(crate) fn completion_glyph(kind: CompletionKind, theme: ThemeSpec) -> (&'static str, Color) {
     match kind {
         CompletionKind::Subcommand => (icons::TERMINAL, theme.modified_token),
@@ -482,7 +165,7 @@ pub(crate) fn completion_glyph(kind: CompletionKind, theme: ThemeSpec) -> (&'sta
         CompletionKind::Value => (icons::CHECK, theme.subtle_text),
         CompletionKind::Function | CompletionKind::Alias => (icons::CODE, theme.info),
         CompletionKind::Bookmark | CompletionKind::RemoteBookmark => {
-            (icons::HASH, theme.modified_token)
+            (crate::overlay_kit::glyph::BOOKMARK, theme.modified_token)
         }
         CompletionKind::Tag => (icons::TAG, theme.modified_token),
         CompletionKind::Remote => (icons::FETCH, theme.info),
@@ -490,83 +173,6 @@ pub(crate) fn completion_glyph(kind: CompletionKind, theme: ThemeSpec) -> (&'sta
         CompletionKind::Path => (icons::FILE, theme.info),
         CompletionKind::History => (icons::HISTORY, theme.subtle_text),
     }
-}
-
-/// The footer: the kind badge and what Enter does, in words.
-pub(crate) fn footer<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    command: &'a CommandLine,
-) -> Element<'a, Message> {
-    let font = ui.config.ui_font;
-    let mono = ui.config.mono_font;
-    let plan = ui.plan(command);
-    let mut lead: Vec<Aligned<'a, Message>> = Vec::new();
-    if let Some(kind) = plan.kind {
-        lead.push(badge(kind, font, theme));
-        lead.push(Aligned::gap(theme::space::SM));
-    }
-    let blocked = matches!(plan.state, PlanState::Blocked { .. });
-    let words = if plan.words.is_empty() {
-        crate::prose::Prose::from(if blocked {
-            "Fix the line to run it"
-        } else {
-            ""
-        })
-    } else {
-        plan.words.clone()
-    };
-    lead.push(sentence(&words, font, mono, theme.text, theme));
-    let (key, label, live) = match &plan.state {
-        PlanState::Ready(_) => ("\u{21b5}", enter_label(plan.kind), true),
-        PlanState::Pending => ("", "Resolving\u{2026}", false),
-        PlanState::Blocked { .. } => ("\u{21b5}", enter_label(plan.kind), false),
-    };
-    lead.push(Aligned::gap(theme::space::LG));
-    let hint_color = if live {
-        theme.muted_text
-    } else {
-        theme::mix(theme.subtle_text, theme.panel_background, 0.4)
-    };
-    if !key.is_empty() {
-        lead.push(Aligned::text(
-            text(key)
-                .size(text_size::CAPTION)
-                .font(font)
-                .color(hint_color),
-            font,
-            text_size::CAPTION,
-        ));
-        lead.push(Aligned::gap(theme::space::XS));
-    }
-    lead.push(Aligned::text(
-        text(label)
-            .size(text_size::CAPTION)
-            .font(font)
-            .color(if live { theme.subtle_text } else { hint_color }),
-        font,
-        text_size::CAPTION,
-    ));
-    container(typography::baseline_row(lead, 0.0))
-        .padding([0.0, CONTENT_X])
-        .width(Length::Fill)
-        .height(Length::Fixed(palette::FOOTER_HEIGHT))
-        .center_y(Length::Fixed(palette::FOOTER_HEIGHT))
-        .style(move |_| palette::footer_style(theme))
-        .into()
-}
-
-/// A one-line sentence that shares the row's baseline with its badge or
-/// glyph, clipped at the row's end.
-fn sentence<'a>(
-    words: &crate::prose::Prose,
-    font: iced::Font,
-    mono: iced::Font,
-    color: Color,
-    theme: ThemeSpec,
-) -> Aligned<'a, Message> {
-    typography::group(words.runs(font, mono, color, theme, text_size::UI), 0.0)
-        .map(|line| container(line).width(Length::Fill).clip(true).into())
 }
 
 fn enter_label(kind: Option<CommandKind>) -> &'static str {
@@ -578,26 +184,560 @@ fn enter_label(kind: Option<CommandKind>) -> &'static str {
     }
 }
 
+/// The command line's input: the `jj` it always starts with as a solid chip,
+/// then a one-line editor in the code font holding the rest, its words
+/// coloured over the editor's own layout, so the text, the caret and the
+/// selection can never drift apart.
+pub(crate) fn input(
+    ui: &Diffui,
+    look: Look,
+    query: &str,
+    command: &CommandLine,
+    focused: bool,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    // The field holds what follows the `jj ` the chip stands for; offsets into
+    // the line move by its length.
+    let shown = query.strip_prefix(PREFIX).unwrap_or(query);
+    let offset = query.len() - shown.len();
+    let colors = painted_roles(ui, query, command)
+        .into_iter()
+        .filter_map(|(range, role)| {
+            let start = range.start.max(offset);
+            (range.end > start)
+                .then(|| (start - offset..range.end - offset, role_color(role, theme)))
+        })
+        .collect();
+    let mut spec =
+        input::FieldSpec::new(COMMAND_INPUT_ID, shown).placeholder("Subcommand and arguments");
+    if focused {
+        let on_edit = Diffui::listen(cx, |this, (line, cursor): &(String, usize), _, cx| {
+            this.command_line_edit(format!("{PREFIX}{line}"), cursor + PREFIX.len(), cx);
+        });
+        let on_submit = Diffui::listen(cx, |this, _: &(), _, cx| this.palette_submit(cx));
+        spec = spec
+            .on_edit(move |line, cursor, window, cx| on_edit(&(line, cursor), window, cx))
+            .on_submit(move |window, cx| on_submit(&(), window, cx));
+    }
+    let styled = input::StyledLook {
+        submit_on_enter: true,
+        colors,
+        ..Default::default()
+    };
+    let line_height = text_size::BODY_LG * typography::DEFAULT_LINE_HEIGHT;
+    div()
+        .w_full()
+        .flex_none()
+        .h(px(INPUT_BAND))
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(CONTENT_X))
+        .font(mono.gpui())
+        .child(prefix_chip(look))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                // The editor keeps its own margin before the text.
+                .ml(px(GLYPH_GAP - EDITOR_MARGIN))
+                .child(
+                    input::styled_text(spec, styled, mono, text_size::BODY_LG, window, cx)
+                        .with_size(gpui_kit::component::Size::XSmall)
+                        .line_height(px(line_height))
+                        .h(px(line_height)),
+                ),
+        )
+        .child(ui::chord(
+            crate::overlay_kit::bound_keys(
+                ui,
+                crate::commands::Context::Palette,
+                &["palette.back"],
+            ),
+            look,
+        ))
+        .into_any_element()
+}
+
+/// The solid `jj` the command line starts with.
+fn prefix_chip(look: Look) -> impl IntoElement {
+    let Look { theme, mono, .. } = look;
+    let mono = theme::emphasis_font(mono, Weight::SEMIBOLD);
+    div()
+        .flex_none()
+        .h(px(22.0))
+        .px(px(7.0))
+        .flex()
+        .items_center()
+        .rounded(px(theme::radius::XS))
+        .bg(theme.accent)
+        .child(typography::centered(
+            typography::line(
+                "jj",
+                mono,
+                text_size::BODY,
+                theme::primary_button_style(theme).label,
+            ),
+            mono,
+            text_size::BODY,
+        ))
+}
+
+/// The strip under the input: each revset argument with its count, or the
+/// error. Nothing when there's neither.
+pub(crate) fn args_strip(
+    ui: &Diffui,
+    look: Look,
+    line: &str,
+    command: &CommandLine,
+    _window: &mut Window,
+    _cx: &mut Cx,
+) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
+    let font = look.font;
+    let mono = look.mono;
+    let plan = ui.plan(command);
+    let blocked = match &plan.state {
+        PlanState::Blocked { reason, span } if command.error_visible(line, span.as_ref()) => {
+            Some(reason.clone())
+        }
+        _ => None,
+    };
+    if let Some(reason) = blocked {
+        // One line, cut rather than wrapped.
+        let line = typography::baseline_row(
+            [sentence(
+                &crate::prose::Prose::from_backticks(&reason),
+                theme.removed_text,
+                look,
+            )],
+            0.0,
+        );
+        return Some(
+            ui::Banner::new(ui::Tone::Danger)
+                .shape(ui::BannerShape::Strip)
+                .icon(icons::ALERT_TRIANGLE)
+                .child(line)
+                .build(look)
+                .into_any_element(),
+        );
+    }
+    let content = {
+        let slots = command.slots();
+        if slots.is_empty() {
+            return None;
+        }
+        let focused = command.focused_slot();
+        let mut parts: Vec<Aligned> = Vec::new();
+        for (index, slot) in slots.iter().enumerate().take(4) {
+            if index > 0 {
+                parts.push(Aligned::gap(theme::space::LG));
+            }
+            let is_focused = Some(index) == focused;
+            let flag = crate::cmdline::typed_flag(line, slot);
+            if !flag.is_empty() {
+                parts.push(Aligned::text(
+                    typography::line(flag.to_owned(), mono, text_size::BODY, theme.subtle_text),
+                    mono,
+                    text_size::BODY,
+                ));
+                parts.push(Aligned::gap(theme::space::XS));
+            }
+            let shown: String = if slot.revset.chars().count() > 18 {
+                let head: String = slot.revset.chars().take(17).collect();
+                format!("{head}\u{2026}")
+            } else {
+                slot.revset.clone()
+            };
+            let color = if is_focused {
+                theme.accent
+            } else {
+                theme.muted_text
+            };
+            parts.push(Aligned::text(
+                typography::line(shown, mono, text_size::BODY, color),
+                mono,
+                text_size::BODY,
+            ));
+            parts.push(Aligned::gap(theme::space::SM));
+            let (label, color) = match command.resolution(&slot.revset).map(|r| &r.result) {
+                Some(Ok(found)) => (found.count_label(), theme.accent),
+                Some(Err(_)) => ("no match".to_owned(), theme.removed_text),
+                None => ("\u{2026}".to_owned(), theme.subtle_text),
+            };
+            parts.push(crate::ui::tag(label, color, crate::ui::TagSize::Regular, font).aligned());
+        }
+        typography::baseline_row(parts, 0.0)
+    };
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .h(px(ARGS_HEIGHT))
+            .flex()
+            .items_center()
+            .px(px(CONTENT_X))
+            .overflow_hidden()
+            .child(content)
+            .into_any_element(),
+    )
+}
+
+/// Above the candidates, the command that would run; then the candidates in
+/// the palette's row style, grouped by kind. With none, a hint.
+pub(crate) fn results(
+    ui: &Diffui,
+    look: Look,
+    line: &str,
+    command: &CommandLine,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let preview = preview(ui, look, line, command);
+    let list = if command.completions.is_empty() {
+        let label = if line.trim_end() != "jj" {
+            "No suggestions here"
+        } else if ui.recents.cli.is_empty() {
+            "Type a jj command, as in a terminal"
+        } else {
+            "Type a jj command, or \u{2191} for recent ones"
+        };
+        palette::empty_results(look, label.to_owned()).into_any_element()
+    } else {
+        let id = "command-results";
+        let handle = ui::scroll_handle("command-results-scroll", window, cx)
+            .read(cx)
+            .clone();
+        ui::reveal_on_change(
+            "command-results-revealed",
+            &handle,
+            Some(command.selected),
+            |row| {
+                let (top, bottom) = palette::row_span(
+                    command
+                        .completions
+                        .iter()
+                        .map(|completion| completion_group(completion.kind)),
+                    row,
+                );
+                (top, bottom + 2.0 * RESULTS_INSET)
+            },
+            window,
+            cx,
+        );
+        let viewport = ui::scroll_viewport(&handle, window);
+        let items = palette::visible_results(
+            command
+                .completions
+                .iter()
+                .map(|completion| Some(completion_group(completion.kind))),
+            &handle,
+            viewport,
+            palette::ROW_HEIGHT,
+            |heading| palette::group_heading(heading, look).into_any_element(),
+            |index| {
+                let completion = &command.completions[index];
+                let selected = index == command.selected;
+                let body = candidate_row(ui, look, completion, selected, window, cx);
+                div()
+                    .id(("command-row", index))
+                    .child(palette::row_shell(body, selected, theme, window, cx))
+                    .on_mouse_move(cx.listener(
+                        move |this: &mut Diffui, _: &MouseMoveEvent, _, cx| {
+                            if this
+                                .command_line()
+                                .is_some_and(|command| command.selected != index)
+                            {
+                                this.act_on(cx, PaneSet::FLOATS, |this, _| {
+                                    this.palette_on_select_index(0, index)
+                                });
+                            }
+                        },
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        Diffui::listen(cx, move |this, _, _, cx| {
+                            this.palette_on_accept_index(0, index, cx);
+                        }),
+                    )
+                    .into_any_element()
+            },
+        );
+        let list = div().w_full().flex().flex_col().children(items);
+        palette::results_list(id.into(), &handle, list)
+    };
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .children(preview)
+        .child(div().flex_1().min_h_0().w_full().child(list))
+        .into_any_element()
+}
+
+/// The heading a candidate lists under.
+pub(crate) fn completion_group(kind: CompletionKind) -> &'static str {
+    match kind {
+        CompletionKind::Subcommand => "Subcommands",
+        CompletionKind::Flag => "Flags",
+        CompletionKind::Value => "Values",
+        CompletionKind::Function | CompletionKind::Alias => "Functions",
+        CompletionKind::Bookmark | CompletionKind::RemoteBookmark => "Bookmarks",
+        CompletionKind::Tag => "Tags",
+        CompletionKind::Remote => "Remotes",
+        CompletionKind::Revision => "Revisions",
+        CompletionKind::Path => "Paths",
+        CompletionKind::History => "Recent",
+    }
+}
+
+/// The command Enter would run, in full: the line as typed with the
+/// highlighted candidate ghosted in where it would go, what kind of command it
+/// is, and what it will do in words. Nothing on a bare `jj ` with nothing to
+/// offer.
+fn preview(ui: &Diffui, look: Look, line: &str, command: &CommandLine) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
+    let completion = command.completions.get(command.selected);
+    if line.trim_end() == "jj" && completion.is_none() {
+        return None;
+    }
+    let mono = look.mono;
+    let plan = ui.plan(command);
+    let line = line.trim_end_matches(['\n', '\r']);
+    let mut spans: Vec<crate::ellipsis::Span<'_>> = Vec::new();
+    // What a candidate would add, ghosted in. The kind and the words are the
+    // typed line's, so they show only while there's none: they'd describe
+    // something other than the line on show.
+    let mut ghosted = false;
+    match completion {
+        Some(completion) => {
+            let start = completion.replace.start.min(line.len());
+            let end = completion.replace.end.clamp(start, line.len());
+            let typed = line.get(start..end).unwrap_or("");
+            // What's typed of the candidate stays plain; the rest is ghosted.
+            let kept = if completion.insert.starts_with(typed) {
+                typed.len()
+            } else {
+                0
+            };
+            spans.push(crate::ellipsis::Span::new(
+                line.get(..start).unwrap_or(line),
+            ));
+            spans.push(crate::ellipsis::Span::new(&completion.insert[..kept]));
+            ghosted = kept < completion.insert.len();
+            spans.push(
+                crate::ellipsis::Span::new(&completion.insert[kept..]).color(theme.subtle_text),
+            );
+            spans.push(crate::ellipsis::Span::new(line.get(end..).unwrap_or("")));
+        }
+        None => spans.push(crate::ellipsis::Span::new(line)),
+    }
+    let mut head: Vec<Aligned> = Vec::new();
+    if let Some(kind) = plan.kind.filter(|_| !ghosted) {
+        head.push(badge(kind, look));
+        head.push(Aligned::gap(theme::space::MD));
+    }
+    head.push(
+        Aligned::text(
+            crate::overlay_kit::rich_line(mono, text_size::BODY, theme.text)
+                .w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(crate::ellipsis::rich_text(&spans, mono, theme.text)),
+            mono,
+            text_size::BODY,
+        )
+        .fill(),
+    );
+    let mut card = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::XS))
+        .px(px(theme::space::LG))
+        .py(px(10.0))
+        .map(|card| {
+            theme::squircle(
+                card,
+                theme::radius::MD,
+                Some(crate::overlay_kit::inset_fill(theme)),
+                Some(theme.border),
+            )
+        })
+        .child(typography::baseline_row(head, 0.0));
+    if !ghosted && !plan.words.is_empty() {
+        card = card.child(typography::baseline_row(
+            [sentence(&plan.words, theme.muted_text, look)],
+            0.0,
+        ));
+    }
+    Some(
+        div()
+            .w_full()
+            .flex_none()
+            .px(px(RESULTS_INSET))
+            .pt(px(RESULTS_INSET))
+            .child(card)
+            .into_any_element(),
+    )
+}
+
+/// One candidate: a glyph for its kind, the text it inserts, and its help.
+pub(crate) fn completion_row(
+    ui: &Diffui,
+    look: Look,
+    completion: &Completion,
+    selected: bool,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    candidate_row(ui, look, completion, selected, window, cx)
+}
+
+/// [`completion_row`], the highlighted one showing the key that takes it.
+fn candidate_row(
+    ui: &Diffui,
+    look: Look,
+    completion: &Completion,
+    selected: bool,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let mono = look.mono;
+    let font = look.font;
+    let (glyph, _) = completion_glyph(completion.kind, theme);
+    let label_color = match completion.kind {
+        CompletionKind::Revision => theme.accent,
+        CompletionKind::Bookmark | CompletionKind::RemoteBookmark => theme.lane_base,
+        _ => theme.text,
+    };
+    let text = typography::baseline_row(
+        [
+            palette::glyph_icon(glyph, palette::glyph_ink(selected, theme), window, cx),
+            Aligned::gap(GLYPH_GAP),
+            Aligned::text(
+                typography::line(completion.label.clone(), mono, text_size::BODY, label_color)
+                    .overflow_hidden()
+                    .text_ellipsis(),
+                mono,
+                text_size::BODY,
+            )
+            .shrink(),
+            Aligned::gap(theme::space::MD),
+            Aligned::text(
+                palette::filling(
+                    completion.detail.clone(),
+                    font,
+                    text_size::BODY,
+                    theme.subtle_text,
+                ),
+                font,
+                text_size::BODY,
+            )
+            .fill(),
+        ],
+        0.0,
+    )
+    .flex_1()
+    .min_w_0();
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::LG))
+        .child(text)
+        .when(selected, |row| {
+            row.child(ui::chord(
+                crate::overlay_kit::bound_keys(
+                    ui,
+                    crate::commands::Context::Palette,
+                    &["palette.actions"],
+                ),
+                look,
+            ))
+        })
+        .into_any_element()
+}
+
+/// The footer: the keys of the command line, and where what runs ends up.
+pub(crate) fn footer(
+    ui: &Diffui,
+    look: Look,
+    command: &CommandLine,
+    _window: &mut Window,
+    _cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let plan = ui.plan(command);
+    let enter = match &plan.state {
+        PlanState::Pending => "Resolving\u{2026}",
+        PlanState::Ready(_) | PlanState::Blocked { .. } => enter_label(plan.kind),
+    };
+    let lands = match plan.kind {
+        Some(CommandKind::View) => "Shows it in diffui",
+        Some(CommandKind::Mutation) => "Previews it before it runs",
+        Some(CommandKind::OpensUi) => "Opens the editor",
+        Some(CommandKind::Passthrough) | None => "Output opens in the CLI panel",
+    };
+    let hint = |keys: &[&str], label: &'static str| crate::overlay_kit::key_hint(keys, label, look);
+    crate::overlay_kit::footer(
+        crate::overlay_kit::Density::Strip,
+        crate::overlay_kit::MODAL_FOOT,
+        theme,
+    )
+    .children(crate::overlay_kit::bound_hint(
+        ui,
+        crate::commands::Context::Palette,
+        &["palette.actions"],
+        "Complete",
+        look,
+    ))
+    .child(hint(&[crate::keymap::key_label("enter")], enter))
+    .children(crate::overlay_kit::bound_hint(
+        ui,
+        crate::commands::Context::Palette,
+        &["palette.leave-command-line"],
+        "Back to commands",
+        look,
+    ))
+    .child(crate::overlay_kit::footer_note(lands, look).ml_auto())
+    .into_any_element()
+}
+
+/// A one-line sentence that shares the row's baseline with its badge or
+/// glyph, clipped at the row's end.
+fn sentence(words: &crate::prose::Prose, color: Color, look: Look) -> Aligned {
+    typography::group(words.runs(look, color, text_size::BODY), 0.0)
+        .map(|line| {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(line)
+                .into_any_element()
+        })
+        .fill()
+}
+
 /// The kind badge: View, Preview, Opens editor, CLI.
-pub(crate) fn badge<'a>(
-    kind: CommandKind,
-    font: iced::Font,
-    theme: ThemeSpec,
-) -> Aligned<'a, Message> {
+pub(crate) fn badge(kind: CommandKind, look: Look) -> Aligned {
+    let Look { theme, font, .. } = look;
     let color = match kind {
         CommandKind::View => theme.info,
         CommandKind::Mutation => theme.accent,
         CommandKind::OpensUi => theme.modified_token,
         CommandKind::Passthrough => theme.muted_text,
     };
-    Aligned::chip(
-        text(kind.label())
-            .size(text_size::CAPTION)
-            .font(theme::emphasis_font(font, iced::font::Weight::Medium))
-            .color(color),
-        theme::emphasis_font(font, iced::font::Weight::Medium),
-        text_size::CAPTION,
-        Padding::from([1.0, 6.0]),
-        move |_| crate::chip::container_style(color),
+    crate::ui::tag(
+        kind.label(),
+        color,
+        crate::ui::TagSize::Regular,
+        theme::emphasis_font(font, Weight::MEDIUM),
     )
+    .aligned()
 }

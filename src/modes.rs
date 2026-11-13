@@ -1,15 +1,12 @@
 //! The mode stack: what owns the keyboard, and what is on screen because of
 //! it.
 //!
-//! An overlay used to be a field of its own — `palette: Option<…>`,
-//! `confirm: Option<…>`, `find: Option<…>` — and "who owns the keyboard" was a
-//! tuple of eight booleans read in a hardcoded order inside `subscription`.
-//! Every bug that model produced was the same bug: a flag that was set while
-//! its overlay wasn't visible (the description editor eating keys after a view
-//! switch), or one that wasn't checked at all (the popup menu letting keys fall
-//! through to file navigation).
+//! A mode is on screen exactly while it is on a stack, so nothing can hold
+//! the keyboard for an overlay that isn't showing (the description editor
+//! eating keys after a view switch) or let keys fall through one that is (the
+//! popup menu passing them to file navigation).
 //!
-//! Now there are two stacks and the top of them decides. Global overlays live
+//! There are two stacks and the top of them decides. Global overlays live
 //! on [`crate::Diffui`]; the ones bound to one tab's document live on
 //! [`crate::TabState`], and the keyboard reads the *active* tab's — so a tab
 //! switch can never leave an off-screen mode holding the keys.
@@ -18,118 +15,119 @@
 //! arriving while one dialog is open queues behind it and is raised when that
 //! one resolves), every other kind replaces its own peer.
 
-use iced::keyboard;
-
 use crate::commands::Context;
 use crate::find::FindState;
 use crate::keymap::{Chord, ChordKey};
+use crate::keys as keyboard;
 use crate::menu::OverlayMenu;
 use crate::palette::PaletteState;
 use crate::{ConfirmDialog, DescriptionEditor, Diffui, DraftUi, OpenRepoDialog, TabState};
 
-/// A window-level mode. These sit above every tab, so they live on the app.
-#[derive(Debug)]
-pub(crate) enum Mode {
-    Palette(PaletteState),
-    /// A popup menu (toolbar dropdown or right-click). Non-macOS only; macOS
-    /// pops a native `NSMenu`, which owns the keyboard itself while it runs,
-    /// so nothing there constructs this variant and the dead-code lint would
-    /// otherwise fail a macOS build with warnings denied.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Menu(OverlayMenu),
-    Confirm(ConfirmDialog),
-    OpenRepo(OpenRepoDialog),
-    ActivityPopover,
-    /// The bookmark-name prompt (create / rename).
-    NamePrompt(crate::bookmarks::NamePrompt),
-    /// The keyboard-shortcut cheat sheet.
-    Shortcuts,
-    /// git or ssh asking for a credential.
-    Credential(crate::credentials::CredentialDialog),
-    /// A jj CLI run's output.
-    CliOutput(crate::cli_output::OutputView),
-}
-
-/// A mode bound to one tab: it names rows, files, or text that belong to that
-/// tab's document and would point at the wrong thing anywhere else.
-#[derive(Debug)]
-pub(crate) enum TabMode {
-    Find(FindState),
-    Description(DescriptionEditor),
-    /// Target mode — an in-progress rebase/squash/merge destination pick.
-    Draft(DraftUi),
-    /// Line-select mode: the diff's changed lines are pickable one by one.
-    Lines(crate::changes::LineSelect),
-}
-
-/// What a mode is, independent of what it holds. Used to decide whether a push
-/// replaces an existing mode or stacks on top of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModeKind {
-    Palette,
-    Menu,
-    Confirm,
-    OpenRepo,
-    ActivityPopover,
-    Shortcuts,
-    Find,
-    Description,
-    Draft,
-    NamePrompt,
-    Lines,
-    Credential,
-    CliOutput,
-}
-
-impl Mode {
-    pub(crate) fn kind(&self) -> ModeKind {
-        match self {
-            Mode::Palette(_) => ModeKind::Palette,
-            Mode::Menu(_) => ModeKind::Menu,
-            Mode::Confirm(_) => ModeKind::Confirm,
-            Mode::OpenRepo(_) => ModeKind::OpenRepo,
-            Mode::ActivityPopover => ModeKind::ActivityPopover,
-            Mode::NamePrompt(_) => ModeKind::NamePrompt,
-            Mode::Shortcuts => ModeKind::Shortcuts,
-            Mode::Credential(_) => ModeKind::Credential,
-            Mode::CliOutput(_) => ModeKind::CliOutput,
+/// The modes, declared once: each variant, the keyboard context it puts the
+/// keys in, and its accessors (`get` and `get_mut` on the stack's owner).
+/// Generates [`Mode`], [`TabMode`], [`ModeKind`] and their `kind` and
+/// `context`.
+macro_rules! modes {
+    ($(
+        $(#[$enum_meta:meta])*
+        $Enum:ident on $Owner:ty {
+            $(
+                $(#[$meta:meta])*
+                $Variant:ident $(($Payload:ty $(; $get:ident $(, $get_mut:ident)?)?))? => $Context:ident,
+            )*
         }
+    )*) => {
+        $(
+            $(#[$enum_meta])*
+            #[derive(Debug)]
+            pub(crate) enum $Enum {
+                $( $(#[$meta])* $Variant $(($Payload))?, )*
+            }
+
+            impl $Enum {
+                pub(crate) fn kind(&self) -> ModeKind {
+                    match self {
+                        $( Self::$Variant { .. } => ModeKind::$Variant, )*
+                    }
+                }
+
+                pub(crate) fn context(&self) -> Context {
+                    match self {
+                        $( Self::$Variant { .. } => Context::$Context, )*
+                    }
+                }
+            }
+
+            impl $Owner {
+                $($($(
+                    pub(crate) fn $get(&self) -> Option<&$Payload> {
+                        match self.mode(ModeKind::$Variant) {
+                            Some($Enum::$Variant(state)) => Some(state),
+                            _ => None,
+                        }
+                    }
+                    $(
+                        pub(crate) fn $get_mut(&mut self) -> Option<&mut $Payload> {
+                            match self.mode_mut(ModeKind::$Variant) {
+                                Some($Enum::$Variant(state)) => Some(state),
+                                _ => None,
+                            }
+                        }
+                    )?
+                )?)?)*
+            }
+        )*
+
+        /// What a mode is, independent of what it holds. Used to decide whether
+        /// a push replaces an existing mode or stacks on top of it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ModeKind {
+            $($( $Variant, )*)*
+        }
+    };
+}
+
+modes! {
+    /// A window-level mode. These sit above every tab, so they live on the
+    /// app, and each floats above the whole shell.
+    Mode on Diffui {
+        Palette(PaletteState; palette, palette_mut) => Palette,
+        /// A popup menu (toolbar dropdown or right-click). Non-macOS only;
+        /// macOS pops a native `NSMenu`, which owns the keyboard itself while
+        /// it runs, so nothing there constructs this variant and the dead-code
+        /// lint would otherwise fail a macOS build with warnings denied.
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        Menu(OverlayMenu; menu, menu_mut) => Menu,
+        /// A guarded mutation's confirmation. These stack: `confirm` is the
+        /// one on top, and the ones under it surface as it resolves.
+        Confirm(ConfirmDialog; confirm) => Confirm,
+        OpenRepo(OpenRepoDialog; open_repo_dialog, open_repo_dialog_mut) => OpenRepo,
+        ActivityPopover => ActivityPopover,
+        /// The bookmark-name prompt (create / rename).
+        NamePrompt(crate::bookmarks::NamePrompt) => Prompt,
+        /// The keyboard-shortcut cheat sheet.
+        Shortcuts => Shortcuts,
+        /// The settings dialog.
+        Settings => Settings,
+        /// git or ssh asking for a credential.
+        Credential(crate::credentials::CredentialDialog) => Credential,
+        /// A jj CLI run's output.
+        CliOutput(crate::cli_output::OutputView) => Output,
     }
 
-    pub(crate) fn context(&self) -> Context {
-        match self {
-            Mode::Palette(_) => Context::Palette,
-            Mode::Menu(_) => Context::Menu,
-            Mode::Confirm(_) => Context::Confirm,
-            Mode::OpenRepo(_) => Context::OpenRepo,
-            Mode::ActivityPopover => Context::ActivityPopover,
-            Mode::NamePrompt(_) => Context::Prompt,
-            Mode::Shortcuts => Context::Shortcuts,
-            Mode::Credential(_) => Context::Credential,
-            Mode::CliOutput(_) => Context::Output,
-        }
+    /// A mode bound to one tab: it names rows, files, or text that belong to
+    /// that tab's document and would point at the wrong thing anywhere else.
+    TabMode on TabState {
+        Find(FindState; find, find_mut) => Find,
+        Description(DescriptionEditor; description_editor, description_editor_mut) => Description,
+        /// Target mode — an in-progress rebase/squash/merge destination pick.
+        Draft(DraftUi; op_draft, op_draft_mut) => Draft,
+        /// Line-select mode: the diff's changed lines are pickable one by one.
+        Lines(crate::changes::LineSelect; line_select) => Lines,
     }
 }
 
 impl TabMode {
-    pub(crate) fn kind(&self) -> ModeKind {
-        match self {
-            TabMode::Find(_) => ModeKind::Find,
-            TabMode::Description(_) => ModeKind::Description,
-            TabMode::Draft(_) => ModeKind::Draft,
-            TabMode::Lines(_) => ModeKind::Lines,
-        }
-    }
-
-    pub(crate) fn context(&self) -> Context {
-        match self {
-            TabMode::Find(_) => Context::Find,
-            TabMode::Description(_) => Context::Description,
-            TabMode::Draft(_) => Context::Draft,
-            TabMode::Lines(_) => Context::Lines,
-        }
-    }
-
     /// Where this mode sits in the tab's stack, regardless of the order the
     /// two were opened in.
     ///
@@ -175,15 +173,24 @@ pub(crate) fn needs_unconsumed(context: Context, chord: &Chord) -> bool {
         Context::Base | Context::Lines => !chord.mods.any_command_like() || is_text_undo(chord),
         Context::Draft => {
             (!chord.mods.any_command_like()
-                && !matches!(chord.key, ChordKey::Named(keyboard::key::Named::Escape)))
+                && !matches!(chord.key, ChordKey::Named(keyboard::Named::Escape)))
                 || is_text_undo(chord)
         }
+        // ⌘C copies what's selected in the output; only with nothing selected
+        // does it mean the whole output.
+        Context::Output => is_copy(chord),
         _ => false,
     }
 }
 
+fn is_copy(chord: &Chord) -> bool {
+    chord.mods.command
+        && !chord.mods.alt
+        && matches!(&chord.key, ChordKey::Char(c) if c.eq_ignore_ascii_case("c"))
+}
+
 /// ⌃A, ⌃E, ⌃K, …: on macOS a focused text field takes them as caret and
-/// delete keys ([`crate::ui::cocoa_text_key`]) and reports the key consumed,
+/// delete keys ([`crate::keys::cocoa_text_key`]) and reports the key consumed,
 /// so a command bound to one yields while a field has it, as in native apps.
 fn is_cocoa_text_chord(chord: &Chord) -> bool {
     let ChordKey::Char(key) = &chord.key else {
@@ -204,7 +211,7 @@ fn is_cocoa_text_chord(chord: &Chord) -> bool {
             modifiers |= modifier;
         }
     }
-    cfg!(target_os = "macos") && crate::ui::cocoa_text_key(latin, modifiers, true).is_some()
+    cfg!(target_os = "macos") && crate::keys::cocoa_text_key(latin, modifiers, true).is_some()
 }
 
 /// ⌘Z / ⌘⇧Z: a focused text field (the revset box) takes them as its own
@@ -266,57 +273,6 @@ impl Diffui {
         self.modes.iter_mut().rev().find(|mode| mode.kind() == kind)
     }
 
-    pub(crate) fn palette(&self) -> Option<&PaletteState> {
-        match self.mode(ModeKind::Palette) {
-            Some(Mode::Palette(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn palette_mut(&mut self) -> Option<&mut PaletteState> {
-        match self.mode_mut(ModeKind::Palette) {
-            Some(Mode::Palette(state)) => Some(state),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn menu(&self) -> Option<&OverlayMenu> {
-        match self.mode(ModeKind::Menu) {
-            Some(Mode::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn menu_mut(&mut self) -> Option<&mut OverlayMenu> {
-        match self.mode_mut(ModeKind::Menu) {
-            Some(Mode::Menu(menu)) => Some(menu),
-            _ => None,
-        }
-    }
-
-    /// The confirmation on top. A second one raised while this is open sits
-    /// under it and surfaces when it resolves.
-    pub(crate) fn confirm(&self) -> Option<&ConfirmDialog> {
-        match self.mode(ModeKind::Confirm) {
-            Some(Mode::Confirm(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn open_repo_dialog(&self) -> Option<&OpenRepoDialog> {
-        match self.mode(ModeKind::OpenRepo) {
-            Some(Mode::OpenRepo(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn open_repo_dialog_mut(&mut self) -> Option<&mut OpenRepoDialog> {
-        match self.mode_mut(ModeKind::OpenRepo) {
-            Some(Mode::OpenRepo(dialog)) => Some(dialog),
-            _ => None,
-        }
-    }
-
     pub(crate) fn activity_popover_open(&self) -> bool {
         self.mode(ModeKind::ActivityPopover).is_some()
     }
@@ -348,54 +304,132 @@ impl TabState {
     fn mode_mut(&mut self, kind: ModeKind) -> Option<&mut TabMode> {
         self.modes.iter_mut().rev().find(|mode| mode.kind() == kind)
     }
+}
 
-    pub(crate) fn find(&self) -> Option<&FindState> {
-        match self.mode(ModeKind::Find) {
-            Some(TabMode::Find(state)) => Some(state),
-            _ => None,
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use crate::tabs::tests::{app, push_tab};
+    use crate::{ConfirmDialog, OpenRepoDialog, PendingMutation, TabId, activity, mutations};
+
+    fn confirm(title: &str) -> ConfirmDialog {
+        ConfirmDialog {
+            title: title.into(),
+            body: crate::prose::Prose::new(),
+            confirm_label: "Do it".to_owned(),
+            look: Default::default(),
+            pending: PendingMutation {
+                op: mutations::MutationOp::Undo { operation_id: None },
+                tab_id: TabId(0),
+                activity_id: activity::ActivityId(0),
+                allow_immutable: false,
+            },
         }
     }
 
-    pub(crate) fn find_mut(&mut self) -> Option<&mut FindState> {
-        match self.mode_mut(ModeKind::Find) {
-            Some(TabMode::Find(state)) => Some(state),
-            _ => None,
-        }
+    #[test]
+    fn the_top_of_the_stack_owns_the_keyboard() {
+        let mut ui = app();
+        assert_eq!(ui.key_context(), Context::Base);
+        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
+        assert_eq!(ui.key_context(), Context::OpenRepo);
+        ui.push_mode(Mode::Confirm(confirm("first")));
+        assert_eq!(ui.key_context(), Context::Confirm);
+        ui.pop_mode(ModeKind::Confirm);
+        assert_eq!(ui.key_context(), Context::OpenRepo);
+        ui.pop_mode(ModeKind::OpenRepo);
+        assert_eq!(ui.key_context(), Context::Base);
     }
 
-    pub(crate) fn description_editor(&self) -> Option<&DescriptionEditor> {
-        match self.mode(ModeKind::Description) {
-            Some(TabMode::Description(editor)) => Some(editor),
-            _ => None,
-        }
+    #[test]
+    fn a_second_mode_of_a_kind_replaces_the_first_but_confirmations_queue() {
+        let mut ui = app();
+        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
+        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
+        assert_eq!(ui.modes.len(), 1, "two dialogs would fight over one card");
+
+        // A confirmation raised while one is open waits under it: dismissing
+        // the top one surfaces the next rather than dropping its mutation.
+        ui.push_mode(Mode::Confirm(confirm("first")));
+        ui.push_mode(Mode::Confirm(confirm("second")));
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("second")
+        );
+        ui.pop_mode(ModeKind::Confirm);
+        assert_eq!(
+            ui.confirm().map(|d| d.title.to_string()).as_deref(),
+            Some("first")
+        );
     }
 
-    pub(crate) fn description_editor_mut(&mut self) -> Option<&mut DescriptionEditor> {
-        match self.mode_mut(ModeKind::Description) {
-            Some(TabMode::Description(editor)) => Some(editor),
-            _ => None,
-        }
+    #[test]
+    fn a_per_tab_mode_only_owns_the_keyboard_while_its_tab_is_on_screen() {
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let _second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 0;
+            ui.tab_mut(first)
+                .expect("the tab is open")
+                .push_mode(TabMode::Find(crate::find::FindState::default()));
+            assert_eq!(ui.key_context(), Context::Find);
+
+            // The find bar belongs to the tab it was opened on; switching away
+            // must not leave it holding keys for a document it isn't showing.
+            ui.active = 1;
+            assert_eq!(ui.key_context(), Context::Base);
+            ui.active = 0;
+            assert_eq!(ui.key_context(), Context::Find);
+        });
     }
 
-    pub(crate) fn op_draft(&self) -> Option<&DraftUi> {
-        match self.mode(ModeKind::Draft) {
-            Some(TabMode::Draft(draft)) => Some(draft),
-            _ => None,
-        }
+    #[test]
+    fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
+        crate::tabs::tests::with_cx(|_| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/first");
+            ui.active = 0;
+            // This tab has no diff to pick lines from.
+            ui.tab_mut(tab)
+                .expect("the tab is open")
+                .push_mode(TabMode::Lines(crate::changes::LineSelect::new(
+                    diffui_core::RevisionSelection::WorkingCopy,
+                    0,
+                )));
+            assert_eq!(ui.key_context(), Context::Base);
+        });
     }
 
-    pub(crate) fn line_select(&self) -> Option<&crate::changes::LineSelect> {
-        match self.mode(ModeKind::Lines) {
-            Some(TabMode::Lines(mode)) => Some(mode),
-            _ => None,
-        }
-    }
+    #[test]
+    fn switching_tabs_closes_the_description_editor() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let first = push_tab(&mut ui, "/tmp/first");
+            let second = push_tab(&mut ui, "/tmp/second");
+            ui.active = 0;
+            ui.tab_mut(first)
+                .expect("the tab is open")
+                .push_mode(TabMode::Description(crate::DescriptionEditor {
+                    target: diffui_core::RevisionSelection::WorkingCopy,
+                    original: String::new(),
+                    content: String::new(),
+                    saving_activity: None,
+                    switch_blocked: false,
+                    commit: false,
+                    wc_change: None,
+                }));
 
-    pub(crate) fn op_draft_mut(&mut self) -> Option<&mut DraftUi> {
-        match self.mode_mut(ModeKind::Draft) {
-            Some(TabMode::Draft(draft)) => Some(draft),
-            _ => None,
-        }
+            ui.activate_tab(second, cx);
+
+            assert_eq!(ui.active_tab_id(), Some(second));
+            assert!(
+                ui.tab_mut(first)
+                    .expect("the tab is open")
+                    .description_editor()
+                    .is_none()
+            );
+        });
     }
 }
 
@@ -475,6 +509,12 @@ mod tests {
     /// A command bound to ⌃A must not take it from the field moving its caret.
     #[cfg(target_os = "macos")]
     #[test]
+    fn a_selection_in_the_output_keeps_its_copy() {
+        assert!(needs_unconsumed(Context::Output, &chord("cmd+c")));
+        assert!(!needs_unconsumed(Context::Output, &chord("esc")));
+    }
+
+    #[test]
     fn a_focused_input_keeps_its_cocoa_chords() {
         for context in [Context::Base, Context::Palette, Context::Draft] {
             for raw in ["ctrl+a", "ctrl+e", "ctrl+k", "ctrl+n", "ctrl+shift+a"] {
@@ -484,124 +524,5 @@ mod tests {
             assert!(!needs_unconsumed(context, &chord("cmd+a")));
             assert!(!needs_unconsumed(context, &chord("ctrl+alt+a")));
         }
-    }
-}
-
-#[cfg(test)]
-mod stack_tests {
-    use super::*;
-    use crate::tabs::tests::{app, push_tab};
-    use crate::{ConfirmDialog, OpenRepoDialog, PendingMutation, TabId, activity, mutations};
-
-    fn confirm(title: &str) -> ConfirmDialog {
-        ConfirmDialog {
-            title: title.into(),
-            body: crate::prose::Prose::new(),
-            confirm_label: "Do it".to_owned(),
-            pending: PendingMutation {
-                op: mutations::MutationOp::Undo { operation_id: None },
-                tab_id: TabId(0),
-                activity_id: activity::ActivityId(0),
-                allow_immutable: false,
-            },
-        }
-    }
-
-    #[test]
-    fn the_top_of_the_stack_owns_the_keyboard() {
-        let mut ui = app();
-        assert_eq!(ui.key_context(), Context::Base);
-        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
-        assert_eq!(ui.key_context(), Context::OpenRepo);
-        ui.push_mode(Mode::Confirm(confirm("first")));
-        assert_eq!(ui.key_context(), Context::Confirm);
-        ui.pop_mode(ModeKind::Confirm);
-        assert_eq!(ui.key_context(), Context::OpenRepo);
-        ui.pop_mode(ModeKind::OpenRepo);
-        assert_eq!(ui.key_context(), Context::Base);
-    }
-
-    #[test]
-    fn a_second_mode_of_a_kind_replaces_the_first_but_confirmations_queue() {
-        let mut ui = app();
-        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
-        ui.push_mode(Mode::OpenRepo(OpenRepoDialog::default()));
-        assert_eq!(ui.modes.len(), 1, "two dialogs would fight over one card");
-
-        // A confirmation raised while one is open waits under it: dismissing
-        // the top one surfaces the next rather than dropping its mutation.
-        ui.push_mode(Mode::Confirm(confirm("first")));
-        ui.push_mode(Mode::Confirm(confirm("second")));
-        assert_eq!(
-            ui.confirm().map(|d| d.title.to_string()).as_deref(),
-            Some("second")
-        );
-        ui.pop_mode(ModeKind::Confirm);
-        assert_eq!(
-            ui.confirm().map(|d| d.title.to_string()).as_deref(),
-            Some("first")
-        );
-    }
-
-    #[test]
-    fn a_per_tab_mode_only_owns_the_keyboard_while_its_tab_is_on_screen() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let _second = push_tab(&mut ui, "/tmp/second");
-        ui.active = 0;
-        ui.tab_mut(first)
-            .expect("the tab is open")
-            .push_mode(TabMode::Find(crate::find::FindState::default()));
-        assert_eq!(ui.key_context(), Context::Find);
-
-        // The find bar belongs to the tab it was opened on; switching away
-        // must not leave it holding keys for a document it isn't showing.
-        ui.active = 1;
-        assert_eq!(ui.key_context(), Context::Base);
-        ui.active = 0;
-        assert_eq!(ui.key_context(), Context::Find);
-    }
-
-    #[test]
-    fn a_line_select_mode_that_no_longer_applies_holds_no_keys() {
-        let mut ui = app();
-        let tab = push_tab(&mut ui, "/tmp/first");
-        ui.active = 0;
-        // This tab has no diff to pick lines from.
-        ui.tab_mut(tab)
-            .expect("the tab is open")
-            .push_mode(TabMode::Lines(crate::changes::LineSelect::new(
-                diffui_core::RevisionSelection::WorkingCopy,
-                0,
-            )));
-        assert_eq!(ui.key_context(), Context::Base);
-    }
-
-    #[test]
-    fn switching_tabs_closes_the_description_editor() {
-        let mut ui = app();
-        let first = push_tab(&mut ui, "/tmp/first");
-        let second = push_tab(&mut ui, "/tmp/second");
-        ui.active = 0;
-        ui.tab_mut(first)
-            .expect("the tab is open")
-            .push_mode(TabMode::Description(crate::DescriptionEditor {
-                target: diffui_core::RevisionSelection::WorkingCopy,
-                original: String::new(),
-                content: iced::widget::text_editor::Content::new(),
-                saving_activity: None,
-                switch_blocked: false,
-                commit: false,
-            }));
-
-        let _ = ui.activate_tab(second);
-
-        assert_eq!(ui.active_tab_id(), Some(second));
-        assert!(
-            ui.tab_mut(first)
-                .expect("the tab is open")
-                .description_editor()
-                .is_none()
-        );
     }
 }

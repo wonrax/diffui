@@ -3,71 +3,53 @@
 //! UI glyphs come from the [Lucide](https://lucide.dev) icon font, fetched at
 //! build time (see `build.rs`) and embedded here. Rendering them as **text**
 //! (rather than rasterized SVG) is deliberate: glyphs go through the same
-//! cosmic-text rasterizer + glyph-atlas cache as the rest of our text, so they
-//! stay crisp at every size, tint for free via `.color()`, and — crucially —
-//! carry **identical metrics on every OS**. The platform UI font differs across
-//! macOS/Windows/Linux, so glyphs drawn from it (the old `text("\u{2193}")`
-//! approach) shifted vertically per platform; a bundled font we ship removes
-//! that variance entirely.
-//!
-//! One-off icons that aren't in Lucide are imported as monochrome SVG via
-//! [`svg_icon`] and recolored to the theme.
+//! rasterizer and glyph atlas as the rest of our text, so they stay crisp at
+//! every size, tint for free, and carry **identical metrics on every OS**.
 
-// This module is a catalog: the codepoint constants and `svg_icon` helper are a
-// shared palette consumed incrementally as call sites migrate off the old
-// text-glyph icons, so some entries are intentionally ahead of their first use.
+// This module is a catalog: some entries are intentionally ahead of their
+// first use.
 #![allow(dead_code)]
 
-use iced::{
-    Color, Element, Length,
-    widget::{container, svg, text, text::LineHeight},
-};
+use gpui_kit::prelude::*;
+use gpui_kit::{App, Div, div, px};
+
+use crate::theme::{Color, Font};
 
 /// The Lucide TTF, fetched + checksummed by `build.rs` into `OUT_DIR`. Embedded
-/// so there's no runtime file dependency. Registered with iced in `main` via
-/// `.font(icons::ICON_FONT_BYTES)`.
+/// so there's no runtime file dependency. Registered by [`register`].
 pub const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lucide.ttf"));
 
 /// The family name inside the Lucide TTF (its `name` table). Must match exactly
-/// or cosmic-text falls back to `.notdef` tofu boxes.
-pub const ICON_FONT: iced::Font = iced::Font::new("lucide");
+/// or the text system falls back to tofu boxes.
+pub const ICON_FONT: Font = Font::new("lucide");
+
+/// Adds the icon font to the app's text system. Call once at startup.
+pub fn register(cx: &App) {
+    if let Err(error) = cx
+        .text_system()
+        .add_fonts(vec![std::borrow::Cow::Borrowed(ICON_FONT_BYTES)])
+    {
+        tracing::warn!("couldn't load the icon font: {error}");
+    }
+}
 
 /// A Lucide glyph as a themeable icon, centered inside a `size`×`size` square.
 ///
-/// The fixed box — not the glyph's font-specific line metrics — is what drives
+/// The fixed box, not the glyph's font-specific line metrics, is what drives
 /// alignment next to text, so an icon + label row centers the same way on every
-/// platform. Collapsing the default 1.3× line height keeps the glyph's own box
-/// ≈ `size` so the container can center it tightly.
-pub fn icon<'a, Message: 'a>(glyph: &'a str, size: f32, color: Color) -> Element<'a, Message> {
-    container(
-        text(glyph)
-            .font(ICON_FONT)
-            .size(size)
-            .color(color)
-            .line_height(LineHeight::Relative(1.0)),
-    )
-    .center_x(Length::Fixed(size))
-    .center_y(Length::Fixed(size))
-    .into()
-}
-
-/// A custom icon imported from an embedded, monochrome SVG and tinted to
-/// `color` (the tint overrides every fill in the SVG). Use the escape hatch for
-/// marks Lucide doesn't have:
-///
-/// ```ignore
-/// icons::svg_icon(include_bytes!("../assets/icons/my-mark.svg"), 16.0, theme.text)
-/// ```
-pub fn svg_icon<'a, Message: 'a>(
-    bytes: &'static [u8],
-    size: f32,
-    color: Color,
-) -> Element<'a, Message> {
-    svg(svg::Handle::from_memory(bytes))
-        .width(Length::Fixed(size))
-        .height(Length::Fixed(size))
-        .style(move |_theme, _status| svg::Style { color: Some(color) })
-        .into()
+/// platform.
+pub fn icon(glyph: &'static str, size: f32, color: Color) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .font(ICON_FONT.gpui())
+        .text_size(px(size))
+        .line_height(px(size))
+        .text_color(color)
+        .child(glyph)
 }
 
 // --- Lucide codepoints ------------------------------------------------------
@@ -95,6 +77,7 @@ pub const CHEVRON_UP: &str = "\u{e070}"; // chevron-up
 pub const CHECK: &str = "\u{e06c}"; // check
 pub const PENCIL: &str = "\u{e1f9}"; // pencil
 pub const FOLDER: &str = "\u{e0d7}"; // folder
+pub const BOOKMARK: &str = "\u{e060}"; // bookmark
 pub const CIRCLE: &str = "\u{e076}"; // circle
 pub const HASH: &str = "\u{e0ef}"; // hash
 pub const SEARCH: &str = "\u{e151}"; // search
@@ -125,3 +108,10 @@ pub const USER: &str = "\u{e19f}"; // user
 pub const CLOCK: &str = "\u{e087}"; // clock
 pub const TERMINAL: &str = "\u{e181}"; // terminal
 pub const LIST_CHECKS: &str = "\u{e1d0}"; // list-checks
+pub const PANEL_LEFT: &str = "\u{e12a}"; // panel-left
+pub const ELLIPSIS: &str = "\u{e0b6}"; // ellipsis
+pub const SCISSORS: &str = "\u{e14e}"; // scissors
+pub const MOVE: &str = "\u{e121}"; // move
+pub const ARROW_DOWN_TO_LINE: &str = "\u{e455}"; // arrow-down-to-line
+pub const COMBINE: &str = "\u{e44c}"; // combine
+pub const BINARY: &str = "\u{e1f2}"; // binary

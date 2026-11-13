@@ -1,16 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, TryStreamExt};
-use jj_cli::description_util::try_combine_messages;
+use jj_cli::{description_util::try_combine_messages, text_util::complete_newline};
 use jj_lib::{
     absorb::{AbsorbSource, absorb_hunks, split_hunks_to_trees},
     backend::{ChangeId, CommitId},
     commit::Commit,
-    git::export_refs,
     matchers::EverythingMatcher,
     object_id::ObjectId,
     op_store::{OperationId, RefTarget},
@@ -20,8 +20,8 @@ use jj_lib::{
     revset::{RevsetExpression, SymbolResolver},
     rewrite::{
         CommitWithSelection, MoveCommitsLocation, MoveCommitsStats, MoveCommitsTarget,
-        RebaseOptions, RebasedCommit, duplicate_commits_onto_parents, merge_commit_trees,
-        move_commits, squash_commits,
+        RebaseOptions, RebasedCommit, RewriteRefsOptions, duplicate_commits_onto_parents,
+        merge_commit_trees, move_commits, squash_commits,
     },
     settings::UserSettings,
     transaction::Transaction,
@@ -34,8 +34,9 @@ use super::push::{
 };
 use super::walk::*;
 use super::workspace::{
-    LockOutcome, LockedWorkingCopy, SnapshotContext, TargetContext, follow_rewritten,
-    lock_working_copy,
+    LockOutcome, LockedWorkingCopy, Place, SnapshotContext, TargetContext,
+    WC_BECAME_IMMUTABLE_NOTE, fold_into_working_copy, follow_rewritten, lock_working_copy,
+    renew_immutable_working_copy,
 };
 use crate::model::{LoadProgress, RevisionSelection};
 use crate::mutations::{Destination, MutationOp, MutationOutcome, RebaseSourceMode, SquashTarget};
@@ -96,8 +97,10 @@ pub(crate) async fn check_bookmark_move_backwards(
 /// would leave the old files in place, and the next snapshot would record them
 /// into the moved-to commit.
 ///
-/// The flag beside the outcome says the checkout was stale and had to be
-/// recovered first, which the caller tells the user about.
+/// A stale checkout is recovered first when `update_stale` says so (jj's
+/// `snapshot.auto-update-stale`, or diffui's refresh mode), and refused
+/// otherwise. The flag beside the outcome says it was, which the caller tells
+/// the user about.
 ///
 /// `seen_op` is the operation the sender's rows reflect, which tells a stale
 /// row from a hidden commit picked on purpose (see [`follow_rewritten`]).
@@ -106,45 +109,49 @@ pub(crate) async fn apply_mutation(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repository: &Repository,
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
-) -> Result<(MutationOutcome, bool)> {
+    seen_wc: Option<&str>,
+) -> Result<(MutationOutcome, bool, Arc<ReadonlyRepo>)> {
     if is_view_only(op) {
-        return Ok((
-            apply_view_only(
-                workspace,
-                settings,
-                context,
-                &repository.root,
-                op,
-                progress,
-                seen_op,
-            )
-            .await?,
-            false,
-        ));
+        let (outcome, repo) = apply_view_only(
+            workspace,
+            settings,
+            context,
+            update_stale,
+            &repository.root,
+            op,
+            progress,
+            seen_op,
+            seen_wc,
+        )
+        .await?;
+        return Ok((outcome, false, repo));
     }
     // Recovering a stale checkout finishes the lock session the mutation needs,
     // so the attempt reports back without mutating and the retry runs against
     // the recovered `@`. A second stale report means something outside is still
     // rewriting this workspace's `@`; refuse rather than keep taking the lock.
     for attempt in 0..2 {
-        if let Some(outcome) = apply_mutation_attempt(
+        if let Some((outcome, repo)) = apply_mutation_attempt(
             workspace,
             settings,
             context,
+            update_stale,
             repository,
             op,
             progress,
             allow_immutable,
             seen_op,
+            seen_wc,
         )
         .await?
         {
-            return Ok((outcome, attempt > 0));
+            return Ok((outcome, attempt > 0, repo));
         }
     }
     bail!("jj working copy kept going stale while applying the mutation")
@@ -175,15 +182,18 @@ fn is_view_only(op: &MutationOp) -> bool {
 /// signed first, in an operation of their own under the working-copy lock
 /// ([`sign_before_push`]), and the push is then planned again over the signed
 /// commits. A push that fails after that keeps the signatures, as in the CLI.
+#[allow(clippy::too_many_arguments)]
 async fn apply_view_only(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repo_root: &Path,
     op: &MutationOp,
     progress: &LoadProgress,
     seen_op: Option<&str>,
-) -> Result<MutationOutcome> {
+    seen_wc: Option<&str>,
+) -> Result<(MutationOutcome, Arc<ReadonlyRepo>)> {
     let workspace_name = workspace.workspace_name().to_owned();
     let mut signed: Option<Signed> = None;
     loop {
@@ -203,7 +213,8 @@ async fn apply_view_only(
             "args".to_owned(),
             super::op_args::op_args(base_repo.as_ref(), op, false).await,
         );
-        let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
+        let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op)
+            .seeing_working_copy(seen_wc);
         let push_context = PushContext {
             settings,
             repo_root,
@@ -224,8 +235,17 @@ async fn apply_view_only(
                     }
                     drop(tx);
                     signed = Some(
-                        sign_before_push(workspace, settings, context, repo_root, op, seen_op)
-                            .await?,
+                        sign_before_push(
+                            workspace,
+                            settings,
+                            context,
+                            update_stale,
+                            repo_root,
+                            op,
+                            seen_op,
+                            seen_wc,
+                        )
+                        .await?,
                     );
                     continue;
                 }
@@ -247,9 +267,22 @@ async fn apply_view_only(
             None => moved.context("a bookmark op without a push describes itself")?,
         };
 
+        // A bookmark moved onto `@` (and pushed) makes it immutable; the CLI
+        // starts a new `@` on top so the next save can't amend shared history.
+        // Same tree, so the disk needs no checkout and no lock.
+        let place = Place {
+            settings,
+            workspace_name: &workspace_name,
+            workspace_root: repo_root,
+        };
+        if renew_immutable_working_copy(&place, tx.repo_mut()).await? {
+            output.push(WC_BECAME_IMMUTABLE_NOTE.to_owned());
+        }
         // Mirror jj's own post-operation behavior: export the updated bookmarks to
-        // the colocated git repo so the real git branches follow the move.
-        export_refs(tx.repo_mut()).context("failed to export bookmarks to the git backend")?;
+        // the colocated git repo so the real git branches follow the move, and
+        // point git's `HEAD` at a renewed `@`'s parent.
+        super::colocate::sync_git_after_transaction(tx.repo_mut(), &workspace_name, repo_root)
+            .await?;
         let new_repo = tx
             .commit(format!("diffui: {message}"))
             .await
@@ -260,13 +293,14 @@ async fn apply_view_only(
             return Err(super::push::PushFailed(failure).into());
         }
 
-        return Ok(MutationOutcome {
+        let outcome = MutationOutcome {
             message,
             moved_working_copy: false,
             rewritten_commit: None,
             output,
             operation_id: Some(new_repo.op_id().hex()),
-        });
+        };
+        return Ok((outcome, new_repo));
     }
 }
 
@@ -287,11 +321,18 @@ async fn stage_view_only(
         } => {
             let commit = resolve_mutation_target(repo, push_context.targets, to).await?;
             let short = short_change_id(&commit);
-            repo.set_local_bookmark_target(
-                RefName::new(name),
-                RefTarget::normal(commit.id().clone()),
-            );
-            let moved = format!("Moved bookmark {name} to {short}");
+            let ref_name = RefName::new(name);
+            // `jj bookmark set` on a name with no local target and nothing
+            // tracked creates it, auto-tracking included; else it moves.
+            let moved = if repo.view().get_local_bookmark(ref_name).is_absent()
+                && !jj_cli::cli_util::has_tracked_remote_bookmarks(repo, ref_name)
+            {
+                create_bookmark(settings, repo, name, &commit).await?;
+                format!("Created bookmark {name} at {short}")
+            } else {
+                repo.set_local_bookmark_target(ref_name, RefTarget::normal(commit.id().clone()));
+                format!("Moved bookmark {name} to {short}")
+            };
             match push_remote {
                 // The push reads the bookmark's target back out of this
                 // transaction's view, so it pushes the position set above —
@@ -323,6 +364,17 @@ async fn stage_view_only(
         },
         MutationOp::Push(request) => request,
         MutationOp::DeleteBookmark { name } => {
+            // jj warns and writes no operation for a name that isn't there.
+            if repo
+                .view()
+                .get_local_bookmark(RefName::new(name))
+                .is_absent()
+            {
+                bail!(
+                    "No matching bookmarks for names: {}",
+                    jj_lib::revset::format_symbol(name)
+                );
+            }
             repo.set_local_bookmark_target(RefName::new(name), RefTarget::absent());
             return Ok((Some(format!("Deleted bookmark {name}")), None));
         }
@@ -365,25 +417,34 @@ async fn stage_view_only(
 /// planned again inside the transaction to pick the commits (the repo may have
 /// moved since the lock-free plan); its bookmark changes are then rolled back,
 /// since they belong to the push, which runs afterwards without the lock.
+#[allow(clippy::too_many_arguments)]
 async fn sign_before_push(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repo_root: &Path,
     op: &MutationOp,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<Signed> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
     // A stale checkout is recovered instead of locked; the retry signs against
     // the recovered `@`, as `apply_mutation` does.
     for _ in 0..2 {
-        let mut locked =
-            match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
-                LockOutcome::Locked(locked) => locked,
-                LockOutcome::Recovered { .. } => continue,
-            };
+        let mut locked = match lock_working_copy(
+            workspace,
+            &repo_loader,
+            &workspace_name,
+            context,
+            update_stale,
+        )
+        .await?
+        {
+            LockOutcome::Locked(locked) => locked,
+            LockOutcome::Recovered { .. } => continue,
+        };
         let result = sign_locked(
             &mut locked,
             settings,
@@ -391,6 +452,7 @@ async fn sign_before_push(
             &workspace_name,
             op,
             seen_op,
+            seen_wc,
         )
         .await;
         if result.is_err() {
@@ -409,17 +471,24 @@ async fn sign_locked(
     workspace_name: &WorkspaceName,
     op: &MutationOp,
     seen_op: Option<&str>,
+    seen_wc: Option<&str>,
 ) -> Result<Signed> {
     let base_repo = locked.repo.clone();
+    let place = Place {
+        settings,
+        workspace_name,
+        workspace_root: repo_root,
+    };
     let mut tx = base_repo.start_transaction();
-    fold_working_copy(&mut tx, locked, workspace_name).await?;
+    fold_working_copy(&mut tx, locked, &place).await?;
     let wc_commit_id = tx
         .repo()
         .view()
         .get_wc_commit_id(workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    let targets = TargetContext::new(base_repo.loader(), wc_commit_id, seen_op);
+    let targets =
+        TargetContext::new(base_repo.loader(), wc_commit_id, seen_op).seeing_working_copy(seen_wc);
     let push_context = PushContext {
         settings,
         repo_root,
@@ -460,6 +529,7 @@ async fn sign_locked(
         locked.finish(base_repo.op_id().clone()).await?;
         return Ok(signed);
     }
+    renew_immutable_working_copy(&place, tx.repo_mut()).await?;
     super::colocate::sync_git_after_transaction(tx.repo_mut(), workspace_name, repo_root).await?;
     let new_repo = tx
         .commit("diffui: sign commits before push")
@@ -485,21 +555,14 @@ async fn sign_locked(
 async fn fold_working_copy(
     tx: &mut Transaction,
     locked: &LockedWorkingCopy<'_>,
-    workspace_name: &WorkspaceName,
+    place: &Place<'_>,
 ) -> Result<bool> {
     if !locked.tree_changed() {
         return Ok(false);
     }
-    let rewritten = tx
-        .repo_mut()
-        .rewrite_commit(&locked.wc_commit)
-        .set_tree(locked.tree.clone())
-        .write()
+    fold_into_working_copy(place, tx.repo_mut(), &locked.wc_commit, locked.tree.clone())
         .await
         .context("failed to fold working-copy changes before mutation")?;
-    tx.repo_mut()
-        .set_wc_commit(workspace_name.to_owned(), rewritten.id().clone())
-        .context("failed to update working-copy pointer before mutation")?;
     tx.repo_mut()
         .rebase_descendants()
         .await
@@ -515,21 +578,29 @@ async fn apply_mutation_attempt(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     repository: &Repository,
     op: &MutationOp,
     progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
-) -> Result<Option<MutationOutcome>> {
+    seen_wc: Option<&str>,
+) -> Result<Option<(MutationOutcome, Arc<ReadonlyRepo>)>> {
     let workspace_name = workspace.workspace_name().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
 
-    let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
-            LockOutcome::Locked(locked) => locked,
-            LockOutcome::Recovered { .. } => return Ok(None),
-        };
+    let mut locked = match lock_working_copy(
+        workspace,
+        &repo_loader,
+        &workspace_name,
+        context,
+        update_stale,
+    )
+    .await?
+    {
+        LockOutcome::Locked(locked) => locked,
+        LockOutcome::Recovered { .. } => return Ok(None),
+    };
 
     let result = mutate_locked(
         &mut locked,
@@ -541,10 +612,11 @@ async fn apply_mutation_attempt(
         progress,
         allow_immutable,
         seen_op,
+        seen_wc,
     )
     .await;
     match result {
-        Ok(outcome) => Ok(Some(outcome)),
+        Ok(applied) => Ok(Some(applied)),
         Err(error) => {
             // Nothing landed, so there is nothing to persist — say so, rather
             // than letting the lock fall out of scope unfinished, which leaves
@@ -569,10 +641,16 @@ async fn mutate_locked(
     _progress: &LoadProgress,
     allow_immutable: bool,
     seen_op: Option<&str>,
-) -> Result<MutationOutcome> {
+    seen_wc: Option<&str>,
+) -> Result<(MutationOutcome, Arc<ReadonlyRepo>)> {
     let base_repo = locked.repo.clone();
     let workspace_name = workspace_name.to_owned();
-    let args = super::op_args::op_args(base_repo.as_ref(), op, allow_immutable).await;
+    let args = super::op_args::op_args(
+        base_repo.as_ref(),
+        op,
+        allow_immutable && !op.restores_operation(),
+    )
+    .await;
 
     // An undo, redo or revert has to know its target *before* the pre-op fold
     // is committed: resolving it can fail (a merge operation has no single
@@ -592,6 +670,14 @@ async fn mutate_locked(
         MutationOp::Redo => Some(super::undo::plan_redo(repo_loader, base_repo.operation()).await?),
         _ => None,
     };
+    // jj-cli only warns after the fact that undoing a push "often leads to
+    // conflicted bookmarks"; here the user confirms first, and the confirmed
+    // rerun carries the guards-off flag.
+    if let Some(summary) = op_plan.as_ref().and_then(|plan| plan.undoes_push.clone())
+        && !allow_immutable
+    {
+        return Err(super::undo::UndoesPush { summary }.into());
+    }
     // Same discipline for a restore: an operation from before this workspace
     // existed has no `@` for it, and finding that out after the fold landed
     // would strand the lock.
@@ -602,6 +688,11 @@ async fn mutate_locked(
         _ => None,
     };
 
+    let place = Place {
+        settings,
+        workspace_name: &workspace_name,
+        workspace_root: &repository.root,
+    };
     let mut tx = base_repo.start_transaction();
 
     // Fold any uncommitted on-disk changes into `@` first so moving off it
@@ -612,7 +703,7 @@ async fn mutate_locked(
     // unrecoverable from the op log. For those the fold is committed as its
     // own snapshot op first, mirroring the CLI's snapshot-before-command; the
     // undo then carries the edit over onto the `@` it restores.
-    if fold_working_copy(&mut tx, locked, &workspace_name).await?
+    if fold_working_copy(&mut tx, locked, &place).await?
         && (op_plan.is_some() || restore_target.is_some())
     {
         tx.set_is_snapshot(true);
@@ -643,7 +734,9 @@ async fn mutate_locked(
         .with_context(|| format!("failed to load jj commit {}", current_wc_id.hex()))?
         .change_id()
         .clone();
-    let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op);
+    let context = TargetContext::new(repo_loader, current_wc_id.clone(), seen_op)
+        .seeing_working_copy(seen_wc)
+        .resolving_trunk(&place);
 
     // Captured side output: remote sideband for push, skipped/absorbed notes
     // for absorb; empty for the other mutations.
@@ -671,8 +764,8 @@ async fn mutate_locked(
         }
         MutationOp::Edit { target } => {
             let commit = resolve_mutation_target(tx.repo(), &context, target).await?;
-            // The CLI refuses `jj edit` on immutable commits: a working copy
-            // parked there would amend them on the next snapshot.
+            // The CLI refuses `jj edit` on immutable commits. Edited anyway,
+            // the tail below starts a new `@` on top, as the CLI's does.
             ensure_rewritable(
                 &repository.root,
                 settings,
@@ -708,20 +801,32 @@ async fn mutate_locked(
                 allow_immutable,
             )
             .await?;
-            match commits.as_slice() {
+            let message = match commits.as_slice() {
                 [] => bail!("abandon needs at least one revision"),
-                [only] => {
-                    let short = short_change_id(only);
-                    tx.repo_mut().record_abandoned_commit(only);
-                    format!("Abandoned {short}")
-                }
-                many => {
-                    for commit in many {
-                        tx.repo_mut().record_abandoned_commit(commit);
-                    }
-                    format!("Abandoned {} revisions", many.len())
-                }
+                [only] => format!("Abandoned {}", short_change_id(only)),
+                many => format!("Abandoned {} revisions", many.len()),
+            };
+            for commit in &commits {
+                tx.repo_mut().record_abandoned_commit(commit);
             }
+            // `jj abandon` deletes the bookmarks on what it abandons (unless
+            // `--retain-bookmarks`); the default rebase would slide them to
+            // the parent, and the next push would move the remote bookmark
+            // backwards instead of deleting it.
+            tx.repo_mut()
+                .rebase_descendants_with_options(
+                    &RevsetExpression::none(),
+                    &RebaseOptions {
+                        rewrite_refs: RewriteRefsOptions {
+                            delete_abandoned_bookmarks: true,
+                        },
+                        ..RebaseOptions::default()
+                    },
+                    |_, _| {},
+                )
+                .await
+                .context("failed to rebase descendants after abandon")?;
+            message
         }
         MutationOp::Describe {
             target,
@@ -741,7 +846,10 @@ async fn mutate_locked(
             let rewritten = tx
                 .repo_mut()
                 .rewrite_commit(&commit)
-                .set_description(description.clone())
+                // jj stores every description newline-terminated
+                // (`complete_newline`); without it the same text gives a
+                // different commit id and git message than the CLI's.
+                .set_description(complete_newline(description.as_str()))
                 .write()
                 .await
                 .with_context(|| format!("failed to describe revision {short}"))?;
@@ -935,7 +1043,7 @@ async fn mutate_locked(
                 None => format!("Duplicated {short}"),
             }
         }
-        MutationOp::Absorb { from } => {
+        MutationOp::Absorb { from, paths } => {
             let source = resolve_mutation_target(tx.repo(), &context, from).await?;
             let short = short_change_id(&source);
             ensure_rewritable(
@@ -967,8 +1075,18 @@ async fn mutate_locked(
                     .ancestors()
                     .intersection(&mutable)
             };
+            let matcher: Box<dyn jj_lib::matchers::Matcher> = if paths.is_empty() {
+                Box::new(EverythingMatcher)
+            } else {
+                let paths = paths
+                    .iter()
+                    .map(|path| jj_lib::repo_path::RepoPathBuf::from_internal_string(path.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid path to absorb")?;
+                Box::new(jj_lib::matchers::FilesMatcher::new(paths))
+            };
             let selected =
-                split_hunks_to_trees(tx.repo(), &absorb_source, &destinations, &EverythingMatcher)
+                split_hunks_to_trees(tx.repo(), &absorb_source, &destinations, matcher.as_ref())
                     .await
                     .context("failed to plan absorb")?;
             for (path, reason) in &selected.skipped_paths {
@@ -1027,7 +1145,7 @@ async fn mutate_locked(
             let plan = op_plan
                 .as_ref()
                 .expect("an undo resolves its plan before the fold");
-            plan.apply(&mut tx, repo_loader, &workspace_name).await?;
+            plan.apply(&mut tx, repo_loader, &place).await?;
             plan.message.clone()
         }
         MutationOp::Split {
@@ -1234,6 +1352,9 @@ async fn mutate_locked(
         .rebase_descendants()
         .await
         .context("failed to rebase descendants after mutation")?;
+    if renew_immutable_working_copy(&place, tx.repo_mut()).await? {
+        output.push(WC_BECAME_IMMUTABLE_NOTE.to_owned());
+    }
 
     // Mirror jj's own post-operation behavior: export the updated bookmarks to
     // the git repo so the real git branches (which jj surfaces as `name@git`)
@@ -1268,7 +1389,7 @@ async fn mutate_locked(
     locked.check_out(&new_wc_commit).await?;
     locked.finish(new_repo.op_id().clone()).await?;
 
-    Ok(mutation_outcome(
+    let outcome = mutation_outcome(
         op,
         message,
         output,
@@ -1276,7 +1397,8 @@ async fn mutate_locked(
         &current_wc_change,
         new_wc_commit.change_id(),
         new_repo.op_id(),
-    ))
+    );
+    Ok((outcome, new_repo))
 }
 
 /// The operation a revert targets, resolved before anything has been written.
@@ -1391,7 +1513,7 @@ pub(super) async fn resolve_rebase_location(
     context: &TargetContext,
     destination: &Destination,
 ) -> Result<(Vec<CommitId>, Vec<CommitId>, Commit)> {
-    Ok(match destination {
+    let (parents, children, anchor) = match destination {
         Destination::Onto(target) => {
             let anchor = resolve_mutation_target(repo, context, target).await?;
             (vec![anchor.id().clone()], Vec::new(), anchor)
@@ -1421,7 +1543,30 @@ pub(super) async fn resolve_rebase_location(
             let child = resolve_mutation_target(repo, context, child).await?;
             (vec![parent.id().clone()], vec![child.id().clone()], parent)
         }
-    })
+        Destination::Trunk => {
+            let anchor = context.trunk(repo).await?;
+            (vec![anchor.id().clone()], Vec::new(), anchor)
+        }
+    };
+    // jj-cli's `ensure_no_commit_loop`: `-A x -B y` with `y` an ancestor of
+    // `x` would make the moved commits both, which jj-lib can't rewrite.
+    if !children.is_empty()
+        && let Some(id) = RevsetExpression::commits(children.clone())
+            .dag_range_to(&RevsetExpression::commits(parents.clone()))
+            .evaluate(repo)
+            .context("failed to check the destination for a loop")?
+            .stream()
+            .next()
+            .await
+    {
+        let id = id.context("failed to check the destination for a loop")?;
+        bail!(
+            "Refusing to create a loop: commit {} would be both an ancestor and a descendant of \
+             the moved commits",
+            jj_cli::cli_util::short_commit_hash(&id)
+        );
+    }
+    Ok((parents, children, anchor))
 }
 
 /// The ids in the reverse-topological order (children first) that
@@ -1518,8 +1663,7 @@ impl std::fmt::Display for ImmutableRewriteError {
 impl std::error::Error for ImmutableRewriteError {}
 
 /// jj CLI parity: refuse to touch immutable commits (rewrites, and `edit`'s
-/// checkout — a working copy parked on an immutable commit would amend it on
-/// the next snapshot). `immutable()` resolves through the same alias map the
+/// checkout). `immutable()` resolves through the same alias map the
 /// revset filter uses, so a user override of `immutable_heads()` is honored.
 /// Callers skip this under the frontend's confirmed `allow_immutable`
 /// override, mirroring `jj --ignore-immutable`.
@@ -1579,7 +1723,7 @@ pub(super) fn rebase_stats_message(
     destination: &Destination,
 ) -> String {
     let place = match destination {
-        Destination::Onto(_) => "onto",
+        Destination::Onto(_) | Destination::Trunk => "onto",
         Destination::After(_) => "after",
         Destination::Before(_) => "before",
         Destination::Between { .. } => "between",
@@ -1661,7 +1805,8 @@ pub(super) async fn squash_whole(
 }
 
 /// Resolve a `RevisionSelection` to a `Commit`. The working-copy case uses
-/// `context.wc_id` (the post-snapshot `@`); a commit the caller still names by
+/// `context.wc_id` (the post-snapshot `@`), refused when `@` moved to another
+/// change since the sender looked; a commit the caller still names by
 /// an id that has since been rewritten resolves to its visible successor (see
 /// [`follow_rewritten`]).
 pub(super) async fn resolve_mutation_target(
@@ -1670,7 +1815,7 @@ pub(super) async fn resolve_mutation_target(
     target: &RevisionSelection,
 ) -> Result<Commit> {
     let commit_id = match target {
-        RevisionSelection::WorkingCopy => context.wc_id.clone(),
+        RevisionSelection::WorkingCopy => return context.working_copy(repo).await,
         RevisionSelection::Commit(hex) => {
             CommitId::try_from_hex(hex).with_context(|| format!("invalid jj commit id {hex}"))?
         }
@@ -1680,9 +1825,6 @@ pub(super) async fn resolve_mutation_target(
         .get_commit_async(&commit_id)
         .await
         .with_context(|| format!("failed to load jj commit {}", commit_id.hex()))?;
-    if matches!(target, RevisionSelection::WorkingCopy) {
-        return Ok(commit);
-    }
     follow_rewritten(repo, commit, Some(context)).await
 }
 

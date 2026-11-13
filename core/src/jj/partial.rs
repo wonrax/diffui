@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use jj_lib::{
     backend::{ChangeId, CommitId, CopyId, FileId, TreeValue},
     commit::Commit,
+    copies::CopyRecords,
+    matchers::EverythingMatcher,
     merge::Merge,
     merged_tree::MergedTree,
     merged_tree_builder::MergedTreeBuilder,
@@ -72,14 +74,23 @@ pub(super) async fn read_file(store: &Store, path: &RepoPath, id: &FileId) -> Re
     Ok(content)
 }
 
+/// The renames and copies `commit` records against its parents, as its diff
+/// shows them.
+async fn commit_copies(repo: &MutableRepo, commit: &Commit) -> Result<CopyRecords> {
+    let head = std::slice::from_ref(commit.id());
+    super::diff::copy_records(repo, commit.parent_ids(), head, &EverythingMatcher).await
+}
+
 /// Build a tree from `base` with the selected changes of `parent → commit`
 /// either applied (`apply_selected`, base = the parent tree: the "selected
 /// tree" of `jj split -i`) or reverted (base = the commit's tree: what
-/// `jj restore -i` leaves behind).
+/// `jj restore -i` leaves behind). `copies` are the renames and copies the
+/// diff shows: a picked file renamed in `commit` takes its old path along.
 pub(super) async fn tree_with_selection(
     base: &MergedTree,
     parent: &MergedTree,
     commit: &MergedTree,
+    copies: &CopyRecords,
     selection: &DiffSelection,
     apply_selected: bool,
 ) -> Result<MergedTree> {
@@ -87,6 +98,10 @@ pub(super) async fn tree_with_selection(
     let mut builder = MergedTreeBuilder::new(base.clone());
     for file in &selection.files {
         let path = repo_path(&file.path)?;
+        let copied_from = copies
+            .for_target(&path)
+            .map(|record| record.source.clone())
+            .filter(|source| *source != path);
         let refs = match &file.hunks {
             HunkPick::All => {
                 let source = if apply_selected { commit } else { parent };
@@ -95,11 +110,35 @@ pub(super) async fn tree_with_selection(
                     .await
                     .with_context(|| format!("failed to read {}", file.path))?;
                 builder.set_or_remove(path, value);
+                // A rename's old path goes (or comes back) with it; a copy's
+                // source is a file of its own.
+                if let Some(old) = copied_from {
+                    let renamed = commit
+                        .path_value(&old)
+                        .await
+                        .with_context(|| {
+                            format!("failed to read {}", old.as_internal_file_string())
+                        })?
+                        .is_absent();
+                    if renamed {
+                        let value = source.path_value(&old).await.with_context(|| {
+                            format!("failed to read {}", old.as_internal_file_string())
+                        })?;
+                        builder.set_or_remove(old, value);
+                    }
+                }
                 continue;
             }
             HunkPick::Hunks(refs) if refs.is_empty() => continue,
             HunkPick::Hunks(refs) => refs,
         };
+        if let Some(old) = copied_from {
+            bail!(
+                "{} came from {}, so select the whole file",
+                file.path,
+                old.as_internal_file_string()
+            );
+        }
         let before = plain_file(parent, &path, &file.path).await?;
         let after = plain_file(commit, &path, &file.path).await?;
         let executable = match (&before, &after) {
@@ -183,8 +222,16 @@ pub(super) async fn split(
         .parent_tree(repo)
         .await
         .context("failed to load the split revision's parent tree")?;
-    let selected =
-        tree_with_selection(&parent_tree, &parent_tree, &commit.tree(), selection, true).await?;
+    let copies = commit_copies(repo, commit).await?;
+    let selected = tree_with_selection(
+        &parent_tree,
+        &parent_tree,
+        &commit.tree(),
+        &copies,
+        selection,
+        true,
+    )
+    .await?;
     if selected.tree_ids() == parent_tree.tree_ids() {
         bail!("nothing selected: the new revision would take every change");
     }
@@ -254,8 +301,16 @@ pub(super) async fn squash_selection(
         .parent_tree(repo)
         .await
         .context("failed to load the squash source's parent tree")?;
-    let selected_tree =
-        tree_with_selection(&parent_tree, &parent_tree, &source.tree(), selection, true).await?;
+    let copies = commit_copies(repo, source).await?;
+    let selected_tree = tree_with_selection(
+        &parent_tree,
+        &parent_tree,
+        &source.tree(),
+        &copies,
+        selection,
+        true,
+    )
+    .await?;
     let picked = CommitWithSelection {
         commit: source.clone(),
         selected_tree,
@@ -305,7 +360,9 @@ pub(super) async fn restore_selection(
         .await
         .context("failed to load the parent tree")?;
     let tree = commit.tree();
-    let restored = tree_with_selection(&tree, &parent_tree, &tree, selection, false).await?;
+    let copies = commit_copies(repo, commit).await?;
+    let restored =
+        tree_with_selection(&tree, &parent_tree, &tree, &copies, selection, false).await?;
     if restored.tree_ids() == tree.tree_ids() {
         bail!("nothing to discard: the selection changes nothing");
     }

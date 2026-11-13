@@ -273,6 +273,7 @@ impl TestRepo {
         let events = self.run(|job| Command::Snapshot {
             job,
             origin: diffui_core::RefreshOrigin::Focus,
+            disk: diffui_core::DiskSync::Fold,
         });
         match events.into_iter().next_back() {
             Some(Payload::SnapshotDone { snapshot, .. }) => snapshot,
@@ -317,6 +318,7 @@ impl TestRepo {
             op,
             allow_immutable: false,
             seen_op: None,
+            seen_wc: None,
         });
         match events.into_iter().next_back() {
             Some(Payload::MutationDone { outcome, .. }) => Ok(outcome),

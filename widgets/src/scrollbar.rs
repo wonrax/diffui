@@ -1,243 +1,110 @@
-//! Vertical scrollbar geometry, drawing, and drag handling shared by
-//! `RevisionList` and `DiffView`.
-//!
-//! The scrollable widgets already own their `vertical_offset` in tree
-//! state; this module just supplies pure helpers so they don't each
-//! reinvent the same hit-testing and pill drawing. The scrollbar is an
-//! overlay — it draws on top of content rather than reserving layout
-//! space, matching the macOS / VS Code feel.
+//! The scrollbar of the views that scroll themselves (the diff, the graph, the
+//! file tree): kit's own bar, the one every plain scroll view gets, fed through
+//! [`Shared`]. [`place_kit_bars`] puts every kit bar in the app where these views
+//! keep text clear of it.
 
-use iced::advanced::renderer;
-use iced::{Background, Border, Color, Point, Rectangle, Shadow, border};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-/// Width of the outer (transparent) container holding the track.
-const WIDTH: f32 = 12.0;
-/// How far from a scroll view's right edge its content keeps text: the
-/// bar's whole footprint, so text never sits beneath it. Row washes and
-/// backgrounds still run under the bar. Every scroll view, hand-drawn or
-/// [`crate::ui::scrollable`], leaves this gutter.
-pub const GUTTER: f32 = WIDTH;
-/// Padding from each side of the container to the inner pill track.
-const PADDING: f32 = 2.0;
-/// Floor for the thumb height. Purely proportional sizing collapses the pill
-/// into a barely-grabbable dot on very long documents; this keeps a real
-/// handle while still reading "long". Clamped to the track for tiny panels.
-const MIN_THUMB_HEIGHT: f32 = 32.0;
+use gpui_kit::base::{ScrollbarHandle, ScrollbarTheme, Theme};
+use gpui_kit::{App, Bounds, Pixels, Point as GpuiPoint, Size, point, px, size};
 
-#[derive(Debug, Clone, Copy)]
-pub struct ScrollbarStyle {
-    /// Pill background color.
-    pub track_color: Color,
-    /// Draggable thumb color.
-    pub thumb_color: Color,
+use crate::geometry::{Point, Rectangle};
+
+/// How far from a scroll view's right edge its content keeps text: the bar's
+/// whole hover zone, so text never sits beneath it. Row washes and backgrounds
+/// still run under the bar. Every scroll view leaves this gutter.
+pub const GUTTER: f32 = 12.0;
+/// The thumb's gap from the view's right edge.
+const INSET: f32 = 2.0;
+
+/// Places kit's bars: within [`GUTTER`], [`INSET`] off the edge. Kit's own
+/// theme sync rewrites these, so this runs after each one.
+pub fn place_kit_bars(cx: &mut App) {
+    let base = Theme::global_mut(cx);
+    let bar = base.scrollbar.clone();
+    base.scrollbar = ScrollbarTheme::new()
+        .with_mode(bar.mode())
+        .with_motion(bar.motion())
+        .with_styles(
+            bar.styles()
+                .clone()
+                .track(|track| track.width(px(GUTTER)))
+                .track_hover(|track| track.width(px(GUTTER)))
+                .track_active(|track| track.width(px(GUTTER)))
+                .thumb(|thumb| thumb.inset(px(INSET)))
+                .thumb_hover(|thumb| thumb.inset(px(INSET)))
+                .thumb_active(|thumb| thumb.inset(px(INSET))),
+        );
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ScrollbarState {
-    drag: Option<DragState>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DragState {
-    start_cursor_y: f32,
-    start_offset: f32,
-}
-
-pub struct ScrollbarGeometry {
-    pub container: Rectangle,
-    pub track: Rectangle,
-    pub thumb: Option<Rectangle>,
-}
-
-pub fn geometry(bounds: Rectangle, content_height: f32, offset: f32) -> ScrollbarGeometry {
-    let container = Rectangle {
-        x: bounds.x + bounds.width - WIDTH,
-        y: bounds.y,
-        width: WIDTH,
-        height: bounds.height,
-    };
-    let track = Rectangle {
-        x: container.x + PADDING,
-        y: container.y + PADDING,
-        width: (container.width - 2.0 * PADDING).max(0.0),
-        height: (container.height - 2.0 * PADDING).max(0.0),
-    };
-    let thumb = if content_height <= bounds.height || track.height <= 0.0 || track.width <= 0.0 {
-        None
-    } else {
-        // Thumb height proportional to viewport/content ratio, floored at
-        // MIN_THUMB_HEIGHT so it stays grabbable on huge content.
-        let min_thumb = MIN_THUMB_HEIGHT.min(track.height);
-        let raw_h = track.height * (bounds.height / content_height);
-        let thumb_h = raw_h.max(min_thumb).min(track.height);
-        let scroll_range = (content_height - bounds.height).max(0.0);
-        let track_range = (track.height - thumb_h).max(0.0);
-        let progress = if scroll_range > 0.0 {
-            (offset / scroll_range).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let thumb_y = track.y + progress * track_range;
-        Some(Rectangle {
-            x: track.x,
-            y: thumb_y,
-            width: track.width,
-            height: thumb_h,
-        })
-    };
-    ScrollbarGeometry {
-        container,
-        track,
-        thumb,
-    }
-}
-
-pub fn draw<R: renderer::Renderer>(
-    renderer: &mut R,
-    geometry: &ScrollbarGeometry,
-    style: &ScrollbarStyle,
-) {
-    let Some(thumb) = geometry.thumb else {
-        return;
-    };
-    let track_radius = (geometry.track.width.min(geometry.track.height)) / 2.0;
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: geometry.track,
-            border: Border {
-                radius: border::Radius::from(track_radius),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(style.track_color),
-    );
-    let thumb_radius = (thumb.width.min(thumb.height)) / 2.0;
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: thumb,
-            border: Border {
-                radius: border::Radius::from(thumb_radius),
-                ..Border::default()
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(style.thumb_color),
-    );
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ScrollbarEvent {
-    /// Cursor missed the scrollbar — fall through to the widget's
-    /// usual handling.
-    None,
-    /// The scrollbar consumed the event but the offset didn't change
-    /// (e.g. mouse-released after a drag).
-    Captured,
-    /// Caller should set its `vertical_offset` to this value, capture
-    /// the event, and request a redraw.
-    OffsetChanged(f32),
-}
-
-pub fn on_button_pressed(
-    state: &mut ScrollbarState,
-    cursor: Point,
-    bounds: Rectangle,
-    content_height: f32,
-    offset: f32,
-) -> ScrollbarEvent {
-    let geom = geometry(bounds, content_height, offset);
-    let Some(thumb) = geom.thumb else {
-        return ScrollbarEvent::None;
-    };
-    if !geom.container.contains(cursor) {
-        return ScrollbarEvent::None;
-    }
-    if thumb.contains(cursor) {
-        state.drag = Some(DragState {
-            start_cursor_y: cursor.y,
-            start_offset: offset,
-        });
-        return ScrollbarEvent::Captured;
-    }
-    let new_offset = cursor_to_offset(
-        cursor.y,
-        geom.track,
-        thumb.height,
-        content_height,
-        bounds.height,
-    );
-    state.drag = Some(DragState {
-        start_cursor_y: cursor.y,
-        start_offset: new_offset,
-    });
-    ScrollbarEvent::OffsetChanged(new_offset)
-}
-
-pub fn on_cursor_moved(
-    state: &mut ScrollbarState,
-    cursor: Point,
-    bounds: Rectangle,
-    content_height: f32,
-) -> ScrollbarEvent {
-    let Some(drag) = state.drag else {
-        return ScrollbarEvent::None;
-    };
-    let geom = geometry(bounds, content_height, drag.start_offset);
-    let Some(thumb) = geom.thumb else {
-        return ScrollbarEvent::None;
-    };
-    let scroll_range = (content_height - bounds.height).max(0.0);
-    let track_range = (geom.track.height - thumb.height).max(0.0);
-    if track_range <= 0.0 || scroll_range <= 0.0 {
-        return ScrollbarEvent::Captured;
-    }
-    let delta_y = cursor.y - drag.start_cursor_y;
-    let new_offset =
-        (drag.start_offset + delta_y * scroll_range / track_range).clamp(0.0, scroll_range);
-    ScrollbarEvent::OffsetChanged(new_offset)
-}
-
-pub fn on_button_released(state: &mut ScrollbarState) -> ScrollbarEvent {
-    if state.drag.take().is_some() {
-        ScrollbarEvent::Captured
-    } else {
-        ScrollbarEvent::None
-    }
-}
-
-pub fn is_dragging(state: &ScrollbarState) -> bool {
-    state.drag.is_some()
-}
-
+/// Whether `cursor` is over the bar's zone: nothing under it takes hover or a
+/// text cursor.
 pub fn hits_container(bounds: Rectangle, cursor: Point, content_height: f32) -> bool {
     if content_height <= bounds.height {
         return false;
     }
-    let container = Rectangle {
-        x: bounds.x + bounds.width - WIDTH,
+    let zone = Rectangle {
+        x: bounds.x + bounds.width - GUTTER,
         y: bounds.y,
-        width: WIDTH,
+        width: GUTTER,
         height: bounds.height,
     };
-    container.contains(cursor)
+    zone.contains(cursor)
 }
 
-fn cursor_to_offset(
-    cursor_y: f32,
-    track: Rectangle,
-    thumb_height: f32,
+/// What kit's bar reads from a view that owns its offset, and how a drag on the
+/// bar reaches it. The view [`publishes`](Shared::publish) its viewport and
+/// offset each frame and [takes](Shared::take_requested) a dragged-to offset
+/// before laying out; kit redraws the view that holds the bar.
+#[derive(Clone, Default)]
+pub struct Shared(Rc<RefCell<SharedState>>);
+
+#[derive(Default)]
+struct SharedState {
+    viewport: Bounds<Pixels>,
     content_height: f32,
-    viewport_height: f32,
-) -> f32 {
-    let scroll_range = (content_height - viewport_height).max(0.0);
-    let track_range = (track.height - thumb_height).max(0.0);
-    if track_range <= 0.0 || scroll_range <= 0.0 {
-        return 0.0;
+    offset: f32,
+    requested: Option<f32>,
+}
+
+impl Shared {
+    /// What this frame shows: the viewport, the content's height, and how far
+    /// down it is scrolled.
+    pub fn publish(&self, viewport: Rectangle, content_height: f32, offset: f32) {
+        let mut state = self.0.borrow_mut();
+        state.viewport = viewport.bounds();
+        state.content_height = content_height;
+        state.offset = offset;
     }
-    let target_thumb_y = cursor_y - thumb_height / 2.0;
-    let raw_progress = (target_thumb_y - track.y) / track_range;
-    raw_progress.clamp(0.0, 1.0) * scroll_range
+
+    /// The offset a drag on the bar asked for since the last frame.
+    pub fn take_requested(&self) -> Option<f32> {
+        self.0.borrow_mut().requested.take()
+    }
+}
+
+impl ScrollbarHandle for Shared {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.0.borrow().viewport
+    }
+
+    /// GPUI's convention: the offset goes negative as content scrolls up.
+    fn offset(&self) -> GpuiPoint<Pixels> {
+        point(px(0.0), px(-self.0.borrow().offset))
+    }
+
+    fn set_offset(&self, offset: GpuiPoint<Pixels>) {
+        let mut state = self.0.borrow_mut();
+        let max = (state.content_height - f32::from(state.viewport.size.height)).max(0.0);
+        let offset = (-f32::from(offset.y)).clamp(0.0, max);
+        // The bar reads its thumb from here before the view's next frame.
+        state.offset = offset;
+        state.requested = Some(offset);
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        let state = self.0.borrow();
+        size(state.viewport.size.width, px(state.content_height))
+    }
 }

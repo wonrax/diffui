@@ -72,7 +72,10 @@ use super::settings::cli_error;
 use super::walk::{parse_user_revset, with_revset_parse_context};
 use super::workspace::TargetContext;
 use crate::model::LoadProgress;
-use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
+use crate::push::{
+    BookmarkMove, MoveKind, PushAllow, PushCheck, PushRejection, PushRequest, PushTarget,
+    RejectedCommit,
+};
 
 /// How many offending commits a rejection lists before it says "and more".
 const MAX_REJECTED: usize = 20;
@@ -109,6 +112,10 @@ struct Named {
 pub(super) struct PlannedPush {
     remote: String,
     updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
+    /// Tracked tags the default push carries along, as `jj git push` does.
+    /// They take no part in signing: a tag doesn't follow its commit's
+    /// rewrite.
+    tags: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
     /// Lines that lead the activity output: bookmarks created or already in
     /// place, and what signing did.
     pub notes: Vec<String>,
@@ -211,6 +218,7 @@ pub(super) async fn plan_push(
     // Classify. An explicitly named bookmark that can't be pushed fails the
     // whole push, as it does in the CLI.
     let mut updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)> = Vec::new();
+    let mut tags: Vec<(RefNameBuf, Diff<Option<CommitId>>)> = Vec::new();
     let mut seen: HashSet<RefNameBuf> = HashSet::new();
     for item in &named {
         if !seen.insert(item.name.clone()) {
@@ -253,11 +261,32 @@ pub(super) async fn plan_push(
                 Err(error) => notes.push(format!("skipped: {error}")),
             }
         }
+        // And the tracked tags pointing there, as jj 0.45 pushes them.
+        let tag_candidates: Vec<RefNameBuf> = repo
+            .view()
+            .local_remote_tags(remote)
+            .filter(|(_, targets)| targets.remote_ref.is_tracked())
+            .filter(|(_, targets)| {
+                targets
+                    .local_target
+                    .added_ids()
+                    .any(|id| in_range.contains(id))
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for name in tag_candidates {
+            match classify_tag(repo, &name, remote) {
+                Ok(Some(update)) => tags.push((name, update)),
+                Ok(None) => {}
+                Err(error) => notes.push(format!("skipped: {error}")),
+            }
+        }
     }
-    if updates.is_empty() {
+    if updates.is_empty() && tags.is_empty() {
         return Ok(PlannedPush {
             remote: request.remote.clone(),
             updates,
+            tags,
             notes,
             plan: Vec::new(),
         });
@@ -265,15 +294,18 @@ pub(super) async fn plan_push(
 
     let new_heads: Vec<CommitId> = updates
         .iter()
+        .chain(&tags)
         .filter_map(|(_, update)| update.after.clone())
         .collect();
     let (commits, truncated, private_revset) =
         check_commits(context, repo, remote, &new_heads, request.allow).await?;
-    let plan = describe_updates(repo, &updates).await;
+    let mut moves = describe_updates(repo, remote, &updates, false).await?;
+    moves.extend(describe_updates(repo, remote, &tags, true).await?);
+    let plan = moves.iter().map(BookmarkMove::line).collect();
     if !commits.is_empty() || request.confirm {
         return Err(anyhow!(PushRejection {
             remote: request.remote.clone(),
-            plan,
+            moves,
             commits,
             truncated,
             private_commits: private_revset,
@@ -283,6 +315,7 @@ pub(super) async fn plan_push(
     Ok(PlannedPush {
         remote: request.remote.clone(),
         updates,
+        tags,
         notes,
         plan,
     })
@@ -298,10 +331,11 @@ pub(super) fn send_push(
     let PlannedPush {
         remote: remote_name,
         updates,
+        tags,
         mut notes,
         plan,
     } = planned;
-    if updates.is_empty() {
+    if updates.is_empty() && tags.is_empty() {
         notes.push("Nothing changed.".to_owned());
         return Ok(PushOutcome {
             message: format!("Nothing to push to {remote_name}"),
@@ -310,9 +344,15 @@ pub(super) fn send_push(
         });
     }
     let remote = RemoteName::new(&remote_name);
+    let names: Vec<&str> = updates
+        .iter()
+        .chain(&tags)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let message = format!("Pushed {} to {remote_name}", names.join(", "));
     let targets = GitPushRefTargets {
         bookmarks: updates.clone(),
-        tags: Vec::new(),
+        tags: tags.clone(),
     };
     let mut subprocess_options = GitSubprocessOptions::from_settings(context.settings)
         .context("failed to read git subprocess options")?;
@@ -335,9 +375,6 @@ pub(super) fn send_push(
     let mut output = notes;
     output.extend(plan);
     output.append(&mut callback.lines);
-    let names: Vec<&str> = updates.iter().map(|(name, _)| name.as_str()).collect();
-    let message = format!("Pushed {} to {remote_name}", names.join(", "));
-
     if stats.all_ok() {
         return Ok(PushOutcome {
             message,
@@ -622,6 +659,35 @@ fn classify(
     }
 }
 
+/// The CLI's `classify_tag_update` for the default push, which allows no new
+/// or deleted remote tags.
+fn classify_tag(
+    repo: &MutableRepo,
+    name: &RefName,
+    remote: &RemoteName,
+) -> Result<Option<Diff<Option<CommitId>>>> {
+    let symbol = name.to_remote_symbol(remote);
+    let targets = LocalAndRemoteRef {
+        local_target: repo.view().get_local_tag(name),
+        remote_ref: repo.view().get_remote_tag(symbol),
+    };
+    match classify_ref_push_action(targets) {
+        RefPushAction::AlreadyMatches => Ok(None),
+        RefPushAction::LocalConflicted => bail!("tag {} is conflicted", name.as_str()),
+        RefPushAction::RemoteConflicted => {
+            bail!("tag {symbol} is conflicted; fetch to update the conflicted remote tag")
+        }
+        RefPushAction::RemoteUntracked => bail!("non-tracking remote tag {symbol} exists"),
+        RefPushAction::Update(_) if !targets.remote_ref.is_tracked() => {
+            bail!("refusing to create new remote tag {symbol}; track it and try again")
+        }
+        RefPushAction::Update(update) if update.after.is_none() => {
+            bail!("refusing to push deleted tag {}", name.as_str())
+        }
+        RefPushAction::Update(update) => Ok(Some(update)),
+    }
+}
+
 /// The CLI's `CommitsValidator`, collecting every offending commit instead of
 /// stopping at the first: the range `(remote heads | immutable_heads())..new_heads`
 /// is exactly what the push would make newly reachable on the remote.
@@ -772,34 +838,72 @@ async fn default_push_range(
         .await
 }
 
-/// `  bookmark: main [move forward from abc to def]`, as the CLI prints the
-/// plan before pushing.
+/// What each update does to the remote: the CLI's "Changes to push" plan
+/// (`print_commits_ready_to_push`), with the revisions each move publishes,
+/// the ones not yet reachable from any of the remote's bookmarks.
 async fn describe_updates(
     repo: &MutableRepo,
+    remote: &RemoteName,
     updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
-) -> Vec<String> {
+    tag: bool,
+) -> Result<Vec<BookmarkMove>> {
     let short = short_commit_hash;
-    let mut lines = Vec::new();
+    let known_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .cloned()
+        .collect();
+    let mut moves = Vec::new();
     for (name, update) in updates {
-        let what = match (&update.before, &update.after) {
+        let kind = match (&update.before, &update.after) {
             (Some(old), Some(new)) => {
                 let index = repo.index();
-                let direction = if index.is_ancestor(old, new).await.unwrap_or(false) {
-                    "forward"
+                if index.is_ancestor(old, new).await.unwrap_or(false) {
+                    MoveKind::Forward
                 } else if index.is_ancestor(new, old).await.unwrap_or(false) {
-                    "backward"
+                    MoveKind::Backward
                 } else {
-                    "sideways"
-                };
-                format!("move {direction} from {} to {}", short(old), short(new))
+                    MoveKind::Sideways
+                }
             }
-            (Some(old), None) => format!("delete from {}", short(old)),
-            (None, Some(new)) => format!("add to {}", short(new)),
+            (Some(_), None) => MoveKind::Delete,
+            (None, Some(_)) => MoveKind::Add,
             (None, None) => continue,
         };
-        lines.push(format!("bookmark: {} [{what}]", name.as_str()));
+        let (mut revisions, mut revision_count) = (Vec::new(), 0);
+        if let Some(new) = &update.after {
+            let published: Arc<ResolvedRevsetExpression> =
+                RevsetExpression::commits(known_heads.clone())
+                    .range(&RevsetExpression::commits(vec![new.clone()]));
+            let mut stream = published
+                .evaluate(repo)
+                .context("failed to evaluate the revisions a push publishes")?
+                .stream();
+            while let Some(id) = stream.next().await {
+                let id = id.context("failed to walk the revisions a push publishes")?;
+                revision_count += 1;
+                if revisions.len() < BookmarkMove::LISTED {
+                    let commit = repo
+                        .store()
+                        .get_commit_async(&id)
+                        .await
+                        .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+                    revisions.push(short_change_id(&commit));
+                }
+            }
+        }
+        moves.push(BookmarkMove {
+            bookmark: name.as_str().to_owned(),
+            tag,
+            from: update.before.as_ref().map(short),
+            to: update.after.as_ref().map(short),
+            kind,
+            revisions,
+            revision_count,
+        });
     }
-    lines
+    Ok(moves)
 }
 
 /// The CLI's `ensure_new_bookmark_name` for `--change`.

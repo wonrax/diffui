@@ -443,6 +443,7 @@ pub(crate) async fn history_diff(
                 matcher.as_ref(),
                 &DiffOptions::default(),
                 true,
+                &crate::repo::CancelFlag::default(),
             )
             .await?;
             Ok((document, Some(jj_revision_details(repo, &commit).await)))
@@ -466,6 +467,7 @@ pub(crate) async fn history_diff(
                 matcher.as_ref(),
                 &DiffOptions::default(),
                 true,
+                &crate::repo::CancelFlag::default(),
             )
             .await?;
             Ok((document, Some(jj_revision_details(repo, &to).await)))

@@ -1,16 +1,9 @@
-//! Native macOS integration points used from the iced app.
+//! Native macOS integration points: the open panel, popup menus and the menu bar.
 //!
-//! The popup-menu bridge: iced widgets can ask AppKit to show a real `NSMenu`
-//! at the cursor — now a *tree* of items with nested submenus — and report
-//! back which leaf the user picked. A previous attempt to inject an
-//! `NSVisualEffectView` for a liquid glass sidebar was reverted because
-//! iced/winit owns the window's `contentView` directly — wrapping it triggers a
-//! panic in winit's view subclass (`tried to access uninitialized instance
-//! variable`), and adding the effect view at the window's frame-view level
-//! doesn't composite behind the contentView. Getting that working requires
-//! either patching winit to support hosting iced inside a foreign `NSView`, or
-//! rebuilding the app shell against a SwiftUI-hosted `MTKView` à la the
-//! egui+SwiftUI article.
+//! The popup-menu bridge asks AppKit to show a real `NSMenu` at the cursor (a
+//! *tree* of items with nested submenus) and reports back which leaf the user
+//! picked. Both it and the open panel run modal loops on the main thread, so call
+//! them only from outside any GPUI update; see `Diffui::popup` in `menus.rs`.
 
 use std::cell::Cell;
 
@@ -26,6 +19,15 @@ use objc2_foundation::{
     MainThreadMarker, NSNumber, NSObject, NSObjectProtocol, NSString, ns_string,
 };
 use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming, CATransaction};
+
+/// Bounces the Dock icon once, leaving focus with whichever app has it.
+pub fn request_attention() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    NSApplication::sharedApplication(mtm)
+        .requestUserAttention(objc2_app_kit::NSRequestUserAttentionType::InformationalRequest);
+}
 
 /// Show the system directory picker and return the selected working-copy path.
 pub fn choose_repository_folder() -> Option<String> {
@@ -110,9 +112,9 @@ impl MenuItem {
     }
 }
 
-/// A row rectangle to glow while the menu is open, in iced window-content
-/// logical points (top-left origin) — exactly what the sidebar widget hands
-/// back with the right-click. Converted to the window's content-layer space in
+/// A row rectangle to glow while the menu is open, in window-content logical
+/// points (top-left origin), exactly what the sidebar widget hands back with the
+/// right-click. Converted to the window's content-layer space in
 /// [`install_glow`].
 #[derive(Clone, Copy)]
 pub struct GlowRect {
@@ -236,6 +238,12 @@ fn set_subtitle(item: &NSMenuItem, subtitle: &str) {
 /// loop.
 pub fn popup_menu(items: &[MenuItem], glow: Option<GlowRect>) -> Option<u32> {
     let mtm = MainThreadMarker::new()?;
+    // Foreground tasks run under the tracking loop, so a second popup queued before
+    // this one opened could start on top of it. One menu at a time.
+    thread_local!(static TRACKING: Cell<bool> = const { Cell::new(false) });
+    if TRACKING.replace(true) {
+        return None;
+    }
     let target = MenuTarget::new(mtm);
     let target_ref: &AnyObject = &target;
     let menu = build_menu(mtm, target_ref, items);
@@ -243,29 +251,26 @@ pub fn popup_menu(items: &[MenuItem], glow: Option<GlowRect>) -> Option<u32> {
     let glow_layer = glow.and_then(|rect| install_glow(mtm, rect));
 
     let location = NSEvent::mouseLocation();
-    let positioned = menu.popUpMenuPositioningItem_atLocation_inView(None, location, None);
+    menu.popUpMenuPositioningItem_atLocation_inView(None, location, None);
+    TRACKING.set(false);
 
     if let Some(layer) = glow_layer {
         layer.removeFromSuperlayer();
-    }
-    if !positioned {
-        return None;
     }
     let tag = target.ivars().selected.get();
     if tag < 0 { None } else { Some(tag as u32) }
 }
 
-/// Add a pulsing accent `CALayer` over `rect` on the key window's content
-/// layer, and return it so the caller can remove it when the menu closes.
+/// Add a pulsing accent `CALayer` over `rect` on the layer GPUI draws into, and
+/// return it so the caller can remove it when the menu closes.
 /// `None` if there's no key window (nothing to anchor to).
 fn install_glow(mtm: MainThreadMarker, rect: GlowRect) -> Option<Retained<CALayer>> {
     let app = NSApplication::sharedApplication(mtm);
     let window = app.keyWindow().or_else(|| app.mainWindow())?;
-    let content_view = window.contentView()?;
-    let parent = content_view.layer()?;
+    let parent = drawing_layer(&window)?;
 
-    // iced reports the row in top-left-origin points. Map into the content
-    // layer's space: if it isn't geometry-flipped, flip Y against its height.
+    // The row arrives in top-left-origin points. Map into the layer's space: if it
+    // isn't geometry-flipped, flip Y against its height.
     let parent_height = parent.bounds().size.height;
     let h = f64::from(rect.height);
     let y_top = f64::from(rect.y);
@@ -325,27 +330,50 @@ fn install_glow(mtm: MainThreadMarker, rect: GlowRect) -> Option<Retained<CALaye
     Some(glow)
 }
 
+/// The Metal layer GPUI draws the window into. GPUI's view is a subview of the
+/// window's content view, and its layer is the one that spans the window (the
+/// transparent title bar included) with our pixels on it; a sublayer composites
+/// over them. The content view itself has no layer to rely on.
+fn drawing_layer(window: &objc2_app_kit::NSWindow) -> Option<Retained<CALayer>> {
+    let content_view = window.contentView()?;
+    let gpui_view = objc2::runtime::AnyClass::get(c"GPUIView")?;
+    content_view
+        .subviews()
+        .iter()
+        .find(|view| view.isKindOfClass(gpui_view))?
+        .layer()
+}
+
 // ── The menu bar ────────────────────────────────────────────────────────────
 //
-// winit installs a bare app menu (About / Hide / Quit). [`install_menu_bar`]
-// replaces it with the app's own, built from the command registry by
-// `crate::app_menu`. Two rules keep it from fighting the keymap:
+// [`install_menu_bar`] puts up the app's own bar, built from the command registry
+// by `crate::app_menu`, rather than GPUI's `cx.set_menus`. That API can't do what
+// this bar does: its items run GPUI actions validated by action *type* against the
+// focused dispatch path (`is_action_available`), not per command, and they show a
+// key equivalent only by binding it in GPUI's keymap, which would make AppKit
+// perform it past our mode stack and `[keys]` overrides. GPUI touches the main menu
+// only inside `set_menus`, so the two never meet. GPUI's delegate implements
+// `validateMenuItem:` and would grey anything it doesn't know, but AppKit asks only
+// for auto-enabled menus, and these aren't.
 //
-//   * A command item doesn't fire on its key equivalent. The command menus
-//     are a `KeymapMenu`, whose `performKeyEquivalent:` declines every key,
-//     so the keystroke falls through to the window and the keymap resolves
-//     it against the mode stack as before (and honours `[keys]`); the menu
+// Two rules keep it from fighting the keymap:
+//
+//   * A command item doesn't fire on its key equivalent. GPUI's view hears a
+//     modified key first, and the keymap resolves it against the mode stack. A
+//     key it leaves alone then reaches the menu bar, where the command menus are
+//     a `KeymapMenu`, whose `performKeyEquivalent:` declines every key; the menu
 //     only *shows* the chord. A click sends the item's tag down
 //     [`menu_bar_picks`]. (Disabling the item during the key match doesn't
 //     work: AppKit swallows a key that matches a disabled item.) The app and
 //     Window menus stay plain `NSMenu`s, so ⌘, ⌘H ⌘Q ⌘M work natively.
 //   * Edit's copy / paste / select-all re-post their own key to the window
-//     when clicked, so the focused iced text field handles them exactly as
-//     it handles the keystroke.
+//     when clicked, so the focused text field handles them exactly as it
+//     handles the keystroke.
 //
-// Like the popup menus, the bar blocks the main thread while it is open;
-// picks are queued on a channel and read by an iced subscription once it
-// closes.
+// Like the popup menus, the bar runs a tracking loop on the main thread while it
+// is open. AppKit runs that one outside any GPUI update, and nothing here enters
+// the app from it: picks are queued on a channel, read by the loop `app_menu::start`
+// spawns.
 
 /// A key equivalent as AppKit spells it: the key (lower-case for a plain
 /// letter, upper-case implies shift) and the modifiers.
@@ -544,9 +572,8 @@ fn repost_key(key: &str, mask: objc2_app_kit::NSEventModifierFlags) {
     let Some(window) = app.keyWindow() else {
         return;
     };
-    // Virtual key codes (US layout) for the keys the Edit menu reposts;
-    // winit reads the physical key from it and the logical key from the
-    // characters.
+    // Virtual key codes (US layout) for the keys the Edit menu reposts. GPUI reads
+    // the key from the code and the characters.
     let code: u16 = match key {
         "a" => 0,
         "x" => 7,
@@ -584,8 +611,8 @@ fn repost_key(key: &str, mask: objc2_app_kit::NSEventModifierFlags) {
     }
 }
 
-/// Replace the menu bar with `menus`. Call on the main thread once the app
-/// has finished launching (winit installs its default menu then).
+/// Replace the menu bar with `menus`. Call on the main thread once the app has
+/// finished launching.
 pub fn install_menu_bar(menus: &[BarMenu]) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;

@@ -2,14 +2,12 @@
 //!
 //! Every producer — the keyboard (through [`crate::keymap`]), the command
 //! palette, the menus, toolbar buttons, drag & drop — ends up emitting an
-//! [`Action`], and `Message::Action` is the single arm that performs it. That
-//! is what keeps a fix in one place: before this existed the same intent was
-//! spelled three ways (a `MenuAction`, a palette `CommandId`, a key match) and
-//! a bug fixed in one spelling stayed alive in the other two.
+//! [`Action`], and [`crate::Diffui::perform`] is the one place that carries it
+//! out, so a fix lands once for every way of asking.
 //!
 //! An `Action` is *what the user asked for*, not how a widget said it. Widget
-//! plumbing (scroll offsets, hover, debounce ticks) stays out — see
-//! [`crate::message::UiEvent`].
+//! plumbing (scroll offsets, hover, debounce ticks) stays out: those are
+//! listeners that change state directly.
 
 use diffui_core::{FetchTarget, RevisionSelection};
 
@@ -114,6 +112,8 @@ pub(crate) enum Action {
     /// Open or close the keyboard-shortcut cheat sheet.
     ToggleShortcuts,
     CloseShortcuts,
+    OpenSettings,
+    CloseSettings,
     ConfirmAccept,
     ConfirmCancel,
 
@@ -122,6 +122,9 @@ pub(crate) enum Action {
     Fetch(FetchTarget),
     Undo,
     Redo,
+    /// `jj workspace update-stale`, through the jj CLI: bring a stale
+    /// checkout's files up to date.
+    UpdateStaleWorkingCopy,
     /// Revert exactly this jj operation (an activity row's "Revert").
     UndoOperation(activity::ActivityId, String),
     /// Replace the revset and re-evaluate.
@@ -142,6 +145,11 @@ pub(crate) enum Action {
     /// Collapse or restore the changed-files pane.
     ToggleFilesPanel,
     SetTheme(ThemePreference),
+    /// Keep up with the disk on its own, or only when Refresh is pressed.
+    SetRefreshMode(diffui_core::RefreshMode),
+    /// A font or code text setting from the settings dialog: applied now and
+    /// saved.
+    ChangeSetting(crate::config::Setting),
     SetMainView(MainView),
 
     // ── Tabs ────────────────────────────────────────────────────────────
@@ -197,8 +205,8 @@ pub(crate) enum Action {
     // ── Diagnostics ─────────────────────────────────────────────────────
     /// Show diffui's log file in the file manager.
     RevealLogFile,
-    /// Open `config.toml` in a text editor, creating it if missing.
-    OpenConfigFile,
+    /// Show `config.toml` or `settings.toml` in the file manager.
+    RevealConfigFile(crate::config::ConfigFile),
 
     // ── Comparing ───────────────────────────────────────────────────────
     /// Diff two revisions against each other (see [`crate::compare`]).

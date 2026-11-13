@@ -250,6 +250,10 @@ impl Sentence<'_> {
                 self.text(" and ");
                 self.revision(child);
             }
+            Destination::Trunk => {
+                self.text(onto);
+                self.phrases.push(Phrase::Revision("trunk()".to_owned()));
+            }
         }
     }
 

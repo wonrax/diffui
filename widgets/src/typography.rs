@@ -1,34 +1,36 @@
 //! Where glyphs actually sit, from the fonts the app loads.
 //!
-//! iced (cosmic-text) lays a line of text out in a *line box*: the font's
-//! ascent + descent, centred in the line height, with the baseline `ascent`
-//! below the top of that inner box. Centring the line box (what
-//! `align_y(Center)` and a centred container do) therefore centres
-//! ascent + descent, not the ink — and since a font's descent is roughly a
-//! third of its cap height, capitals and digits ride visibly high or low,
-//! by an amount that differs per font. Rows that put fonts or sizes side by
-//! side by their boxes disagree on where their baselines are.
+//! GPUI lays a line of text out in a *line box*: the font's ascent + descent,
+//! centred in the line height, with the baseline `ascent` below the top of
+//! that inner box. Centring the line box (what `items_center` does) therefore
+//! centres ascent + descent, not the ink, and since a font's descent is roughly
+//! a third of its cap height, capitals and digits ride visibly high or low, by
+//! an amount that differs per font. Rows that put fonts or sizes side by side
+//! by their boxes disagree on where their baselines are.
 //!
 //! This module reads each font's real ascent, descent and cap height (via the
-//! same cosmic-text font system the renderer draws with), and answers the two
-//! questions the UI keeps asking:
+//! text system the renderer draws with), and answers the two questions the UI
+//! keeps asking:
 //!
-//! * **Baseline alignment** — where a run's baseline lies in its line box
+//! * **Baseline alignment**: where a run's baseline lies in its line box
 //!   ([`TextBox::baseline`]), so runs in different fonts, sizes or containers
 //!   can be placed on one shared baseline ([`baseline_row`], [`group`],
 //!   [`TextBox::center_for_baseline`]).
-//! * **Optical centring** — the CSS `text-box: trim-both cap alphabetic`
-//!   model: a text's visual box is cap-height top to alphabetic baseline, and
-//!   that is what gets centred in a control ([`TextBox::trim_shift`],
-//!   [`centered`], [`TextBox::baseline_for_center`]).
+//! * **Optical centring**: the CSS `text-box: trim-both cap alphabetic` model:
+//!   a text's visual box is cap-height top to alphabetic baseline, and that is
+//!   what gets centred in a control ([`TextBox::trim_shift`], [`centered`],
+//!   [`TextBox::baseline_for_center`]).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
-use iced::advanced::graphics::text::{Paragraph, font_system};
-use iced::advanced::text::{self, Paragraph as _, Shaping, Text};
-use iced::widget::{container, row};
-use iced::{Element, Font, Length, Padding, Pixels, Size, alignment};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, App, Div, Hsla, IntoElement, SharedString, TextAlign, TextRun, Window, div, point,
+    px,
+};
+
+use crate::theme::{Color, Font, Padding};
 
 /// A font's vertical metrics, as fractions of its em size. `descent` is
 /// positive (below the baseline).
@@ -37,6 +39,7 @@ pub struct FontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub cap_height: f32,
+    pub x_height: f32,
 }
 
 impl FontMetrics {
@@ -45,6 +48,7 @@ impl FontMetrics {
         ascent: 0.95,
         descent: 0.25,
         cap_height: 0.70,
+        x_height: 0.52,
     };
 
     /// The metrics of the face `font` resolves to for Latin text, read once
@@ -72,46 +76,71 @@ impl FontMetrics {
     }
 }
 
-/// Shape a capital in `font` the way the renderer would, and read the metrics
-/// of the face the shaper actually picked (a generic family resolves to a
-/// platform face; a named one may fall back).
+/// The metrics of the face the text system resolves `font` to.
 fn read_metrics(font: Font) -> Option<FontMetrics> {
-    let paragraph = Paragraph::with_text(Text {
-        content: "H",
-        bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(100.0),
-        line_height: text::LineHeight::Relative(1.0),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: Shaping::Advanced,
-        wrapping: text::Wrapping::None,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
-    });
-    let glyph = paragraph
-        .buffer()
-        .layout_runs()
-        .next()?
-        .glyphs
-        .first()?
-        .clone();
-    let mut system = font_system().write().ok()?;
-    let face = system.raw().get_font(glyph.font_id, glyph.font_weight)?;
-    let metrics = face.metrics();
-    let em = f32::from(metrics.units_per_em);
-    if em <= 0.0 {
-        return None;
-    }
-    let ascent = metrics.ascent / em;
-    let descent = -metrics.descent / em;
-    // Fonts without an OS/2 cap height: capitals reach ~70% of the em.
-    let cap_height = metrics.cap_height.map_or(0.70, |cap| cap / em);
+    const EM: f32 = 100.0;
+    let system = crate::measure::text_system();
+    let id = system.resolve_font(&font.gpui());
+    let size = px(EM);
+    let ascent = f32::from(system.ascent(id, size)) / EM;
+    let descent = f32::from(system.descent(id, size)).abs() / EM;
+    let cap_height = f32::from(system.cap_height(id, size)) / EM;
+    let x_height = f32::from(system.x_height(id, size)) / EM;
     (ascent.is_finite() && descent.is_finite() && cap_height > 0.0).then_some(FontMetrics {
         ascent,
         descent,
         cap_height,
+        x_height: if x_height > 0.0 {
+            x_height
+        } else {
+            FontMetrics::FALLBACK.x_height
+        },
     })
+}
+
+/// The face body text is set in: what [`optical_size`] matches other faces to.
+static UI_FONT: RwLock<Option<Font>> = RwLock::new(None);
+
+/// Tells the module which face body text is set in. The app calls it when it
+/// loads its config.
+pub fn set_ui_font(font: Font) {
+    if let Ok(mut slot) = UI_FONT.write() {
+        *slot = Some(font);
+    }
+}
+
+/// The size to set `font` at so a label in it reads as large as one in the UI
+/// font does at `size`. How big text looks is both how tall its lowercase
+/// stands and how wide its letters run, and a monospace face usually exceeds a
+/// sans on both at one point size (Menlo against SF: 4% taller, 23% wider), so
+/// a mono chip beside sans ones reads a size up. The factor is the mean of the
+/// two ratios, from the faces' own metrics, so it holds for whatever fonts the
+/// config names. Only ever smaller, and never by more than 15%.
+pub fn optical_size(font: Font, size: f32) -> f32 {
+    let Some(ui) = UI_FONT.read().ok().and_then(|slot| *slot) else {
+        return size;
+    };
+    if font == ui {
+        return size;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(Font, Font), f32>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let known = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&(ui, font)).copied());
+    let factor = known.unwrap_or_else(|| {
+        const SAMPLE: &str = "divergent conflict hidden 0123456789";
+        let tall = FontMetrics::of(ui).x_height / FontMetrics::of(font).x_height;
+        let wide = crate::measure::line_width(SAMPLE, 100.0, ui)
+            / crate::measure::line_width(SAMPLE, 100.0, font).max(1.0);
+        let factor = (tall * wide).sqrt().clamp(0.85, 1.0);
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert((ui, font), factor);
+        }
+        factor
+    });
+    size * factor
 }
 
 /// One line of text in one font and size, laid out in a line box
@@ -129,8 +158,8 @@ impl TextBox {
         Self::with_metrics(FontMetrics::of(font), size, line_height)
     }
 
-    /// A box with iced's default line height (1.3 × size), which every
-    /// `text` widget without an explicit `line_height` uses.
+    /// A box with the app's default line height (1.3 × size), which every
+    /// text element inherits from the root unless it sets its own.
     pub fn default_line(font: Font, size: f32) -> Self {
         Self::new(font, size, size * DEFAULT_LINE_HEIGHT)
     }
@@ -147,7 +176,7 @@ impl TextBox {
         self.line_height
     }
 
-    /// The baseline: cosmic-text centres ascent + descent in the line box and
+    /// The baseline: GPUI centres ascent + descent in the line box and
     /// puts the baseline `ascent` below the top of that.
     pub fn baseline(&self) -> f32 {
         let ascent = self.metrics.ascent * self.size;
@@ -185,7 +214,7 @@ impl TextBox {
     }
 }
 
-/// iced's default `LineHeight::Relative` for a `text` widget.
+/// The line height the root sets for all text, as a multiple of its size.
 pub const DEFAULT_LINE_HEIGHT: f32 = 1.3;
 
 /// Default row-height factor of the code grid — 1.85 × the font size gives
@@ -252,27 +281,99 @@ fn trim(padding: Padding, shift: f32) -> Padding {
     }
 }
 
-/// `content`, a single-line text in `font` at `size` with iced's default
-/// line height, padded so that when a container centres it the cap box is
-/// what lands in the middle (`text-box: trim-both cap alphabetic`). The
-/// building block of every centred label: buttons, tabs, chips, inputs.
-pub fn centered<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>,
-    font: Font,
+/// One line of `content` in `font` at `size` and `color`, in the default line
+/// box, unwrapped. The building block of labels; [`centered`] and [`Aligned`]
+/// place it by its real metrics.
+pub fn line(content: impl Into<SharedString>, font: Font, size: f32, color: Color) -> Div {
+    div()
+        .font(font.gpui())
+        .text_size(px(size))
+        .line_height(px(size * DEFAULT_LINE_HEIGHT))
+        .text_color(color)
+        .whitespace_nowrap()
+        .child(content.into())
+}
+
+/// Paints one line of `content` for a painter that places its text by hand.
+/// `top` is the top of a line box `line_height` tall; `x` is the left edge, or
+/// the right edge when `align` is [`TextAlign::Right`]. Newlines read as spaces.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_line(
+    content: &str,
+    x: f32,
+    top: f32,
     size: f32,
-) -> Element<'a, Message> {
-    container(content)
-        .padding(shift_padding(
-            TextBox::default_line(font, size).trim_shift(),
-        ))
-        .into()
+    line_height: f32,
+    font: Font,
+    color: Color,
+    align: TextAlign,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let text: SharedString = if content.contains(['\n', '\r']) {
+        content.replace(['\n', '\r'], " ").into()
+    } else {
+        SharedString::from(content.to_owned())
+    };
+    let run = TextRun {
+        len: text.len(),
+        font: font.gpui(),
+        color: Hsla::from(color),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, px(size), &[run], None);
+    let left = match align {
+        TextAlign::Right => x - f32::from(shaped.width),
+        TextAlign::Center => x - f32::from(shaped.width) / 2.0,
+        TextAlign::Left => x,
+    };
+    // The width is taken out by hand above, so the line itself paints from
+    // its left edge whatever the alignment.
+    if let Err(error) = shaped.paint(
+        point(px(left), px(top)),
+        px(line_height),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        tracing::warn!("a line didn't paint: {error}");
+    }
+}
+
+/// `content`, a single-line text in `font` at `size` with the default line
+/// height, padded so that when a container centres it the cap box is what lands
+/// in the middle (`text-box: trim-both cap alphabetic`). The building block of
+/// every centred label: buttons, tabs, chips, inputs.
+pub fn centered(content: impl IntoElement, font: Font, size: f32) -> Div {
+    let padding = shift_padding(TextBox::default_line(font, size).trim_shift());
+    padding.apply(div()).child(content)
 }
 
 /// One child of a [`baseline_row`]: an element, where its baseline and cap
 /// top fall (measured down from its top edge), and its height.
-pub struct Aligned<'a, Message> {
-    element: Element<'a, Message>,
+pub struct Aligned {
+    element: AnyElement,
     line: Line,
+    width: Width,
+}
+
+/// How a child of a line takes width from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Width {
+    /// Its own, always.
+    Natural,
+    /// Its own until the line runs out, then it gives way.
+    Shrink,
+    /// Whatever the line has left.
+    Fill,
 }
 
 /// The vertical facts [`baseline_row`] needs about a child.
@@ -285,44 +386,54 @@ struct Line {
     glyph: bool,
 }
 
-impl<'a, Message: 'a> Aligned<'a, Message> {
-    /// A single-line `text` in `font` at `size` with iced's default line
-    /// height.
-    pub fn text(element: impl Into<Element<'a, Message>>, font: Font, size: f32) -> Self {
+impl Aligned {
+    /// A single-line text in `font` at `size` with the default line height.
+    pub fn text(element: impl IntoElement, font: Font, size: f32) -> Self {
         Self::boxed(element, Padding::ZERO, TextBox::default_line(font, size))
     }
 
     /// A container (chip, badge) around one line of text, `padding` around
     /// the text's line box.
-    pub fn boxed(
-        element: impl Into<Element<'a, Message>>,
-        padding: Padding,
-        text: TextBox,
-    ) -> Self {
+    pub fn boxed(element: impl IntoElement, padding: Padding, text: TextBox) -> Self {
         Self {
-            element: element.into(),
+            element: element.into_any_element(),
             line: Line {
                 baseline: padding.top + text.baseline(),
                 cap_height: text.cap_height(),
                 height: padding.top + text.line_height() + padding.bottom,
                 glyph: false,
             },
+            width: Width::Natural,
         }
     }
 
-    /// A chip, badge or keycap: one line of text in a styled box, its
-    /// padding trimmed so the text is optically centred in the box
-    /// ([`trimmed_padding`]) and the box placed by that text's baseline.
+    /// Takes whatever width the line has left. Give the text
+    /// `text_ellipsis`, so what doesn't fit is cut rather than overflowing.
+    pub fn fill(mut self) -> Self {
+        self.width = Width::Fill;
+        self
+    }
+
+    /// Keeps its natural width until the line runs out, then gives way. Give the
+    /// text `text_ellipsis`.
+    pub fn shrink(mut self) -> Self {
+        self.width = Width::Shrink;
+        self
+    }
+
+    /// A chip, badge or keycap: one line of text in a styled box, its padding
+    /// trimmed so the text is optically centred in the box ([`trimmed_padding`])
+    /// and the box placed by that text's baseline.
     pub fn chip(
-        content: impl Into<Element<'a, Message>>,
+        content: impl IntoElement,
         font: Font,
         size: f32,
         padding: Padding,
-        style: impl Fn(&iced::Theme) -> container::Style + 'a,
+        style: impl FnOnce(Div) -> Div,
     ) -> Self {
         let padding = trimmed_padding(padding, font, size);
         Self::boxed(
-            container(content).padding(padding).style(style),
+            style(padding.apply(div())).child(content),
             padding,
             TextBox::default_line(font, size),
         )
@@ -330,68 +441,86 @@ impl<'a, Message: 'a> Aligned<'a, Message> {
 
     /// The same child wrapped in something that doesn't move it vertically
     /// (a tooltip, a width limit).
-    pub fn map(self, wrap: impl FnOnce(Element<'a, Message>) -> Element<'a, Message>) -> Self {
+    pub fn map(self, wrap: impl FnOnce(AnyElement) -> AnyElement) -> Self {
         Self {
             element: wrap(self.element),
             line: self.line,
+            width: self.width,
         }
     }
 
     /// Fixed horizontal space between two children.
     pub fn gap(width: f32) -> Self {
-        Self::glyph(iced::widget::Space::new().width(Length::Fixed(width)), 0.0)
+        Self::glyph(div().w(px(width)).flex_none(), 0.0)
     }
 
     /// Something with no text of its own (an icon, a dot): centred on the
     /// line's caps.
-    pub fn glyph(element: impl Into<Element<'a, Message>>, height: f32) -> Self {
+    pub fn glyph(element: impl IntoElement, height: f32) -> Self {
         Self {
-            element: element.into(),
+            element: element.into_any_element(),
             line: Line {
                 baseline: height,
                 cap_height: height,
                 height,
                 glyph: true,
             },
+            width: Width::Natural,
         }
     }
 }
 
-/// A line whose children share one text baseline, whatever their fonts,
-/// sizes or containers — where `align_y(Center)` would line up their box
-/// centres instead. Each child drops by the difference between its baseline
-/// and the deepest one, and the line as a whole is padded so that a parent
-/// centring it centres its caps (see [`centered`]). Glyph children (icons)
-/// are centred on the caps instead of sitting on the baseline.
-pub fn baseline_row<'a, Message: 'a>(
-    items: impl IntoIterator<Item = Aligned<'a, Message>>,
-    spacing: f32,
-) -> Element<'a, Message> {
+/// A line whose children share one text baseline, whatever their fonts, sizes
+/// or containers, where `items_center` would line up their box centres instead.
+/// Each child drops by the difference between its baseline and the deepest one,
+/// and the line as a whole is padded so that a parent centring it centres its
+/// caps (see [`centered`]). Glyph children (icons) are centred on the caps
+/// instead of sitting on the baseline.
+pub fn baseline_row(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Div {
     let line = group(items, spacing);
     let shift = line.line.height / 2.0 - (line.line.baseline - line.line.cap_height / 2.0);
-    container(line.element).padding(shift_padding(shift)).into()
+    let row = shift_padding(shift).apply(div()).child(line.element);
+    match line.width {
+        Width::Natural => row,
+        Width::Shrink => row.flex().min_w_0(),
+        Width::Fill => row.flex().w_full().min_w_0(),
+    }
 }
 
-/// [`baseline_row`] without the centring, as one [`Aligned`] child of an
-/// outer line: how a group with its own spacing (an icon and its label, an
-/// id's two colours) joins a line and stays on its baseline.
-pub fn group<'a, Message: 'a>(
-    items: impl IntoIterator<Item = Aligned<'a, Message>>,
-    spacing: f32,
-) -> Aligned<'a, Message> {
-    let items: Vec<Aligned<'a, Message>> = items.into_iter().collect();
+/// [`baseline_row`] without the centring, as one [`Aligned`] child of an outer
+/// line: how a group with its own spacing (an icon and its label, an id's two
+/// colours) joins a line and stays on its baseline.
+pub fn group(items: impl IntoIterator<Item = Aligned>, spacing: f32) -> Aligned {
+    let items: Vec<Aligned> = items.into_iter().collect();
     let lines: Vec<Line> = items.iter().map(|item| item.line).collect();
     let layout = line_layout(&lines);
-    let mut row = row![].spacing(spacing).align_y(alignment::Vertical::Top);
+    let width = items
+        .iter()
+        .map(|item| item.width)
+        .fold(Width::Natural, |line, item| match (line, item) {
+            (Width::Fill, _) | (_, Width::Fill) => Width::Fill,
+            (Width::Shrink, _) | (_, Width::Shrink) => Width::Shrink,
+            _ => Width::Natural,
+        });
+    let mut row = div().flex().flex_row().items_start().gap(px(spacing));
+    match width {
+        Width::Natural => {}
+        Width::Shrink => row = row.min_w_0(),
+        Width::Fill => row = row.w_full().min_w_0(),
+    }
     for (item, top) in items.into_iter().zip(&layout.tops) {
-        row = row.push(container(item.element).padding(Padding {
-            top: *top,
-            ..Padding::ZERO
-        }));
+        let cell = div().pt(px(*top));
+        let cell = match item.width {
+            Width::Natural => cell.flex_none(),
+            Width::Shrink => cell.flex_shrink(1.0).min_w_0().overflow_hidden(),
+            Width::Fill => cell.flex_1().min_w_0().overflow_hidden(),
+        };
+        row = row.child(cell.child(item.element));
     }
     Aligned {
-        element: row.into(),
+        element: row.into_any_element(),
         line: layout.line,
+        width,
     }
 }
 
@@ -449,12 +578,14 @@ mod tests {
         ascent: 0.95,
         descent: 0.25,
         cap_height: 0.70,
+        x_height: 0.52,
     };
     /// A mono with a deeper descent and shorter caps.
     const MONO: FontMetrics = FontMetrics {
         ascent: 0.80,
         descent: 0.30,
         cap_height: 0.66,
+        x_height: 0.55,
     };
 
     fn close(a: f32, b: f32) {
@@ -467,7 +598,6 @@ mod tests {
     fn real_fonts_report_sane_metrics() {
         for font in [Font::DEFAULT, Font::MONOSPACE] {
             let metrics = FontMetrics::of(font);
-            println!("{font:?}: {metrics:?}");
             assert!(metrics.ascent > metrics.cap_height, "{font:?}: {metrics:?}");
             assert!(metrics.cap_height > 0.4, "{font:?}: {metrics:?}");
             assert!(metrics.descent > 0.0, "{font:?}: {metrics:?}");
@@ -475,12 +605,11 @@ mod tests {
         // Whatever face a named family resolves to here (or the fallback),
         // its metrics are usable.
         let named = FontMetrics::of(Font::new("Cascadia Code"));
-        println!("Cascadia Code: {named:?}");
         assert!(named.ascent > 0.0 && named.cap_height > 0.0);
     }
 
     #[test]
-    fn the_baseline_follows_cosmic_texts_line_box() {
+    fn the_baseline_follows_the_line_box() {
         // 10px text in a 13px box: ascent 9.5 + descent 2.5 = 12, centred
         // leaves 0.5 above, so the baseline is 0.5 + 9.5 down.
         let line = TextBox::with_metrics(SANS, 10.0, 13.0);

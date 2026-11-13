@@ -51,6 +51,7 @@ impl Diffui {
                 .bookmarks
                 .default_push_remote()
                 .map(str::to_owned),
+            bookmarks: &tab.session.bookmarks,
         };
         let words = Words { ui: self, command };
         // A revset that didn't resolve stops everything, whatever the kind:
@@ -151,6 +152,7 @@ impl Diffui {
                         state: PlanState::Ready(Run::Native {
                             action,
                             command: mutation.clone(),
+                            ignore_immutable: parsed.ignore_immutable,
                         }),
                     },
                     Err(LowerError::NeedsCli(reason)) => cli_plan(Some(reason)),
@@ -230,6 +232,8 @@ pub(crate) enum Run {
     Native {
         action: NativeAction,
         command: MutationCommand,
+        /// `--ignore-immutable`: run without the immutable-commit guard.
+        ignore_immutable: bool,
     },
     Ui {
         command: UiCommand,
@@ -291,6 +295,7 @@ struct Resolver<'a> {
     command: &'a CommandLine,
     working_copy: Option<&'a str>,
     push_remote: Option<String>,
+    bookmarks: &'a diffui_core::model::BookmarksInfo,
 }
 
 impl Resolver<'_> {
@@ -339,6 +344,12 @@ impl LowerContext for Resolver<'_> {
             Some(Err(error)) => Err(error.to_string()),
             None => Err(format!("Revset `{revset}` is still resolving")),
         }
+    }
+
+    fn has_local_bookmark(&self, name: &str) -> bool {
+        self.bookmarks
+            .entry(name)
+            .is_some_and(|entry| !entry.local_targets.is_empty())
     }
 
     fn default_push_remote(&self) -> Option<String> {
@@ -558,7 +569,8 @@ impl Words<'_> {
                 .then(quoted(&name.value))
                 .text(" at ")
                 .then(self.arg(to)),
-            MutationCommand::BookmarkSet { name, to, .. } => Prose::from("Move ")
+            MutationCommand::BookmarkSet { name, to, .. }
+            | MutationCommand::BookmarkMove { name, to, .. } => Prose::from("Move ")
                 .then(quoted(&name.value))
                 .text(" to ")
                 .then(self.arg(to)),
@@ -656,6 +668,24 @@ mod tests {
         let plan = ui.plan(&command);
         let words = plan.words.to_string();
         (plan, words)
+    }
+
+    #[test]
+    fn ignore_immutable_rides_into_the_run() {
+        let a = "a".repeat(40);
+        for (line, expected) in [
+            ("jj abandon x", false),
+            ("jj --ignore-immutable abandon x", true),
+        ] {
+            let (plan, _) = plan_for(line, &[("x", Ok(vec![&a]))]);
+            let PlanState::Ready(Run::Native {
+                ignore_immutable, ..
+            }) = plan.state
+            else {
+                panic!("{line} runs natively");
+            };
+            assert_eq!(ignore_immutable, expected, "{line}");
+        }
     }
 
     #[test]

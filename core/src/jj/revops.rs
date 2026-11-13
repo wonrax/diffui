@@ -148,7 +148,7 @@ async fn insertion_point(
 
 fn placement_word(destination: &Destination) -> &'static str {
     match destination {
-        Destination::Onto(_) => "on",
+        Destination::Onto(_) | Destination::Trunk => "on",
         Destination::After(_) => "after",
         Destination::Before(_) => "before",
         Destination::Between { .. } => "between",
@@ -175,11 +175,7 @@ pub(super) async fn commit(
     description: &str,
 ) -> Result<RevopOutcome> {
     let wc_id = &context.wc_id;
-    let commit = repo
-        .store()
-        .get_commit_async(wc_id)
-        .await
-        .with_context(|| format!("failed to load jj commit {}", wc_id.hex()))?;
+    let commit = context.working_copy(repo).await?;
     guard.check(repo, std::slice::from_ref(wc_id)).await?;
     let committed = repo
         .rewrite_commit(&commit)

@@ -46,15 +46,20 @@ pub enum Destination {
         parent: RevisionSelection,
         child: RevisionSelection,
     },
+    /// New children of `trunk()` as it resolves when the op runs
+    /// (`jj rebase -o 'trunk()'`), not as the last graph walk saw it.
+    Trunk,
 }
 
 impl Destination {
     /// The revision the destination is anchored on — what target-mode
-    /// highlights and preview summaries name.
-    pub fn anchor(&self) -> &RevisionSelection {
+    /// highlights and preview summaries name. `None` for [`Self::Trunk`],
+    /// which only names a revision once it runs.
+    pub fn anchor(&self) -> Option<&RevisionSelection> {
         match self {
-            Self::Onto(target) | Self::After(target) | Self::Before(target) => target,
-            Self::Between { parent, .. } => parent,
+            Self::Onto(target) | Self::After(target) | Self::Before(target) => Some(target),
+            Self::Between { parent, .. } => Some(parent),
+            Self::Trunk => None,
         }
     }
 }
@@ -106,8 +111,11 @@ pub enum MutationOp {
     /// Copy `target` onto its own parents (`jj duplicate`).
     Duplicate { target: RevisionSelection },
     /// Move `from`'s hunks into the mutable ancestors that last touched those
-    /// lines (`jj absorb --from`).
-    Absorb { from: RevisionSelection },
+    /// lines (`jj absorb --from`), only those of `paths` when it's not empty.
+    Absorb {
+        from: RevisionSelection,
+        paths: Vec<String>,
+    },
     /// Point local bookmark `name` at `to`, creating it if needed
     /// (`jj bookmark set -r <to> <name>`). With `push_remote`, the same
     /// transaction then pushes the bookmark there (`jj git push -b <name>`)
@@ -230,6 +238,21 @@ pub enum MutationOp {
     /// Reverse exactly what `operation_id` did while keeping everything since
     /// (`jj op revert`).
     RevertOperation { operation_id: String },
+}
+
+impl MutationOp {
+    /// Undo, redo and the op-log restores: they put back views and rewrite
+    /// nothing the immutable guard covers. Their `allow_immutable` is the
+    /// confirmation of undoing a push instead, never `--ignore-immutable`.
+    pub fn restores_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::Undo { .. }
+                | Self::Redo
+                | Self::RestoreOperation { .. }
+                | Self::RevertOperation { .. }
+        )
+    }
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.

@@ -6,51 +6,60 @@
 //!
 //! Elsewhere this is a no-op: there is no global menu bar to fill.
 
-use iced::{Subscription, Task};
-
+use crate::Cx;
+use crate::Diffui;
 use crate::commands::{CommandArg, CommandId, REGISTRY};
-use crate::{Diffui, Message};
 
 impl Diffui {
     /// A menu-bar pick: `tag` is the command's position in the registry.
-    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32) -> Task<Message> {
-        match REGISTRY.get(tag as usize) {
-            Some(command) => self.run_command(command.id, CommandArg::None),
-            None => Task::none(),
+    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
+        if let Some(command) = REGISTRY.get(tag as usize) {
+            self.run_command(command.id, CommandArg::None, cx)
         }
     }
 }
 
-/// The menu bar's clicks, as messages.
-pub(crate) fn subscription() -> Subscription<Message> {
+/// Starts the loop that turns menu-bar clicks into commands.
+pub(crate) fn start(cx: &mut Cx) {
     #[cfg(target_os = "macos")]
     {
-        Subscription::run(crate::macos_native::menu_bar_picks).map(Message::MenuBar)
+        use futures::StreamExt as _;
+        let mut picks = crate::macos_native::menu_bar_picks();
+        cx.spawn(async move |this, cx| {
+            while let Some(tag) = picks.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.act(cx, |this, cx| this.on_menu_bar_pick(tag, cx));
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        Subscription::none()
-    }
+    let _ = cx;
 }
 
-/// Install the menu bar. Called once the window is open, after winit has put
-/// up its default one.
+/// Install the menu bar. Called once the window is open. Why this isn't GPUI's
+/// `cx.set_menus` is in [`crate::macos_native`].
 pub(crate) fn install(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let menus = mac::menus(ui);
         mac::record_bar_tags(&menus);
         crate::macos_native::install_menu_bar(&menus);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     let _ = ui;
 }
 
 /// Tell the menu bar which of its commands can't run in the state `ui` is in
 /// now, so their items are greyed when a menu opens. Cheap enough to run
 /// after every update: a predicate per bar command, no repository reads.
+#[cfg_attr(test, allow(unused_variables))]
 pub(crate) fn refresh_availability(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let unavailable = mac::bar_tags()
             .iter()
@@ -67,45 +76,6 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
     let _ = ui;
 }
 
-/// Open `config.toml` in the user's text editor, creating it (with a pointer
-/// to what can go in it) when there isn't one yet. Behind Settings… in the
-/// app menu and "Open settings file" in the palette.
-pub(crate) fn open_config_file() -> Task<Message> {
-    let Some(path) = crate::config::config_path() else {
-        return Task::none();
-    };
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, CONFIG_TEMPLATE);
-    }
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .spawn();
-    #[cfg(not(target_os = "macos"))]
-    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-    Task::none()
-}
-
-const CONFIG_TEMPLATE: &str = "\
-# diffui settings. Read at launch; restart diffui after editing.
-#
-# theme = \"System\"        # System | Light | Dark | Contrast
-# ui_font = \"Inter\"
-# mono_font = \"JetBrains Mono\"
-# code_font_size = 12
-#
-# [keys.base]
-# \"file.next\" = \"n\"      # rebind; \"none\" unbinds. Ids are listed by `?`.
-#
-# [[revset_presets]]
-# name = \"My stack\"
-# revset = \"trunk()..@\"
-";
-
 /// The registry position of `id`, which is what a menu item's tag carries.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn tag_of(id: CommandId) -> Option<u32> {
@@ -116,6 +86,8 @@ fn tag_of(id: CommandId) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
+// Tests never install the bar, so nothing there asks for its tags.
+#[cfg_attr(test, allow(dead_code))]
 mod mac {
     use objc2::sel;
 
@@ -124,7 +96,6 @@ mod mac {
     use crate::commands::{self, CommandId, Context};
     use crate::keymap::{Chord, ChordKey};
     use crate::macos_native::{BarItem, BarMenu, BarRole, KeyEquivalent};
-    use iced::keyboard::key::Named;
 
     /// The chord the keymap binds `id` to in the base context, as an AppKit
     /// key equivalent, when AppKit can spell it.
@@ -137,14 +108,14 @@ mod mac {
         let key = match &chord.key {
             ChordKey::Char(c) => c.clone(),
             ChordKey::Named(named) => match named {
-                Named::Enter => "\r".to_owned(),
-                Named::Escape => "\u{1b}".to_owned(),
-                Named::Tab => "\t".to_owned(),
-                Named::Space => " ".to_owned(),
-                Named::ArrowUp => "\u{f700}".to_owned(),
-                Named::ArrowDown => "\u{f701}".to_owned(),
-                Named::ArrowLeft => "\u{f702}".to_owned(),
-                Named::ArrowRight => "\u{f703}".to_owned(),
+                crate::keys::Named::Enter => "\r".to_owned(),
+                crate::keys::Named::Escape => "\u{1b}".to_owned(),
+                crate::keys::Named::Tab => "\t".to_owned(),
+                crate::keys::Named::Space => " ".to_owned(),
+                crate::keys::Named::ArrowUp => "\u{f700}".to_owned(),
+                crate::keys::Named::ArrowDown => "\u{f701}".to_owned(),
+                crate::keys::Named::ArrowLeft => "\u{f702}".to_owned(),
+                crate::keys::Named::ArrowRight => "\u{f703}".to_owned(),
                 _ => return None,
             },
         };
@@ -240,7 +211,7 @@ mod mac {
                         None,
                     ),
                     sep(),
-                    command(ui, "Settings\u{2026}", "app.open-config"),
+                    command(ui, "Settings\u{2026}", "app.settings"),
                     sep(),
                     standard(&format!("Hide {app_name}"), sel!(hide:), Some(("h", false))),
                     standard(

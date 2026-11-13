@@ -3,18 +3,15 @@
 //! doesn't evaluate, a load still running, and a diff pane holding on to a
 //! revision the current view no longer lists.
 
-use iced::{
-    Background, Border, Color, Element, Length, Padding, alignment,
-    font::Weight,
-    widget::{Space, column, container, text},
-};
-
-use diffui_core::RevisionSelection;
+use diffui_core::{LoadStatus, RevisionSelection};
+use gpui_kit::prelude::*;
+use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::prose::Prose;
-use crate::theme::{self, ThemeSpec, chip_background, emphasis_font, text_size};
-use crate::typography::{self, Aligned};
-use crate::{Action, Diffui, LoadStatus, Message, icons, ui};
+use crate::theme::{self, Weight, emphasis_font, text_size};
+use crate::typography;
+use crate::ui::Look;
+use crate::{Action, Cx, Diffui, icons, ui};
 
 /// The prefixes jj-lib's revset errors arrive with once the actor has
 /// flattened the chain (see `classify` in the core actor). Stripped for
@@ -28,94 +25,98 @@ pub(crate) fn is_revset_error(message: &str) -> bool {
         || (message.contains("Revision") && message.contains("doesn't exist"))
 }
 
+/// Whether the diff pane is showing a revision the loaded list doesn't
+/// contain — the revset changed under it, or it was picked from the palette.
+pub(crate) fn selection_outside_view(ui: &Diffui) -> bool {
+    let tab = ui.active();
+    if tab.repository.is_none() || !matches!(tab.session.status, LoadStatus::Loaded) {
+        return false;
+    }
+    tab.session
+        .commits
+        .find(&tab.session.selected_revision)
+        .is_none()
+}
+
 /// The revision list's stand-in while it has no rows: a load in flight, or a
 /// revset that matched nothing. `None` when there are rows (or a failure,
 /// which [`load_error`] reports above the list).
-pub(crate) fn revision_list_placeholder<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
+pub(crate) fn revision_list_placeholder(
+    ui: &Diffui,
+    look: Look,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     let tab = ui.active();
     if !tab.session.commits.is_empty() {
         return None;
     }
-    let body: Element<'a, Message> = match &tab.session.status {
+    let (ui_font, mono) = (look.font, look.mono);
+    let state = match &tab.session.status {
         LoadStatus::Failed(_) => return None,
-        LoadStatus::Loading => text("Loading revisions\u{2026}")
-            .size(text_size::UI)
-            .color(theme.subtle_text)
-            .font(ui.config.ui_font)
-            .into(),
+        LoadStatus::Loading => ui::empty_state(
+            "Loading revisions\u{2026}",
+            ui::Placement::Top,
+            ui_font,
+            theme.subtle_text,
+        ),
         LoadStatus::Loaded => {
             let revset = tab.session.revset.trim();
-            let mut body = column![
-                text("No revisions match")
-                    .size(text_size::BODY)
-                    .color(theme.text)
-                    .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-                text(if revset.is_empty() { "(empty)" } else { revset })
-                    .size(text_size::UI)
-                    .color(theme.accent)
-                    .font(ui.config.mono_font)
-                    .wrapping(text::Wrapping::WordOrGlyph),
-                text("Try another, or pick one from the presets menu on the filter.")
-                    .size(text_size::CAPTION)
-                    .color(theme.subtle_text)
-                    .font(ui.config.ui_font),
-            ]
-            .spacing(theme::space::SM)
-            .align_x(alignment::Horizontal::Center);
-            if let Some(reset) = reset_button(ui, theme) {
-                body = body.push(Space::new().height(Length::Fixed(theme::space::XS)));
-                body = body.push(reset);
-            }
-            body.into()
+            let revset = if revset.is_empty() { "(empty)" } else { revset };
+            ui::empty_state(
+                "No revisions match",
+                ui::Placement::Top,
+                emphasis_font(ui_font, Weight::MEDIUM),
+                theme.text,
+            )
+            // The expression can be long: this one wraps.
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .font(mono.gpui())
+                    .text_size(px(text_size::BODY))
+                    .text_color(theme.accent)
+                    .child(revset.to_owned()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .font(ui_font.gpui())
+                    .text_size(px(text_size::CAPTION))
+                    .text_color(theme.subtle_text)
+                    .child("Try another, or pick one from the presets menu on the filter."),
+            )
+            .children(
+                reset_button(ui, look, cx).map(|reset| div().pt(px(theme::space::XS)).child(reset)),
+            )
         }
     };
-    Some(
-        container(body)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(alignment::Horizontal::Center)
-            .align_y(alignment::Vertical::Top)
-            .padding(Padding {
-                top: theme::space::XXL * 2.0,
-                ..Padding::from(theme::space::XL)
-            })
-            .into(),
-    )
+    Some(state.into_any_element())
 }
 
-/// "Reset to default" — the repo's own `revsets.log` (or jj's default) —
-/// unless that is what is already applied.
-pub(crate) fn reset_button<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Option<Element<'a, Message>> {
+/// "Reset to default" (the repo's own `revsets.log`, or jj's default), unless
+/// that is what is already applied.
+pub(crate) fn reset_button(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<AnyElement> {
     let tab = ui.active();
-    let default = tab.default_revset.clone();
+    let default = tab.default_revset().to_owned();
     if tab.repository.is_none() || tab.session.revset.trim() == default.trim() {
         return None;
     }
     Some(
-        ui::text_button(
-            None,
-            "Reset to default",
-            ui::Variant::Raised,
-            ui::Size::Compact,
-            ui.config.ui_font,
-            theme,
-        )
-        .on_press(Message::Action(Action::SetRevset(default)))
-        .into(),
+        look.button("reset-revset", "Reset to default")
+            .compact()
+            .on_click(Diffui::on_action(Action::SetRevset(default), cx))
+            .into_any_element(),
     )
 }
 
 /// The alert card above the list when the graph load failed. A revset error
 /// gets its own wording, the parser's message in mono (it points a caret at
 /// the offending column), and a way back to the default.
-pub(crate) fn load_error<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-    error: &'a str,
-) -> Element<'a, Message> {
+pub(crate) fn load_error(ui: &Diffui, look: Look, error: &str, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
     let revset = is_revset_error(error);
     let (title, detail) = if revset {
         let detail = REVSET_ERROR_PREFIXES
@@ -127,114 +128,116 @@ pub(crate) fn load_error<'a>(
     } else {
         ("Couldn't load the history", error)
     };
-    let mut body = column![
-        typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
-                    ui::ICON_SIZE,
-                ),
-                Aligned::text(
-                    text(title)
-                        .size(text_size::UI)
-                        .color(theme.removed_text)
-                        .font(emphasis_font(ui.config.ui_font, Weight::Medium)),
-                    emphasis_font(ui.config.ui_font, Weight::Medium),
-                    text_size::UI,
-                ),
-            ],
-            theme::space::SM,
-        ),
-        text(detail)
-            .size(text_size::CAPTION)
-            .color(theme.text)
-            .font(if revset {
-                ui.config.mono_font
+    let title_font = emphasis_font(look.font, Weight::MEDIUM);
+    let card = ui::Banner::new(ui::Tone::Danger)
+        .icon(icons::ALERT_TRIANGLE)
+        .child(typography::line(
+            title,
+            title_font,
+            text_size::BODY,
+            theme.removed_text,
+        ))
+        .child(
+            div()
+                .font(if revset { look.mono } else { look.font }.gpui())
+                .text_size(px(text_size::CAPTION))
+                .text_color(theme.text)
+                .child(detail.to_owned()),
+        )
+        .children(
+            if revset {
+                reset_button(ui, look, cx)
             } else {
-                ui.config.ui_font
-            })
-            .wrapping(text::Wrapping::WordOrGlyph),
-    ]
-    .spacing(theme::space::SM);
-    if revset && let Some(reset) = reset_button(ui, theme) {
-        body = body.push(reset);
-    }
-    container(
-        container(body)
-            .width(Length::Fill)
-            .padding([theme::space::MD, theme::space::LG])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(chip_background(theme.removed_text))),
-                border: Border {
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                    radius: theme::radius::CONTROL.into(),
-                },
-                ..container::Style::default()
-            }),
-    )
-    .width(Length::Fill)
-    .padding([6, 8])
-    .into()
-}
-
-/// Whether the diff pane is showing a revision the loaded list doesn't
-/// contain — the revset changed under it, or it was picked from the palette.
-pub(crate) fn selection_outside_view(ui: &Diffui) -> bool {
-    let tab = ui.active();
-    if tab.repository.is_none() || !matches!(tab.session.status, LoadStatus::Loaded) {
-        return false;
-    }
-    let commits = &tab.session.commits;
-    match &tab.session.selected_revision {
-        RevisionSelection::WorkingCopy => commits.working_copy().is_none(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex).is_none(),
-    }
+                None
+            }
+            .map(
+                // A column stretches its children; the button keeps its own width.
+                |reset| div().flex().pt(px(theme::space::XS)).child(reset),
+            ),
+        )
+        .build(look);
+    crate::field::panel_strip().child(card).into_any_element()
 }
 
 /// A strip over the diff saying so, when [`selection_outside_view`].
-pub(crate) fn outside_view_banner<'a>(
-    ui: &'a Diffui,
-    theme: ThemeSpec,
-) -> Option<Element<'a, Message>> {
+pub(crate) fn outside_view_banner(ui: &Diffui, look: Look) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
     if !selection_outside_view(ui) {
         return None;
     }
     let label = match &ui.active().session.selected_revision {
         RevisionSelection::WorkingCopy => Prose::from("The working copy ").rev("@"),
-        selection => ui.revision_prose(selection),
+        selection => ui.active().revision_prose(selection),
     };
+    let sentence = label
+        .text(" isn't in the current revset.")
+        .view(look, theme.muted_text);
     Some(
-        container(typography::baseline_row(
-            [
-                Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.info),
-                    ui::ICON_SIZE,
-                ),
-                Aligned::text(
-                    label
-                        .text(" isn't in the current revset.")
-                        .view(
-                            ui.config.ui_font,
-                            ui.config.mono_font,
-                            theme.muted_text,
-                            theme,
-                        )
-                        .size(text_size::UI)
-                        .width(Length::Fill)
-                        .wrapping(text::Wrapping::None)
-                        .ellipsis(text::Ellipsis::End),
-                    ui.config.ui_font,
-                    text_size::UI,
-                ),
-            ],
-            theme::space::MD,
-        ))
-        .width(Length::Fill)
-        .padding([theme::space::SM, theme::space::LG])
-        .style(move |_| container::Style::default().background(chip_background(theme.info)))
-        .into(),
+        ui::Banner::new(ui::Tone::Accent)
+            .shape(ui::BannerShape::Strip)
+            .icon(icons::ALERT_TRIANGLE)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(sentence),
+            )
+            .build(look)
+            .into_any_element(),
     )
+}
+
+/// Welcome screen shown whenever no repository is open: a fresh launch with
+/// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
+/// `/`), or after the last tab is closed. It is the open prompt itself, the same
+/// card ⌘O raises over a tab, inline and focused, with the recent repositories,
+/// under the wordmark, then a few tips. Only an explicit `--path` that failed to
+/// resolve surfaces an error; the session and cwd fallbacks resolve silently to
+/// this screen instead.
+pub(crate) fn welcome(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let font = look.font;
+    // The wordmark alone is the identity: big enough to anchor the page.
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(theme::space::XXL))
+        .child(typography::line(
+            "Diffui",
+            emphasis_font(font, Weight::SEMIBOLD),
+            text_size::DISPLAY,
+            theme.text,
+        ));
+    // A `Failed` status can now only come from an explicit `--path` (the session
+    // and cwd fallbacks resolve silently), so it's always worth surfacing.
+    if let LoadStatus::Failed(error) = &ui.active().session.status {
+        body = body.child(typography::line(
+            format!("Couldn't open repository: {error}"),
+            font,
+            text_size::BODY,
+            theme.removed_text,
+        ));
+    }
+    // `reconcile` keeps the prompt's state alive whenever no tab is open.
+    if let Some(dialog) = ui.open_repo_dialog() {
+        body = body.child(crate::tab_bar::open_repo_card(ui, look, dialog, window, cx));
+    }
+    body = body.child(crate::shortcuts::welcome_hints(ui, look, window, cx));
+
+    // Optically centered: a touch above the true middle, where a centered block
+    // reads as centered rather than as sinking.
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .pb(px(theme::space::XXL * 3.0))
+        .child(body)
+        .into_any_element()
 }
 
 #[cfg(test)]

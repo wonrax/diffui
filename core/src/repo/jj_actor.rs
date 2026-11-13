@@ -18,18 +18,19 @@ use jj_lib::{
     workspace::Workspace,
 };
 use tokio::sync::mpsc;
-use tracing::Instrument as _;
 
 use super::cancel::CancelFlag;
+use super::cancel::JobTicket;
 use super::protocol::{
     Command, Event, GraphTail, JobId, Payload, PreviewRequest, RepoError, RepoId,
 };
-use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands};
+use super::{Envelope, Jobs, SettingsSource, catch_panic, route_commands, run_job};
 use crate::history::{HistoryRequest, HistoryResponse};
 use crate::jj;
 use crate::model::{DiffBase, LoadProgress, RevisionSelection, StreamRow};
 use crate::mutations::MutationOp;
 use crate::repository::Repository;
+use crate::session::RefreshMode;
 use crate::watcher::WatchBatch;
 
 /// Rows per streamed batch. Small enough that the first screenful paints
@@ -87,7 +88,10 @@ pub(super) fn spawn(
                         workspace: None,
                         repo: None,
                         op_head: None,
+                        sides: None,
                         jobs,
+                        stale_notice: None,
+                        refresh_mode: None,
                     }
                     .run(work_rx)
                     .await;
@@ -108,24 +112,33 @@ struct Actor {
     /// The repo at head, reloaded only when the operation head actually moves.
     repo: Option<Arc<ReadonlyRepo>>,
     op_head: Option<String>,
+    /// The trees the last diff compared, for the reads that follow it (each
+    /// file's full sources for highlighting, a file expanded in full). Keyed
+    /// by operation, so anything written since misses it.
+    sides: Option<(SidesKey, jj::DiffSides)>,
     jobs: Jobs,
+    /// The stale-checkout notice last reported, so a refresh on every save
+    /// doesn't raise it again until it changes or the checkout is updated.
+    stale_notice: Option<String>,
+    /// The app's refresh mode, once it has said ([`Command::SetRefreshMode`]).
+    /// Until then a stale checkout is handled by jj's setting alone.
+    refresh_mode: Option<RefreshMode>,
 }
 
+/// Stops [`Actor::relay_progress`]'s thread when dropped.
+struct ProgressRelay(CancelFlag);
+
+impl Drop for ProgressRelay {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// What [`Actor::sides`] was resolved for: an operation id, a revision and a
+/// base.
+type SidesKey = (String, RevisionSelection, DiffBase);
+
 impl Actor {
-    /// Start `job`, picking up a cancel that arrived before its turn came.
-    fn begin(&self, job: JobId) -> CancelFlag {
-        match self.jobs.lock() {
-            Ok(mut jobs) => jobs.begin(job),
-            Err(_) => CancelFlag::default(),
-        }
-    }
-
-    fn finish(&self, job: JobId) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.finish(job);
-        }
-    }
-
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<Envelope>) {
         while let Some(envelope) = commands.recv().await {
             match envelope {
@@ -140,6 +153,10 @@ impl Actor {
                     repository,
                     command,
                 } => {
+                    if let Command::SetRefreshMode { mode } = command.as_ref() {
+                        self.refresh_mode = Some(*mode);
+                        continue;
+                    }
                     // Cancels never reach here; `route_commands` applies them.
                     let Some(job) = command.job() else { continue };
                     // Let the reader run before the job starts. A caller that
@@ -147,35 +164,30 @@ impl Actor {
                     // cancel together, and a short job can otherwise finish
                     // without ever yielding — the two futures share a thread.
                     tokio::task::yield_now().await;
-                    let cancel = self.begin(job);
                     let span = tracing::info_span!(
                         "repo_command",
                         repo = %self.id,
                         job = job.0,
                         command = command_name(&command),
                     );
-                    let work = async {
+                    let (events, id) = (self.events.clone(), self.id.clone());
+                    let emit = |payload| {
+                        let _ = events.send(Event::new(id.clone(), payload));
+                    };
+                    let jobs = self.jobs.clone();
+                    let actor = &mut *self;
+                    let panicked = run_job(&jobs, job, span, emit, move |ticket| async move {
                         #[cfg(feature = "fault-injection")]
                         super::fault::trip(&repository.root);
-                        self.dispatch(&repository, command, &cancel).await
-                    };
-                    let error = match catch_panic(work).instrument(span.clone()).await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => {
-                            let error = classify(error);
-                            span.in_scope(|| tracing::warn!(%error, "command failed"));
-                            Some(error)
-                        }
-                        Err(message) => {
-                            span.in_scope(|| tracing::error!("command panicked: {message}"));
-                            self.forget_loaded_state();
-                            Some(RepoError::Crashed(message))
-                        }
-                    };
-                    if let Some(error) = error {
-                        self.emit(Payload::Failed { job, error });
+                        actor
+                            .dispatch(&repository, *command, ticket)
+                            .await
+                            .map_err(classify)
+                    })
+                    .await;
+                    if panicked {
+                        self.forget_loaded_state();
                     }
-                    self.finish(job);
                 }
             }
             if self.events.is_closed() {
@@ -198,8 +210,7 @@ impl Actor {
         let Some(slot) = self.workspace.as_ref() else {
             return;
         };
-        let root = slot.workspace.workspace_root().to_owned();
-        match jj::read_op_head_with(&slot.settings, &root).await {
+        match jj::read_op_heads(slot.workspace.repo_loader()).await {
             Ok(fingerprint) => {
                 if self.op_head.as_deref() != Some(fingerprint.as_str()) {
                     self.op_head = Some(fingerprint.clone());
@@ -217,10 +228,45 @@ impl Actor {
         self.workspace = None;
         self.repo = None;
         self.op_head = None;
+        self.sides = None;
     }
 
     fn emit(&self, payload: Payload) {
         let _ = self.events.send(Event::new(self.id.clone(), payload));
+    }
+
+    /// A progress handle for `job`'s git transfer (a fetch, a push), relayed
+    /// as `Progress` events while the returned guard lives. git runs inside a
+    /// blocking jj-lib call that holds this thread until it returns, so the
+    /// relay polls from a thread of its own.
+    fn relay_progress(&self, job: JobId) -> (LoadProgress, ProgressRelay) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let progress = LoadProgress::default();
+        let stop = CancelFlag::default();
+        let (events, id) = (self.events.clone(), self.id.clone());
+        let (reporter, stopped) = (progress.clone(), stop.clone());
+        let spawned = std::thread::Builder::new()
+            .name("diffui-progress".to_owned())
+            .spawn(move || {
+                let mut last = (0, 0);
+                while !stopped.is_cancelled() {
+                    std::thread::sleep(POLL);
+                    let (loaded, total) = reporter.snapshot();
+                    // Nothing to show until git reports a total.
+                    if total > 0 && (loaded, total) != last {
+                        last = (loaded, total);
+                        let _ = events.send(Event::new(
+                            id.clone(),
+                            Payload::Progress { job, loaded, total },
+                        ));
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "failed to spawn the progress relay");
+        }
+        (progress, ProgressRelay(stop))
     }
 
     /// Open (once) the workspace `repository` names.
@@ -253,6 +299,22 @@ impl Actor {
             .expect("the workspace was just opened"))
     }
 
+    /// Whether a stale checkout is updated rather than refused: jj's
+    /// `snapshot.auto-update-stale`, or the app's automatic refresh mode.
+    fn update_stale(&mut self, repository: &Repository) -> Result<bool> {
+        let auto = self.refresh_mode == Some(RefreshMode::Auto);
+        Ok(auto || self.slot(repository)?.snapshot.auto_update_stale)
+    }
+
+    /// [`Self::slot`], about to take the working-copy lock: the repo we hold
+    /// goes along, so the lock reuses it instead of loading the one at head.
+    fn slot_for_lock(&mut self, repository: &Repository) -> Result<&mut WorkspaceSlot> {
+        let head = self.repo.clone();
+        let slot = self.slot(repository)?;
+        slot.snapshot.head.set(head);
+        Ok(slot)
+    }
+
     /// Re-read the jj config when one of its files changed since the
     /// workspace was opened, so an edited identity, signing setup or
     /// `immutable_heads()` applies without reopening the tab. jj-lib bakes the
@@ -272,21 +334,21 @@ impl Actor {
             return;
         }
         tracing::info!("jj config changed on disk; reloading the workspace settings");
-        self.workspace = None;
-        self.repo = None;
-        self.op_head = None;
+        self.forget_loaded_state();
     }
 
     /// The repo at head, reloading only when the operation head has moved.
-    /// The op-heads read is a bare readdir, so paying it before every read is
-    /// far cheaper than re-reading the commit index would be.
+    /// Reading the op heads is a readdir through the workspace's loader, so
+    /// paying it before every read is far cheaper than re-reading the commit
+    /// index would be.
+    ///
+    /// A head that moved since we last looked is an operation someone else
+    /// wrote, so it is announced here as the watcher would have: the watcher's
+    /// own signal arrives later and finds the head already seen.
     async fn repo_at_head(&mut self, repository: &Repository) -> Result<Arc<ReadonlyRepo>> {
-        let root = repository.root.clone();
-        let settings = self.slot(repository)?.settings.clone();
-        // A bare readdir of `.jj/repo/op_heads/heads` — cheap enough to pay
-        // before every read, and far cheaper than re-reading the commit index
-        // would be.
-        let fingerprint = jj::read_op_head_with(&settings, &root).await.ok();
+        let fingerprint = jj::read_op_heads(self.slot(repository)?.workspace.repo_loader())
+            .await
+            .ok();
         if let Some(repo) = self.repo.clone()
             && fingerprint.is_some()
             && fingerprint == self.op_head
@@ -306,8 +368,15 @@ impl Actor {
                 .await
                 .context("failed to load the jj repo")?,
         };
-        self.op_head = Some(repo.op_id().hex());
+        let previous = self.op_head.replace(repo.op_id().hex());
         self.repo = Some(repo.clone());
+        if let Some(previous) = previous
+            && Some(&previous) != self.op_head.as_ref()
+        {
+            self.emit(Payload::OpHeadChanged {
+                fingerprint: repo.op_id().hex(),
+            });
+        }
         Ok(repo)
     }
 
@@ -320,22 +389,28 @@ impl Actor {
 
     /// Take note of an operation we just wrote.
     ///
-    /// The cached repo is a generation behind, so it goes; the op head is read
-    /// afresh so the watcher's next signal dedups against *our* write. Leaving
-    /// it stale made every mutation and fetch look like an external operation,
-    /// which cost a second lock-and-snapshot that could only report "already
-    /// up to date".
-    async fn adopt_written_op(&mut self, repository: &Repository) {
-        self.repo = None;
+    /// The op head is read afresh so the watcher's next signal dedups against
+    /// *our* write. Leaving it stale made every mutation and fetch look like
+    /// an external operation, which cost a second lock-and-snapshot that could
+    /// only report "already up to date". `written` is the repo the work left
+    /// at head, kept when the head is still its operation; otherwise the
+    /// cached repo stays only when the head didn't move.
+    async fn adopt_written_op(
+        &mut self,
+        repository: &Repository,
+        written: Option<Arc<ReadonlyRepo>>,
+    ) {
         let Ok(slot) = self.slot(repository) else {
+            self.repo = None;
             self.op_head = None;
             return;
         };
-        let (settings, root) = (
-            slot.settings.clone(),
-            slot.workspace.workspace_root().to_owned(),
-        );
-        self.op_head = jj::read_op_head_with(&settings, &root).await.ok();
+        self.op_head = jj::read_op_heads(slot.workspace.repo_loader()).await.ok();
+        let at_head = |repo: &Arc<ReadonlyRepo>| Some(repo.op_id().hex()) == self.op_head;
+        self.repo = match written.filter(at_head) {
+            Some(repo) => Some(repo),
+            None => self.repo.take().filter(at_head),
+        };
     }
 
     /// After a CLI run: it may have written operations (or edited the jj
@@ -345,7 +420,7 @@ impl Actor {
     async fn notice_cli_writes(&mut self, repository: &Repository) {
         let before = self.op_head.clone();
         self.reload_settings_if_changed(repository);
-        self.adopt_written_op(repository).await;
+        self.adopt_written_op(repository, None).await;
         if self.op_head != before
             && let Some(fingerprint) = self.op_head.clone()
         {
@@ -357,8 +432,9 @@ impl Actor {
         &mut self,
         repository: &Repository,
         command: Command,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
+        let cancel = &ticket.flag().clone();
         match command {
             Command::LoadGraph { job, revset } => {
                 self.load_graph(repository, job, revset, cancel).await
@@ -369,7 +445,7 @@ impl Actor {
                 base,
                 expand,
             } => {
-                self.load_diff(repository, job, revision, base, &expand)
+                self.load_diff(repository, job, revision, base, &expand, cancel)
                     .await
             }
             Command::ExpandFile {
@@ -378,52 +454,59 @@ impl Actor {
                 base,
                 path,
             } => {
-                let repo = self.repo_at_head(repository).await?;
-                let name = self.slot(repository)?.name.clone();
+                let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
                 let expand = [path.clone()];
                 let options = jj::DiffOptions {
                     limits: jj::large_diff::DiffLimits::unlimited(),
                     expand: &expand,
                     only: Some(&path),
                 };
-                let document = if let DiffBase::Range(revset) = &base {
-                    let range = revset_scope(&repo, &name, repository).range(revset).await?;
-                    jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?
-                } else {
-                    let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-                    let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
-                    jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options)
-                        .await?
-                        .0
-                };
+                let document =
+                    match jj::diff_jj(repo.as_ref(), &sides, repository, &options, cancel).await {
+                        Err(_) if cancel.is_cancelled() => {
+                            self.emit(Payload::Cancelled { job });
+                            return Ok(());
+                        }
+                        document => document?,
+                    };
                 let file = document.files.into_iter().find(|file| file.path == path);
                 self.emit(Payload::FileExpanded { job, path, file });
                 Ok(())
             }
-            Command::Snapshot { job, origin } => {
+            Command::Snapshot { job, origin, disk } => {
                 // A watcher tick is a file save; only a refresh (or the tail
                 // of a mutation, or focus regain) is worth the config check.
                 if origin == crate::session::RefreshOrigin::Focus {
                     self.reload_settings_if_changed(repository);
                 }
-                let slot = self.slot(repository)?;
+                let update_stale = self.update_stale(repository)?;
+                let slot = self.slot_for_lock(repository)?;
                 let outcome = {
                     let WorkspaceSlot {
                         workspace,
                         snapshot,
                         ..
                     } = slot;
-                    jj::snapshot_working_copy(workspace, snapshot).await?
+                    jj::snapshot_working_copy(workspace, snapshot, disk, update_stale).await?
                 };
                 self.adopt(outcome.repo.clone());
                 if outcome.recovered_stale {
                     self.emit(Payload::StaleWorkingCopyRecovered);
+                }
+                if outcome.disk.stale != self.stale_notice {
+                    if let Some(message) = &outcome.disk.stale {
+                        self.emit(Payload::StaleWorkingCopy {
+                            message: message.clone(),
+                        });
+                    }
+                    self.stale_notice = outcome.disk.stale.clone();
                 }
                 self.emit(Payload::SnapshotDone {
                     job,
                     origin,
                     snapshot: outcome.snapshot,
                     warnings: outcome.warnings,
+                    disk: outcome.disk,
                 });
                 Ok(())
             }
@@ -432,9 +515,17 @@ impl Actor {
                 op,
                 allow_immutable,
                 seen_op,
+                seen_wc,
             } => {
-                self.mutate(repository, job, &op, allow_immutable, seen_op.as_deref())
-                    .await
+                self.mutate(
+                    repository,
+                    job,
+                    &op,
+                    allow_immutable,
+                    seen_op.as_deref(),
+                    seen_wc.as_deref(),
+                )
+                .await
             }
             Command::Preview {
                 job,
@@ -442,23 +533,35 @@ impl Actor {
                 graph,
                 seen_op,
             } => {
-                self.preview(repository, job, draft, graph, seen_op, cancel)
+                self.preview(repository, job, draft, graph, seen_op, ticket)
                     .await
             }
             Command::Fetch { job, target } => {
                 self.reload_settings_if_changed(repository);
-                let progress = LoadProgress::default();
-                let slot = self.slot(repository)?;
-                let outcome = {
+                let (progress, _relay) = self.relay_progress(job);
+                let update_stale = self.update_stale(repository)?;
+                let slot = self.slot_for_lock(repository)?;
+                let (outcome, recovered_stale, written) = {
                     let WorkspaceSlot {
                         workspace,
                         settings,
                         snapshot,
                         ..
                     } = slot;
-                    jj::fetch_jj(workspace, settings, snapshot, &target, &progress).await?
+                    jj::fetch_jj(
+                        workspace,
+                        settings,
+                        snapshot,
+                        update_stale,
+                        &target,
+                        &progress,
+                    )
+                    .await?
                 };
-                self.adopt_written_op(repository).await;
+                self.adopt_written_op(repository, Some(written)).await;
+                if recovered_stale {
+                    self.emit(Payload::StaleWorkingCopyRecovered);
+                }
                 self.emit(Payload::FetchDone { job, outcome });
                 Ok(())
             }
@@ -524,18 +627,9 @@ impl Actor {
                 old_path,
                 base,
             } => {
-                let repo = self.repo_at_head(repository).await?;
-                let name = self.slot(repository)?.name.clone();
-                let (old, new) = jj::read_jj_file_pair_inner(
-                    repo.as_ref(),
-                    &name,
-                    &repository.root,
-                    &revision,
-                    &base,
-                    &path,
-                    old_path.as_deref(),
-                )
-                .await?;
+                let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
+                let (old, new) =
+                    jj::read_jj_file_pair(repo.as_ref(), &sides, &path, old_path.as_deref()).await;
                 self.emit(Payload::FilePairRead {
                     job,
                     path,
@@ -617,7 +711,7 @@ impl Actor {
                 Ok(())
             }
             Command::History { job, request } => {
-                self.history(repository, job, request, cancel).await
+                self.history(repository, job, request, ticket).await
             }
             Command::ResolveRevset { job, query } => {
                 let repo = self.repo_at_head(repository).await?;
@@ -660,7 +754,7 @@ impl Actor {
                 self.notice_cli_writes(repository).await;
                 Ok(())
             }
-            Command::Cancel { .. } => Ok(()),
+            Command::Cancel { .. } | Command::SetRefreshMode { .. } => Ok(()),
         }
     }
 
@@ -732,18 +826,24 @@ impl Actor {
         revision: RevisionSelection,
         base: DiffBase,
         expand: &[String],
+        cancel: &CancelFlag,
     ) -> Result<()> {
-        let repo = self.repo_at_head(repository).await?;
-        let name = self.slot(repository)?.name.clone();
+        let (repo, sides) = self.diff_sides(repository, &revision, &base).await?;
         let options = jj::DiffOptions {
             expand,
             ..Default::default()
         };
-        if let DiffBase::Range(revset) = &base {
-            // The revset names both sides; the selected revision rides along
-            // untouched as the graph's cursor.
-            let range = revset_scope(&repo, &name, repository).range(revset).await?;
-            let document = jj::diff_jj_range(repo.as_ref(), range, repository, &options).await?;
+        let document = match jj::diff_jj(repo.as_ref(), &sides, repository, &options, cancel).await
+        {
+            Err(_) if cancel.is_cancelled() => {
+                self.emit(Payload::Cancelled { job });
+                return Ok(());
+            }
+            document => document?,
+        };
+        // A range's revset names both sides, and the selected revision rides
+        // along untouched as the graph's cursor.
+        let Some(commit) = &sides.commit else {
             self.emit(Payload::DiffLoaded {
                 job,
                 revision,
@@ -751,17 +851,14 @@ impl Actor {
                 details: None,
             });
             return Ok(());
-        }
-        let commit_id = jj::resolve_revision(repo.as_ref(), &name, &revision).await?;
-        let base = jj::resolve_base(repo.as_ref(), &name, &base).await?;
-        let (document, details) =
-            jj::diff_jj_with_repo(repo.as_ref(), &commit_id, &base, repository, &options).await?;
+        };
+        let details = jj::jj_revision_details(repo.as_ref(), commit).await;
         // A commit rewritten since the caller read its id resolved to its
         // successor; answer under the id that was actually loaded, so the
         // selection follows the change instead of naming a hidden commit.
         let revision = match revision {
-            RevisionSelection::Commit(hex) if hex != commit_id.hex() => {
-                RevisionSelection::Commit(commit_id.hex())
+            RevisionSelection::Commit(hex) if hex != commit.id().hex() => {
+                RevisionSelection::Commit(commit.id().hex())
             }
             revision => revision,
         };
@@ -769,9 +866,31 @@ impl Actor {
             job,
             revision,
             document,
-            details,
+            details: Some(details),
         });
         Ok(())
+    }
+
+    /// The trees a diff of `revision` against `base` compares, resolved once
+    /// per operation and shared by the load and the reads that follow it.
+    async fn diff_sides(
+        &mut self,
+        repository: &Repository,
+        revision: &RevisionSelection,
+        base: &DiffBase,
+    ) -> Result<(Arc<ReadonlyRepo>, jj::DiffSides)> {
+        let repo = self.repo_at_head(repository).await?;
+        let key = (repo.op_id().hex(), revision.clone(), base.clone());
+        if let Some((cached, sides)) = &self.sides
+            && *cached == key
+        {
+            return Ok((repo, sides.clone()));
+        }
+        let name = self.slot(repository)?.name.clone();
+        let sides =
+            jj::DiffSides::resolve(repo.as_ref(), &name, &repository.root, revision, base).await?;
+        self.sides = Some((key, sides.clone()));
+        Ok((repo, sides))
     }
 
     async fn mutate(
@@ -781,11 +900,13 @@ impl Actor {
         op: &MutationOp,
         allow_immutable: bool,
         seen_op: Option<&str>,
+        seen_wc: Option<&str>,
     ) -> Result<()> {
         self.reload_settings_if_changed(repository);
-        let progress = LoadProgress::default();
-        let slot = self.slot(repository)?;
-        let (outcome, recovered_stale) = {
+        let (progress, _relay) = self.relay_progress(job);
+        let update_stale = self.update_stale(repository)?;
+        let slot = self.slot_for_lock(repository)?;
+        let (outcome, recovered_stale, written) = {
             let WorkspaceSlot {
                 workspace,
                 settings,
@@ -796,15 +917,17 @@ impl Actor {
                 workspace,
                 settings,
                 snapshot,
+                update_stale,
                 repository,
                 op,
                 &progress,
                 allow_immutable,
                 seen_op,
+                seen_wc,
             )
             .await?
         };
-        self.adopt_written_op(repository).await;
+        self.adopt_written_op(repository, Some(written)).await;
         if recovered_stale {
             self.emit(Payload::StaleWorkingCopyRecovered);
         }
@@ -825,12 +948,12 @@ impl Actor {
         draft: PreviewRequest,
         graph: Option<String>,
         seen_op: Option<String>,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
         let operation = self.repo_at_head(repository).await?.op_id().hex();
         let settings = self.slot(repository)?.settings.clone();
         let repository = repository.clone();
-        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        let (events, id) = (self.events.clone(), self.id.clone());
         std::thread::Builder::new()
             .name("diffui-preview".to_owned())
             .spawn(move || {
@@ -845,12 +968,12 @@ impl Actor {
                         &draft,
                         graph.as_deref(),
                         seen_op.as_deref(),
-                        &cancel,
+                        ticket.flag(),
                     )),
                     Err(error) => Err(error.into()),
                 };
                 let payload = match result {
-                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    _ if ticket.flag().is_cancelled() => Payload::Cancelled { job },
                     Ok((simulation, graph)) => Payload::PreviewDone {
                         job,
                         simulation,
@@ -880,12 +1003,12 @@ impl Actor {
         job: JobId,
         revision: crate::model::RevisionSelection,
         path: String,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
         let settings = self.slot(repository)?.settings.clone();
         let root = repository.root.clone();
         let operation = repo.op_id().hex();
-        let (events, id, cancel) = (self.events.clone(), self.id.clone(), cancel.clone());
+        let (events, id) = (self.events.clone(), self.id.clone());
         std::thread::Builder::new()
             .name("diffui-annotate".to_owned())
             .spawn(move || {
@@ -899,7 +1022,7 @@ impl Actor {
                     Err(error) => Err(error.into()),
                 };
                 let payload = match result {
-                    _ if cancel.is_cancelled() => Payload::Cancelled { job },
+                    _ if ticket.flag().is_cancelled() => Payload::Cancelled { job },
                     Ok(annotation) => Payload::History {
                         job,
                         response: HistoryResponse::Annotation(annotation),
@@ -922,8 +1045,9 @@ impl Actor {
         repository: &Repository,
         job: JobId,
         request: HistoryRequest,
-        cancel: &CancelFlag,
+        ticket: JobTicket,
     ) -> Result<()> {
+        let cancel = ticket.flag();
         let repo = self.repo_at_head(repository).await?;
         let name = self.slot(repository)?.name.clone();
         let response = match request {
@@ -960,7 +1084,7 @@ impl Actor {
                 }
             }
             HistoryRequest::Annotate { revision, path } => {
-                self.annotate_detached(repository, &repo, job, revision, path, cancel)?;
+                self.annotate_detached(repository, &repo, job, revision, path, ticket)?;
                 return Ok(());
             }
         };
@@ -996,6 +1120,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ResolveDiff { .. } => "resolve_diff",
         Command::RunCli { .. } => "run_cli",
         Command::Cancel { .. } => "cancel",
+        Command::SetRefreshMode { .. } => "set_refresh_mode",
     }
 }
 
@@ -1021,6 +1146,14 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
             short_id: immutable.short_id.clone(),
         };
     }
+    if let Some(stale) = error.downcast_ref::<jj::workspace::StaleWorkingCopy>() {
+        return RepoError::StaleWorkspace(stale.message.clone());
+    }
+    if let Some(undo) = error.downcast_ref::<jj::undo::UndoesPush>() {
+        return RepoError::UndoesPush {
+            summary: undo.summary.clone(),
+        };
+    }
     if let Some(rejection) = error.downcast_ref::<crate::push::PushRejection>() {
         return RepoError::PushRejected(Box::new(rejection.clone()));
     }
@@ -1044,7 +1177,7 @@ pub(super) fn classify(error: anyhow::Error) -> RepoError {
         return RepoError::Lock;
     }
     if message.contains("stale") {
-        return RepoError::StaleWorkspace;
+        return RepoError::StaleWorkspace(message);
     }
     RepoError::Other(message)
 }
@@ -1097,7 +1230,7 @@ pub fn rewritten_targets(
                 Destination::Between { child, .. } => push(child),
                 // `Onto` rewrites only the sources; `After` rewrites the
                 // target's children, which nobody can enumerate up front.
-                Destination::Onto(_) | Destination::After(_) => {}
+                Destination::Onto(_) | Destination::After(_) | Destination::Trunk => {}
             }
         }
         MutationOp::Squash { from, into } => {
@@ -1106,13 +1239,13 @@ pub fn rewritten_targets(
                 push(target);
             }
         }
-        MutationOp::Absorb { from } => push(from),
+        MutationOp::Absorb { from, .. } => push(from),
         MutationOp::Commit { .. } => push(&RevisionSelection::WorkingCopy),
         MutationOp::NewAt { destination } => match destination {
             // The insertion's far side gains the new commit as a parent.
             Destination::Before(target) => push(target),
             Destination::Between { child, .. } => push(child),
-            Destination::Onto(_) | Destination::After(_) => {}
+            Destination::Onto(_) | Destination::After(_) | Destination::Trunk => {}
         },
         MutationOp::Parallelize { targets: picked }
         | MutationOp::Metaedit {

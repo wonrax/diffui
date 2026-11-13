@@ -4,17 +4,14 @@
 //! stopping for is a forecast conflict, so the rebase preview runs first and
 //! a confirmation names the changes that would end up conflicted.
 
-use iced::Task;
-
 use diffui_core::{
-    Destination, DraftSimulation, JobId, PreviewRequest, RebaseSourceMode, RevisionSelection,
+    Destination, DraftSimulation, PreviewRequest, RebaseSourceMode, RevisionSelection,
 };
 
 use crate::commands::{self, CommandArg};
-use crate::modes::Mode;
 use crate::mutations::MutationOp;
 use crate::prose::Prose;
-use crate::{ConfirmDialog, Diffui, Message, PendingMutation, activity};
+use crate::{ConfirmDialog, Diffui, Pending};
 
 /// Why X's branch can't be rebased onto trunk, or `None` when it can.
 pub(crate) fn blocker(ui: &Diffui, arg: &CommandArg) -> Option<&'static str> {
@@ -36,11 +33,7 @@ pub(crate) fn blocker_for(ui: &Diffui, targets: &[RevisionSelection]) -> Option<
         return Some("trunk() doesn't resolve to a bookmark");
     }
     for target in targets {
-        let row = match target {
-            RevisionSelection::WorkingCopy => session.commits.working_copy(),
-            RevisionSelection::Commit(hex) => session.commits.find_by_commit_id(hex),
-        };
-        let Some(row) = row else {
+        let Some(row) = session.commits.find(target) else {
             return Some("Revision isn't in the log");
         };
         if row.is_immutable() {
@@ -54,40 +47,40 @@ pub(crate) fn blocker_for(ui: &Diffui, targets: &[RevisionSelection]) -> Option<
 }
 
 /// The op the command runs: the whole branches the `sources` sit on, onto
-/// trunk.
-fn rebase_op(sources: Vec<RevisionSelection>, trunk: String) -> MutationOp {
+/// `trunk()` as it resolves when the op runs (a fetch may have moved it
+/// since the graph was walked).
+fn rebase_op(sources: Vec<RevisionSelection>) -> MutationOp {
     MutationOp::Rebase {
         mode: RebaseSourceMode::Branch,
         sources,
-        destination: Destination::Onto(RevisionSelection::Commit(trunk)),
+        destination: Destination::Trunk,
     }
 }
 
 impl Diffui {
     /// Preview the rebase, then run it (or ask first, if it would conflict).
-    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>) -> Task<Message> {
+    pub(crate) fn rebase_onto_trunk(&mut self, sources: Vec<RevisionSelection>) {
         let Some(tab) = self.active_tab_id() else {
-            return Task::none();
+            return;
         };
-        let Some(trunk) = self.active().session.bookmarks.trunk.clone() else {
-            return Task::none();
-        };
-        let op = rebase_op(sources.clone(), trunk.clone());
+        if self.active().session.bookmarks.trunk.is_none() {
+            return;
+        }
+        let op = rebase_op(sources.clone());
         let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
+            return;
         };
         let mut effects = Vec::new();
-        if let Some((previous, _)) = state.jobs.trunk_rebase.take() {
+        let (job, preview) = state.session.preview(PreviewRequest::Rebase {
+            mode: RebaseSourceMode::Branch,
+            sources,
+            destination: Destination::Trunk,
+        });
+        if let Some(previous) = state.jobs.issue(job, Pending::TrunkRebase(op)) {
             effects.push(diffui_core::Effect::Send(diffui_core::Command::Cancel {
                 job: previous,
             }));
         }
-        let (job, preview) = state.session.preview(PreviewRequest::Rebase {
-            mode: RebaseSourceMode::Branch,
-            sources,
-            destination: Destination::Onto(RevisionSelection::Commit(trunk)),
-        });
-        state.jobs.trunk_rebase = Some((job, op));
         effects.extend(preview);
         self.run_effects(tab, effects)
     }
@@ -97,15 +90,9 @@ impl Diffui {
     pub(crate) fn finish_trunk_preview(
         &mut self,
         tab: crate::TabId,
-        job: JobId,
+        op: MutationOp,
         simulation: Result<&DraftSimulation, String>,
-    ) -> Task<Message> {
-        let Some(state) = self.tab_mut(tab) else {
-            return Task::none();
-        };
-        let Some((_, op)) = state.jobs.trunk_rebase.take_if(|(id, _)| *id == job) else {
-            return Task::none();
-        };
+    ) {
         let conflicts = match simulation {
             Ok(DraftSimulation::Rebase(preview)) => preview.new_conflicts.clone(),
             Ok(_) => Vec::new(),
@@ -114,15 +101,15 @@ impl Diffui {
                 Vec::new()
             }
         };
-        if conflicts.is_empty() || self.active_tab_id() != Some(tab) {
-            return self.start_mutation_op(op);
+        if conflicts.is_empty() || !self.is_active(tab) {
+            return self.start_mutation_on(tab, op, false, false);
         }
         let MutationOp::Rebase { sources, .. } = &op else {
-            return Task::none();
+            return;
         };
         let title = if let [source] = sources.as_slice() {
             Prose::from("Rebase ")
-                .then(self.revision_prose(source))
+                .then(self.active().revision_prose(source))
                 .text(" onto trunk?")
         } else {
             Prose::from(format!(
@@ -145,22 +132,14 @@ impl Diffui {
             body = body.text(" conflicted");
         }
         body = body.text(". Undo takes it back.");
-        let (activity_id, _) = self.begin_activity(tab, "Rebase onto trunk", false);
-        if let Some(log) = self.activity_log_for(tab) {
-            log.set_status(activity_id, activity::ActivityStatus::Queued);
-        }
-        self.push_mode(Mode::Confirm(ConfirmDialog {
+        let pending = self.begin_mutation(tab, "Rebase onto trunk", op);
+        self.ask(ConfirmDialog {
             title,
             body,
             confirm_label: "Rebase".to_owned(),
-            pending: PendingMutation {
-                op,
-                tab_id: tab,
-                activity_id,
-                allow_immutable: false,
-            },
-        }));
-        Task::none()
+            look: Default::default(),
+            pending,
+        });
     }
 }
 
@@ -177,6 +156,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -193,7 +173,7 @@ mod tests {
 
     /// "s" sits on trunk "t", "f" is a feature branch off older history,
     /// "o" is old immutable history.
-    fn ui(trunk: Option<&str>) -> Diffui {
+    fn ui(trunk: Option<&str>, _cx: &mut crate::Cx) -> Diffui {
         let mut ui = app();
         push_tab(&mut ui, "/tmp/trunk");
         let tab = ui.active_mut();
@@ -218,18 +198,20 @@ mod tests {
 
     #[test]
     fn says_why_a_branch_cannot_move_onto_trunk() {
-        let ui = ui(Some("t"));
-        assert_eq!(blocker(&ui, &on("f")), None);
-        assert_eq!(blocker(&ui, &on("s")), Some("Already on trunk"));
-        assert_eq!(blocker(&ui, &on("t")), Some("Revision is immutable"));
-        assert_eq!(blocker(&ui, &on("o")), Some("Revision is immutable"));
-        assert_eq!(blocker(&ui, &on("x")), Some("Revision isn't in the log"));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = ui(Some("t"), cx);
+            assert_eq!(blocker(&ui, &on("f")), None);
+            assert_eq!(blocker(&ui, &on("s")), Some("Already on trunk"));
+            assert_eq!(blocker(&ui, &on("t")), Some("Revision is immutable"));
+            assert_eq!(blocker(&ui, &on("o")), Some("Revision is immutable"));
+            assert_eq!(blocker(&ui, &on("x")), Some("Revision isn't in the log"));
 
-        let no_trunk = super::tests::ui(None);
-        assert_eq!(
-            blocker(&no_trunk, &on("f")),
-            Some("trunk() doesn't resolve to a bookmark")
-        );
+            let no_trunk = super::tests::ui(None, cx);
+            assert_eq!(
+                blocker(&no_trunk, &on("f")),
+                Some("trunk() doesn't resolve to a bookmark")
+            );
+        });
     }
 
     #[test]
@@ -239,28 +221,46 @@ mod tests {
             mode,
             sources,
             destination,
-        } = rebase_op(vec![source.clone()], "t".repeat(8))
+        } = rebase_op(vec![source.clone()])
         else {
             panic!("a rebase");
         };
         assert_eq!(mode, RebaseSourceMode::Branch);
         assert_eq!(sources, vec![source]);
-        assert_eq!(
-            destination,
-            Destination::Onto(RevisionSelection::Commit("t".repeat(8)))
-        );
+        assert_eq!(destination, Destination::Trunk);
     }
 
     #[test]
     fn a_batch_blocks_on_the_first_revision_that_cannot_move() {
-        let ui = ui(Some("t"));
-        let f = RevisionSelection::Commit("f".repeat(8));
-        let s = RevisionSelection::Commit("s".repeat(8));
-        let o = RevisionSelection::Commit("o".repeat(8));
+        crate::tabs::tests::with_cx(|cx| {
+            let ui = ui(Some("t"), cx);
+            let f = RevisionSelection::Commit("f".repeat(8));
+            let s = RevisionSelection::Commit("s".repeat(8));
+            let o = RevisionSelection::Commit("o".repeat(8));
 
-        assert_eq!(blocker_for(&ui, std::slice::from_ref(&f)), None);
-        assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
-        assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
-        assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
+            assert_eq!(blocker_for(&ui, std::slice::from_ref(&f)), None);
+            assert_eq!(blocker_for(&ui, &[]), Some("No revisions marked"));
+            assert_eq!(blocker_for(&ui, &[f, s]), Some("Already on trunk"));
+            assert_eq!(blocker_for(&ui, &[o]), Some("Revision is immutable"));
+        });
+    }
+
+    /// A forecast that lands after a tab switch starts its rebase on the tab
+    /// that asked for it, not on the one now on screen.
+    #[test]
+    fn a_late_forecast_rebases_its_own_tab() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = ui(Some("t"), cx);
+            let asked = ui.active_tab_id().unwrap();
+            let other = push_tab(&mut ui, "/tmp/other");
+            ui.tab_mut(other).unwrap().session.capabilities.mutate = true;
+            let op = rebase_op(vec![RevisionSelection::Commit("f".repeat(8))]);
+            ui.active = 1;
+
+            ui.finish_trunk_preview(asked, op, Err("no forecast".to_owned()));
+
+            assert!(ui.tab(asked).unwrap().jobs.mutation().is_some());
+            assert!(ui.tab(other).unwrap().jobs.mutation().is_none());
+        });
     }
 }

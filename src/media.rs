@@ -6,21 +6,27 @@
 //! seconds of CPU on a large photo, so it runs on a thread of its own, one
 //! side at a time, for the documents the active tab shows.
 
+use crate::Cx;
+use crate::root::PaneSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use diffui_core::{BlobChange, BlobKind, BlobSide, DiffDocument, DiffFile};
-use iced::Task;
-use iced::widget::image::Handle;
 
 use crate::diff_view::{Media, MediaImage, MediaSide};
-use crate::{Diffui, Message, UiEvent};
+use gpui_kit::RenderImage;
+
+use crate::Diffui;
 
 /// One side's decode, by blob id.
 #[derive(Debug, Clone)]
 enum Entry {
-    Pending,
-    Ready(Handle),
+    /// Queued or decoding. The decoder holds a weak handle to `_wanted` and
+    /// skips the job once the entry is dropped.
+    Pending {
+        _wanted: Arc<()>,
+    },
+    Ready(Arc<RenderImage>),
     Failed,
 }
 
@@ -28,7 +34,7 @@ enum Entry {
 #[derive(Debug, Clone)]
 pub(crate) struct Decoded {
     id: String,
-    result: Result<Handle, String>,
+    result: Result<Arc<RenderImage>, String>,
 }
 
 #[derive(Debug, Default)]
@@ -37,9 +43,31 @@ pub(crate) struct MediaCache {
     /// The active tab's documents as of the last scan: a new id there is
     /// what starts decodes.
     scanned: Option<(Option<crate::TabId>, u64, Option<u64>)>,
+    /// Pixels nothing shows any more. They stay in the window's sprite atlas
+    /// until [`MediaCache::release`] gives them back, which needs the window.
+    retired: Vec<Arc<RenderImage>>,
 }
 
 impl MediaCache {
+    /// Decoded previews held, and dropped ones still waiting for the window.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        let ready = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, Entry::Ready(_)))
+            .count();
+        (ready, self.retired.len())
+    }
+
+    /// Takes the dropped previews out of the window's sprite atlas: it only
+    /// grows otherwise, so every image ever shown would keep its GPU memory.
+    pub(crate) fn release(&mut self, window: &mut gpui_kit::Window) {
+        for image in self.retired.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
+
     fn image(&self, side: &BlobSide) -> MediaImage {
         if side.bytes.is_none() {
             return MediaImage::Unavailable;
@@ -47,7 +75,7 @@ impl MediaCache {
         match self.entries.get(&side.id) {
             Some(Entry::Ready(handle)) => MediaImage::Ready(handle.clone()),
             Some(Entry::Failed) => MediaImage::Unavailable,
-            Some(Entry::Pending) | None => MediaImage::Loading,
+            Some(Entry::Pending { .. }) | None => MediaImage::Loading,
         }
     }
 }
@@ -132,7 +160,7 @@ impl Diffui {
     /// Start decoding what the active tab's diffs show and haven't decoded,
     /// and drop the decodes no open tab shows any more. Cheap when nothing
     /// changed: the active tab's document ids are compared first.
-    pub(crate) fn sync_media(&mut self) -> Task<Message> {
+    pub(crate) fn sync_media(&mut self, cx: &mut Cx) {
         let tab = self.active();
         let history = tab.history.diff_document();
         let key = (
@@ -141,15 +169,23 @@ impl Diffui {
             history.map(|(_, id)| id),
         );
         if self.media.scanned == Some(key) {
-            return Task::none();
+            return;
         }
-        let mut jobs: Vec<(String, BlobKind, Arc<[u8]>)> = Vec::new();
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut tokens: Vec<Arc<()>> = Vec::new();
         let shown = std::iter::once(&tab.session.document).chain(history.map(|(doc, _)| doc));
         for (kind, side) in shown.flat_map(previewable_sides) {
             let known = self.media.entries.contains_key(&side.id)
-                || jobs.iter().any(|(id, ..)| id == &side.id);
+                || jobs.iter().any(|job| job.id == side.id);
             if let (false, Some(bytes)) = (known, &side.bytes) {
-                jobs.push((side.id.clone(), kind, Arc::clone(bytes)));
+                let token = Arc::new(());
+                jobs.push(Job {
+                    id: side.id.clone(),
+                    kind,
+                    bytes: Arc::clone(bytes),
+                    wanted: Arc::downgrade(&token),
+                });
+                tokens.push(token);
             }
         }
         self.media.scanned = Some(key);
@@ -166,20 +202,27 @@ impl Diffui {
             .flat_map(previewable_sides)
             .map(|(_, side)| side.id.as_str())
             .collect();
-        self.media
-            .entries
-            .retain(|id, _| live.contains(id.as_str()));
+        let retired = &mut self.media.retired;
+        self.media.entries.retain(|id, entry| {
+            let keep = live.contains(id.as_str());
+            if let (false, Entry::Ready(image)) = (keep, entry) {
+                retired.push(image.clone());
+            }
+            keep
+        });
 
         if jobs.is_empty() {
-            return Task::none();
+            return;
         }
-        for (id, ..) in &jobs {
-            self.media.entries.insert(id.clone(), Entry::Pending);
+        for (job, token) in jobs.iter().zip(tokens) {
+            self.media
+                .entries
+                .insert(job.id.clone(), Entry::Pending { _wanted: token });
         }
-        decode(jobs)
+        decode(jobs, cx)
     }
 
-    pub(crate) fn on_media_decoded(&mut self, decoded: Decoded) -> Task<Message> {
+    pub(crate) fn on_media_decoded(&mut self, decoded: Decoded) {
         // Dropped meanwhile (a reload replaced the document): don't revive it.
         if let Some(entry) = self.media.entries.get_mut(&decoded.id) {
             *entry = match decoded.result {
@@ -190,20 +233,47 @@ impl Diffui {
                 }
             };
         }
-        Task::none()
     }
 }
 
+/// The decoded pixels as what GPUI paints. It takes BGRA.
+fn render_image(image: diffui_core::media::DecodedImage) -> Result<Arc<RenderImage>, String> {
+    let mut bytes = image.rgba;
+    for pixel in bytes.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(image.width, image.height, bytes)
+        .ok_or_else(|| "the decoded buffer doesn't match its size".to_owned())?;
+    Ok(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
+}
+
+/// One side to decode, while its entry still wants it.
+struct Job {
+    id: String,
+    kind: BlobKind,
+    bytes: Arc<[u8]>,
+    wanted: std::sync::Weak<()>,
+}
+
 /// Decode `jobs` one after another on a thread of their own, reporting each
-/// as it lands so the first previews paint while the rest decode.
-fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>) -> Task<Message> {
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
+/// as it lands so the first previews paint while the rest decode. A job whose
+/// entry was dropped meanwhile (the user moved on) is skipped.
+fn decode(jobs: Vec<Job>, cx: &mut Cx) {
+    let (sender, mut receiver) = futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("diffui-media".to_owned())
         .spawn(move || {
-            for (id, kind, bytes) in jobs {
-                let result = diffui_core::media::decode(kind, &bytes)
-                    .map(|image| Handle::from_rgba(image.width, image.height, image.rgba));
+            for Job {
+                id,
+                kind,
+                bytes,
+                wanted,
+            } in jobs
+            {
+                if wanted.strong_count() == 0 {
+                    continue;
+                }
+                let result = diffui_core::media::decode(kind, &bytes).and_then(render_image);
                 if sender.unbounded_send(Decoded { id, result }).is_err() {
                     break;
                 }
@@ -212,12 +282,22 @@ fn decode(jobs: Vec<(String, BlobKind, Arc<[u8]>)>) -> Task<Message> {
         .map_or_else(
             |error| {
                 tracing::warn!(%error, "could not start the preview decoder");
-                Task::none()
             },
             |_| {
-                Task::run(receiver, |decoded| {
-                    Message::Ui(UiEvent::MediaDecoded(Box::new(decoded)))
+                cx.spawn(async move |this, cx| {
+                    use futures::StreamExt as _;
+                    while let Some(decoded) = receiver.next().await {
+                        let updated = this.update(cx, |this, cx| {
+                            this.act_on(cx, PaneSet::MAIN, |this, _| {
+                                this.on_media_decoded(decoded)
+                            });
+                        });
+                        if updated.is_err() {
+                            return;
+                        }
+                    }
                 })
+                .detach();
             },
         )
 }

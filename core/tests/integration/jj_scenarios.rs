@@ -129,6 +129,7 @@ async fn load_jj_repository_snapshot(repository: Repository) -> anyhow::Result<R
     let events = run_one(&repository.root, |job| Command::Snapshot {
         job,
         origin: diffui_core::RefreshOrigin::Focus,
+        disk: diffui_core::DiskSync::Fold,
     })
     .await;
     match events.into_iter().next_back() {
@@ -179,6 +180,7 @@ async fn run_mutation(
         op,
         allow_immutable,
         seen_op: None,
+        seen_wc: None,
     })
     .await;
     match events.into_iter().next_back() {
@@ -589,7 +591,11 @@ fn describe_mutation_replaces_the_full_message_without_moving_working_copy() {
     assert_eq!(change_id(&root, "@"), working_copy_change);
     let rewritten = outcome.rewritten_commit.expect("rewritten commit id");
     assert_ne!(rewritten, target, "describe rewrites the commit");
-    assert_eq!(harness::full_description(&root, &rewritten), description);
+    // Newline-terminated, as `jj describe -m` stores it.
+    assert_eq!(
+        harness::full_description(&root, &rewritten),
+        format!("{description}\n")
+    );
 }
 
 /// diffui's operations carry the `args` tag jj-cli would have written for
@@ -683,6 +689,12 @@ fn secondary_workspace_resolves_and_labels() {
 /// Returns the two workspace roots.
 fn stale_workspace_pair(test: &str) -> (PathBuf, PathBuf) {
     let root = scratch_repo(test);
+    // Recovery is opt-in, as in jj-cli.
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[snapshot]\nauto-update-stale = true\n",
+    )
+    .expect("write repo config");
     write(&root, "shared.txt", "base\n");
     commit(&root, "base");
     let base = commit_id(&root, "description(glob:\"base*\")");
@@ -786,7 +798,7 @@ fn stale_workspace_mutation_recovers_instead_of_reverting_the_rebase() {
     );
     assert_eq!(
         harness::full_description(&root, &working_copy),
-        "described merge",
+        "described merge\n",
         "the mutation applies after the recovery, not instead of it"
     );
     assert!(
@@ -1086,6 +1098,119 @@ fn rebase_between_inserts_into_the_gap() {
     assert_eq!(
         parent_ids(&root, &mid_change),
         vec![commit_id(&root, &leaf_change)]
+    );
+}
+
+/// `jj rebase -A mid -B base` with `base` below `mid`: jj refuses the loop
+/// before jj-lib sees it.
+#[test]
+fn rebase_between_refuses_a_loop() {
+    let root = scratch_repo("rebase-between-loop");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "file.txt", "base\nmid\n");
+    commit(&root, "mid");
+    let mid = commit_id(&root, "description(exact:\"mid\\n\")");
+    let leaf = new_leaf(&root, std::slice::from_ref(&base), "leaf");
+
+    let error = block_on(run_mutation(
+        repository(&root),
+        MutationOp::Rebase {
+            mode: RebaseSourceMode::Revisions,
+            sources: vec![RevisionSelection::Commit(leaf)],
+            destination: Destination::Between {
+                parent: RevisionSelection::Commit(mid),
+                child: RevisionSelection::Commit(base),
+            },
+        },
+        LoadProgress::default(),
+        false,
+    ))
+    .expect_err("a loop is refused");
+    assert!(
+        error.to_string().contains("Refusing to create a loop"),
+        "{error}"
+    );
+}
+
+/// Rebase onto trunk resolves `trunk()` when it runs: a fetch that moved
+/// trunk after the graph was walked is what the branch lands on.
+#[test]
+fn rebase_onto_trunk_follows_trunk_as_it_is_now() {
+    let root = scratch_repo("rebase-onto-moved-trunk");
+    write(&root, "file.txt", "base\n");
+    commit(&root, "base");
+    let base = commit_id(&root, "description(exact:\"base\\n\")");
+    let feature = new_leaf(&root, std::slice::from_ref(&base), "feature");
+    let rebase = || {
+        block_on(run_mutation(
+            repository(&root),
+            MutationOp::Rebase {
+                mode: RebaseSourceMode::Branch,
+                sources: vec![RevisionSelection::Commit(feature.clone())],
+                destination: Destination::Trunk,
+            },
+            LoadProgress::default(),
+            false,
+        ))
+    };
+    let error = rebase().expect_err("no trunk bookmark yet");
+    assert!(
+        error
+            .to_string()
+            .contains("trunk() doesn't resolve to a bookmark"),
+        "{error}"
+    );
+
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'trunk()' = 'present(main)'\n",
+    )
+    .expect("write repo config");
+    let old_trunk = new_leaf(&root, std::slice::from_ref(&base), "old trunk");
+    harness::set_bookmark(&root, OpBase::Head, "main", &old_trunk);
+    let (_, _, _, bookmarks) = block_on(load_jj_commits(
+        root.clone(),
+        "all()".to_owned(),
+        LoadProgress::default(),
+    ))
+    .expect("load commits");
+    assert_eq!(bookmarks.trunk.as_deref(), Some(old_trunk.as_str()));
+
+    let new_trunk = new_leaf(&root, std::slice::from_ref(&old_trunk), "new trunk");
+    harness::set_bookmark(&root, OpBase::Head, "main", &new_trunk);
+    rebase().expect("rebase onto trunk");
+    assert_eq!(
+        commit_id(&root, "description(exact:\"feature\\n\")-"),
+        new_trunk
+    );
+}
+
+/// `jj bookmark delete` of a name that isn't there changes nothing.
+#[test]
+fn deleting_a_missing_bookmark_is_refused() {
+    let root = scratch_repo("delete-missing-bookmark");
+    snapshot(&root);
+    let before = block_on(read_jj_op_head(repository(&root))).expect("op head");
+    let error = block_on(run_mutation(
+        repository(&root),
+        MutationOp::DeleteBookmark {
+            name: "nope".to_owned(),
+        },
+        LoadProgress::default(),
+        false,
+    ))
+    .expect_err("nothing to delete");
+    assert!(
+        error
+            .to_string()
+            .contains("No matching bookmarks for names: nope"),
+        "{error}"
+    );
+    assert_eq!(
+        block_on(read_jj_op_head(repository(&root))).expect("op head"),
+        before
     );
 }
 
@@ -1571,6 +1696,7 @@ fn absorb_moves_hunks_into_the_touching_ancestor() {
         &root,
         MutationOp::Absorb {
             from: RevisionSelection::WorkingCopy,
+            paths: Vec::new(),
         },
     );
 
@@ -1598,6 +1724,37 @@ fn absorb_moves_hunks_into_the_touching_ancestor() {
             .any(|line| line.starts_with("absorbed into")),
         "absorb reports its destinations: {:?}",
         outcome.output
+    );
+}
+
+/// `jj absorb` with paths: only the named files' hunks move; the rest stay in
+/// the working copy.
+#[test]
+fn absorb_with_paths_leaves_other_files_behind() {
+    let root = scratch_repo("absorb-paths");
+    write(&root, "a.txt", "a1\na2\n");
+    write(&root, "b.txt", "b1\nb2\n");
+    commit(&root, "base");
+    let base_change = change_id(&root, "description(exact:\"base\\n\")");
+    write(&root, "a.txt", "a1\na2 edited\n");
+    write(&root, "b.txt", "b1\nb2 edited\n");
+    snapshot(&root);
+
+    run(
+        &root,
+        MutationOp::Absorb {
+            from: RevisionSelection::WorkingCopy,
+            paths: vec!["a.txt".to_owned()],
+        },
+    );
+
+    let base = commit_id(&root, &base_change);
+    assert_eq!(harness::file_at(&root, &base, "a.txt"), "a1\na2 edited\n");
+    assert_eq!(harness::file_at(&root, &base, "b.txt"), "b1\nb2\n");
+    assert_eq!(
+        harness::file_at(&root, &commit_id(&root, "@"), "b.txt"),
+        "b1\nb2 edited\n",
+        "the unnamed file's edit stays in the working copy"
     );
 }
 
@@ -1798,7 +1955,145 @@ fn immutable_guard_covers_describe_and_honors_override() {
     describe(true).expect("override rewrites the immutable commit");
     assert_eq!(
         harness::full_description(&root, &commit_id(&root, "description(glob:\"renamed*\")")),
-        "renamed anyway"
+        "renamed anyway\n"
+    );
+}
+
+/// A working copy on an immutable commit is never amended. jj-cli's snapshot
+/// puts the disk into a new commit on top instead, and so must every place
+/// that folds the disk into `@`: published history rewritten on a file save
+/// diverges from its remote copy.
+#[test]
+fn edits_on_an_immutable_working_copy_go_into_a_new_commit_on_top() {
+    let root = scratch_repo("immutable-wc-fold");
+    write(&root, "a.txt", "one\n");
+    run(
+        &root,
+        MutationOp::Describe {
+            target: RevisionSelection::WorkingCopy,
+            description: "protected wc\n".to_owned(),
+        },
+    );
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"protected*\")'\n",
+    )
+    .expect("write repo config");
+    let protected = commit_id(&root, "description(glob:\"protected*\")");
+
+    // The refresh path.
+    write(&root, "a.txt", "two\n");
+    snapshot(&root);
+    let wc = commit_id(&root, "@");
+    assert_ne!(wc, protected, "the save starts a new commit");
+    assert_eq!(parent_ids(&root, "@"), vec![protected.clone()]);
+    assert_eq!(harness::file_at(&root, &protected, "a.txt"), "one\n");
+    assert_eq!(harness::file_at(&root, &wc, "a.txt"), "two\n");
+
+    // The mutation path: `@` made immutable behind diffui's back, an edit,
+    // then a mutation that folds the disk before it runs.
+    harness::describe(&root, OpBase::Head, &wc, "protected too\n");
+    let protected_too = commit_id(&root, "description(glob:\"protected too*\")");
+    write(&root, "a.txt", "three\n");
+    run(
+        &root,
+        MutationOp::New {
+            parent: RevisionSelection::Commit(protected.clone()),
+        },
+    );
+    assert_eq!(harness::file_at(&root, &protected_too, "a.txt"), "two\n");
+    let folded = commit_ids(&root, &format!("children({protected_too})"));
+    assert_eq!(folded.len(), 1, "the edit went into a commit on top");
+    assert_eq!(harness::file_at(&root, &folded[0], "a.txt"), "three\n");
+
+    // Edit anyway: jj-cli's transaction tail starts a new `@` on top.
+    let edited = block_on(run_mutation(
+        repository(&root),
+        MutationOp::Edit {
+            target: RevisionSelection::Commit(protected.clone()),
+        },
+        LoadProgress::default(),
+        true,
+    ))
+    .expect("edit the immutable commit anyway");
+    assert!(
+        edited
+            .output
+            .iter()
+            .any(|line| line.contains("became immutable")),
+        "{:?}",
+        edited.output
+    );
+    assert_eq!(parent_ids(&root, "@"), vec![protected.clone()]);
+    assert_eq!(harness::file_at(&root, &protected, "a.txt"), "one\n");
+}
+
+/// A bookmark moved onto `@` can make it immutable. jj-cli ends every
+/// transaction by starting a new `@` on top of one that became immutable, so
+/// the next save can't rewrite what was just published.
+#[test]
+fn a_working_copy_that_becomes_immutable_gets_a_new_commit_on_top() {
+    let root = scratch_repo("immutable-wc-tail");
+    write(&root, "a.txt", "one\n");
+    snapshot(&root);
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'immutable_heads()' = 'present(main)'\n",
+    )
+    .expect("write repo config");
+    let before = commit_id(&root, "@");
+
+    let moved = run(
+        &root,
+        MutationOp::MoveBookmark {
+            name: "main".to_owned(),
+            to: RevisionSelection::WorkingCopy,
+            push_remote: None,
+        },
+    );
+    assert!(
+        moved
+            .output
+            .iter()
+            .any(|line| line.contains("became immutable")),
+        "{:?}",
+        moved.output
+    );
+    assert_eq!(commit_id(&root, "main"), before);
+    assert_eq!(parent_ids(&root, "@"), vec![before.clone()]);
+
+    write(&root, "a.txt", "two\n");
+    snapshot(&root);
+    assert_eq!(commit_id(&root, "main"), before, "main is never rewritten");
+    assert_eq!(harness::file_at(&root, &before, "a.txt"), "one\n");
+}
+
+/// `jj abandon` deletes the bookmarks on the commits it abandons. Sliding
+/// them to the parent instead made the next push move the remote bookmark
+/// backwards rather than delete it.
+#[test]
+fn abandon_deletes_the_bookmarks_on_what_it_abandons() {
+    let root = scratch_repo("abandon-bookmarks");
+    write(&root, "a.txt", "base\n");
+    commit(&root, "base");
+    write(&root, "a.txt", "feature\n");
+    commit(&root, "feature tip");
+    let tip = commit_id(&root, "description(glob:\"feature tip*\")");
+    harness::set_bookmark(&root, OpBase::Head, "feature", &tip);
+
+    run(
+        &root,
+        MutationOp::Abandon {
+            targets: vec![RevisionSelection::Commit(tip.clone())],
+        },
+    );
+    assert!(
+        commit_ids(&root, "description(glob:\"feature tip*\")").is_empty(),
+        "the tip is abandoned"
+    );
+    assert!(
+        !is_present(&root, "feature"),
+        "the bookmark goes with it instead of sliding to the parent"
     );
 }
 
@@ -1918,6 +2213,45 @@ fn log_rows_carry_the_immutable_flag() {
             .is_some_and(|working_copy| !working_copy.is_immutable()),
         "@ stays mutable"
     );
+}
+
+/// The graph's change-id prefixes are unique within
+/// `revsets.short-prefixes` first, as `jj log` shortens them, not across the
+/// whole repo.
+#[test]
+fn change_id_prefixes_are_unique_within_short_prefixes() {
+    let root = scratch_repo("short-prefixes");
+    snapshot(&root);
+    let base = commit_id(&root, "@-");
+    // More changes than the 16 one-letter prefixes, so some need two.
+    harness::new_chain(&root, &base, 20);
+    let load = || {
+        block_on(load_jj_commits(
+            root.clone(),
+            "all()".to_owned(),
+            LoadProgress::default(),
+        ))
+        .expect("load commits")
+        .0
+    };
+    let store = load();
+    let long = store
+        .iter()
+        .find(|row| row.shortest_change_id_len().is_some_and(|len| len > 1))
+        .expect("a change whose prefix needs two letters");
+    let (commit, change) = (long.commit_id().to_owned(), long.change_id().to_owned());
+
+    std::fs::write(
+        root.join(".jj/repo/config.toml"),
+        format!("[revsets]\nshort-prefixes = '{commit}'\n"),
+    )
+    .expect("write repo config");
+    let store = load();
+    let row = store
+        .iter()
+        .find(|row| row.change_id() == change)
+        .expect("the change is still in the graph");
+    assert_eq!(row.shortest_change_id_len(), Some(1));
 }
 
 /// Rows descending from `trunk()` are flagged, and the trunk's id rides

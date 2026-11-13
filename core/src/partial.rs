@@ -32,9 +32,9 @@ use jj_lib::merge::Diff;
 use crate::diff_parse::format_hunk_header;
 use crate::model::{DiffLine, DiffLineKind};
 
-/// Lines of context around each hunk. Must match the diff pane's (see
-/// `jj::diff::diff_jj_with_repo`), or hunk indices would name different lines
-/// on the two sides.
+/// Lines of context around each hunk. The diff pane's hunks are cut with it
+/// too (`jj::diff::diff_trees_with_copies`), or hunk indices would name
+/// different lines on the two sides.
 pub const HUNK_CONTEXT: usize = 3;
 
 /// A subset of one revision's changes, by file, hunk and line.

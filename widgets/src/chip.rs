@@ -1,51 +1,38 @@
 //! The one chip component: small rounded-rect label used for bookmark /
-//! workspace / status indicators in the sidebar's commit rows, the file
-//! list's A/M/D badges, and the diff view's revision-header bookmarks and
-//! file-header status. Every custom-drawn chip goes through [`draw`] so they
-//! share geometry, text treatment, and border styles by construction;
-//! widget-built chips (the activity bar's counters) pick up the same look
-//! via [`container_style`].
+//! workspace / status indicators in the sidebar's commit rows, the file list's
+//! A/M/D badges, and the diff view's revision-header bookmarks and file-header
+//! status. Every chip goes through [`view`] so they share geometry, text
+//! treatment, and border styles by construction.
 
-use iced::advanced::graphics::geometry::{self, Frame, LineCap, LineJoin, Path, Stroke};
-use iced::advanced::text;
-use iced::advanced::{renderer, text::Text};
-use iced::{Background, Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
+use gpui_kit::prelude::*;
+use gpui_kit::{App, BorderStyle, Bounds, Div, TextAlign, Window, div, point, px, quad, size};
 
 use crate::icons;
-use crate::theme::chip_background;
+use crate::theme::{Color, Font};
 use crate::typography::TextBox;
 use crate::width_memo::WidthMemo;
 
 pub const TEXT_SIZE: f32 = crate::theme::text_size::BODY;
-pub const PAD_X: f32 = 6.0;
-/// Soft rounding just under half of [`height`] — rounder than a plain tag,
-/// deliberately short of a full pill.
-pub const RADIUS: f32 = 6.0;
+
+/// The label size of a chip set in `font`: [`TEXT_SIZE`], matched to the UI
+/// font's x-height so a mono chip (`conflict`, `divergent`) reads the same
+/// size as a sans one beside it.
+pub fn text_size(font: Font) -> f32 {
+    crate::typography::optical_size(font, TEXT_SIZE)
+}
+pub const PAD_X: f32 = 7.0;
+/// The app's smallest radius step, shared with keycaps and badges.
+pub const RADIUS: f32 = crate::theme::radius::XS;
 /// Chip icon glyph size — a step under the label size so the glyph's optical
 /// weight matches the text next to it.
-const ICON_SIZE: f32 = 11.0;
+pub const ICON_SIZE: f32 = 11.0;
 /// Gap between a chip's icon and its label.
-const ICON_GAP: f32 = 3.0;
+pub const ICON_GAP: f32 = 3.0;
 
-/// Tight box: just enough vertical room for the cap-height plus a hair of
-/// breathing room. Anything more makes the chip dwarf the text around it.
+/// Enough room around the label that the chip reads as a box of its own,
+/// short of dwarfing the text it sits beside.
 pub fn height() -> f32 {
-    (TEXT_SIZE + 3.0).round()
-}
-
-/// Container style for chips built from iced widgets rather than drawn via
-/// [`draw`] (the activity bar's `+N` / `N queued`), so element-based chips
-/// share the drawn chips' corner radius and translucent fill.
-pub fn container_style(color: Color) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(Background::Color(chip_background(color))),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: RADIUS.into(),
-        },
-        ..iced::widget::container::Style::default()
-    }
+    (TEXT_SIZE + 5.0).round()
 }
 
 #[derive(Debug, Clone)]
@@ -63,17 +50,36 @@ pub struct Chip {
     /// bookmark chips — outlined, lane-colored).
     pub border_color: Option<Color>,
     pub border_dashed: bool,
-    /// Optional Lucide glyph drawn ahead of the label, tinted like it.
-    /// Workspace chips carry one so a `name@` working-copy marker reads as
-    /// a different kind of thing than the bookmark pills around it —
-    /// color alone doesn't separate two chips in the same rail.
+    /// Optional Lucide glyph drawn ahead of the label. Workspace chips
+    /// carry one so a `name@` working-copy marker reads as a different kind
+    /// of thing than the bookmark pills around it.
     pub icon: Option<&'static str>,
+    /// The glyph's own tint, when it differs from the label's: a neutral
+    /// bookmark chip shows its graph lane through the icon alone.
+    pub icon_color: Option<Color>,
+    /// A trailing run in its own colour, right after the label: a remote
+    /// bookmark's `@origin`, or the `*` of a bookmark that differs from its
+    /// remote.
+    pub suffix: Option<(String, Color)>,
 }
 
 /// Full chip width (icon + label + horizontal padding) for the given label,
-/// rendered with `font` at [`TEXT_SIZE`].
+/// rendered with `font` at its [`text_size`].
 pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
     width_memoized(&WidthMemo::default(), label, icon, font)
+}
+
+/// Full width of `chip`, its suffix included.
+pub fn full_width(chip: &Chip) -> f32 {
+    chip_width(&WidthMemo::default(), chip)
+}
+
+/// [`full_width`], shaping through `memo`.
+pub fn chip_width(memo: &WidthMemo, chip: &Chip) -> f32 {
+    width_memoized(memo, &chip.label, chip.icon, chip.font)
+        + chip.suffix.as_ref().map_or(0.0, |(suffix, _)| {
+            memo.width(suffix, text_size(chip.font), chip.font)
+        })
 }
 
 /// [`width`], shaping through `memo`.
@@ -84,201 +90,156 @@ pub fn width(label: &str, icon: Option<&str>, font: Font) -> f32 {
 /// in; the rest go through [`width`], which is the same call against an empty
 /// one.
 pub fn width_memoized(memo: &WidthMemo, label: &str, icon: Option<&str>, font: Font) -> f32 {
-    let label_w = memo.width(label, TEXT_SIZE, font);
+    let label_w = memo.width(label, text_size(font), font);
     let icon_w = icon.map_or(0.0, |glyph| {
         memo.width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP
     });
     label_w + icon_w + PAD_X * 2.0
 }
 
-/// Draw `chip` with its left edge at `x`, vertically centered on `center_y`.
-/// Returns the chip's width so rails can advance to the next chip.
 /// The `center_y` to draw `chip` at so its label's baseline lands on
 /// `baseline_y` — for a chip sitting in a line of text.
 pub fn center_for_baseline(chip: &Chip, baseline_y: f32) -> f32 {
-    TextBox::new(chip.font, TEXT_SIZE, height()).center_for_baseline(baseline_y)
+    TextBox::new(chip.font, text_size(chip.font), height()).center_for_baseline(baseline_y)
 }
 
-pub fn draw<R>(renderer: &mut R, chip: &Chip, x: f32, center_y: f32, clip: Rectangle) -> f32
-where
-    R: text::Renderer + geometry::Renderer,
-{
-    draw_memoized(renderer, chip, &WidthMemo::default(), x, center_y, clip)
-}
-
-/// [`draw`], shaping through `memo` — the label's width is the one the caller's
-/// layout pass already asked for.
-pub fn draw_memoized<R>(
-    renderer: &mut R,
+/// Paints `chip` with its left edge at `x`, centred on `center_y`: the chip of
+/// [`view`], for a painter that places its rows by hand.
+pub fn paint(
     chip: &Chip,
     memo: &WidthMemo,
     x: f32,
     center_y: f32,
-    clip: Rectangle,
-) -> f32
-where
-    R: text::Renderer + geometry::Renderer,
-{
-    let label_w = memo.width(&chip.label, TEXT_SIZE, chip.font);
-    let icon_block = chip
-        .icon
-        .map(|glyph| (glyph, memo.width(glyph, ICON_SIZE, icons::ICON_FONT)));
-    let icon_indent = icon_block.map_or(0.0, |(_, icon_w)| icon_w + ICON_GAP);
+    window: &mut Window,
+    cx: &mut App,
+) {
     let chip_h = height();
-    let chip_w = icon_indent + label_w + PAD_X * 2.0;
-    let rect = Rectangle {
-        x,
-        y: (center_y - chip_h / 2.0).round(),
-        width: chip_w,
-        height: chip_h,
+    let width = chip_width(memo, chip);
+    let top = (center_y - chip_h / 2.0).round();
+    let bounds = Bounds::new(point(px(x), px(top)), size(px(width), px(chip_h)));
+    let background = if chip.background.a > f32::EPSILON {
+        chip.background
+    } else {
+        Color {
+            a: 0.0,
+            ..chip.text_color
+        }
     };
-    // Skip the fill when the chip is meant to read as outlined-only —
-    // a translucent fill with `a == 0` would still emit a quad but
-    // avoiding it keeps the layer count down and makes intent clear.
-    if chip.background.a > f32::EPSILON {
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: rect,
-                border: Border {
-                    radius: iced::border::Radius::from(RADIUS),
-                    ..Border::default()
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            },
-            Background::Color(chip.background),
+    let (border_width, border_color) = chip
+        .border_color
+        .map_or((0.0, background), |color| (1.0, color));
+    window.paint_quad(quad(
+        bounds,
+        px(RADIUS),
+        background,
+        px(border_width),
+        border_color,
+        if chip.border_dashed {
+            BorderStyle::Dashed
+        } else {
+            BorderStyle::Solid
+        },
+    ));
+    let mut text_x = x + PAD_X;
+    if let Some(glyph) = chip.icon {
+        crate::typography::paint_line(
+            glyph,
+            text_x,
+            top + (chip_h - ICON_SIZE) / 2.0,
+            ICON_SIZE,
+            ICON_SIZE,
+            icons::ICON_FONT,
+            chip.icon_color.unwrap_or(chip.text_color),
+            TextAlign::Left,
+            window,
+            cx,
+        );
+        text_x += memo.width(glyph, ICON_SIZE, icons::ICON_FONT) + ICON_GAP;
+    }
+    // Same box as `view`: the line is the chip's height, shifted so the caps
+    // sit on the mid-line.
+    let label_size = text_size(chip.font);
+    let shift = TextBox::new(chip.font, label_size, chip_h).trim_shift();
+    crate::typography::paint_line(
+        &chip.label,
+        text_x,
+        top + shift,
+        label_size,
+        chip_h,
+        chip.font,
+        chip.text_color,
+        TextAlign::Left,
+        window,
+        cx,
+    );
+    if let Some((suffix, color)) = &chip.suffix {
+        crate::typography::paint_line(
+            suffix,
+            text_x + memo.width(&chip.label, label_size, chip.font),
+            top + shift,
+            label_size,
+            chip_h,
+            chip.font,
+            *color,
+            TextAlign::Left,
+            window,
+            cx,
         );
     }
-    if let Some(border_color) = chip.border_color {
+}
+
+/// `chip` as an element, [`height`] tall. A painter placing chips by hand (a
+/// row's rail) takes its width from [`width_memoized`].
+pub fn view(chip: &Chip) -> Div {
+    let chip_h = height();
+    // Line box pinned to the chip's own height: a taller box distributes its
+    // extra leading around the glyphs, and any asymmetry in that distribution
+    // shows up as the label riding high or low inside a box this tight. The
+    // shift then puts the label's caps, not its line box, on the mid-line.
+    let shift = TextBox::new(chip.font, text_size(chip.font), chip_h).trim_shift();
+    let mut element = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .h(px(chip_h))
+        .px(px(PAD_X))
+        .gap(px(ICON_GAP))
+        .rounded(px(RADIUS));
+    // Skip the fill when the chip is meant to read as outlined-only.
+    if chip.background.a > f32::EPSILON {
+        element = element.bg(chip.background);
+    }
+    if let Some(color) = chip.border_color {
+        // The outline comes out of the padding, as `paint` draws it, so an
+        // outlined chip is as wide as `width` says and as its filled twin.
+        element = element.px(px(PAD_X - 1.0)).border_1().border_color(color);
         if chip.border_dashed {
-            stroke_dashed_rounded_rect(renderer, rect, border_color, RADIUS);
-        } else {
-            stroke_solid_rounded_rect(renderer, rect, border_color, RADIUS);
+            element = element.border_dashed();
         }
     }
-    // The icon can't share the label's centering path: Lucide's em box
-    // sits entirely above the baseline (ascent = em, descent = 0), so any
-    // line-height leading beyond the glyph size lands asymmetrically and
-    // shoves the ink off-center. Collapsing the line box to exactly the
-    // glyph size makes centering it equal centering the ink — the same
-    // trick `icons::icon` documents for the widget path.
-    // Anchor the label (and icon) to the *rounded* rect's own mid-line, not
-    // the raw `center_y` — the rect's y snaps to the pixel grid above, and
-    // anchoring the text elsewhere reads as the label floating off-center.
-    let rect_mid_y = rect.y + chip_h / 2.0;
-    if let Some((glyph, icon_w)) = icon_block {
-        renderer.fill_text(
-            Text {
-                content: glyph.to_owned(),
-                bounds: Size::new(icon_w.max(1.0), ICON_SIZE),
-                size: Pixels(ICON_SIZE),
-                line_height: text::LineHeight::Absolute(Pixels(ICON_SIZE)),
-                font: icons::ICON_FONT,
-                align_x: text::Alignment::Left,
-                align_y: alignment::Vertical::Center,
-                shaping: text::Shaping::Advanced,
-                wrapping: text::Wrapping::None,
-                ellipsis: text::Ellipsis::None,
-                hint_factor: None,
-            },
-            Point::new(
-                x + PAD_X,
-                rect_mid_y + TextBox::new(icons::ICON_FONT, ICON_SIZE, ICON_SIZE).trim_shift(),
-            ),
-            chip.text_color,
-            clip,
-        );
+    if let Some(glyph) = chip.icon {
+        element = element.child(icons::icon(
+            glyph,
+            ICON_SIZE,
+            chip.icon_color.unwrap_or(chip.text_color),
+        ));
     }
-    // Line box pinned to the chip's own height: a taller box (the usual
-    // 1.4× multiplier) distributes its extra leading around the glyphs,
-    // and any asymmetry in that distribution shows up as the label riding
-    // high or low inside a box this tight.
-    renderer.fill_text(
-        Text {
-            content: chip.label.clone(),
-            bounds: Size::new((chip_w - icon_indent).max(1.0), chip_h),
-            size: Pixels(TEXT_SIZE),
-            line_height: text::LineHeight::Absolute(Pixels(chip_h)),
-            font: chip.font,
-            align_x: text::Alignment::Center,
-            align_y: alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::None,
-            hint_factor: None,
-        },
-        // Optically centred: the label's caps, not its line box, sit on the
-        // chip's mid-line (see `crate::typography`).
-        Point::new(
-            x + icon_indent + (chip_w - icon_indent) / 2.0,
-            rect_mid_y + TextBox::new(chip.font, TEXT_SIZE, chip_h).trim_shift(),
-        ),
-        chip.text_color,
-        clip,
-    );
-    chip_w
-}
-
-/// Solid 1px rounded-rect outline. Cheaper than the dashed variant —
-/// goes through iced's quad border instead of a geometry path. Used by
-/// remote-bookmark chips that want a crisp outlined look.
-fn stroke_solid_rounded_rect<R: renderer::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    color: Color,
-    radius: f32,
-) {
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                color,
-                width: 1.0,
-                radius: iced::border::Radius::from(radius),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        Background::Color(Color::TRANSPARENT),
-    );
-}
-
-/// Dashed 1px rounded-rect outline. Used by outlined chips (e.g. the
-/// `empty` indicator). Iced's quad border can't be dashed, so we stroke
-/// a canvas path with a `LineDash` pattern.
-fn stroke_dashed_rounded_rect<R: geometry::Renderer>(
-    renderer: &mut R,
-    rect: Rectangle,
-    color: Color,
-    radius: f32,
-) {
-    // Inset by half a pixel so the 1px stroke sits on the rect's
-    // edge rather than straddling it (avoids fuzzy aliasing).
-    let inset_rect = Rectangle {
-        x: rect.x + 0.5,
-        y: rect.y + 0.5,
-        width: rect.width - 1.0,
-        height: rect.height - 1.0,
+    let text = |value: String, color: Color| {
+        div()
+            .relative()
+            .top(px(shift))
+            .font(chip.font.gpui())
+            .text_size(px(text_size(chip.font)))
+            .line_height(px(chip_h))
+            .text_color(color)
+            .whitespace_nowrap()
+            .child(value)
     };
-    let path = Path::rounded_rectangle(
-        Point::new(inset_rect.x, inset_rect.y),
-        Size::new(inset_rect.width, inset_rect.height),
-        iced::border::Radius::from(radius),
-    );
-    let segments: [f32; 2] = [4.0, 2.2];
-    let mut stroke = Stroke::default()
-        .with_color(color)
-        .with_width(1.0)
-        .with_line_cap(LineCap::Butt)
-        .with_line_join(LineJoin::Miter);
-    stroke.line_dash = geometry::LineDash {
-        segments: &segments,
-        offset: 0,
-    };
-    let mut frame = Frame::new(
-        renderer,
-        Size::new(rect.x + rect.width + 1.0, rect.y + rect.height + 1.0),
-    );
-    frame.stroke(&path, stroke);
-    renderer.draw_geometry(frame.into_geometry());
+    element = element.child(text(chip.label.clone(), chip.text_color));
+    if let Some((suffix, color)) = &chip.suffix {
+        // Flush against the label: the row's gap is for the icon.
+        element = element.child(text(suffix.clone(), *color).ml(px(-ICON_GAP)));
+    }
+    element
 }
