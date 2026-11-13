@@ -74,6 +74,7 @@ mod tabs;
 mod toolbar;
 mod trunk;
 mod update;
+mod when;
 mod window_state;
 
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the

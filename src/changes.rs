@@ -774,6 +774,17 @@ pub(crate) fn live_line_select(tab: &TabState) -> Option<&LineSelect> {
         .filter(|mode| editable(tab) && mode.revision == tab.session.selected_revision)
 }
 
+/// The file path and the line number (new side, else old) under line-select
+/// mode's cursor on the active tab.
+pub(crate) fn cursor_line(ui: &Diffui) -> Option<(String, usize)> {
+    let tab = ui.active();
+    let mode = live_line_select(tab).filter(|mode| mode.document == tab.session.document_id)?;
+    let at = mode.cursor?;
+    let file = tab.session.document.files.get(at.file)?;
+    let line = file.hunks.get(at.hunk)?.lines.get(at.line)?;
+    Some((file.path.clone(), line.new_line.or(line.old_line)?))
+}
+
 /// Whether line-select mode can be entered on the active tab.
 pub(crate) fn can_select_lines(ui: &Diffui) -> bool {
     editable(ui.active())
