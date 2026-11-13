@@ -253,6 +253,19 @@ impl MutationOp {
                 | Self::RevertOperation { .. }
         )
     }
+
+    /// Whether it sends anything to a remote.
+    pub fn pushes(&self) -> bool {
+        matches!(
+            self,
+            Self::Push(_)
+                | Self::PushBookmark { .. }
+                | Self::MoveBookmark {
+                    push_remote: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.

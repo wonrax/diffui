@@ -435,8 +435,9 @@ impl Diffui {
         }
     }
 
-    /// A mutation finished: a push refreshes the pull requests, and a
-    /// submission waiting on this push goes on (or stops).
+    /// A mutation finished: any push (a bookmark's own, a move that pushes)
+    /// refreshes the pull requests, and a submission waiting on this push goes
+    /// on (or stops).
     pub(crate) fn forge_after_mutation(
         &mut self,
         tab: TabId,
@@ -446,7 +447,7 @@ impl Diffui {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
-        if result.is_ok() && matches!(pending.op, diffui_core::MutationOp::Push(_)) {
+        if result.is_ok() && pending.op.pushes() {
             state.forge.wanted = true;
         }
         self.submission_push_finished(tab, pending, result);
@@ -995,6 +996,43 @@ mod tests {
         assert_eq!(number(&ui, result("other*")), Some(5));
         assert_eq!(number(&ui, result("feature")), Some(3));
         assert_eq!(number(&ui, result("other@origin")), None, "a remote copy");
+    }
+
+    #[test]
+    fn a_bookmark_s_own_push_refreshes_the_pull_requests() {
+        use diffui_core::MutationOp;
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/forge-pushed");
+        let outcome = || {
+            Ok(diffui_core::MutationOutcome {
+                message: String::new(),
+                moved_working_copy: false,
+                rewritten_commit: None,
+                output: Vec::new(),
+                operation_id: None,
+                bookmarks: Vec::new(),
+            })
+        };
+        let finished = |ui: &mut Diffui, op| {
+            ui.tab_mut(tab).unwrap().forge.wanted = false;
+            let pending = crate::PendingMutation {
+                op,
+                tab_id: tab,
+                activity_id: crate::activity::ActivityId(1),
+                allow_immutable: false,
+            };
+            ui.forge_after_mutation(tab, &pending, &outcome());
+            ui.tab(tab).unwrap().forge.wanted
+        };
+        let push = MutationOp::PushBookmark {
+            name: "feature".to_owned(),
+            remote: "origin".to_owned(),
+        };
+        assert!(finished(&mut ui, push));
+        let local = MutationOp::DeleteBookmark {
+            name: "feature".to_owned(),
+        };
+        assert!(!finished(&mut ui, local), "nothing reached the forge");
     }
 
     #[test]

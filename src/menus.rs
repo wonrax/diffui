@@ -670,15 +670,7 @@ impl Diffui {
         };
         // Only pushes report real progress (git transfer); the rest are quick
         // local ops, so they stay indeterminate.
-        let determinate = matches!(
-            op,
-            MutationOp::PushBookmark { .. }
-                | MutationOp::MoveBookmark {
-                    push_remote: Some(_),
-                    ..
-                }
-                | MutationOp::Push(_)
-        );
+        let determinate = op.pushes();
         // A batch abandon consumes the marked rows — the marks (and their
         // wash) mustn't outlive the pick.
         if crate::revops::consumes_marks(tab, &op)
