@@ -1421,7 +1421,7 @@ impl Diffui {
                 .text(". Undo brings them back."),
             confirm_label: "Discard".to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 

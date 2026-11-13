@@ -15,6 +15,8 @@ use std::sync::Arc;
 use super::{Availability, Command, CommandArg, Context, PaletteScope};
 use crate::Diffui;
 use crate::action::Action;
+use crate::palette::ResultRef;
+use crate::user_commands::UserCommand;
 
 /// A command's stable identity: a string, so it survives in a config file and
 /// in the persisted palette recents, and owned, so commands that config
@@ -90,6 +92,10 @@ pub(crate) enum Handler {
         enabled: fn(&Diffui, &CommandArg) -> Availability,
         build: fn(&Diffui, CommandArg) -> Option<Action>,
     },
+    /// A declared command: a `[[commands]]` row of `config.toml` or of the
+    /// rows diffui ships. Its when-clause and the variables it names decide
+    /// whether it runs; running it is [`Action::RunUserCommand`].
+    User(Arc<UserCommand>),
 }
 
 /// One command, wherever it was declared.
@@ -139,10 +145,28 @@ impl Entry {
         }
     }
 
+    fn user(command: Arc<UserCommand>) -> Self {
+        Self {
+            id: command.id.as_str().into(),
+            label: Cow::Owned(command.label.clone()),
+            palette_label: Cow::Owned(command.label.clone()),
+            hint: Cow::Owned(command.hint.clone()),
+            group: command.group,
+            icon: crate::icons::TERMINAL,
+            contexts: &[Context::Base],
+            chords: command.keys.iter().cloned().map(Cow::Owned).collect(),
+            // Declared commands say where they go with `places`.
+            palette: PaletteScope::Hidden,
+            aliases: &[],
+            handler: Handler::User(command),
+        }
+    }
+
     /// `Err` with why the command can't run on `arg` right now.
     pub(crate) fn enabled(&self, ui: &Diffui, arg: &CommandArg) -> Result<(), Disabled> {
         match &self.handler {
             Handler::Builtin { enabled, .. } => enabled(ui, arg).map_err(Cow::Borrowed),
+            Handler::User(command) => command.availability(ui, arg),
         }
     }
 
@@ -151,6 +175,38 @@ impl Entry {
     pub(crate) fn build(&self, ui: &Diffui, arg: CommandArg) -> Option<Action> {
         match &self.handler {
             Handler::Builtin { build, .. } => build(ui, arg),
+            Handler::User(command) => Some(Action::RunUserCommand {
+                command: command.clone(),
+                tab: ui.active_tab_id()?,
+                arg,
+            }),
+        }
+    }
+
+    /// The declared command behind this entry, if it is one.
+    pub(crate) fn declared(&self) -> Option<&Arc<UserCommand>> {
+        match &self.handler {
+            Handler::User(command) => Some(command),
+            Handler::Builtin { .. } => None,
+        }
+    }
+
+    /// Whether the palette lists it in `scope`, run on `arg`.
+    fn listed_in(&self, scope: PaletteScope, arg: &CommandArg) -> bool {
+        let Some(command) = self.declared() else {
+            return self.palette == scope
+                || (self.palette == PaletteScope::RevisionVerb
+                    && matches!(scope, PaletteScope::Root | PaletteScope::Revision));
+        };
+        let places = command.places;
+        match scope {
+            PaletteScope::Root => places.palette,
+            PaletteScope::Revision => match arg {
+                CommandArg::Result(ResultRef::Bookmark(_)) => places.bookmark || places.revision,
+                _ => places.revision,
+            },
+            PaletteScope::File => places.file,
+            PaletteScope::Hidden | PaletteScope::RevisionVerb => false,
         }
     }
 }
@@ -179,6 +235,87 @@ impl Registry {
     /// The built-in commands alone.
     pub(crate) fn builtin() -> Self {
         Self::from_entries(super::REGISTRY.iter().map(Entry::builtin).collect())
+    }
+
+    /// The built-ins, then `shipped` (the rows diffui declares), then
+    /// `declared` (config's), and what was wrong with the declarations. A
+    /// declared command whose id a built-in or a shipped row already has
+    /// takes its place only with `override = true`; otherwise it is left out.
+    pub(crate) fn build(
+        shipped: &[Arc<UserCommand>],
+        declared: &[Arc<UserCommand>],
+    ) -> (Self, Vec<String>) {
+        let mut entries: Vec<Entry> = super::REGISTRY.iter().map(Entry::builtin).collect();
+        let mut problems = Vec::new();
+        let builtins = entries.len();
+        for command in shipped {
+            entries.push(Entry::user(command.clone()));
+        }
+        let fixed = entries.len();
+        for command in declared {
+            match entries
+                .iter()
+                .position(|entry| entry.id == command.id.as_str())
+            {
+                Some(index) if index < fixed && command.replaces => {
+                    entries[index] = Entry::user(command.clone());
+                }
+                Some(index) if index < fixed => problems.push(format!(
+                    "{}: [[commands]] {:?} is {}; set override = true to replace it",
+                    command.source,
+                    command.id,
+                    if index < builtins {
+                        "a built-in command"
+                    } else {
+                        "a command diffui ships"
+                    }
+                )),
+                // `parse_commands` keeps one row per id.
+                Some(_) => {}
+                None => entries.push(Entry::user(command.clone())),
+            }
+        }
+        let registry = Self::from_entries(entries);
+        problems.extend(registry.chord_collisions());
+        (registry, problems)
+    }
+
+    /// A declared command's key that another command in the same context
+    /// already binds by default. The declared one wins (its key is bound
+    /// first); this says so.
+    fn chord_collisions(&self) -> Vec<String> {
+        use crate::keymap::Chord;
+        let mut problems = Vec::new();
+        for entry in &self.entries {
+            let Some(command) = entry.declared() else {
+                continue;
+            };
+            for raw in &entry.chords {
+                let Some(chord) = Chord::parse(raw) else {
+                    continue;
+                };
+                for context in entry.contexts {
+                    let other = self.entries.iter().find(|other| {
+                        other.id != entry.id
+                            && other.contexts.contains(context)
+                            && other
+                                .chords
+                                .iter()
+                                .any(|theirs| Chord::parse(theirs).as_ref() == Some(&chord))
+                    });
+                    if let Some(other) = other {
+                        problems.push(format!(
+                            "{}: [[commands]] {:?}: {raw} is also {}'s in {}; this one wins",
+                            command.source,
+                            command.id,
+                            other.id,
+                            context.name()
+                        ));
+                    }
+                }
+            }
+        }
+        problems
     }
 
     fn from_entries(entries: Vec<Entry>) -> Self {
@@ -217,11 +354,7 @@ impl Registry {
     ) -> Vec<(&Entry, Result<(), Disabled>)> {
         self.entries
             .iter()
-            .filter(|entry| {
-                entry.palette == scope
-                    || (entry.palette == PaletteScope::RevisionVerb
-                        && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
-            })
+            .filter(|entry| entry.listed_in(scope, arg))
             .map(|entry| (entry, entry.enabled(ui, arg)))
             .collect()
     }
@@ -248,6 +381,21 @@ fn builtin_palette_label(command: &Command) -> &'static str {
         _ => command.label,
     }
 }
+
+/// The palette's headings, in no particular order. A declared command may
+/// name one of these as its group.
+pub(crate) const GROUPS: &[&str] = &[
+    "Repository",
+    "Revisions",
+    "Bookmarks",
+    "Changes",
+    "Conflicts",
+    "Compare",
+    "View",
+    "Appearance",
+    "App",
+    "Commands",
+];
 
 /// A built-in's group, from its id's namespace.
 fn builtin_group(id: &str) -> &'static str {
@@ -284,6 +432,7 @@ fn builtin_icon(id: &str) -> &'static str {
         "theme.contrast" => glyph::EYE,
         "app.settings" => glyph::SETTINGS,
         "app.reveal-config" => glyph::FILE_TEXT,
+        "app.reload-commands" => icons::REFRESH,
         "app.reveal-log" => glyph::FILE_TEXT,
         "help.shortcuts" => glyph::KEYBOARD,
         "find.open" => icons::SEARCH,
@@ -356,5 +505,153 @@ fn builtin_aliases(id: &str) -> &'static [&'static str] {
         "file.open" => &["open-file"],
         "file.copy-path" => &["copy-file-path"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::{Chord, Keymap, RawKeys};
+    use std::path::Path;
+
+    fn declared(toml: &str) -> Vec<Arc<UserCommand>> {
+        let (commands, problems) =
+            crate::user_commands::parse_commands(Path::new("config.toml"), toml);
+        assert!(problems.is_empty(), "{problems:?}");
+        commands.into_iter().map(Arc::new).collect()
+    }
+
+    #[test]
+    fn a_declared_id_takes_a_builtin_only_with_override() {
+        let (registry, problems) = Registry::build(
+            &[],
+            &declared(
+                r#"
+[[commands]]
+id = "repo.refresh"
+label = "Mine"
+exec = ["true"]
+"#,
+            ),
+        );
+        assert!(problems[0].contains("override = true"), "{problems:?}");
+        assert!(registry.get("repo.refresh").unwrap().declared().is_none());
+
+        let (registry, problems) = Registry::build(
+            &[],
+            &declared(
+                r#"
+[[commands]]
+id = "repo.refresh"
+label = "Mine"
+exec = ["true"]
+override = true
+"#,
+            ),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let entry = registry.get("repo.refresh").unwrap();
+        assert!(entry.declared().is_some());
+        assert_eq!(entry.label, "Mine");
+        // It keeps the built-in's place in the list.
+        assert_eq!(
+            registry.iter().position(|e| e.id == "repo.refresh"),
+            Registry::builtin()
+                .iter()
+                .position(|e| e.id == "repo.refresh")
+        );
+    }
+
+    #[test]
+    fn a_shipped_row_is_replaced_the_same_way() {
+        let shipped = declared(
+            r#"
+[[commands]]
+id = "file.open-in-editor"
+label = "Shipped"
+edit = "{path}"
+"#,
+        );
+        let mine = declared(
+            r#"
+[[commands]]
+id = "file.open-in-editor"
+label = "Mine"
+exec = ["true"]
+"#,
+        );
+        let (registry, problems) = Registry::build(&shipped, &mine);
+        assert!(problems[0].contains("ships"), "{problems:?}");
+        assert_eq!(
+            registry.get("file.open-in-editor").unwrap().label,
+            "Shipped"
+        );
+    }
+
+    /// `[keys]` naming a command config hasn't declared yet is kept, and
+    /// binds once a rebuild brings the command in; a declared key wins over
+    /// a default it collides with, and says so.
+    #[test]
+    fn a_rebuild_picks_up_keys_for_late_commands() {
+        let keys: RawKeys = toml::from_str(
+            r#""user.late" = "cmd+shift+l"
+"#,
+        )
+        .expect("parses");
+        let chord = Chord::parse("cmd+shift+l").expect("a chord");
+        let (map, problems) = Keymap::build(&Registry::builtin(), &keys);
+        assert!(problems[0].contains("kept"), "{problems:?}");
+        assert_eq!(map.resolve(Context::Base, &chord), None);
+
+        let late = declared(
+            r#"
+[[commands]]
+id = "user.late"
+label = "Late"
+keys = ["cmd+k"]
+exec = ["true"]
+"#,
+        );
+        let (registry, problems) = Registry::build(&[], &late);
+        assert!(problems[0].contains("palette.toggle"), "{problems:?}");
+        let (map, problems) = Keymap::build(&registry, &keys);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            map.resolve(Context::Base, &chord).as_deref(),
+            Some("user.late")
+        );
+        // The override replaced its own `cmd+k`, so the palette keeps it.
+        let palette = Chord::parse("cmd+k").expect("a chord");
+        assert_eq!(
+            map.resolve(Context::Base, &palette).as_deref(),
+            Some("palette.toggle")
+        );
+
+        let (registry, _) = Registry::build(&[], &late);
+        let (map, _) = Keymap::build(&registry, &RawKeys::default());
+        assert_eq!(
+            map.resolve(Context::Base, &palette).as_deref(),
+            Some("user.late"),
+            "a declared key goes in front of the default it shadows"
+        );
+    }
+
+    #[test]
+    fn recents_for_a_late_command_rank_once_it_loads() {
+        let mut recents = crate::palette::Recents::default();
+        recents.push_command("user.late".into());
+        let (registry, _) = Registry::build(
+            &[],
+            &declared(
+                r#"
+[[commands]]
+id = "user.late"
+label = "Late"
+exec = ["true"]
+"#,
+            ),
+        );
+        assert!(registry.get("user.late").is_some());
+        assert!(recents.command_bonus("user.late") > 0);
     }
 }

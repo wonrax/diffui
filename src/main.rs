@@ -74,6 +74,7 @@ mod tabs;
 mod toolbar;
 mod trunk;
 mod update;
+mod user_commands;
 mod when;
 mod window_state;
 
@@ -337,6 +338,12 @@ pub(crate) struct Diffui {
     /// Chord → command id per context, built from the registry's defaults
     /// with the `[keys]` section of `config.toml` layered on top.
     pub(crate) keymap: Keymap,
+    /// What `config.toml` declares beyond settings: keys, commands, and the
+    /// editor and agent CLI they start.
+    pub(crate) user_config: config::UserConfig,
+    /// The declared command waiting on a prompt, its confirm or the
+    /// repository.
+    pub(crate) user_runs: user_commands::Runs,
     /// Window-level modes, innermost last. The top of this stack (or, when it
     /// is empty, the top of the active tab's) owns the keyboard — see
     /// [`crate::modes`].
@@ -507,6 +514,8 @@ pub(crate) struct Toast {
     /// Stays up until dismissed instead of expiring after [`TOAST_TTL`] — for
     /// startup problems the user may not be looking at the window for.
     pub(crate) sticky: bool,
+    /// Something to read rather than a failure: no warning glyph or color.
+    pub(crate) info: bool,
 }
 
 /// How long a toast lingers before the tick prunes it.
@@ -528,6 +537,9 @@ pub(crate) struct DescriptionEditor {
     /// `@` is refused once `@` has moved to another change, so the text never
     /// lands on a change the user wasn't describing.
     pub(crate) wc_change: Option<String>,
+    /// A program writing the description (Generate): the field is read-only
+    /// until it exits.
+    pub(crate) generating: Option<user_commands::Generation>,
 }
 
 impl DescriptionEditor {
@@ -537,6 +549,26 @@ impl DescriptionEditor {
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.text().trim_end() != self.original.trim_end()
+    }
+}
+
+/// What a [`ConfirmDialog`] holds until it's answered.
+#[derive(Debug, Clone)]
+pub(crate) enum Held {
+    /// A mutation, run on accept.
+    Mutation(PendingMutation),
+    /// A declared command's run, which carries on past its `confirm` on
+    /// accept and stops on cancel.
+    Command(user_commands::RunId),
+}
+
+impl Held {
+    /// The tab the held work is for.
+    pub(crate) fn tab_id(&self) -> TabId {
+        match self {
+            Held::Mutation(pending) => pending.tab_id,
+            Held::Command(run) => run.tab,
+        }
     }
 }
 
@@ -554,7 +586,7 @@ pub(crate) struct ConfirmDialog {
     pub(crate) confirm_label: String,
     /// What the dialog shows beyond its words, and how its confirm looks.
     pub(crate) look: ConfirmLook,
-    pub(crate) pending: PendingMutation,
+    pub(crate) pending: Held,
 }
 
 /// The parts of a [`ConfirmDialog`] only some confirms have. The default is
@@ -1288,7 +1320,7 @@ pub(crate) fn expand_user_path(input: &str) -> PathBuf {
 /// clickable links in an activity's captured remote output (e.g. a GitHub
 /// "create a pull request" URL). Fire-and-forget — a failure to launch is
 /// non-fatal and silently ignored.
-fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");

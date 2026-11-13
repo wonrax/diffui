@@ -554,7 +554,7 @@ impl Diffui {
             body,
             confirm_label: confirm_label.to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 

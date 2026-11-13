@@ -215,4 +215,18 @@ pub(crate) enum Action {
     Range(crate::range::RangeAction),
     /// Load the full diff of a file (by index) the backend collapsed for size.
     ExpandFile(usize),
+
+    // ── Declared commands ───────────────────────────────────────────────
+    /// Run a `[[commands]]` row on `arg`, on `tab`: the tab it was offered
+    /// on, which its prompts and its output stay with whatever is on screen
+    /// by then.
+    RunUserCommand {
+        command: std::sync::Arc<crate::user_commands::UserCommand>,
+        tab: TabId,
+        arg: crate::commands::CommandArg,
+    },
+    /// Stop the program writing into the description editor.
+    StopGenerating,
+    /// Read `config.toml`'s keys and commands again.
+    ReloadCommands,
 }

@@ -30,7 +30,7 @@ use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
 mod registry;
-pub(crate) use registry::{CommandId, Disabled, Entry, Registry};
+pub(crate) use registry::{CommandId, Disabled, Entry, GROUPS, Registry};
 
 /// Declares [`Context`] once: each variant with the name it goes by in
 /// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
@@ -2921,6 +2921,17 @@ pub(crate) static REGISTRY: &[Command] = &[
             )
         },
         build: |_ui, _arg| Some(Action::RevealConfigFile(crate::config::ConfigFile::Config)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.reload-commands",
+        label: "Reload keys and commands",
+        hint: "Read config.toml's [keys] and [[commands]] again",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::ReloadCommands),
         palette: PaletteScope::Root,
     },
     Command {

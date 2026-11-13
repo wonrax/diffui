@@ -69,6 +69,40 @@ impl Diffui {
         }
     }
 
+    /// The declared commands a menu offers where `wanted` says, run on
+    /// `arg`, after a separator; nothing when there are none. One whose
+    /// when-clause doesn't hold here isn't offered at all.
+    pub(crate) fn declared_rows(
+        &self,
+        wanted: fn(&crate::user_commands::Places) -> bool,
+        arg: CommandArg,
+    ) -> Vec<menu::MenuEntry> {
+        let keys = crate::when::AppKeys {
+            ui: self,
+            arg: &arg,
+        };
+        let rows: Vec<menu::MenuEntry> = self
+            .registry
+            .iter()
+            .filter(|entry| {
+                entry.declared().is_some_and(|command| {
+                    wanted(&command.places)
+                        && command
+                            .when
+                            .as_ref()
+                            .is_none_or(|(_, when)| when.eval(&keys))
+                })
+            })
+            .map(|entry| self.menu_item(&entry.id, arg.clone()))
+            .collect();
+        if rows.is_empty() {
+            return rows;
+        }
+        std::iter::once(menu::MenuEntry::Separator)
+            .chain(rows)
+            .collect()
+    }
+
     /// Build the revision context menu's entry tree from the already-loaded
     /// bookmarks / commit graph (so it opens instantly, no repo read).
     /// Shared by the macOS native popup and the overlay; author/committer/
@@ -163,6 +197,23 @@ impl Diffui {
         ]);
         if crate::history_panel::available(self) {
             top.push(self.menu_item("history.evolog", on()));
+        }
+        top.extend(self.declared_rows(|places| places.revision, on()));
+        if let Some(bookmark) = self
+            .active()
+            .session
+            .commits
+            .find(selection)
+            .and_then(|row| row.bookmarks().first().cloned())
+        {
+            top.extend(self.declared_rows(
+                |places| places.bookmark,
+                CommandArg::Bookmark {
+                    name: bookmark.trim_end_matches('?').to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            ));
         }
 
         // Copy revision metadata — values come from the loaded graph row.
@@ -650,7 +701,7 @@ impl Diffui {
             body: Prose::from(body),
             confirm_label: "Abandon".to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 
@@ -737,6 +788,13 @@ impl Diffui {
                 },
             ));
             items.push(MenuEntry::Separator);
+        }
+        if is_file {
+            let declared = self.declared_rows(|places| places.file, CommandArg::Path(path.clone()));
+            if !declared.is_empty() {
+                items.extend(declared.into_iter().skip(1));
+                items.push(MenuEntry::Separator);
+            }
         }
         items.push(self.menu_row(
             "Copy path",

@@ -836,6 +836,12 @@ pub(crate) fn toast_layer(
         .occlude();
     for toast in &ui.toasts {
         let id = toast.id;
+        // An info toast (a command's output) keeps the quiet colors.
+        let (glyph, tone) = if toast.info {
+            (icons::CHECK, theme.text)
+        } else {
+            (icons::ALERT_TRIANGLE, theme.removed_text)
+        };
         // The error color lives in the glyph + title; the card itself keeps the
         // shared quiet popover chrome so the stack doesn't read as four screaming
         // outlines. The title row is the close button's height, so the top and
@@ -845,10 +851,7 @@ pub(crate) fn toast_layer(
             [
                 // A warning triangle, deliberately not an ✕: that glyph reads as
                 // a dismiss button, not severity.
-                Aligned::glyph(
-                    icons::icon(icons::ALERT_TRIANGLE, ui::ICON_SIZE, theme.removed_text),
-                    ui::ICON_SIZE,
-                ),
+                Aligned::glyph(icons::icon(glyph, ui::ICON_SIZE, tone), ui::ICON_SIZE),
                 Aligned::text(
                     div()
                         .w_full()
@@ -858,7 +861,7 @@ pub(crate) fn toast_layer(
                                 font: title_font,
                                 ..look
                             },
-                            theme.removed_text,
+                            tone,
                         )),
                     title_font,
                     text_size::BODY,

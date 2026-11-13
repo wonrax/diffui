@@ -30,7 +30,7 @@ use crate::{Action, Diffui, MainView, TabId};
 mod headless;
 mod plan;
 use headless::Arm;
-pub(crate) use headless::{LineError, LineId, LineReply};
+pub(crate) use headless::{LineId, LineReply};
 pub(crate) use plan::sentence;
 
 pub(crate) use plan::{PlanState, ResolvedView, Run};

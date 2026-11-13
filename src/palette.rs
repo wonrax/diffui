@@ -203,6 +203,12 @@ pub enum ColumnSource {
     /// Action menu for a specific result. Renders a fixed catalog instead
     /// of fuzzy-matching against repo data.
     Actions(ResultRef),
+    /// A declared command's `choose` prompt: pick one of `choices`.
+    Choose {
+        run: crate::user_commands::RunId,
+        title: String,
+        choices: Vec<String>,
+    },
 }
 
 /// A jj change id (the stable k–z identifier) — **not** a commit id. Wrapped
@@ -240,6 +246,8 @@ pub enum ResultRef {
     /// A file, identified by its path within the current revision's diff.
     File(String),
     Command(CommandId),
+    /// One answer of a `choose` prompt.
+    Choice(String),
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +482,36 @@ impl PaletteState {
         }
     }
 
+    /// The palette as one column offering `choices`, for a declared
+    /// command's `choose` prompt.
+    pub(crate) fn choose(
+        ui: &Diffui,
+        run: crate::user_commands::RunId,
+        title: String,
+        choices: Vec<String>,
+    ) -> Self {
+        let mut column = PaletteColumn {
+            query: String::new(),
+            source: ColumnSource::Choose {
+                run,
+                title,
+                choices,
+            },
+            matches: Vec::new(),
+            selected: 0,
+            query_version: 0,
+            dirty: false,
+            searched: false,
+            command: None,
+            counts: ScopeCounts::default(),
+        };
+        recompute_matches(&mut column, ui, false);
+        Self {
+            stack: vec![column],
+            shift_anim: build_shift_anim(0.0),
+        }
+    }
+
     pub fn top(&self) -> Option<&PaletteColumn> {
         self.stack.last()
     }
@@ -590,6 +628,13 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         ColumnSource::Actions(target) => {
             push_action_candidates(&mut candidates, ui, target);
         }
+        ColumnSource::Choose { choices, .. } => {
+            candidates.extend(choices.iter().map(|choice| Candidate {
+                item: ResultRef::Choice(choice.clone()),
+                haystack: choice.clone(),
+                disabled: None,
+            }));
+        }
     }
 
     let mut counts = ScopeCounts::default();
@@ -610,7 +655,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             ResultRef::Command(_) => counts.commands += 1,
             ResultRef::Bookmark(_) => counts.bookmarks += 1,
             ResultRef::File(_) => counts.files += 1,
-            ResultRef::WorkingCopy | ResultRef::Commit { .. } => {}
+            ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Choice(_) => {}
         }
         if root && !mode.lists(&candidate.item) {
             continue;
@@ -619,7 +664,10 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         let bonus = match &candidate.item {
             ResultRef::Commit { change, .. } => ui.recents.revision_bonus(change.as_str()),
             ResultRef::Command(id) => ui.recents.command_bonus(id),
-            ResultRef::WorkingCopy | ResultRef::Bookmark(_) | ResultRef::File(_) => 0,
+            ResultRef::WorkingCopy
+            | ResultRef::Bookmark(_)
+            | ResultRef::File(_)
+            | ResultRef::Choice(_) => 0,
         };
         // Category gets a stable tie-break, but the fuzzy score is the
         // dominant term — multiply by a wide constant so a barely-better
@@ -632,6 +680,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
             ResultRef::WorkingCopy | ResultRef::Commit { .. } => 3,
             ResultRef::File(_) => 2,
             ResultRef::Command(_) => 1,
+            ResultRef::Choice(_) => 0,
         };
         let total = (raw_score as u32 * 100) + bonus + category_tiebreak;
         matches.push((
@@ -725,7 +774,7 @@ impl Mode {
 fn label_leads_haystack(item: &ResultRef) -> bool {
     matches!(
         item,
-        ResultRef::Command(_) | ResultRef::Bookmark(_) | ResultRef::File(_)
+        ResultRef::Command(_) | ResultRef::Bookmark(_) | ResultRef::File(_) | ResultRef::Choice(_)
     )
 }
 
@@ -736,6 +785,7 @@ pub(crate) fn group_of(registry: &commands::Registry, item: &ResultRef) -> &'sta
         ResultRef::Bookmark(_) => "Bookmarks",
         ResultRef::File(_) => "Files",
         ResultRef::Command(id) => registry.get(id).map_or("Commands", |command| command.group),
+        ResultRef::Choice(_) => "Choices",
     }
 }
 
@@ -884,7 +934,7 @@ fn push_action_candidates(out: &mut Vec<Candidate>, ui: &Diffui, target: &Result
             PaletteScope::Revision
         }
         ResultRef::File(_) => PaletteScope::File,
-        ResultRef::Command(_) => return,
+        ResultRef::Command(_) | ResultRef::Choice(_) => return,
     };
     push_command_candidates(out, ui, scope, &CommandArg::Result(target.clone()));
 }
@@ -909,6 +959,7 @@ fn target_label(target: &ResultRef, ui: &Diffui) -> String {
         ResultRef::Bookmark(name) => name.clone(),
         ResultRef::File(path) => path.clone(),
         ResultRef::Command(id) => command_label(ui, id),
+        ResultRef::Choice(choice) => choice.clone(),
     }
 }
 
@@ -1258,6 +1309,28 @@ fn column_footer(ui: &Diffui, look: Look, column: &PaletteColumn) -> AnyElement 
                 )
                 .into_any_element()
         }
+        ColumnSource::Choose { title, .. } => {
+            let font = theme::emphasis_font(font, Weight::MEDIUM);
+            strip
+                .child(hint(&[crate::keymap::key_label("enter")], "Choose"))
+                .child(
+                    div()
+                        .ml_auto()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .justify_end()
+                        .child(
+                            typography::centered(
+                                filling(title.clone(), font, text_size::CAPTION, theme.subtle_text),
+                                font,
+                                text_size::CAPTION,
+                            )
+                            .min_w_0(),
+                        ),
+                )
+                .into_any_element()
+        }
         ColumnSource::Actions(target) => {
             let font = theme::emphasis_font(font, Weight::MEDIUM);
             strip
@@ -1301,6 +1374,7 @@ fn build_input(
     let placeholder = match &column.source {
         ColumnSource::Root => "Run a command, or find a file, bookmark or revision",
         ColumnSource::Actions(_) => "Filter actions\u{2026}",
+        ColumnSource::Choose { .. } => "Filter\u{2026}",
     };
     let font = look.font;
     let band = div()
@@ -1717,6 +1791,12 @@ fn result_row_body(
                     .chord_for(commands::Context::Base, id)
                     .map(|chord| crate::overlay_kit::chord_keys(&chord.display()))
                     .unwrap_or_default(),
+            ),
+            ResultRef::Choice(choice) => (
+                glyph_icon(icons::CHEVRON_RIGHT, ink, window, cx),
+                highlighted(choice, indices, primary, look),
+                None,
+                Vec::new(),
             ),
         };
     // The lead, the label and the hint are different fonts and sizes: they share

@@ -6,8 +6,8 @@
 //! - `settings.toml` is the settings dialog's, written whole by the app.
 //!
 //! Both hold the settings below; `config.toml` wins per key, and a key it
-//! sets is locked in the dialog. `[keys]` and `[[revset_presets]]` are read
-//! from `config.toml` only.
+//! sets is locked in the dialog. `[keys]`, `[[revset_presets]]`,
+//! `[[commands]]`, `[editor]` and `[ai]` are read from `config.toml` only.
 //!
 //! Configurable fields:
 //!   ui_font              — family used for chrome, sidebar, file names, etc.
@@ -63,6 +63,20 @@
 //! revset = "ancestors(@, 30)"
 //! ```
 //!
+//! `[[commands]]` declares commands of your own (see [`crate::user_commands`]
+//! and the agent docs in `assets/agent/SKILL.md` for the schema). `[editor]
+//! command` is the argv "Open in editor" starts, the path and line added the
+//! way that editor takes them; `[ai] command` is the agent CLI "Generate
+//! description" and `agent = "…"` rows run, the prompt added last:
+//!
+//! ```toml
+//! [editor]
+//! command = ["zed"]
+//!
+//! [ai]
+//! command = ["claude", "-p"]
+//! ```
+//!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
 //! configurable: the text stack exposes no per-run feature or letter-spacing
 //! control today.
@@ -103,30 +117,35 @@ pub const CODE_LINE_HEIGHT: RangeInclusive<f32> = 1.0..=3.0;
 pub const CODE_BASELINE_OFFSET: RangeInclusive<f32> = -8.0..=8.0;
 
 impl AppConfig {
-    /// Read both files, returning the resolved settings, the raw `[keys]`
-    /// section for [`crate::keymap::Keymap::build`] to layer over the
-    /// registry's defaults, and the files as read (with why either was
-    /// ignored, if it was).
-    pub fn load() -> (Self, RawKeys, ConfigFiles) {
+    /// Read both files, returning the resolved settings, what `config.toml`
+    /// declares (keys, commands) for the registry and the keymap, and the
+    /// files as read (with why either was ignored, if it was).
+    pub(crate) fn load() -> (Self, UserConfig, ConfigFiles) {
         Self::load_from(config_path(), settings_path())
     }
 
     fn load_from(
         config_path: Option<PathBuf>,
         settings_path: Option<PathBuf>,
-    ) -> (Self, RawKeys, ConfigFiles) {
+    ) -> (Self, UserConfig, ConfigFiles) {
         // Each file stands alone: one that doesn't parse leaves every setting
         // it holds on what the other file or the default says, since a
         // partial read would apply half a file that was never meant to be
         // used that way.
-        let (config, file_only, config_error) = match read_config_file(config_path.as_deref()) {
+        let (config, file_only, text, config_error) = match read_config_file(config_path.as_deref())
+        {
             Ok(read) => {
-                let (config, file_only) = read.unwrap_or_default();
-                (config, file_only, None)
+                let (config, file_only, text) = read.unwrap_or_default();
+                (config, file_only, text, None)
             }
             Err(error) => {
                 tracing::warn!("ignoring config file: {error}");
-                (Scalars::default(), FileOnly::default(), Some(error))
+                (
+                    Scalars::default(),
+                    FileOnly::default(),
+                    String::new(),
+                    Some(error),
+                )
             }
         };
         let (stored, settings_error) = match read_settings_file(settings_path.as_deref()) {
@@ -137,9 +156,11 @@ impl AppConfig {
             }
         };
         let resolved = Self::resolve(&config, &stored);
-        if let Some(presets) = file_only.revset_presets {
+        let mut file_only = file_only;
+        if let Some(presets) = file_only.revset_presets.take() {
             let _ = REVSET_PRESETS.set(presets);
         }
+        let declared = UserConfig::read(config_path.as_deref(), &text, file_only);
         let files = ConfigFiles {
             config_path,
             settings_path,
@@ -147,7 +168,7 @@ impl AppConfig {
             config_error,
             settings_error,
         };
-        (resolved, file_only.keys, files)
+        (resolved, declared, files)
     }
 
     /// The settings `config` and `settings` add up to: `config.toml` wins
@@ -469,6 +490,54 @@ struct FileOnly {
     #[serde(default)]
     keys: RawKeys,
     revset_presets: Option<Vec<RevsetPreset>>,
+    #[serde(default)]
+    editor: Tool,
+    #[serde(default)]
+    ai: Tool,
+}
+
+/// `[editor]` / `[ai]`: the program a shipped command starts.
+#[derive(Default, Debug, Deserialize)]
+struct Tool {
+    command: Option<Vec<String>>,
+}
+
+/// What `config.toml` declares beyond settings: keys, commands and the
+/// programs they start. Re-read whole on reload.
+#[derive(Default, Debug)]
+pub(crate) struct UserConfig {
+    pub(crate) keys: RawKeys,
+    /// `[[commands]]`, the rows that read.
+    pub(crate) commands: Vec<std::sync::Arc<crate::user_commands::UserCommand>>,
+    /// What was wrong with the rows that didn't, `path:line:col: message`.
+    pub(crate) problems: Vec<String>,
+    pub(crate) editor: Option<Vec<String>>,
+    pub(crate) ai: Option<Vec<String>>,
+}
+
+impl UserConfig {
+    fn read(path: Option<&Path>, text: &str, file_only: FileOnly) -> Self {
+        let (commands, problems) = match path {
+            Some(path) => crate::user_commands::parse_commands(path, text),
+            None => Default::default(),
+        };
+        Self {
+            keys: file_only.keys,
+            commands: commands.into_iter().map(std::sync::Arc::new).collect(),
+            problems,
+            editor: file_only.editor.command,
+            ai: file_only.ai.command,
+        }
+    }
+
+    /// `config.toml` read again, for a reload. `Err` when it doesn't parse.
+    pub(crate) fn reload() -> Result<Self, String> {
+        let path = config_path();
+        Ok(match read_config_file(path.as_deref())? {
+            Some((_, file_only, text)) => Self::read(path.as_deref(), &text, file_only),
+            None => Self::default(),
+        })
+    }
 }
 
 /// Parse a config `theme` value. Case-insensitive; `Contrast` maps to the
@@ -514,11 +583,11 @@ fn refresh_name(mode: RefreshMode) -> &'static str {
 /// `config.toml`'s settings and what only it holds. `Ok(None)` when there is
 /// no file; `Err` with a `path:line:col: message` description when there is
 /// one that can't be read or parsed.
-fn read_config_file(path: Option<&Path>) -> Result<Option<(Scalars, FileOnly)>, String> {
+fn read_config_file(path: Option<&Path>) -> Result<Option<(Scalars, FileOnly, String)>, String> {
     let Some((path, text)) = read_file(path)? else {
         return Ok(None);
     };
-    Ok(Some((parse(path, &text)?, parse(path, &text)?)))
+    Ok(Some((parse(path, &text)?, parse(path, &text)?, text)))
 }
 
 /// `settings.toml`'s settings, as [`read_config_file`] reads its file.

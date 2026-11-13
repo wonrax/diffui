@@ -59,8 +59,17 @@ pub(crate) enum BookmarkAction {
 
 #[derive(Debug, Clone)]
 pub(crate) enum PromptKind {
-    Create { at: RevisionSelection },
-    Rename { old: String },
+    Create {
+        at: RevisionSelection,
+    },
+    Rename {
+        old: String,
+    },
+    /// A declared command's `input` prompt: any line of text, for `run`.
+    Value {
+        run: crate::user_commands::RunId,
+        label: String,
+    },
 }
 
 /// The open bookmark-name prompt.
@@ -80,6 +89,7 @@ enum PromptVerdict {
         old: String,
         new: String,
     },
+    Value(String),
 }
 
 impl Diffui {
@@ -98,7 +108,13 @@ impl Diffui {
                 }
             }
             BookmarkAction::PromptCancel => {
-                self.pop_mode(ModeKind::NamePrompt);
+                if let Some(Mode::NamePrompt(NamePrompt {
+                    kind: PromptKind::Value { run, .. },
+                    ..
+                })) = self.pop_mode(ModeKind::NamePrompt)
+                {
+                    self.user_prompt_answered(run, None, cx);
+                }
             }
             BookmarkAction::PromptSubmit => {
                 let Some(prompt) = self.name_prompt() else {
@@ -106,6 +122,11 @@ impl Diffui {
                 };
                 let op = match (self.prompt_verdict(prompt), &prompt.kind) {
                     (PromptVerdict::Invalid(_), _) => return,
+                    (PromptVerdict::Value(value), PromptKind::Value { run, .. }) => {
+                        let run = *run;
+                        self.pop_mode(ModeKind::NamePrompt);
+                        return self.user_prompt_answered(run, Some(value), cx);
+                    }
                     (PromptVerdict::Create(name), PromptKind::Create { at }) => {
                         MutationOp::CreateBookmark {
                             name,
@@ -202,7 +223,7 @@ impl Diffui {
     }
 
     fn open_name_prompt(&mut self, kind: PromptKind, value: &str, cx: &mut Cx) {
-        if !self.active().session.capabilities.mutate {
+        if !matches!(kind, PromptKind::Value { .. }) && !self.active().session.capabilities.mutate {
             return;
         }
         self.push_mode(Mode::NamePrompt(NamePrompt {
@@ -210,6 +231,15 @@ impl Diffui {
             value: value.to_owned(),
         }));
         crate::input::focus_and_select_all(NAME_PROMPT_INPUT_ID, cx);
+    }
+
+    /// Ask a declared command's `input` prompt in the name prompt.
+    pub(crate) fn ask_input(&mut self, run: crate::user_commands::RunId, label: &str, cx: &mut Cx) {
+        let kind = PromptKind::Value {
+            run,
+            label: label.to_owned(),
+        };
+        self.open_name_prompt(kind, "", cx)
     }
 
     pub(crate) fn name_prompt(&self) -> Option<&NamePrompt> {
@@ -230,6 +260,9 @@ impl Diffui {
         let name = prompt.value.trim().to_owned();
         if name.is_empty() {
             return PromptVerdict::Invalid(Prose::new());
+        }
+        if let PromptKind::Value { .. } = prompt.kind {
+            return PromptVerdict::Value(name);
         }
         // The name is right there in the field; the core error only repeats it.
         if diffui_core::jj::validate_bookmark_name(&name).is_err() {
@@ -259,6 +292,7 @@ impl Diffui {
                 old: old.clone(),
                 new: name,
             },
+            PromptKind::Value { .. } => PromptVerdict::Value(name),
         }
     }
 
@@ -278,10 +312,10 @@ impl Diffui {
                     moves: rejection.moves,
                     callouts: Vec::new(),
                 },
-                pending: PendingMutation {
+                pending: crate::Held::Mutation(PendingMutation {
                     op: MutationOp::Push(request),
                     ..pending
-                },
+                }),
             });
             return;
         }
@@ -352,10 +386,10 @@ impl Diffui {
                 moves: rejection.moves,
                 callouts,
             },
-            pending: PendingMutation {
+            pending: crate::Held::Mutation(PendingMutation {
                 op: MutationOp::Push(request),
                 ..pending
-            },
+            }),
         });
     }
 
@@ -405,7 +439,7 @@ impl Diffui {
                     Some(working_copy_push_warning()),
                 )],
             },
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 
@@ -718,10 +752,11 @@ pub(crate) fn build_name_prompt(
             "Create",
         ),
         PromptKind::Rename { old } => (Prose::from("Rename ").bookmark(old), "Rename"),
+        PromptKind::Value { label, .. } => (Prose::from(label.clone()), "OK"),
     };
     let (note, error, verb) = match &verdict {
         PromptVerdict::Invalid(reason) => (reason.clone(), true, verb),
-        PromptVerdict::Create(_) => (Prose::new(), false, verb),
+        PromptVerdict::Create(_) | PromptVerdict::Value(_) => (Prose::new(), false, verb),
         PromptVerdict::Move(name) => (
             Prose::new()
                 .bookmark(name)
@@ -754,8 +789,12 @@ pub(crate) fn build_name_prompt(
         );
     });
     let on_submit = Diffui::on_action(submit.clone(), cx);
+    let placeholder = match prompt.kind {
+        PromptKind::Value { .. } => "",
+        _ => "bookmark name",
+    };
     let spec = input::FieldSpec::new(NAME_PROMPT_INPUT_ID, &prompt.value)
-        .placeholder("bookmark name")
+        .placeholder(placeholder)
         .on_input(move |value, window, cx| on_input(&value, window, cx))
         .on_submit(move |window, cx| on_submit(&(), window, cx));
     let mut card = crate::overlay_kit::Dialog::new(&title, look).child(crate::field::dialog_input(
@@ -906,8 +945,11 @@ mod tests {
             let dialog = ui.confirm().expect("a confirmation is raised");
             let body = dialog.body.to_string();
             assert!(body.contains("has no description"), "{body}");
-            match &dialog.pending.op {
-                MutationOp::Push(request) => {
+            match &dialog.pending {
+                crate::Held::Mutation(PendingMutation {
+                    op: MutationOp::Push(request),
+                    ..
+                }) => {
                     assert!(request.allow.empty_description);
                     assert!(!request.allow.private && !request.allow.conflicts);
                     assert_eq!(

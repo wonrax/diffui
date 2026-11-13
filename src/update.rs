@@ -13,15 +13,12 @@ use crate::prose::Prose;
 
 impl Diffui {
     pub(crate) fn new(cli: Cli, saved: WindowState, cx: &mut Cx) -> Self {
-        let (config, raw_keys, config_files) = AppConfig::load();
+        let (config, user_config, config_files) = AppConfig::load();
         crate::typography::set_ui_font(config.ui_font);
-        // A keymap problem is never fatal: a config written against another
-        // build still opens the app, having said once what it had to skip.
-        let registry = std::rc::Rc::new(commands::Registry::builtin());
-        let (keymap, problems) = Keymap::build(&registry, &raw_keys);
-        for problem in &problems {
-            tracing::warn!("config: {problem}");
-        }
+        // A keymap or command problem is never fatal: a config written against
+        // another build still opens the app, having said once what it had to
+        // skip.
+        let (registry, keymap, problems) = Self::derive_commands(&user_config);
         let sidebar_min_width = sidebar::min_width(config);
         // Restore the persisted sidebar split and window geometry. The window
         // size/position seed the in-memory tracking; the compositor's `Opened`
@@ -219,6 +216,8 @@ impl Diffui {
             recents: Recents::load(&registry),
             registry,
             keymap,
+            user_config,
+            user_runs: Default::default(),
             modes: Vec::new(),
             focus_before_modes: None,
             sidebar_file_reveal_token: 0,
@@ -253,15 +252,8 @@ impl Diffui {
         }
         if let Some(error) = app.config_files.config_error.clone() {
             app.push_sticky_toast("config.toml ignored, using defaults".to_owned(), &error);
-        } else if let Some(first) = problems.first() {
-            let more = match problems.len() {
-                1 => String::new(),
-                n => format!(" (and {} more; see the log)", n - 1),
-            };
-            app.push_sticky_toast(
-                "Some key bindings were ignored".to_owned(),
-                &format!("{first}{more}"),
-            );
+        } else {
+            app.report_command_problems(&problems);
         }
         // Kicks the streaming load for whatever the active tab is: a repo walk,
         // a PR stream, or nothing when no tab opened.
@@ -782,12 +774,22 @@ impl Diffui {
                 self.edit_description(target, cx)
             }
             Action::SaveDescription => self.save_description(),
+            Action::RunUserCommand { command, tab, arg } => {
+                self.start_user_command(command, tab, arg, cx)
+            }
+            Action::StopGenerating => self.stop_generating(),
+            Action::ReloadCommands => {
+                if let Err(error) = self.reload_commands() {
+                    self.push_error_toast("config.toml didn't load", &error);
+                }
+            }
             Action::CancelDescription => {
                 if self
                     .active()
                     .description_editor()
                     .is_some_and(|editor| editor.saving_activity.is_none())
                 {
+                    self.stop_generating();
                     self.active_mut().pop_mode(ModeKind::Description);
                     self.active_mut().pending_description_edit = None;
                 }
@@ -1005,18 +1007,25 @@ impl Diffui {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
                     return;
                 };
-                self.run_mutation(dialog.pending)
+                match dialog.pending {
+                    crate::Held::Mutation(pending) => self.run_mutation(pending),
+                    crate::Held::Command(run) => self.user_run_confirmed(run, true, cx),
+                }
             }
             Action::ConfirmCancel => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
                     return;
                 };
+                let pending = match dialog.pending {
+                    crate::Held::Mutation(pending) => pending,
+                    crate::Held::Command(run) => return self.user_run_confirmed(run, false, cx),
+                };
                 // Resolve the held activity so it doesn't sit queued forever,
                 // and as *cancelled* — a row that reads "Done" for something
                 // that never ran is a lie the log can't be trusted after.
-                if let Some(log) = self.activity_log_for(dialog.pending.tab_id) {
+                if let Some(log) = self.activity_log_for(pending.tab_id) {
                     log.finish(
-                        dialog.pending.activity_id,
+                        pending.activity_id,
                         activity::ActivityStatus::Cancelled,
                         Some("Canceled".to_owned()),
                     );
@@ -1024,11 +1033,11 @@ impl Diffui {
                 // A canceled describe-on-immutable leaves its editor open
                 // and editable again (it was parked as "Saving…").
                 if let Some(editor) = self.active_mut().description_editor_mut()
-                    && editor.saving_activity == Some(dialog.pending.activity_id)
+                    && editor.saving_activity == Some(pending.activity_id)
                 {
                     editor.saving_activity = None;
                 }
-                self.marker_save_finished(dialog.pending.tab_id, dialog.pending.activity_id, false);
+                self.marker_save_finished(pending.tab_id, pending.activity_id, false);
             }
 
             // ── Repository ──────────────────────────────────────────────
@@ -1952,6 +1961,22 @@ impl Diffui {
 
     /// Open the palette. It shares one keyboard with the find bar and the
     /// open-repo dialog, so those close rather than sit behind the modal.
+    /// Ask a declared command's `choose` prompt in the palette.
+    pub(crate) fn open_choices(
+        &mut self,
+        run: crate::user_commands::RunId,
+        title: &str,
+        choices: Vec<String>,
+        cx: &mut Cx,
+    ) {
+        self.active_mut().pop_mode(ModeKind::Find);
+        self.pop_mode(ModeKind::OpenRepo);
+        self.pop_mode(ModeKind::Palette);
+        let state = PaletteState::choose(self, run, title.to_owned(), choices);
+        self.push_mode(Mode::Palette(state));
+        crate::input::focus(palette::PALETTE_INPUT_ID, cx)
+    }
+
     fn open_palette(&mut self, cx: &mut Cx) {
         self.active_mut().pop_mode(ModeKind::Find);
         self.pop_mode(ModeKind::OpenRepo);
@@ -2213,6 +2238,7 @@ impl Diffui {
                 .commits
                 .working_copy()
                 .map(|row| row.change_id().to_owned()),
+            generating: None,
         };
         target.push_mode(TabMode::Description(editor));
         self.scroll_restore_token = self.scroll_restore_token.wrapping_add(1);
@@ -2597,7 +2623,7 @@ impl Diffui {
         // A confirmation for a closed tab has nothing left to run.
         let tabs = &self.tabs;
         self.modes.retain(|mode| match mode {
-            Mode::Confirm(dialog) => tabs.iter().any(|tab| tab.id == dialog.pending.tab_id),
+            Mode::Confirm(dialog) => tabs.iter().any(|tab| tab.id == dialog.pending.tab_id()),
             _ => true,
         });
         let stale = {
@@ -3009,7 +3035,7 @@ impl Diffui {
             body,
             confirm_label,
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 
@@ -3547,6 +3573,14 @@ impl Diffui {
         let target = match &top.source {
             ColumnSource::Root => None,
             ColumnSource::Actions(target) => Some(target.clone()),
+            ColumnSource::Choose { run, .. } => {
+                let run = *run;
+                let ResultRef::Choice(choice) = item else {
+                    return;
+                };
+                self.pop_mode(ModeKind::Palette);
+                return self.user_prompt_answered(run, Some(choice), cx);
+            }
         };
 
         match (target, &item) {
@@ -3993,6 +4027,67 @@ impl Diffui {
         self.kick_draft_preview(cx)
     }
 
+    /// The registry, the keymap and what was wrong with either, from the
+    /// built-ins, the commands diffui ships and what `user_config` declares.
+    pub(crate) fn derive_commands(
+        user_config: &crate::config::UserConfig,
+    ) -> (std::rc::Rc<commands::Registry>, Keymap, Vec<String>) {
+        let shipped: Vec<std::sync::Arc<crate::user_commands::UserCommand>> =
+            crate::user_commands::parse_commands(
+                std::path::Path::new("commands.toml"),
+                crate::user_commands::SHIPPED,
+            )
+            .0
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+        let (registry, mut problems) = commands::Registry::build(&shipped, &user_config.commands);
+        let (keymap, key_problems) = Keymap::build(&registry, &user_config.keys);
+        problems.splice(0..0, user_config.problems.iter().cloned());
+        problems.extend(key_problems);
+        for problem in &problems {
+            tracing::warn!("config: {problem}");
+        }
+        (std::rc::Rc::new(registry), keymap, problems)
+    }
+
+    /// Say once, in a toast that stays, what of `config.toml`'s keys and
+    /// commands was skipped.
+    fn report_command_problems(&mut self, problems: &[String]) {
+        let Some(first) = problems.first() else {
+            return;
+        };
+        let more = match problems.len() {
+            1 => String::new(),
+            n => format!(" (and {} more; see the log)", n - 1),
+        };
+        self.push_sticky_toast(
+            "Some keys or commands were ignored".to_owned(),
+            &format!("{first}{more}"),
+        );
+    }
+
+    /// Read `config.toml`'s keys and commands again and rebuild what derives
+    /// from them. `Err` (and nothing changes) when the file doesn't parse.
+    pub(crate) fn reload_commands(&mut self) -> Result<Vec<String>, String> {
+        let user_config = crate::config::UserConfig::reload()?;
+        let (registry, keymap, problems) = Self::derive_commands(&user_config);
+        self.registry = registry;
+        self.keymap = keymap;
+        self.user_config = user_config;
+        self.report_command_problems(&problems);
+        crate::app_menu::install(self);
+        Ok(problems)
+    }
+
+    /// A quiet toast: something a command printed, not a failure.
+    pub(crate) fn push_info_toast(&mut self, title: impl Into<Prose>, text: &str) {
+        self.push_error_toast(title, text);
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.info = true;
+        }
+    }
+
     /// Float an error toast (bottom-right) for a failed operation. The
     /// activity log keeps the full record; this only makes the failure
     /// impossible to miss. Newest last, capped so a burst can't wall the UI.
@@ -4016,6 +4111,7 @@ impl Diffui {
             detail: Prose::from_backticks(&detail),
             born: Instant::now(),
             sticky: false,
+            info: false,
         });
         if self.toasts.len() > MAX_TOASTS {
             let excess = self.toasts.len() - MAX_TOASTS;
@@ -4235,8 +4331,9 @@ impl Diffui {
     /// that one resolves, instead of taking over the buttons the user was
     /// about to press.
     pub(crate) fn ask(&mut self, dialog: ConfirmDialog) {
-        let pending = &dialog.pending;
-        if let Some(log) = self.activity_log_for(pending.tab_id) {
+        if let crate::Held::Mutation(pending) = &dialog.pending
+            && let Some(log) = self.activity_log_for(pending.tab_id)
+        {
             log.set_status(pending.activity_id, activity::ActivityStatus::Queued);
         }
         self.push_mode(Mode::Confirm(dialog));
@@ -4291,7 +4388,7 @@ impl Diffui {
             body,
             confirm_label: confirm_label.to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 
@@ -4305,7 +4402,7 @@ impl Diffui {
             body: push_undo_body(summary),
             confirm_label: "Undo anyway".to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 
@@ -4886,14 +4983,14 @@ mod tests {
                 body: Prose::new(),
                 confirm_label: "Abandon".to_owned(),
                 look: Default::default(),
-                pending: PendingMutation {
+                pending: crate::Held::Mutation(PendingMutation {
                     op: mutations::MutationOp::Abandon {
                         targets: vec![RevisionSelection::WorkingCopy],
                     },
                     tab_id: second,
                     activity_id,
                     allow_immutable: false,
-                },
+                }),
             }));
 
             ui.act(cx, |ui, cx| ui.close_tab(second, cx));
@@ -4971,12 +5068,12 @@ mod tests {
             body: Prose::new(),
             confirm_label: "Rewrite anyway".to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
+            pending: crate::Held::Mutation(PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
                 tab_id: TabId(0),
                 activity_id: activity::ActivityId(0),
                 allow_immutable: false,
-            },
+            }),
         }));
         let context = ui.key_context();
         assert_eq!(context, Context::Confirm);
@@ -5009,12 +5106,12 @@ mod tests {
                     routine,
                     ..Default::default()
                 },
-                pending: PendingMutation {
+                pending: crate::Held::Mutation(PendingMutation {
                     op: mutations::MutationOp::Undo { operation_id: None },
                     tab_id: TabId(0),
                     activity_id: activity::ActivityId(0),
                     allow_immutable: false,
-                },
+                }),
             }));
             let enter = Chord::parse("enter").expect("a parsable chord");
             let id = ui.resolve_chord(Context::Confirm, &enter, false);

@@ -338,8 +338,14 @@ impl Keymap {
                     continue;
                 };
                 for context in command.contexts {
-                    map.bindings
-                        .push((*context, chord.clone(), command.id.clone()));
+                    let binding = (*context, chord.clone(), command.id.clone());
+                    // Resolution takes the first match: a declared command's
+                    // key goes in front of the defaults it may shadow.
+                    if command.declared().is_some() {
+                        map.bindings.insert(0, binding);
+                    } else {
+                        map.bindings.push(binding);
+                    }
                 }
             }
         }

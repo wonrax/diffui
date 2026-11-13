@@ -138,7 +138,7 @@ impl Diffui {
             body,
             confirm_label: "Rebase".to_owned(),
             look: Default::default(),
-            pending,
+            pending: crate::Held::Mutation(pending),
         });
     }
 }

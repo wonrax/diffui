@@ -318,12 +318,12 @@ mod stack_tests {
             body: crate::prose::Prose::new(),
             confirm_label: "Do it".to_owned(),
             look: Default::default(),
-            pending: PendingMutation {
+            pending: crate::Held::Mutation(PendingMutation {
                 op: mutations::MutationOp::Undo { operation_id: None },
                 tab_id: TabId(0),
                 activity_id: activity::ActivityId(0),
                 allow_immutable: false,
-            },
+            }),
         }
     }
 
@@ -418,6 +418,7 @@ mod stack_tests {
                     switch_blocked: false,
                     commit: false,
                     wc_change: None,
+                    generating: None,
                 }));
 
             ui.activate_tab(second, cx);

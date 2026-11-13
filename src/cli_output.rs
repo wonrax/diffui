@@ -37,11 +37,13 @@ pub(crate) enum Exit {
     Failed(String),
 }
 
-/// One passthrough run.
+/// One passthrough run, or a program a declared command started.
 #[derive(Debug)]
 pub(crate) struct CliRun {
     pub(crate) activity: ActivityId,
     pub(crate) job: JobId,
+    /// What ran: `jj` for a passthrough.
+    pub(crate) program: String,
     pub(crate) args: Vec<String>,
     pub(crate) lines: Vec<CliLine>,
     /// Lines dropped off the front past [`MAX_LINES`].
@@ -51,11 +53,36 @@ pub(crate) struct CliRun {
     /// Routes a `jj git push/fetch`'s credential prompts to the app; held
     /// for the run's life.
     scope: Option<Scope>,
+    /// What Stop raises for a program the app runs itself; a passthrough
+    /// is stopped through its repository's actor instead.
+    cancel: Option<diffui_core::repo::CancelFlag>,
 }
 
 impl CliRun {
+    /// A program a declared command started, cancelled through `cancel`.
+    pub(crate) fn program(
+        activity: ActivityId,
+        job: JobId,
+        program: String,
+        args: Vec<String>,
+        cancel: diffui_core::repo::CancelFlag,
+    ) -> Self {
+        Self {
+            activity,
+            job,
+            program,
+            args,
+            lines: Vec::new(),
+            dropped: 0,
+            exit: None,
+            started: Instant::now(),
+            scope: None,
+            cancel: Some(cancel),
+        }
+    }
+
     pub(crate) fn command(&self) -> String {
-        let mut line = String::from("jj");
+        let mut line = self.program.clone();
         for arg in &self.args {
             line.push(' ');
             line.push_str(&shell_quote(arg));
@@ -81,6 +108,17 @@ impl std::fmt::Debug for Scope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Scope")
     }
+}
+
+/// Add `run` to a tab's runs, dropping the oldest finished one past
+/// [`MAX_RUNS`].
+pub(crate) fn keep_run(runs: &mut Vec<CliRun>, run: CliRun) {
+    if runs.len() >= MAX_RUNS
+        && let Some(oldest) = runs.iter().position(|run| run.exit.is_some())
+    {
+        runs.remove(oldest);
+    }
+    runs.push(run);
 }
 
 /// What the output panel's controls (and an activity row's Output pill)
@@ -148,22 +186,21 @@ impl Diffui {
             return;
         };
         state.jobs.issue(job, crate::Pending::Cli(activity));
-        let runs = &mut state.cmdline.runs;
-        if runs.len() >= MAX_RUNS
-            && let Some(oldest) = runs.iter().position(|run| run.exit.is_some())
-        {
-            runs.remove(oldest);
-        }
-        runs.push(CliRun {
-            activity,
-            job,
-            args,
-            lines: Vec::new(),
-            dropped: 0,
-            exit: None,
-            started: Instant::now(),
-            scope: scope.map(Scope),
-        });
+        keep_run(
+            &mut state.cmdline.runs,
+            CliRun {
+                activity,
+                job,
+                program: "jj".to_owned(),
+                args,
+                lines: Vec::new(),
+                dropped: 0,
+                exit: None,
+                started: Instant::now(),
+                scope: scope.map(Scope),
+                cancel: None,
+            },
+        );
         handle.send(diffui_core::Command::RunCli { job, invocation });
         self.open_cli_output(tab, activity);
     }
@@ -171,6 +208,14 @@ impl Diffui {
     pub(crate) fn open_cli_output(&mut self, tab: TabId, activity: ActivityId) {
         self.pop_mode(ModeKind::ActivityPopover);
         self.push_mode(Mode::CliOutput(OutputView { tab, activity }));
+    }
+
+    pub(crate) fn cli_run(&self, tab: TabId, job: JobId) -> Option<&CliRun> {
+        self.tab(tab)?
+            .cmdline
+            .runs
+            .iter()
+            .find(|run| run.job == job)
     }
 
     fn cli_run_mut(&mut self, tab: TabId, job: JobId) -> Option<&mut CliRun> {
@@ -273,12 +318,14 @@ impl Diffui {
                 let Some(&Mode::CliOutput(view)) = self.mode(ModeKind::CliOutput) else {
                     return;
                 };
-                let job = self
-                    .shown_cli_run()
-                    .filter(|run| run.exit.is_none())
-                    .map(|run| run.job);
-                if let Some(job) = job
-                    && let Some(state) = self.tab_mut(view.tab)
+                let Some(run) = self.shown_cli_run().filter(|run| run.exit.is_none()) else {
+                    return;
+                };
+                if let Some(cancel) = &run.cancel {
+                    return cancel.cancel();
+                }
+                let job = run.job;
+                if let Some(state) = self.tab_mut(view.tab)
                     && let Some(handle) = &state.handle
                 {
                     handle.send(diffui_core::Command::Cancel { job });

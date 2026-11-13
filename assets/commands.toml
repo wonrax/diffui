@@ -1,0 +1,29 @@
+# The commands diffui ships as [[commands]] rows, read exactly like the ones
+# in config.toml. A config.toml row with the same id and `override = true`
+# replaces one.
+
+[[commands]]
+id = "file.open-in-editor"
+label = "Open in editor"
+hint = "Open the file at this line in your editor"
+group = "Changes"
+when = "file"
+menu = ["file", "palette"]
+edit = "{path}"
+
+[[commands]]
+id = "ai.describe"
+label = "Generate description"
+hint = "Ask your agent CLI to describe this revision"
+group = "Revisions"
+when = "repo.mutate && revision.selected"
+menu = ["revision", "palette"]
+agent = """Write a jj change description for the diff on stdin. Match the style of \
+these recent descriptions from the same repository, separated by lines of ---:
+
+{recent_descriptions}
+
+Reply with the description only: a subject line, then a blank line and a body \
+if the change needs one. No code fences, no commentary."""
+stdin = "{diff}"
+output = "description"

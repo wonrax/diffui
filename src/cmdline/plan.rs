@@ -684,6 +684,54 @@ mod tests {
         (plan, words)
     }
 
+    /// A declared `run` line, its variables filled with awkward values,
+    /// plans to the very op typing the line would.
+    #[test]
+    fn a_declared_run_lowers_like_the_typed_line() {
+        use crate::user_commands::{Step, Var, jj_line, parse_commands};
+        let (commands, problems) = parse_commands(
+            std::path::Path::new("config.toml"),
+            r#"
+[[commands]]
+id = "x"
+label = "X"
+run = "jj describe {commit_id} -m {prompt.name}"
+
+[[commands.prompts]]
+name = "name"
+"#,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let Step::Run(words) = &commands[0].step else {
+            panic!("a run row");
+        };
+        let values = [
+            (Var::Prompt("name".to_owned()), "fix: a b's \"quote\" $(x)"),
+            (Var::CommitId, "abc123"),
+        ]
+        .into_iter()
+        .map(|(var, value)| (var, value.to_owned()))
+        .collect();
+        let words: Vec<String> = words
+            .iter()
+            .map(|word| word.render(&values).expect("every value is there"))
+            .collect();
+        let line = jj_line(&words);
+        // The message with spaces and quotes stays one argument.
+        assert!(line.starts_with("jj describe abc123 -m "), "{line}");
+        let resolved = [("abc123", Ok(vec!["abc123"]))];
+        let ran = |line: &str| match plan_for(line, &resolved).0.state {
+            PlanState::Ready(Run::Native { action, .. }) => format!("{action:?}"),
+            PlanState::Blocked { reason, .. } => panic!("{line}: {reason}"),
+            _ => panic!("{line} doesn't plan to a mutation"),
+        };
+        assert_eq!(
+            ran(&line),
+            ran(r#"jj describe abc123 -m 'fix: a b'"'"'s "quote" $(x)'"#),
+            "declared and typed lines lower alike"
+        );
+    }
+
     #[test]
     fn ignore_immutable_rides_into_the_run() {
         let a = "a".repeat(40);
