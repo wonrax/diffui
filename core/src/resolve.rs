@@ -15,7 +15,8 @@
 //! shipped `[merge-tools]`). Ported, because jj-cli runs the tool itself with
 //! a `Ui`, inside the command (check against jj-cli on a bump):
 //! - `merge_tool_from_settings` ports `MergeEditor::from_settings`
-//!   (`cli/src/merge_tools/mod.rs`), minus `:builtin`, which needs a terminal.
+//!   (`cli/src/merge_tools/mod.rs`), minus `:builtin` and `:editor`, which
+//!   need a terminal.
 //! - `jj::resolve::prepare_merge_tool` and [`MergeToolInvocation::run`] port
 //!   `run_mergetool_external_single_file` (`cli/src/merge_tools/external.rs`).
 
@@ -207,7 +208,9 @@ impl MergeToolSpec {
 
 /// Terminal-only tools: a GUI app has no terminal to run them in.
 fn terminal_tool(name: &str, program: &str) -> bool {
-    matches!(name, "vimdiff" | ":builtin")
+    // `:editor` (jj 0.47) edits the conflict markers in `ui.editor`, which
+    // jj runs in the terminal it was started from.
+    matches!(name, "vimdiff" | ":builtin" | ":editor")
         || matches!(
             std::path::Path::new(program)
                 .file_name()
@@ -301,7 +304,7 @@ mod tests {
             )
             .expect("parse"),
         );
-        UserSettings::from_config(config).expect("settings")
+        UserSettings::from_config_and_home_dir(config, None).expect("settings")
     }
 
     #[test]
@@ -362,6 +365,11 @@ mod tests {
         );
         assert!(
             merge_tool_from_settings(&settings("ui.merge-editor = \":builtin\""))
+                .unwrap_err()
+                .contains("terminal")
+        );
+        assert!(
+            merge_tool_from_settings(&settings("ui.merge-editor = \":editor\""))
                 .unwrap_err()
                 .contains("terminal")
         );
