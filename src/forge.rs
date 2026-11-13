@@ -871,6 +871,40 @@ mod tests {
     }
 
     #[test]
+    fn when_clauses_read_the_forge_and_the_bookmark_s_pull_request() {
+        use crate::when::{AppKeys, When};
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/forge-when");
+        ui.active = ui.tabs.iter().position(|state| state.id == tab).unwrap();
+        let holds = |ui: &Diffui, clause: &str, name: &str| {
+            let arg = CommandArg::Bookmark {
+                name: name.to_owned(),
+                remote: None,
+                to: None,
+            };
+            When::parse(clause)
+                .expect("parses")
+                .eval(&AppKeys { ui, arg: &arg })
+        };
+        assert!(!holds(&ui, "repo.forge", "feature"), "no forge yet");
+        assert!(!holds(&ui, "bookmark.pr", "feature"));
+        let (repo, generation, asked) = asked(&mut ui, tab);
+        ui.tab_mut(tab).unwrap().forge.home = Some(("origin".to_owned(), remote()));
+        ui.apply_refresh(
+            tab,
+            &repo,
+            generation,
+            &asked,
+            answer(vec![pr("feature", 3, PrState::Draft)]),
+            false,
+        );
+        assert!(holds(&ui, "repo.forge == 'github'", "feature"));
+        assert!(holds(&ui, "bookmark.pr == 'draft'", "feature"));
+        assert!(holds(&ui, "bookmark.pr", "feature"));
+        assert!(!holds(&ui, "bookmark.pr", "other"), "no pull request");
+    }
+
+    #[test]
     fn badges_go_on_local_bookmark_chips_only() {
         let ui = app();
         let theme = ui.resolved_theme().spec();

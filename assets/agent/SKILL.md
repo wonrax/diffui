@@ -144,17 +144,19 @@ a key that doesn't exist reads as false and `reload` reports it.
 |---|---|
 | `repo.kind` | `"jj"`, `"git"` or `"pr"` (a pull-request tab) |
 | `repo.mutate` | the repository can be rewritten (jj) |
+| `repo.forge` | `"github"` or `"gitlab"`: the forge one of the repository's remotes is on |
 | `revision.selected` | a revision is in context and in the log |
 | `revision.mutable` | the revision in context isn't immutable |
 | `revision.is_working_copy` | the revision in context is `@` |
 | `selection.count` | how many rows are marked in the log |
 | `bookmark` | a bookmark is in context: the one picked, else the revision's first |
 | `bookmark.has_remote` | the bookmark in context exists on a remote |
+| `bookmark.pr` | the state of the bookmark in context's pull request: `"open"`, `"draft"`, `"merged"` or `"closed"` |
 | `file` | a file is in context: the one picked, else the diff's selected file |
 | `diff.line` | a diff line is in context (line-select mode has a cursor) |
 
 Examples: `repo.kind == "jj" && revision.mutable`, `selection.count >= 2`,
-`bookmark && !bookmark.has_remote`.
+`bookmark && !bookmark.has_remote`, `bookmark.pr == "open"`.
 
 In menus, a command whose when-clause doesn't hold isn't shown; the palette
 lists it greyed with the clause.

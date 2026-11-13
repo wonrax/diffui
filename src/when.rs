@@ -21,8 +21,8 @@
 //! only and are false otherwise. A key the host doesn't know is reported when
 //! the clause loads and reads as false.
 //!
-//! The keys are [`KEYS`]: one table, so adding a key (a forge's
-//! `bookmark.pr`, a plugin's own) is one row.
+//! The keys are [`KEYS`]: one table, so adding a key (a plugin's own, say)
+//! is one row.
 
 use std::fmt;
 
@@ -91,6 +91,14 @@ pub(crate) static KEYS: &[KeyDef] = &[
         read: |ui, _| ui.active().session.capabilities.mutate.into(),
     },
     KeyDef {
+        // "github" or "gitlab": the forge that claims a remote
+        name: "repo.forge",
+        read: |ui, _| match ui.active().forge.kind() {
+            Some(kind) => Value::Text(kind.name().to_lowercase()),
+            None => Value::Missing,
+        },
+    },
+    KeyDef {
         // a revision is in context and in the log
         name: "revision.selected",
         read: |ui, arg| context::revision_row(ui, arg).is_some().into(),
@@ -127,6 +135,19 @@ pub(crate) static KEYS: &[KeyDef] = &[
         read: |ui, arg| match context::bookmark(ui, arg) {
             Some(name) => context::has_remote(ui, &name).into(),
             None => Value::Missing,
+        },
+    },
+    KeyDef {
+        // the bookmark in context's pull request: "open", "draft", "merged"
+        // or "closed"
+        name: "bookmark.pr",
+        read: |ui, arg| {
+            let forge = &ui.active().forge;
+            context::bookmark(ui, arg)
+                .and_then(|name| Some(forge.of(crate::forge::local_name(&name)?)?.pr.state))
+                .map_or(Value::Missing, |state| {
+                    Value::Text(state.label().to_owned())
+                })
         },
     },
     KeyDef {

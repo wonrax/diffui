@@ -509,12 +509,12 @@ exec = ["true"]
 [[commands]]
 id = "x"
 label = "X"
-when = "file && bookmark.pr"
+when = "file && bookmark.reviewers"
 exec = ["true"]
 "#,
         );
         assert_eq!(commands.len(), 1);
-        assert!(problems[0].contains("bookmark.pr"), "{problems:?}");
+        assert!(problems[0].contains("bookmark.reviewers"), "{problems:?}");
     }
 
     #[test]
