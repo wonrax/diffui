@@ -296,6 +296,7 @@ impl Diffui {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
+        let arg = crate::forge::picked(self, &arg);
         let state = self.active();
         if !state.session.capabilities.mutate {
             return;

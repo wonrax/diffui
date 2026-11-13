@@ -25,6 +25,7 @@ use futures::StreamExt as _;
 use crate::chip::Chip;
 use crate::commands::{Availability, CommandArg, require};
 use crate::geometry::Rectangle;
+use crate::palette::ResultRef;
 use crate::root::PaneSet;
 use crate::theme::ThemeSpec;
 use crate::{Action, Cx, Diffui, TabId, icons};
@@ -455,7 +456,7 @@ impl Diffui {
     /// bookmark on the revision it names (the selected one for `None`).
     pub(crate) fn decoration_for(&self, arg: &CommandArg) -> Option<&Decoration> {
         let forge = &self.active().forge;
-        match arg {
+        match &picked(self, arg) {
             CommandArg::Bookmark { name, .. } => forge.of(name),
             _ => self
                 .bookmarks_on(arg)
@@ -468,9 +469,9 @@ impl Diffui {
     /// `None`), in graph order.
     pub(crate) fn bookmarks_on(&self, arg: &CommandArg) -> Vec<String> {
         let tab = self.active();
-        let selection = match arg {
-            CommandArg::Revision(selection) => selection.clone(),
-            CommandArg::Bookmark { name, .. } => return vec![name.clone()],
+        let selection = match picked(self, arg) {
+            CommandArg::Revision(selection) => selection,
+            CommandArg::Bookmark { name, .. } => return vec![name],
             _ => tab.session.selected_revision.clone(),
         };
         tab.session
@@ -662,10 +663,29 @@ impl Diffui {
     }
 }
 
+/// `arg` with a palette result read as the local bookmark or the revision it
+/// names, so a forge command run on a picked result acts on that and not on
+/// the selected row.
+pub(crate) fn picked(ui: &Diffui, arg: &CommandArg) -> CommandArg {
+    let CommandArg::Result(result) = arg else {
+        return arg.clone();
+    };
+    if let ResultRef::Bookmark(label) = result
+        && let Some(name) = crate::bookmarks::local_bookmark_label(label)
+    {
+        return CommandArg::Bookmark {
+            name: name.to_owned(),
+            remote: None,
+            to: None,
+        };
+    }
+    crate::commands::target_revision(ui, arg).map_or(CommandArg::None, CommandArg::Revision)
+}
+
 /// The selection a menu acts on, for the revision rows of the pull-request
 /// menu.
 pub(crate) fn selection_of(arg: &CommandArg, ui: &Diffui) -> RevisionSelection {
-    match arg {
+    match &picked(ui, arg) {
         CommandArg::Revision(selection) => selection.clone(),
         CommandArg::Bookmark { name, .. } => ui
             .active()
@@ -951,6 +971,30 @@ mod tests {
                 .enabled(&ui, &CommandArg::None),
             Err("No merge request".into())
         );
+    }
+
+    #[test]
+    fn a_palette_bookmark_result_names_its_own_pull_request() {
+        let mut ui = app();
+        let tab = push_tab(&mut ui, "/tmp/forge-picked");
+        ui.active = ui.tabs.iter().position(|state| state.id == tab).unwrap();
+        let (repo, generation, asked) = asked(&mut ui, tab);
+        ui.apply_refresh(
+            tab,
+            &repo,
+            generation,
+            &asked,
+            answer(vec![
+                pr("feature", 3, PrState::Open),
+                pr("other", 5, PrState::Open),
+            ]),
+            false,
+        );
+        let result = |label: &str| CommandArg::Result(ResultRef::Bookmark(label.to_owned()));
+        let number = |ui: &Diffui, arg| ui.decoration_for(&arg).map(|found| found.pr.number);
+        assert_eq!(number(&ui, result("other*")), Some(5));
+        assert_eq!(number(&ui, result("feature")), Some(3));
+        assert_eq!(number(&ui, result("other@origin")), None, "a remote copy");
     }
 
     #[test]
