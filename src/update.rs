@@ -66,7 +66,7 @@ impl Diffui {
         // repository" error.
         enum BootTarget {
             Repo(Repository),
-            Pr(github::PrSpec),
+            Pr(forge::ForgePr),
         }
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
@@ -86,7 +86,7 @@ impl Diffui {
         }
         if cli.requested_paths().next().is_some() {
             for path in cli.requested_paths() {
-                if let Some(spec) = github::PrSpec::parse(&path.to_string_lossy()) {
+                if let Some(spec) = forge::ForgePr::parse(&path.to_string_lossy()) {
                     if !targets
                         .iter()
                         .any(|target| matches!(target, BootTarget::Pr(open) if *open == spec))
@@ -152,7 +152,7 @@ impl Diffui {
                 BootTarget::Pr(spec) => (
                     spec.owner.clone(),
                     spec.label(),
-                    TabSource::GitHubPr(spec.clone()),
+                    TabSource::ForgePr(spec.clone()),
                     TabState::unloaded(None, Some(String::new())),
                 ),
             };

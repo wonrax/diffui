@@ -1,7 +1,7 @@
-//! The GitHub pull-request actor.
+//! The pull-request actor.
 //!
 //! A PR has no checkout, no operation log and nothing to mutate, so this is a
-//! plain tokio task over the `gh` CLI. It speaks the protocol so a PR tab and
+//! plain tokio task over its forge's [`ForgeProvider`]. It speaks the protocol so a PR tab and
 //! a repository tab are the same thing to the frontend: the diff streams back
 //! as `Batch`-shaped work, and the commit list arrives as graph rows.
 
@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
 use super::{Envelope, Jobs, route_commands, run_job};
-use crate::github::{self, PrSpec};
+use crate::forge::{self, ForgePr, ForgeProvider, Forges, PrInfo};
 use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
 
 /// Flush the pending file batch once it holds this many diff lines. Small
@@ -20,7 +20,7 @@ const BATCH_LINE_LIMIT: usize = 4_096;
 
 pub(super) fn spawn(
     id: RepoId,
-    spec: PrSpec,
+    spec: ForgePr,
     commands: mpsc::UnboundedReceiver<Envelope>,
     events: mpsc::UnboundedSender<Event>,
 ) {
@@ -30,10 +30,14 @@ pub(super) fn spawn(
     let (work_tx, mut work) = mpsc::unbounded_channel();
     tokio::spawn(route_commands(commands, work_tx, jobs.clone()));
     tokio::spawn(async move {
+        let Some(provider) = Forges::builtin().provider(spec.kind) else {
+            return;
+        };
+        let provider = provider.as_ref();
         // The PR header, read once: the details pane and the diff's totals
         // both start from it. A graph load (opening or refreshing the tab)
         // reads it afresh.
-        let mut info: Option<github::PrInfo> = None;
+        let mut info: Option<PrInfo> = None;
         while let Some(envelope) = work.recv().await {
             match envelope {
                 Envelope::Shutdown => return,
@@ -47,7 +51,7 @@ pub(super) fn spawn(
                     };
                     let (id, spec, events, info) = (&id, &spec, &events, &mut info);
                     run_job(&jobs, job, span, emit, |ticket| async move {
-                        run(id, spec, info, *command, ticket.flag(), events).await;
+                        run(id, provider, spec, info, *command, ticket.flag(), events).await;
                         Ok(())
                     })
                     .await;
@@ -62,8 +66,9 @@ pub(super) fn spawn(
 
 async fn run(
     id: &RepoId,
-    spec: &PrSpec,
-    info: &mut Option<github::PrInfo>,
+    provider: &dyn ForgeProvider,
+    spec: &ForgePr,
+    info: &mut Option<PrInfo>,
     command: Command,
     cancel: &CancelFlag,
     events: &mpsc::UnboundedSender<Event>,
@@ -74,12 +79,12 @@ async fn run(
     match command {
         // The PR's commit list is its graph: an "All changes" row on top, then
         // one row per commit. It arrives whole, in a single batch.
-        Command::LoadGraph { job, .. } => match github::fetch_pr_commits(spec).await {
+        Command::LoadGraph { job, .. } => match provider.commits(spec.clone()).await {
             Ok(commits) => {
                 *info = None;
                 emit(Payload::Batch {
                     job,
-                    rows: github::pr_commit_rows(&commits),
+                    rows: forge::pr_commit_rows(&commits),
                 });
                 emit(Payload::GraphLoaded {
                     job,
@@ -88,7 +93,7 @@ async fn run(
             }
             Err(error) => emit(Payload::Failed {
                 job,
-                error: RepoError::Other(format!("{error:#}")),
+                error: RepoError::Other(error.to_string()),
             }),
         },
         Command::LoadDiff {
@@ -97,22 +102,22 @@ async fn run(
             base: DiffBase::Parents,
             ..
         } => {
-            stream_diff(spec, info, job, revision, cancel, &emit).await;
+            stream_diff(id, provider, spec, info, job, revision, cancel, events).await;
         }
         // A comparison needs two local trees; `Capabilities::compare` is off.
         Command::LoadDiff { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,
         }),
-        Command::RevisionDetails { job, revision } => match pr_info(spec, info).await {
+        Command::RevisionDetails { job, revision } => match pr_info(provider, spec, info).await {
             Ok(info) => emit(Payload::DetailsLoaded {
                 job,
                 revision,
-                details: github::pr_revision_details(info),
+                details: forge::pr_revision_details(spec.kind, info),
             }),
             Err(error) => emit(Payload::Failed {
                 job,
-                error: RepoError::Other(format!("{error:#}")),
+                error: RepoError::Other(error.to_string()),
             }),
         },
         // A PR carries no working copy, no operations and no local tree, and
@@ -145,11 +150,12 @@ async fn run(
 
 /// The PR header, read once and kept in `info`.
 async fn pr_info<'a>(
-    spec: &PrSpec,
-    info: &'a mut Option<github::PrInfo>,
-) -> anyhow::Result<&'a github::PrInfo> {
+    provider: &dyn ForgeProvider,
+    spec: &ForgePr,
+    info: &'a mut Option<PrInfo>,
+) -> forge::ForgeResult<&'a PrInfo> {
     if info.is_none() {
-        *info = Some(github::fetch_pr_info(spec).await?);
+        *info = Some(provider.view(spec.clone()).await?);
     }
     Ok(info.as_ref().expect("just filled"))
 }
@@ -157,16 +163,25 @@ async fn pr_info<'a>(
 /// Stream the whole-PR diff (or one commit's) back as batches. A cancel kills
 /// the `gh` download rather than leaving it to run to completion against a
 /// tab the user has already navigated away from.
+#[allow(clippy::too_many_arguments)]
 async fn stream_diff(
-    spec: &PrSpec,
-    info: &mut Option<github::PrInfo>,
+    id: &RepoId,
+    provider: &dyn ForgeProvider,
+    spec: &ForgePr,
+    info: &mut Option<PrInfo>,
     job: JobId,
     revision: RevisionSelection,
     cancel: &CancelFlag,
-    emit: &impl Fn(Payload),
+    events: &mpsc::UnboundedSender<Event>,
 ) {
+    let emit = |payload: Payload| {
+        let _ = events.send(Event::new(id.clone(), payload));
+    };
     if let RevisionSelection::Commit(oid) = &revision {
-        match github::load_pr_commit_diff(spec, oid, cancel).await {
+        match provider
+            .commit_diff(spec.clone(), oid.clone(), cancel.clone())
+            .await
+        {
             _ if cancel.is_cancelled() => emit(Payload::Cancelled { job }),
             Ok((document, details)) => emit(Payload::DiffLoaded {
                 job,
@@ -176,7 +191,7 @@ async fn stream_diff(
             }),
             Err(error) => emit(Payload::Failed {
                 job,
-                error: RepoError::Other(error),
+                error: RepoError::Other(error.to_string()),
             }),
         }
         return;
@@ -185,15 +200,15 @@ async fn stream_diff(
     // The PR header's own counts, read first: the files-API fallback zeroes
     // per-file counts for oversized blobs, so summing the parsed files
     // undercounts (react#36173: 73k summed against 123k real).
-    let header = pr_info(spec, info)
+    let header = pr_info(provider, spec, info)
         .await
         .ok()
-        .map(|info| (info.additions, info.deletions));
+        .and_then(|info| info.totals);
     let mut batch: Vec<DiffFile> = Vec::new();
     let mut batch_lines = 0usize;
     let summed = header.is_none();
     let mut totals = header.unwrap_or((0, 0));
-    let result = github::stream_pr_diff(spec, cancel, |file| {
+    let on_file = Box::new(|file: DiffFile| {
         if summed {
             totals.0 += file.additions;
             totals.1 += file.deletions;
@@ -218,8 +233,10 @@ async fn stream_diff(
             });
             batch_lines = 0;
         }
-    })
-    .await;
+    });
+    let result = provider
+        .stream_diff(spec.clone(), cancel.clone(), on_file)
+        .await;
 
     match result {
         _ if cancel.is_cancelled() => emit(Payload::Cancelled { job }),
@@ -236,7 +253,7 @@ async fn stream_diff(
         }),
         Err(error) => emit(Payload::Failed {
             job,
-            error: RepoError::Other(format!("{error:#}")),
+            error: RepoError::Other(error.to_string()),
         }),
     }
 }

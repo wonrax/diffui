@@ -220,7 +220,7 @@ impl Diffui {
         self.mark_geometry_dirty();
     }
 
-    /// Resolve `raw` to a repository — or a GitHub PR reference — and open it
+    /// Resolve `raw` to a repository — or a pull request reference — and open it
     /// as a tab (or focus it if it's already open). On failure the dialog
     /// stays open with the reason shown.
     pub(crate) fn open_repository(&mut self, raw: &str, cx: &mut Cx) {
@@ -228,18 +228,19 @@ impl Diffui {
         if trimmed.is_empty() {
             return;
         }
-        // A PR URL / `owner/repo#123` opens a PR tab; anything else is a path.
-        if let Some(spec) = github::PrSpec::parse(trimmed) {
+        // A PR or MR URL, `owner/repo#123` or `group/repo!7` opens a PR tab;
+        // anything else is a path.
+        if let Some(spec) = forge::ForgePr::parse(trimmed) {
             // A bare `owner/repo#123` typed from a repository whose remote
-            // lives on a GitHub Enterprise host means that host's PR.
+            // lives on a company host means that host's PR.
             let remotes = self
                 .tabs
                 .get(self.active)
                 .and_then(|tab| tab.state.repository.as_ref())
-                .map(|repository| github::remote_urls(&repository.root))
+                .map(|repository| forge::remotes(&repository.root))
                 .unwrap_or_default();
-            let spec = spec.with_host_from_remotes(remotes.iter().map(String::as_str));
-            return self.open_github_pr(spec, cx);
+            let spec = spec.with_host_from_remotes(remotes.iter().map(|(_, url)| url.as_str()));
+            return self.open_pull_request(spec, cx);
         }
         match prepare_repository(&expand_user_path(trimmed)) {
             Ok(repository) => {
@@ -344,14 +345,14 @@ impl Diffui {
         }
     }
 
-    /// Open `spec` as a GitHub-PR tab (or focus it if already open). The diff
-    /// streams from the `gh` CLI; the tab has no local repository, so the
+    /// Open `spec` as a pull-request tab (or focus it if already open). The
+    /// diff streams from its forge; the tab has no local repository, so the
     /// graph/watcher/mutation machinery stays disabled (`repository`
     /// is `None`) and only the streamed document renders.
-    pub(crate) fn open_github_pr(&mut self, spec: github::PrSpec, cx: &mut Cx) {
+    pub(crate) fn open_pull_request(&mut self, spec: forge::ForgePr, cx: &mut Cx) {
         self.pop_mode(ModeKind::OpenRepo);
         self.mark_geometry_dirty();
-        let source = TabSource::GitHubPr(spec.clone());
+        let source = TabSource::ForgePr(spec.clone());
         if let Some(existing) = self.tabs.iter().find(|tab| tab.source == source) {
             let id = existing.id;
             return self.activate_tab(id, cx);

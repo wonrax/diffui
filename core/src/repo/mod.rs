@@ -307,10 +307,7 @@ impl Drop for RepoEvents {
 pub fn repo_id(spec: &OpenSpec) -> RepoId {
     match spec {
         OpenSpec::Local { root, .. } => RepoId(root.to_string_lossy().into_owned()),
-        OpenSpec::GitHubPr(pr) => RepoId(match &pr.host {
-            Some(host) => format!("{host}/{}/{}#{}", pr.owner, pr.repo, pr.number),
-            None => format!("{}/{}#{}", pr.owner, pr.repo, pr.number),
-        }),
+        OpenSpec::ForgePr(pr) => RepoId(pr.key()),
     }
 }
 
@@ -332,7 +329,7 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             fetch: true,
             ..Capabilities::default()
         },
-        OpenSpec::GitHubPr(_) => Capabilities::default(),
+        OpenSpec::ForgePr(_) => Capabilities::default(),
     }
 }
 
@@ -389,7 +386,7 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         },
         // A PR has no local checkout; the placeholder keeps `RepoHandle` one
         // shape across every kind of source.
-        OpenSpec::GitHubPr(_) => Repository {
+        OpenSpec::ForgePr(_) => Repository {
             root: PathBuf::new(),
             vcs: Vcs::Git,
             scope: PathBuf::new(),
@@ -417,7 +414,7 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         OpenSpec::Local { root, .. } => {
             git_actor::spawn(id, root, cmd_rx, cmd_tx.clone(), event_tx)
         }
-        OpenSpec::GitHubPr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),
+        OpenSpec::ForgePr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),
     }
 
     RepoEvents {

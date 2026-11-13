@@ -155,7 +155,7 @@ fn drop_index(widths: &[f32], index: usize, slot: f32, x: f32) -> usize {
 fn tab_tooltip(tab: &crate::Tab) -> String {
     let place = match &tab.source {
         crate::TabSource::Repo { root, .. } => crate::contract_user_path(&root.to_string_lossy()),
-        crate::TabSource::GitHubPr(_) => format!("{}/{}", tab.owner, tab.name),
+        crate::TabSource::ForgePr(spec) => spec.reference(),
     };
     if tab_is_dirty(tab) {
         format!("{place}\nWorking copy (@) has changes")
@@ -170,7 +170,7 @@ fn tab_tooltip(tab: &crate::Tab) -> String {
 fn tab_is_dirty(tab: &crate::Tab) -> bool {
     // PR tabs have no working copy; their synthetic "All changes" row would
     // otherwise read as permanently dirty.
-    if matches!(tab.source, crate::TabSource::GitHubPr(_)) {
+    if matches!(tab.source, crate::TabSource::ForgePr(_)) {
         return false;
     }
     tab.state
@@ -854,7 +854,10 @@ fn tab_badge(source: &crate::TabSource, active: bool, look: Look) -> Div {
     let label = match source {
         crate::TabSource::Repo { vcs: Vcs::Jj, .. } => "jj",
         crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
-        crate::TabSource::GitHubPr(_) => "pr",
+        crate::TabSource::ForgePr(spec) if spec.kind == diffui_core::forge::ForgeKind::GitLab => {
+            "mr"
+        }
+        crate::TabSource::ForgePr(_) => "pr",
     };
     let ink = if active {
         theme.accent
@@ -1268,10 +1271,10 @@ fn status_parts(
     match status {
         Status::PullRequest(spec) => {
             let mut runs = vec![
-                plain("Pull request "),
-                strong(format!("#{}", spec.number)),
+                plain(format!("{} ", spec.kind.title_noun())),
+                strong(format!("{}{}", spec.kind.sigil(), spec.number)),
                 plain(" in "),
-                strong(format!("{}/{}", spec.owner, spec.repo)),
+                strong(spec.slug()),
             ];
             if let Some(host) = &spec.host {
                 runs.extend([plain(" on "), code(host.clone())]);
@@ -1442,35 +1445,35 @@ fn status_line(look: Look, status: &crate::path_browse::Status) -> Div {
 }
 
 /// The pull request a reference names, and what opening it does.
-fn pull_request_card(look: Look, spec: &diffui_core::github::PrSpec) -> Div {
+fn pull_request_card(look: Look, spec: &diffui_core::forge::ForgePr) -> Div {
     let Look { theme, .. } = look;
     let font = look.font;
     let title_font = emphasis_font(font, Weight::SEMIBOLD);
-    let mut words = crate::prose::Prose::from(
-        "Opens as its own tab, diffing the pull request's head against its base.",
-    );
+    let noun = spec.kind.noun();
+    let mut words = crate::prose::Prose::from(format!(
+        "Opens as its own tab, diffing the {noun}'s head against its base."
+    ));
     if spec.host.is_none() {
+        let example = match spec.kind {
+            diffui_core::forge::ForgeKind::GitHub => "owner/repo#123",
+            diffui_core::forge::ForgeKind::GitLab => "group/repo!123",
+        };
         words = words
             .text(" A bare ")
-            .code("owner/repo#123")
-            .text(" takes its host from the current tab's remote, so GitHub Enterprise works too.");
+            .code(example)
+            .text(" takes its host from the current tab's remote, so company hosts work too.");
     }
     let title = typography::baseline_row(
         [
             Aligned::text(
-                typography::line(
-                    format!("{}/{}", spec.owner, spec.repo),
-                    title_font,
-                    text_size::BODY_LG,
-                    theme.text,
-                ),
+                typography::line(spec.slug(), title_font, text_size::BODY_LG, theme.text),
                 title_font,
                 text_size::BODY_LG,
             ),
             Aligned::gap(theme::space::SM),
             Aligned::text(
                 typography::line(
-                    format!("#{}", spec.number),
+                    format!("{}{}", spec.kind.sigil(), spec.number),
                     emphasis_font(font, Weight::MEDIUM),
                     text_size::BODY_LG,
                     theme.subtle_text,

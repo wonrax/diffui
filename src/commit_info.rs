@@ -184,12 +184,14 @@ pub(crate) fn header_lines(
         change.buttons = vec![(icons::COPY, HeaderAction::Copy(change_id.to_owned()))];
         lines.push(rich(change));
     }
-    let pull_request = details.commit_id.starts_with('#');
+    // A pull-request tab's header names it by its number: `#12`, or `!12`
+    // for a merge request.
+    let pull_request = details.change_id.is_none() && details.commit_id.starts_with(['#', '!']);
     let mut commit = HeaderField::new(
-        if pull_request {
-            "Pull request"
-        } else {
-            "Commit"
+        match details.commit_id.chars().next() {
+            Some('#') if pull_request => "Pull request",
+            Some('!') if pull_request => "Merge request",
+            _ => "Commit",
         },
         details.commit_id.clone(),
     );

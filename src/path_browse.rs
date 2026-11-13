@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use diffui_core::Vcs;
-use diffui_core::github::PrSpec;
+use diffui_core::forge::ForgePr;
 
 use crate::{Cx, Diffui, TabSource};
 
@@ -162,7 +162,7 @@ pub(crate) fn probe(input: String) -> Probe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Status {
     /// A pull request reference.
-    PullRequest(PrSpec),
+    PullRequest(ForgePr),
     /// Not a path the prompt browses, nor a pull request.
     Relative,
     /// A repository, or a folder inside one.
@@ -331,7 +331,7 @@ impl Diffui {
         if input.is_empty() {
             return None;
         }
-        if let Some(spec) = PrSpec::parse(input) {
+        if let Some(spec) = ForgePr::parse(input) {
             return Some(Status::PullRequest(spec));
         }
         let Some(query) = Query::parse(input) else {

@@ -686,6 +686,6 @@ impl Payload {
 pub enum OpenSpec {
     /// A local jj or git repository at this workspace root.
     Local { root: PathBuf, scope: PathBuf },
-    /// A GitHub pull request, streamed through the `gh` CLI.
-    GitHubPr(crate::github::PrSpec),
+    /// A pull (or merge) request on a forge, streamed through its provider.
+    ForgePr(crate::forge::ForgePr),
 }

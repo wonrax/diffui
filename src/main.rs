@@ -84,7 +84,7 @@ mod window_state;
 // …) so those call sites stay unchanged.
 pub(crate) use action::Action;
 pub(crate) use diffui_core::{
-    FetchTarget, JobId, RepoHandle, github, graph_layout, jj, mutations, repository,
+    FetchTarget, JobId, RepoHandle, forge, graph_layout, jj, mutations, repository,
 };
 // The same for the widget layer in `diffui-widgets`: `crate::theme`,
 // `crate::ui`, `crate::diff_view` and the rest resolve as they did when they
@@ -969,8 +969,8 @@ pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
-/// What a tab views: a local repository, or a GitHub pull request fetched
-/// through the `gh` CLI. Equality is identity — it's what de-duplicates opens.
+/// What a tab views: a local repository, or a pull (merge) request read
+/// through its forge's provider. Equality is identity — it's what de-duplicates opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TabSource {
     Repo {
@@ -978,7 +978,7 @@ pub(crate) enum TabSource {
         /// Repository root, used to de-duplicate opens and key the watcher.
         root: PathBuf,
     },
-    GitHubPr(github::PrSpec),
+    ForgePr(forge::ForgePr),
 }
 
 /// One open tab: its identity + display metadata, plus the per-tab state it
@@ -987,7 +987,7 @@ pub(crate) enum TabSource {
 pub(crate) struct Tab {
     pub(crate) id: TabId,
     /// Dimmed prefix in the tab label — the repo root's parent directory, or
-    /// the PR's GitHub org.
+    /// the PR's owner or group.
     pub(crate) owner: String,
     /// Emphasized name — the repo directory, or `repo#123` for a PR.
     pub(crate) name: String,
@@ -996,13 +996,13 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
-    /// The local repository root, or `None` for a GitHub-PR tab. Persistence
+    /// The local repository root, or `None` for a pull-request tab. Persistence
     /// and the recent-repos list key off this, so PR tabs (session-only for
     /// now) drop out of both naturally.
     pub(crate) fn root(&self) -> Option<&Path> {
         match &self.source {
             TabSource::Repo { root, .. } => Some(root),
-            TabSource::GitHubPr(_) => None,
+            TabSource::ForgePr(_) => None,
         }
     }
 
@@ -1019,7 +1019,7 @@ impl Tab {
                     .map(|repository| repository.scope.clone())
                     .unwrap_or_default(),
             },
-            TabSource::GitHubPr(spec) => diffui_core::OpenSpec::GitHubPr(spec.clone()),
+            TabSource::ForgePr(spec) => diffui_core::OpenSpec::ForgePr(spec.clone()),
         }
     }
 
