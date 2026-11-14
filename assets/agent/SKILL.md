@@ -112,9 +112,9 @@ A row has exactly one of these four:
   into words first, the way a shell would split it, then each word's
   variables are filled in, so a value is always one argument. Needs a jj
   repository.
-- `agent = "<prompt>"`: run the user's agent CLI with the prompt as its last
-  argument: `[ai] command` from config.toml, else `claude -p`, else
-  `codex exec`.
+- `agent = "<prompt>"`: send the prompt (and `stdin`, which a provider gets
+  as what the prompt is about) to the AI provider: the one Settings → AI (or
+  `[ai] provider`) picks, see "AI providers" below.
 - `edit = "<path>"`: open a path (relative to the root) in the user's editor
   at `{line}`: `[editor] command`, else `$VISUAL` / `$EDITOR` when it's a GUI
   editor (code, cursor, zed, subl, idea, mate, …), else the system opener.
@@ -125,7 +125,7 @@ Optional fields:
 | Field | Meaning |
 |---|---|
 | `stdin = "<template>"` | Text fed to the program's standard input (`exec` and `agent` only). |
-| `output = "…"` | Where the program's standard output goes (`exec` and `agent` only): `activity` (default; the activity row and its output panel), `toast` (its first line once it exits), `clipboard`, `description` (written into the description editor as it arrives, opening it on the revision; undoable), `open-url` (its first line, an `http(s)` link, opened in the browser) or `none`. |
+| `output = "…"` | Where the program's standard output (an agent's reply) goes (`exec` and `agent` only): `activity` (default; the activity row and its output panel), `toast` (its first line once it exits), `clipboard`, `description` (written into the description editor as it arrives, opening it on the revision; undoable), `pr` (the pull request dialog's title, the first line, and body, as it arrives, opening the dialog for the revision), `bookmark` (the bookmark name prompt, its first line made a name such as `fix-parser-crash`, opening the prompt at the revision), `panel` (the output panel, opened as it starts, for text to read: rendered as Markdown, with a Rendered | Raw toggle), `open-url` (its first line, an `http(s)` link, opened in the browser) or `none`. A failure puts back what a field held. |
 | `confirm = "<template>"` | Ask before running; the text is the question. Can't use `{diff}` or `{recent_descriptions}`. |
 | `override = true` | Replace the built-in or shipped command with the same `id`. Without it, a row taking an existing id is left out. |
 | `timeout = 300` | Seconds the program may run before it's stopped (default 300). |
@@ -175,6 +175,12 @@ with the reason.
 | `{line}` | a line in that file: line-select mode's cursor, else its first changed line, else 1 |
 | `{diff}` | the revision's diff in git format, read when the command runs (use it in `stdin`; as an argument it must be under 64 KiB) |
 | `{recent_descriptions}` | the ten latest non-empty descriptions below the working copy, each followed by a line of `---` |
+| `{stack_diff}` | the diff of `trunk()..` the revision, its stack, in git format (jj only) |
+| `{stack_descriptions}` | the descriptions of the stack's revisions, oldest first, each followed by a line of `---` (jj only) |
+
+`{diff}` and `{stack_diff}` stop at 200 KB: the rest is left out with a line
+that says so, and diffui tells the user once the command has run (the
+output panel says it first).
 | `{prompt.<name>}` | a prompt's answer |
 
 "The revision" is the one the command was picked for (a menu row, a palette
@@ -195,6 +201,7 @@ a key that doesn't exist reads as false and `reload` reports it.
 | `repo.kind` | `"jj"`, `"git"` or `"pr"` (a pull-request tab) |
 | `repo.mutate` | the repository can be rewritten (jj) |
 | `repo.forge` | `"github"`, `"gitlab"` or a forge plugin's id: the forge one of the repository's remotes is on |
+| `ai` | an AI provider is picked (or found automatically) and set up; the shipped AI rows name it |
 | `revision.selected` | a revision is in context and in the log |
 | `revision.mutable` | the revision in context isn't immutable |
 | `revision.is_working_copy` | the revision in context is `@` |
@@ -237,7 +244,7 @@ keeps an id it doesn't know yet for when a reload declares it:
 
 ### Shipped commands
 
-diffui ships two commands written this way. Replace either with a row of the
+diffui ships these commands written this way. Replace any with a row of the
 same id and `override = true`.
 
 - `file.open-in-editor`: `edit = "{path}"`, offered in the file menu and the
@@ -245,10 +252,60 @@ same id and `override = true`.
 - `ai.describe` ("Generate description", also the description editor's
   Generate button): `agent` with a prompt that includes
   `{recent_descriptions}`, `stdin = "{diff}"` and `output = "description"`.
+- `ai.pr-description` ("Generate pull request title and description", also
+  the pull request dialog's Generate button): `stdin` the stack's
+  descriptions and diff, `output = "pr"`.
+- `ai.bookmark-name` ("Suggest bookmark name", also the new bookmark
+  prompt's Suggest button): the revision's description and diff,
+  `output = "bookmark"`.
+- `ai.explain` ("Explain this change") and `ai.review` ("Review this
+  change"): the revision's description and diff, `output = "panel"`.
+
+### AI providers
+
+An `agent` row goes to one AI provider. diffui bundles four, each a plugin
+with its own page in Settings → AI (the pencil), where Test sends a short
+prompt and shows the reply:
+
+- `claude-code`: runs `claude -p <prompt>` in the repository, `stdin` on its
+  standard input. Settings: `program`, `model` (passed as `--model`).
+- `codex`: runs `codex exec --skip-git-repo-check <prompt>`, the same way.
+  Settings: `program`, `model`.
+- `anthropic`: the Messages API, streamed. Settings: `model` (default
+  `claude-opus-5-5`, chosen from the API's list), `base_url` (for a proxy),
+  and the `api_key`, kept in the Keychain or read from `ANTHROPIC_API_KEY`.
+- `openai`: any OpenAI-compatible chat completions API (OpenAI, OpenRouter,
+  Ollama, LM Studio): `base_url` (default `https://api.openai.com/v1`), an
+  optional `api_key` (or `OPENAI_API_KEY`), a `model` chosen from the
+  server's list, which it needs to be set up, and a `name` diffui calls it
+  by ("Ollama").
+
+`[ai] command` in config.toml is a fifth, "Custom command": a program that
+takes the prompt as its last argument and `stdin` on its standard input.
+
+The shipped AI rows' `when` starts with `ai`: without a provider set up they
+are left out of menus and greyed in the palette with what to do. In the
+revision menu every `agent` row (yours too) sits in a submenu named after the
+provider in use, with sparkles before each label; the pull request rows sit in
+one named after the repository's forge.
+
+Which one runs is `[ai] provider`: Settings → AI writes it to settings.toml;
+in config.toml it wins and locks the setting. `"auto"` (the default) takes
+the custom command when there is one, else the first of `claude-code` (its
+program is on the `PATH`), `codex` (likewise), `anthropic` (a key is saved or
+set), `openai` (it has a model). A plugin of your own is used only when
+named. A named provider has to be set up too; until it is, the AI commands
+say what's missing.
+Every AI command sends the diff to that provider: the palette row and the
+Generate buttons say which.
 
 ```toml
 [ai]
-command = ["claude", "-p"]   # the agent CLI; the prompt is added last
+provider = "anthropic"       # or "auto", "custom", "claude-code", "codex", "openai"
+command = ["llm", "-m", "x"] # the custom command; the prompt is added last
+
+[plugins.anthropic]
+model = "claude-opus-5-5"
 
 [editor]
 command = ["zed"]            # the path and line are added the way it takes them
@@ -371,6 +428,17 @@ pull_request_path = "{owner}/{name}/pull/{number}"   # a pull request's page aft
 subgroups = false               # true when an owner can be several segments (GitLab)
 ```
 
+An AI provider says so, and names the settings the app reads (both
+optional), then calls `ai.register` at load:
+
+```toml
+[provides.ai]
+ready = "api_key"   # a path, secret or string setting: set up when the program
+                    # is there, the secret is set, the string isn't empty
+model = "model"     # the string setting Settings' Choose fills from models()
+label = "name"      # a string setting with what to call it ("Ollama")
+```
+
 A remote goes to the first forge that claims its host: a folder plugin
 that replaces a bundled one, then the bundled ones, then the rest, so a
 plugin from the folder can't take a bundled forge's host unless that forge
@@ -385,6 +453,7 @@ for, and the user sees the list before it runs:
 |---|---|
 | `http = ["host", "*.example.com", "localhost:3000"]` | `http.fetch` those hosts, and ask `auth.token` for their git credentials |
 | `http = ["{forge.hosts}"]` | the same for every host the forge claims: its patterns, `hosts()`, the user's `hosts`, the hosts it has a token for |
+| `http = ["{config.base_url}"]` | the host of the address the string setting `base_url` holds, so the user can point an API at a proxy or a local server |
 | `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes; a word `"{config.program}"` is the string setting `program` (declare it in `[config.schema]`), so the user can point the plugin at a program |
 | `env = ["GH_HOST"]` | set these variables for the programs `exec` runs |
 | `read = ["${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml"]` | `files.read` these files, named as written or by the path they expand to; `~/`, `$NAME` and `${NAME:-default}` expand when read. Read-only, and nothing else on disk |
@@ -422,6 +491,8 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 |---|---|
 | `commands` | `commands.register(id, handler)`: the handler gets `{ repo, changeId, commitId, bookmark, path, line }` |
 | `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`, `hosts` (more hosts to claim, asked once after loading), and for a pull request in a tab of its own `view`, `commits`, `commitDiff` and `diff`, and `account` (who the user is on a host, or whose a pasted token is, for Settings' Account rows); only `pullRequests` is required, and diffui hides what a missing method would serve |
+| `ai` | `ai.register(provider)` for a plugin with `[provides.ai]`: `complete` (called with a `request`, `{ prompt, input, system, model, cwd }`, and `{ signal }`) returns the reply as text or an (async) iterable of text pieces (required), `models` (the list Settings' model picker shows), `account` (what it runs as, `{ label }`, for its page) |
+| `AiError` | `throw new AiError(kind, message)` from an AI provider, `kind` one of `missing-cli`, `auth`, `rate-limited`, `unreachable`, `failed`: diffui adds what to do ("Add an API key in Settings → AI → Anthropic") |
 | `ForgeError` | `throw new ForgeError(kind, message, { host, what })` from a provider, `kind` one of `missing-cli`, `auth`, `not-found`, `rate-limited`, `unreachable`, `timeout`, `failed`: diffui then says what to do (`gh auth login --hostname …`) |
 | `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
