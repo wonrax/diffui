@@ -49,6 +49,21 @@ enum Install {
     Bundled,
     /// Bundled, and a folder copy of the same id under another name.
     Both,
+    /// Bundled beside the build's own GitHub plugin.
+    WithGitHub,
+}
+
+/// The build's GitHub plugin into `dir`: the bundled set a test lays out
+/// replaces the build's.
+fn copy_github(dir: &Path) {
+    let github = super::bundled::built_in()
+        .into_iter()
+        .find(|plugin| plugin.id == "github")
+        .expect("GitHub is bundled");
+    std::fs::create_dir_all(dir).expect("make the plugin's folder");
+    for (name, text) in github.files {
+        std::fs::write(dir.join(name), text).expect("write the plugin");
+    }
 }
 
 /// The app with the test forge installed, on `repo` or the welcome screen.
@@ -56,11 +71,13 @@ fn launch(repo: Option<&Path>, install: Install, config: &str, settings: &str) -
     let mut h = Harness::open_prepared(repo, SIZE, config, settings, |home| {
         install_cli(&home.join("testforge-bin"));
         copy_plugin(&home.join(".bundled-test/testforge"), None);
-        if matches!(install, Install::Both) {
-            copy_plugin(
+        match install {
+            Install::Bundled => {}
+            Install::Both => copy_plugin(
                 &home.join(".config/diffui/plugins/testforge"),
                 Some("My test forge"),
-            );
+            ),
+            Install::WithGitHub => copy_github(&home.join(".bundled-test/github")),
         }
     });
     if repo.is_some() {
@@ -102,7 +119,7 @@ fn open_pr(h: &mut Harness, link: &str) -> ForgePr {
 /// own diff on selecting it.
 #[test]
 fn a_bundled_plugin_forges_pull_request_opens_in_a_tab() {
-    let mut h = launch(None, Install::Bundled, &config(), "");
+    let mut h = launch(None, Install::WithGitHub, &config(), "");
     wait_running(&mut h, "testforge");
     h.read(|ui| {
         let found = ui.plugins.get("testforge").unwrap();

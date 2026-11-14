@@ -28,6 +28,8 @@ mod events;
 mod forge;
 #[cfg(test)]
 mod forge_scenarios;
+#[cfg(test)]
+mod github_scenarios;
 mod query;
 #[cfg(test)]
 mod scenarios;

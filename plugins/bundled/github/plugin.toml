@@ -1,0 +1,24 @@
+# GitHub, through the `gh` CLI (on the PATH and signed in to the host:
+# github.com or a GitHub Enterprise Server). Bundled with diffui; to point it
+# at another gh, set `program` under [plugins.github] in config.toml.
+id = "github"
+name = "GitHub"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+exec = [["{config.program}"]]
+env = ["GH_HOST"]
+
+[provides.forge]
+# github.com, and any host with a `github` label (github.acme.com). The hosts
+# gh is signed in to come from `hosts()`.
+hosts = ["github.com", "github.*", "*.github.*"]
+cli = "gh"
+default_host = "github.com"
+host_env = "GH_HOST"
+pull_request_path = "{owner}/{name}/pull/{number}"
+
+[config.schema]
+program = { type = "string", default = "gh", label = "The gh program" }

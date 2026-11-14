@@ -14,7 +14,6 @@
 //! `glab`), which keeps tokens out of diffui.
 
 mod cli;
-pub mod github;
 pub mod gitlab;
 mod remote;
 
@@ -599,18 +598,16 @@ impl Default for Forges {
 }
 
 impl Forges {
-    /// GitHub through `gh` and GitLab through `glab`, as found on the PATH.
+    /// GitLab through `glab`, as found on the PATH. GitHub is a bundled
+    /// plugin.
     pub fn builtin() -> Self {
-        Self::with_programs("gh".into(), "glab".into())
+        Self::with_programs("glab".into())
     }
 
     /// The built-in providers driving these programs: a test points them at
     /// fakes.
-    pub fn with_programs(gh: PathBuf, glab: PathBuf) -> Self {
-        Self::new(vec![
-            Arc::new(github::GitHub::new(gh)),
-            Arc::new(gitlab::GitLab::new(glab)),
-        ])
+    pub fn with_programs(glab: PathBuf) -> Self {
+        Self::new(vec![Arc::new(gitlab::GitLab::new(glab))])
     }
 
     pub fn new(providers: Vec<Arc<dyn ForgeProvider>>) -> Self {
@@ -715,7 +712,7 @@ impl Forges {
 
 /// For each of `branches`, its pull request among `prs`: the open one when
 /// there is one, else the latest. In `branches`' order.
-pub(crate) fn latest_per_branch(
+pub fn latest_per_branch(
     prs: impl IntoIterator<Item = PullRequest>,
     branches: &[String],
 ) -> Vec<PullRequest> {
@@ -946,17 +943,14 @@ mod tests {
     use super::*;
 
     fn forges() -> Forges {
-        Forges::with_programs("gh-absent".into(), "glab-absent".into())
+        Forges::with_programs("glab-absent".into())
     }
 
+    /// GitHub's claims are its bundled plugin's: the app's
+    /// `the_bundled_github_claims_its_hosts`.
     #[test]
     fn providers_claim_their_hosts() {
         let forges = forges();
-        let github = forges
-            .claim("git@github.com:team/app.git")
-            .expect("claimed");
-        assert_eq!(github.kind, ForgeKind::GitHub);
-        assert_eq!(github.web_url, "https://github.com/team/app");
         let gitlab = forges
             .claim("https://gitlab.com/group/sub/app.git")
             .expect("claimed");
@@ -965,10 +959,6 @@ mod tests {
             (gitlab.owner.as_str(), gitlab.name.as_str()),
             ("group/sub", "app")
         );
-        let enterprise = forges
-            .claim("ssh://git@github.acme.com:2222/team/app")
-            .expect("claimed");
-        assert_eq!(enterprise.host, "github.acme.com");
         let company = forges
             .claim("git@gitlab.acme.org:infra/tools.git")
             .expect("claimed");
@@ -982,10 +972,10 @@ mod tests {
         let forges = forges();
         let remotes = vec![
             ("backup".to_owned(), "/srv/backup.git".to_owned()),
-            ("fork".to_owned(), "git@github.com:me/app.git".to_owned()),
+            ("fork".to_owned(), "git@gitlab.com:me/app.git".to_owned()),
             (
                 "origin".to_owned(),
-                "git@github.com:team/app.git".to_owned(),
+                "git@gitlab.com:team/app.git".to_owned(),
             ),
         ];
         let pick = |preferred| {

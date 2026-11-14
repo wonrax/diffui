@@ -46,7 +46,7 @@ bar), traffic lights, native title bar behavior and window zoom, NSOpenPanel,
 real trackpad scrolling and momentum, the row glow's CoreAnimation pulse. These
 need a later real-window pass. Menu scenes below show the same entries through
 the app's non-macOS overlay. GitHub PR tabs need a real remote and `gh`, so they
-have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
+have no scene; see src/toolbar.rs and plugins/bundled/github for what differs.
 
 ## Welcome (no repository open)
 

@@ -684,7 +684,17 @@ fn ctl_lists_and_reloads_plugins_and_the_log_opens() {
     });
 
     let listed = ask(&mut h, Request::Plugins);
-    let plugins = listed["plugins"].as_array().expect("plugins");
+    // The build's bundled forges list first; these are the folder's.
+    let plugins: Vec<&serde_json::Value> = listed["plugins"]
+        .as_array()
+        .expect("plugins")
+        .iter()
+        .skip_while(|plugin| {
+            plugin["dir"]
+                .as_str()
+                .is_some_and(|dir| dir.starts_with("(bundled)"))
+        })
+        .collect();
     assert_eq!(plugins.len(), 2, "{listed}");
     assert_eq!(plugins[0]["id"], "broken");
     assert_eq!(plugins[0]["state"], "failed");

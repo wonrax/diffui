@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use diffui_core::forge::{
     CheckState, Checks, CreatePr, DiffParts, ForgeAbility, ForgeError, ForgeFuture, ForgeKind,
     ForgePr, ForgeProvider, ForgeRemote, ForgeSpec, OnFile, PrCommit, PrInfo, PrState, PullRequest,
-    ReviewDecision, UpdatePr, parse_remote_url,
+    ReviewDecision, UpdatePr, latest_per_branch, parse_remote_url,
 };
 use diffui_core::model::{DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo};
 use diffui_core::repo::CancelFlag;
@@ -350,14 +350,13 @@ impl ForgeProvider for ScriptForge {
             },
         );
         Box::pin(async move {
-            // Only what was asked for: a script that returns every pull
-            // request of the project badges nothing it shouldn't.
-            Ok(asked
-                .await?
-                .into_iter()
-                .filter(|pr| branches.contains(&pr.head))
-                .map(pull_request)
-                .collect())
+            // One per branch asked for: a script that returns every pull
+            // request of the project badges nothing it shouldn't, and a
+            // branch with several gets its open one, else its latest.
+            Ok(latest_per_branch(
+                asked.await?.into_iter().map(pull_request),
+                &branches,
+            ))
         })
     }
 
@@ -584,13 +583,17 @@ pub(super) fn user_hosts(config: Option<&toml::Table>) -> Vec<HostPattern> {
         .collect()
 }
 
-/// The project `url` names, if its host is one of `hosts`.
+/// The project `url` names, if its host is one of `hosts` and its owner is
+/// one segment on a forge without subgroups.
 ///
 /// An `http(s)://` remote names the web server itself, so its scheme and port
 /// are the project page's. Any other remote (ssh) is taken to be served over
 /// https on the default port.
 fn claim(url: &str, kind: ForgeKind, hosts: &[HostPattern]) -> Option<ForgeRemote> {
     let (host, owner, name) = parse_remote_url(url)?;
+    if owner.contains('/') && !kind.spec().subgroups {
+        return None;
+    }
     let (scheme, port) = ["https", "http"]
         .into_iter()
         .find_map(|scheme| {
@@ -735,6 +738,8 @@ pub(super) mod tests {
         assert_eq!(remote.web_url, "https://codeberg.org/team/app");
         assert_eq!(remote.kind.id(), "forgejo");
         assert!(claim("https://github.com/team/app", kind(), &codeberg).is_none());
+        // An owner of several segments is a subgroup, which this forge has none of.
+        assert!(claim("git@codeberg.org:team/sub/app.git", kind(), &codeberg).is_none());
 
         // A self-hosted instance on plain http and its own port.
         let local = hosts(&["127.0.0.1:3000"]);
@@ -856,18 +861,26 @@ pub(super) mod tests {
         program
     }
 
-    fn test_forge(name: &str) -> TestForge {
+    /// A directory of the system's temp dir for one test, empty. Not under
+    /// the harness's home, which launches clear.
+    pub(crate) fn scratch_dir(name: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        // Not under the harness's home, which launches clear.
         let dir = std::env::temp_dir().join(format!(
             "diffui-testforge-{}-{}-{name}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let program = install_cli(&dir);
-        let manifest =
-            Manifest::load(&fixture_dir().join("testforge")).expect("the fixture's manifest");
+        dir
+    }
+
+    /// `manifest`'s forge running as the app runs it, its `program` setting
+    /// `program`, its data under `dir`.
+    fn spawned(
+        manifest: Manifest,
+        program: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> ScriptForge {
         let mut config = toml::Table::new();
         config.insert("program".into(), program.display().to_string().into());
         let plugin = Plugin::spawn(
@@ -879,16 +892,36 @@ pub(super) mod tests {
             },
             Arc::new(Quiet),
         );
+        ScriptForge {
+            plugin: Arc::new(plugin),
+            kind: ForgeKind::Script(diffui_core::forge::ScriptForge::new(
+                spec_of(&manifest).expect("a forge"),
+            )),
+            hosts: manifest.forge.as_ref().unwrap().hosts.clone(),
+            methods: None,
+            handles: Handles::default(),
+        }
+    }
+
+    /// The bundled GitHub plugin, from the build's own copy whatever a test
+    /// put under `~/.bundled-test`, its `gh` being `program`.
+    pub(crate) fn bundled_github(program: &std::path::Path, dir: &std::path::Path) -> ScriptForge {
+        let github = super::super::bundled::built_in()
+            .into_iter()
+            .find(|plugin| plugin.id == "github")
+            .expect("GitHub is bundled");
+        let manifest = Manifest::bundled(&super::super::bundled::place("github"), github.files)
+            .expect("GitHub's manifest");
+        spawned(manifest, program, dir)
+    }
+
+    fn test_forge(name: &str) -> TestForge {
+        let dir = scratch_dir(name);
+        let program = install_cli(&dir);
+        let manifest =
+            Manifest::load(&fixture_dir().join("testforge")).expect("the fixture's manifest");
         TestForge {
-            provider: ScriptForge {
-                plugin: Arc::new(plugin),
-                kind: ForgeKind::Script(diffui_core::forge::ScriptForge::new(
-                    spec_of(&manifest).expect("a forge"),
-                )),
-                hosts: manifest.forge.as_ref().unwrap().hosts.clone(),
-                methods: None,
-                handles: Handles::default(),
-            },
+            provider: spawned(manifest, &program, &dir),
             dir,
         }
     }
@@ -903,7 +936,7 @@ pub(super) mod tests {
         pr
     }
 
-    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    pub(crate) fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         crate::spawn::runtime().block_on(future)
     }
 
@@ -1036,10 +1069,11 @@ pub(super) mod tests {
 
     /// Not a check: the numbers in the forge-platform report. One pull
     /// request's diff of `MEASURE_LINES` lines (50 000 by default) streamed
-    /// through the built-in GitHub provider and through the test forge
-    /// plugin, both reading the same file from a stand-in program. Run each
-    /// path (`MEASURE_PATH` = `native`, `plugin` or `none` for the baseline)
-    /// in a process of its own under `/usr/bin/time -l` for its peak memory.
+    /// through the bundled GitHub plugin (its `gh pr diff` path) and through
+    /// the test forge plugin, both reading the same file from a stand-in
+    /// program. Run each path (`MEASURE_PATH` = `github`, `plugin` or `none`
+    /// for the baseline) in a process of its own under `/usr/bin/time -l`
+    /// for its peak memory.
     #[test]
     #[ignore = "a measurement, run by hand"]
     fn measure_a_pull_requests_diff() {
@@ -1085,9 +1119,9 @@ pub(super) mod tests {
             methods: None,
             handles: Handles::default(),
         };
-        let native = diffui_core::forge::github::GitHub::new(program.clone());
+        let github = bundled_github(&program, &forge.dir.join("github"));
         let provider: &dyn ForgeProvider = match path.as_str() {
-            "native" => &native,
+            "github" => &github,
             "plugin" => &plugin,
             _ => return,
         };

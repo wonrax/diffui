@@ -31,6 +31,11 @@ pub(crate) fn bundled() -> Vec<Bundled> {
             return from_dir(&dir);
         }
     }
+    built_in()
+}
+
+/// The plugins this build embeds, whatever a test laid out.
+pub(crate) fn built_in() -> Vec<Bundled> {
     diffui_plugins::BUNDLED
         .iter()
         .map(|(id, files)| Bundled {

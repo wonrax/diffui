@@ -1290,11 +1290,21 @@ pub(crate) mod tests {
 
         /// Replace the rules, and forget the calls so far.
         pub(crate) fn answer(&self, rules: &[(&str, &str)]) {
+            let rules: Vec<_> = rules
+                .iter()
+                .map(|(pattern, response)| (*pattern, *response, 0))
+                .collect();
+            self.answer_or_fail(&rules);
+        }
+
+        /// [`Self::answer`], each rule with its exit code: a failure's
+        /// response goes to stderr.
+        pub(crate) fn answer_or_fail(&self, rules: &[(&str, &str, i32)]) {
             let mut table = String::new();
-            for (index, (pattern, response)) in rules.iter().enumerate() {
+            for (index, (pattern, response, status)) in rules.iter().enumerate() {
                 let file = format!("response-{index}");
                 std::fs::write(self.dir.join(&file), response).unwrap();
-                table.push_str(&format!("{pattern}\t{file}\t0\n"));
+                table.push_str(&format!("{pattern}\t{file}\t{status}\n"));
             }
             std::fs::write(self.dir.join("rules"), table).unwrap();
             let _ = std::fs::remove_file(self.dir.join("calls"));
@@ -1472,7 +1482,7 @@ pub(crate) mod tests {
     /// The fixture with a two-commit stack on `main` (`stack-1`, `stack-2`,
     /// and an empty `@` on top), opened, its `origin` looking like a GitHub
     /// project that git sends to the fixture's bare remote, and the app's
-    /// GitHub going through `fake`. `.invalid` never resolves, whatever
+    /// GitHub plugin going through `fake`. `.invalid` never resolves, whatever
     /// happens. Returns the harness and `stack-2`'s commit.
     fn stacked_repo(fake: &FakeCli) -> (crate::harness::Harness, String) {
         use crate::harness::{Harness, fixture_jj, fixture_repo};
@@ -1500,13 +1510,17 @@ pub(crate) mod tests {
         jj(&["new"]);
         let top = jj(&["log", "--no-graph", "-r", "stack-2", "-T", "commit_id"]);
 
-        let mut h = Harness::open(Some(&repo));
+        // GitHub is the bundled plugin, and its `gh` is the fake.
+        let config = format!(
+            "[plugins.github]\nprogram = \"{}\"\n",
+            fake.program().display()
+        );
+        let mut h = Harness::open_fresh(Some(&repo), (1280.0, 800.0), &config, "");
         h.wait_for_graph();
-        h.act(|ui, _| {
-            ui.forge.forges = diffui_core::forge::Forges::with_programs(
-                fake.program(),
-                "/nonexistent/diffui-test/glab".into(),
-            )
+        h.wait_until("GitHub's plugin", |ui| {
+            ui.plugins
+                .get("github")
+                .is_some_and(|found| matches!(found.state, crate::plugins::State::Running(_)))
         });
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
