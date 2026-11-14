@@ -158,6 +158,84 @@ fn manifest_text(id: &str, main: &str, forge: Option<&str>) -> String {
     text
 }
 
+/// The shape `init --forge` reads pull requests in, for `main.ts`.
+const API_PULL_TS: &str = r#"
+// A pull request as the forge's API returns it: the fields read below. This
+// is Forgejo's and Gitea's shape (GET /api/v1/repos/{owner}/{name}/pulls);
+// for another forge, change it, the URL and the mapping.
+interface ApiPull {
+  number: number;
+  html_url: string;
+  title: string;
+  state: "open" | "closed";
+  draft: boolean;
+  merged: boolean;
+  head: { ref: string; sha: string; repo_id: number };
+  base: { ref: string; repo_id: number };
+}
+"#;
+
+/// The same for `main.js`, as a JSDoc type.
+const API_PULL_JS: &str = r#"
+/**
+ * A pull request as the forge's API returns it: the fields read below. This
+ * is Forgejo's and Gitea's shape (GET /api/v1/repos/{owner}/{name}/pulls);
+ * for another forge, change it, the URL and the mapping.
+ *
+ * @typedef {object} ApiPull
+ * @property {number} number
+ * @property {string} html_url
+ * @property {string} title
+ * @property {"open" | "closed"} state
+ * @property {boolean} draft
+ * @property {boolean} merged
+ * @property {{ ref: string, sha: string, repo_id: number }} head
+ * @property {{ ref: string, repo_id: number }} base
+ */
+"#;
+
+/// The provider `init --forge` writes. `@PULLS@` declares the API's answer
+/// and `@PULL@` is the mapping's parameter, each typed the language's way.
+const FORGE_PROVIDER: &str = r#"
+// The forge. diffui asks; these answer with data, and diffui draws the badges
+// and dialogs. Leave a method out and diffui turns off what needs it
+// (`diffui plugin check` says what).
+forge.register({
+  // The pull requests whose head is one of `branches`, in any state.
+  async pullRequests(repo, { branches }) {
+    const remote = repo.forgeRemote;
+    if (!remote) return [];
+    // The token git has for the remote's host. A forge whose API is on another
+    // host needs both hosts under [permissions] http: this one for the token,
+    // the API's for http.fetch.
+    const token = await auth.token(remote.host);
+    const api = `${new URL(remote.webUrl).origin}/api/v1/repos/${remote.owner}/${remote.name}`;
+    const res = await http.fetch(`${api}/pulls?state=all`, {
+      headers: { accept: "application/json", authorization: `token ${token}` },
+    });
+    if (!res.ok) throw new Error(`${remote.host} answered ${res.status}`);
+@PULLS@
+    return pulls
+      // Not the ones from forks: their head is in another repository.
+      .filter((pull) => pull.head.repo_id === pull.base.repo_id && branches.includes(pull.head.ref))
+      .map(@PULL@ => ({
+        number: pull.number,
+        url: pull.html_url,
+        title: pull.title,
+        head: pull.head.ref,
+        base: pull.base.ref,
+        headSha: pull.head.sha,
+        state: pull.merged ? "merged" : pull.state === "closed" ? "closed" : pull.draft ? "draft" : "open",
+      }));
+  },
+  // The checks on a commit (`sha` is a pull request's `headSha`): "pending",
+  // "success", "failure", or "none" when it has none.
+  async checks(_repo, _sha) {
+    return { state: "none" };
+  },
+});
+"#;
+
 /// What `init` writes as the main module.
 fn main_text(id: &str, ts: bool, forge: bool) -> String {
     let mut imports = vec!["commands", "ui"];
@@ -167,9 +245,14 @@ fn main_text(id: &str, ts: bool, forge: bool) -> String {
     imports.sort_unstable();
     let mut text = String::new();
     if ts {
+        let types = if forge {
+            "type CommandContext, type PullRequest"
+        } else {
+            "type CommandContext"
+        };
         let _ = writeln!(
             text,
-            "import {{ {}, type CommandContext }} from \"diffui\";\n",
+            "import {{ {}, {types} }} from \"diffui\";\n",
             imports.join(", ")
         );
     } else {
@@ -194,39 +277,24 @@ fn main_text(id: &str, ts: bool, forge: bool) -> String {
          }});\n"
     );
     if forge {
-        let _ = write!(
-            text,
-            "\n\
-             // The forge. diffui asks; these answer with data, and diffui draws the badges\n\
-             // and dialogs. Leave a method out and diffui hides what needs it.\n\
-             forge.register({{\n\
-             \x20 // The pull requests whose head is one of `branches`.\n\
-             \x20 async pullRequests(repo, {{ branches }}) {{\n\
-             \x20   const remote = repo.forgeRemote;\n\
-             \x20   if (!remote) return [];\n\
-             \x20   const token = await auth.token(remote.host);\n\
-             \x20   const res = await http.fetch(`${{new URL(remote.webUrl).origin}}/api/v1/repos/${{remote.owner}}/${{remote.name}}/pulls`, {{\n\
-             \x20     headers: {{ accept: \"application/json\", authorization: `token ${{token}}` }},\n\
-             \x20   }});\n\
-             \x20   if (!res.ok) throw new Error(`${{remote.host}} answered ${{res.status}}`);\n\
-             \x20   const pulls = await res.json();\n\
-             \x20   return pulls\n\
-             \x20     .filter((pull) => branches.includes(pull.head.ref))\n\
-             \x20     .map((pull) => ({{\n\
-             \x20       number: pull.number,\n\
-             \x20       url: pull.html_url,\n\
-             \x20       title: pull.title,\n\
-             \x20       head: pull.head.ref,\n\
-             \x20       base: pull.base.ref,\n\
-             \x20       headSha: pull.head.sha,\n\
-             \x20       state: pull.merged ? \"merged\" : pull.state === \"closed\" ? \"closed\" : \"open\",\n\
-             \x20     }}));\n\
-             \x20 }},\n\
-             \x20 // The checks on a commit: \"pending\", \"success\", \"failure\" or \"none\".\n\
-             \x20 async checks(repo, sha) {{\n\
-             \x20   return {{ state: \"none\" }};\n\
-             \x20 }},\n\
-             }});\n"
+        let (shape, pulls, pull) = if ts {
+            (
+                API_PULL_TS,
+                "    const pulls: ApiPull[] = await res.json();",
+                "(pull): PullRequest",
+            )
+        } else {
+            (
+                API_PULL_JS,
+                "    /** @type {ApiPull[]} */\n    const pulls = await res.json();",
+                "(pull)",
+            )
+        };
+        text.push_str(shape);
+        text.push_str(
+            &FORGE_PROVIDER
+                .replace("@PULLS@", pulls)
+                .replace("@PULL@", pull),
         );
     }
     text
@@ -554,6 +622,17 @@ mod tests {
             // Outside the plugins folder, the next step names the whole path.
             let next = format!("run `diffui plugin check {}`", dir.display());
             assert!(said.contains(&next), "{said}");
+
+            let written =
+                std::fs::read_to_string(dir.join(if ts { "main.ts" } else { "main.js" })).unwrap();
+            assert_eq!(
+                written.contains("pull.draft ? \"draft\" : \"open\""),
+                forge.is_some()
+            );
+            assert_eq!(
+                written.contains("const pulls: ApiPull[] = await res.json();"),
+                ts && forge.is_some()
+            );
             let main = if ts { "main.ts" } else { "main.js" };
             for file in [
                 MANIFEST_FILE,
