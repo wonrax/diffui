@@ -1858,6 +1858,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre-apple",
  "icu_segmenter",
+ "markdown",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "raw-window-handle",

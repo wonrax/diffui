@@ -689,7 +689,8 @@ pub fn firm_ring(theme: ThemeSpec) -> Color {
 }
 
 /// Primary call-to-action: the accent, with an inverted label, a darker inner
-/// ring and a faint lift, well away from the destructive red.
+/// ring, well away from the destructive red. Its lift is the raised
+/// button's: a heavier one reads as a bigger button beside Cancel.
 pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
     ButtonStyle {
         rest: Some(theme.accent),
@@ -697,7 +698,7 @@ pub fn primary_button_style(theme: ThemeSpec) -> ButtonStyle {
         active: mix(theme.accent, theme.text, 0.18),
         label: theme.background,
         ring: Some(Color { a: 0.10, ..BLACK }),
-        lift: Some(lift(0.08, 1.0)),
+        lift: Some(lift(0.05, 1.0)),
     }
 }
 
@@ -736,7 +737,7 @@ pub fn destructive_button_style(theme: ThemeSpec) -> ButtonStyle {
         active: mix(theme.removed_text, theme.text, 0.18),
         label: theme.background,
         ring: Some(Color { a: 0.10, ..BLACK }),
-        lift: Some(lift(0.08, 1.0)),
+        lift: Some(lift(0.05, 1.0)),
     }
 }
 

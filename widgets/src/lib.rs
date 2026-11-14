@@ -14,6 +14,7 @@ pub mod hunk_actions;
 pub mod icons;
 pub mod input;
 pub mod keys;
+pub mod markdown;
 pub mod measure;
 pub mod prose;
 pub mod resize_handle;

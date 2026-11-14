@@ -10,6 +10,9 @@ gpui-kit = { workspace = true }
 # engine would.
 icu_segmenter = "2.3"
 raw-window-handle = "0.6"
+# Already in the tree through GPUI's component layer, with the same feature:
+# the Markdown renderer's parser.
+markdown = { version = "1.0.0", features = ["serde"] }
 tracing = "0.1"
 
 [dev-dependencies]
