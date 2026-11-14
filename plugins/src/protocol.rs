@@ -185,6 +185,8 @@ pub enum PluginCall {
     Command { id: String, context: CommandContext },
     /// Ask the registered forge provider. The reply is named on [`ForgeCall`].
     Forge { repo: RepoHandle, call: ForgeCall },
+    /// Ask the registered AI provider. The reply is named on [`AiCall`].
+    Ai { call: AiCall },
     /// Deliver an event to its listeners. Fire and forget: the reply is
     /// `null` as soon as the listeners were called, and what they throw goes
     /// to the plugin's log.
@@ -245,6 +247,67 @@ pub enum ForgeCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<Secret>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "camelCase")]
+pub enum AiCall {
+    /// Write a reply to `request`. Streams the text through the call's
+    /// parts, each a string, then replies `null`.
+    Complete { request: AiRequest },
+    /// The models the provider offers. Reply: `Vec<`[`AiModel`]`>`.
+    Models,
+    /// What the provider runs as. Reply: [`AiAccount`].
+    Account,
+}
+
+impl AiCall {
+    /// The provider method this calls, as the script names it.
+    pub fn method(&self) -> &'static str {
+        match self {
+            AiCall::Complete { .. } => "complete",
+            AiCall::Models => "models",
+            AiCall::Account => "account",
+        }
+    }
+}
+
+/// The provider methods a script can register: `complete` is required.
+pub const AI_METHODS: [&str; 3] = ["complete", "models", "account"];
+
+/// What an AI provider is asked to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRequest {
+    /// The instructions.
+    pub prompt: String,
+    /// What they are about (a diff): a command-line provider's stdin.
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub system: Option<String>,
+    /// A model other than the one the provider's settings name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The repository's root, where a command-line provider runs.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiModel {
+    /// What the provider's `model` setting takes.
+    pub id: String,
+    /// A name to show beside it.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// What a provider runs as: a program's version, whose key it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAccount {
+    /// One line for Settings: "claude 2.1.4", "A key for Acme".
+    pub label: String,
 }
 
 /// A token on its way to the script: never printed.

@@ -1,0 +1,30 @@
+# An OpenAI-compatible chat completions API as diffui's AI: OpenAI itself,
+# or OpenRouter, Ollama, LM Studio and the like at their own address.
+# Bundled with diffui; Settings → AI picks it, and `diffui plugin eject
+# openai` copies it out to edit.
+id = "openai"
+name = "OpenAI-compatible"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+http = ["{config.base_url}"]
+env = ["OPENAI_API_KEY"]
+
+[provides.ai]
+# A local server needs no key; it is set up once it has a model.
+ready = "model"
+model = "model"
+label = "name"
+
+[config.schema]
+name = { type = "string", default = "OpenAI-compatible", label = "Name", hint = "What diffui calls it: OpenAI, OpenRouter, Ollama…" }
+base_url = { type = "string", default = "https://api.openai.com/v1", label = "API address", hint = "Where /chat/completions and /models are: http://localhost:11434/v1 for Ollama." }
+model = { type = "string", label = "Model", hint = "Pick one from the server's list." }
+
+[config.schema.api_key]
+type = "secret"
+label = "API key"
+hint = "Not needed for a local server. Or set OPENAI_API_KEY."
+env = { "*" = ["OPENAI_API_KEY"] }

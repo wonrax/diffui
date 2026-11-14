@@ -28,7 +28,7 @@ use crate::host::{
 };
 use crate::js::{Fault, Js, JsError, MainState, StartError, Turn};
 use crate::manifest::{HostPattern, JjAccess, Manifest};
-use crate::protocol::{HostCall, PluginCall, RepoCall};
+use crate::protocol::{AiCall, HostCall, PluginCall, RepoCall};
 use crate::secrets::{self, SecretStore};
 use crate::{Limits, Options};
 
@@ -154,6 +154,8 @@ struct PendingCall {
     reply: ReplyFn,
     what: String,
     deadline: Option<Instant>,
+    /// How long a streaming call may go between parts.
+    window: Duration,
     /// A streaming call's parts; each one moves the deadline.
     parts: Option<PartFn>,
 }
@@ -245,6 +247,10 @@ impl Actor {
             }
             hosts.extend(lock(&self.forge_hosts).iter().cloned());
         }
+        hosts.extend(crate::manifest::resolve_http(
+            &permissions.http_config,
+            &self.config,
+        ));
         hosts
     }
 
@@ -452,6 +458,11 @@ impl Actor {
                 "plugin.toml provides a forge but {main} never called forge.register"
             ));
         }
+        if self.manifest.ai.is_some() && registration.ai.is_none() {
+            return Err(format!(
+                "plugin.toml provides ai but {main} never called ai.register"
+            ));
+        }
         Ok(registration)
     }
 
@@ -587,6 +598,7 @@ impl Actor {
             }
             Phase::Ready { registration, .. } => registration,
         };
+        let mut window = self.limits.forge_call;
         let (what, deadline) = match &call {
             PluginCall::Command { id, .. } => {
                 if !registration.commands.contains(id) {
@@ -594,6 +606,22 @@ impl Actor {
                 }
                 // A command may sit in a prompt for as long as the user does.
                 (format!("command \"{id}\""), None)
+            }
+            PluginCall::Ai { call } => {
+                let method = call.method();
+                let registered = registration
+                    .ai
+                    .as_ref()
+                    .is_some_and(|methods| methods.iter().any(|m| m == method));
+                if !registered {
+                    return reply(Err(PluginError::NotRegistered(format!(
+                        "ai method {method}"
+                    ))));
+                }
+                if matches!(call, AiCall::Complete { .. }) {
+                    window = self.limits.ai_call;
+                }
+                (format!("ai.{method}"), Some(Instant::now() + window))
             }
             PluginCall::Forge { call, .. } => {
                 let method = call.method();
@@ -624,6 +652,7 @@ impl Actor {
                 reply,
                 what,
                 deadline,
+                window,
                 parts,
             },
         );
@@ -769,7 +798,7 @@ impl Actor {
             stream: u64,
         }
         #[derive(Deserialize)]
-        struct ForgePart {
+        struct CallPart {
             call: u64,
             parts: Vec<Value>,
         }
@@ -839,9 +868,8 @@ impl Actor {
                 self.streams.remove(&stream);
                 self.answer(id, Ok(Value::Null));
             }
-            "forge.part" => {
-                let ForgePart { call, parts: sent } = read(op, args)?;
-                let forge_call = limits.forge_call;
+            "call.part" => {
+                let CallPart { call, parts: sent } = read(op, args)?;
                 let pending = self.calls.get_mut(&call);
                 let Some((pending, parts)) =
                     pending.and_then(|pending| pending.parts.take().map(|parts| (pending, parts)))
@@ -851,7 +879,7 @@ impl Actor {
                         "this call takes no parts, or it has ended",
                     ));
                 };
-                pending.deadline = Some(Instant::now() + forge_call);
+                pending.deadline = Some(Instant::now() + pending.window);
                 let mut parts = parts;
                 parts(
                     sent,

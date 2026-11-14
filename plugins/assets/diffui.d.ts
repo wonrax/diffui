@@ -85,6 +85,18 @@
  * host it claims is reachable, the patterns, what `hosts()` answered, the user's `hosts` setting and the hosts it
  * has a token for (GitHub Enterprise's `https://<host>/api/v3`).
  *
+ * An AI provider (a model diffui sends a prompt and a diff to, for "Generate description" and `agent` commands)
+ * says so, and which of its settings matter to the app:
+ *
+ *     [provides.ai]
+ *     ready = "api_key"     # a "path", "secret" or "string" setting: the provider is set up when the program is
+ *                           # there, the secret is set (stored, or its env variable), the string isn't empty
+ *     model = "model"       # a "string" setting Settings offers the provider's models() for
+ *     label = "name"        # a "string" setting with what to call it ("Ollama")
+ *
+ *     [permissions]
+ *     http = ["{config.base_url}"]   # a "{config.<key>}" word reaches the host of the address that string setting holds
+ *
  * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
  * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
  * may reach: `http.fetch` goes only there, and `auth.token(host)` answers only for a host listed there. A forge
@@ -109,9 +121,10 @@
  *   see them. Check them yourself with the tsconfig.json (or jsconfig.json) `diffui plugin init` writes, from
  *   the plugin's folder: `npx -p typescript tsc --noEmit` (`-p jsconfig.json` for JavaScript). It finds the
  *   API's types because this file sits beside the module; without it there, `"diffui"` doesn't resolve.
- * - Plugins never draw. They answer questions (a forge provider), run commands and fill the slots in `ui`.
- * - Call `commands.register`, `forge.register` and `events.on` while the main module loads (top-level `await`
- *   is fine). Loading fails if a declared command or forge has no handler, or if anything throws.
+ * - Plugins never draw. They answer questions (a forge or AI provider), run commands and fill the slots in `ui`.
+ * - Call `commands.register`, `forge.register`, `ai.register` and `events.on` while the main module loads
+ *   (top-level `await` is fine). Loading fails if a declared command or provider has no handler, or if anything
+ *   throws.
  * - Every host function returns a promise. A refusal rejects with an `Error` whose `name` is "PermissionError";
  *   a timeout with "TimeoutError"; a cancelled call with "AbortError".
  * - A handler that runs for more than half a second without awaiting, or a heap past 64 MB, stops the plugin
@@ -326,6 +339,81 @@ declare module "diffui" {
   }
 
   export type ForgeErrorKind = "missing-cli" | "auth" | "not-found" | "rate-limited" | "unreachable" | "timeout" | "failed";
+
+  /**
+   * The AI provider, for a plugin whose manifest has `[provides.ai]`. Settings → AI lists every provider; the
+   * user picks one (or leaves it on automatic), and "Generate description" and `agent` command rows send their
+   * prompt and diff to it.
+   */
+  export const ai: Ai;
+
+  export interface Ai {
+    /** Call once, at load. */
+    register(provider: AiProvider): void;
+  }
+
+  /**
+   * What diffui asks an AI provider. Only `complete` is required. Throw `AiError` so the app can say what to do
+   * ("Add an API key in Settings → AI → Anthropic").
+   */
+  export interface AiProvider {
+    /**
+     * The reply to `request`, as it is written: text pieces cut anywhere, or the whole text. Pass `signal` to
+     * every `exec` and `http.fetch`: it aborts when the user stops it, and the program is killed. diffui waits
+     * up to ten minutes between pieces.
+     *
+     *     async *complete(req, { signal }) {
+     *       const out = await exec.stream(["claude", "-p", req.prompt], { stdin: req.input ?? undefined, cwd: req.cwd ?? undefined, signal });
+     *       yield* out;
+     *       const { ok, stderr } = await out.ended;
+     *       if (!ok) throw new AiError("failed", stderr);
+     *     }
+     */
+    complete(request: AiRequest, options: { signal: AbortSignal }): string | AsyncIterable<string> | Promise<string | AsyncIterable<string>>;
+    /** The models the `[provides.ai] model` setting can take, for Settings' picker. */
+    models?(): Promise<AiModel[]>;
+    /** What the provider runs as, in one line for Settings ("claude 2.1.4"). Throw `AiError` when it can't run. */
+    account?(): Promise<AiAccount>;
+  }
+
+  export interface AiRequest {
+    /** The instructions. */
+    readonly prompt: string;
+    /** What they are about (a diff). A command-line agent gets it on stdin. */
+    readonly input: string | null;
+    readonly system: string | null;
+    /** A model other than the one the settings name, when the caller wants one. */
+    readonly model: string | null;
+    /** The repository's root: where a command-line agent runs. */
+    readonly cwd: string | null;
+  }
+
+  export interface AiModel {
+    /** What the model setting takes. */
+    id: string;
+    /** A name to show beside it. */
+    name?: string | null;
+  }
+
+  export interface AiAccount {
+    label: string;
+  }
+
+  /**
+   * A failure an AI provider throws to say what kind it is. The message is shown, followed by what to do:
+   *
+   * - "missing-cli": the program isn't there (exec rejects with "NotFoundError")
+   * - "auth": no key, a refused key, or a command-line agent that isn't signed in
+   * - "rate-limited", "unreachable"
+   * - "failed": anything else, a refusal or a reply cut at its token limit among them
+   */
+  export class AiError extends Error {
+    constructor(kind: AiErrorKind, message?: string);
+    readonly name: "AiError";
+    readonly kind: AiErrorKind;
+  }
+
+  export type AiErrorKind = "missing-cli" | "auth" | "rate-limited" | "unreachable" | "failed";
 
   export interface PullRequest {
     number: number;

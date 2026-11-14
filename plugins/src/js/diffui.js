@@ -11,6 +11,7 @@ delete globalThis.__diffui_boot;
 const { send, utf8Encode, utf8Decode } = boot.native;
 const declaredCommands = new Set(boot.commands);
 const providesForge = boot.forge;
+const providesAi = boot.ai;
 const eventNames = boot.events;
 
 const post = (message) => send(JSON.stringify(message));
@@ -515,6 +516,7 @@ let loading = true;
 const commandHandlers = new Map();
 const listeners = new Map();
 let forgeProvider = null;
+let aiProvider = null;
 
 function whileLoading(what) {
   if (!loading) throw new Error(`${what} must run while the plugin loads (at the top level of its main module), not later`);
@@ -544,6 +546,18 @@ export const forge = freezeDeep({
       throw new TypeError("forge.register needs an object with at least a pullRequests(repo, { branches }) method");
     }
     forgeProvider = provider;
+  },
+});
+
+export const ai = freezeDeep({
+  register(provider) {
+    whileLoading("ai.register");
+    if (!providesAi) throw new Error("ai.register needs `[provides.ai]` in plugin.toml");
+    if (aiProvider) throw new Error("ai.register was called twice");
+    if (!provider || typeof provider.complete !== "function") {
+      throw new TypeError("ai.register needs an object with at least a complete(request, { signal }) method");
+    }
+    aiProvider = provider;
   },
 });
 
@@ -751,6 +765,19 @@ export class ForgeError extends Error {
   }
 }
 
+const AI_ERROR_KINDS = ["missing-cli", "auth", "rate-limited", "unreachable", "failed"];
+
+export class AiError extends Error {
+  constructor(kind, message = "") {
+    if (!AI_ERROR_KINDS.includes(kind)) {
+      throw new TypeError(`AiError kind "${kind}" is not one of ${AI_ERROR_KINDS.join(", ")}`);
+    }
+    super(String(message));
+    this.name = "AiError";
+    this.kind = kind;
+  }
+}
+
 export const auth = freezeDeep({
   token(host, options = {}) {
     return call("auth.token", { host: String(host), git: options.git !== false });
@@ -846,6 +873,9 @@ function describe(thrown) {
     const { kind, host, what } = thrown;
     return { name: thrown.name, message: thrown.message, stack: thrown.stack ?? "", forge: { kind, host, what } };
   }
+  if (thrown instanceof AiError) {
+    return { name: thrown.name, message: thrown.message, stack: thrown.stack ?? "", ai: thrown.kind };
+  }
   if (thrown instanceof Error) {
     return { name: thrown.name, message: thrown.message, stack: thrown.stack ?? "" };
   }
@@ -895,7 +925,19 @@ async function askForge(id, repo, request, signal) {
   }
 }
 
-/** The most parts one `forge.part` hands over. */
+async function askAi(id, request, signal) {
+  switch (request.method) {
+    case "complete":
+      await sendParts(id, await aiProvider.complete(Object.freeze({ ...request.request }), { signal }), signal, "complete", true);
+      return null;
+    case "models":
+      return aiProvider.models();
+    case "account":
+      return aiProvider.account();
+  }
+}
+
+/** The most parts one `call.part` hands over. */
 const PART_BATCH = 64;
 
 /**
@@ -903,19 +945,23 @@ const PART_BATCH = 64;
  * while one batch is with the host go in the next. Waits for a batch to be
  * taken before sending another, and stops pulling once a batch is full.
  */
-async function sendParts(id, source, signal, what) {
+async function sendParts(id, source, signal, what, textOnly = false) {
   const check = (part) => {
     signal.throwIfAborted();
+    if (textOnly && typeof part !== "string") {
+      throw new TypeError(`${what} sent a part that isn't text`);
+    }
     if (typeof part !== "string" && (part === null || typeof part !== "object" || typeof part.path !== "string")) {
       throw new TypeError(`${what} sent a part that is neither diff text nor a file ({ path, status, patch })`);
     }
   };
   if (typeof source === "string") {
     check(source);
-    return call("forge.part", { call: id, parts: [source] }, { signal });
+    return call("call.part", { call: id, parts: [source] }, { signal });
   }
   if (source == null || (typeof source[Symbol.asyncIterator] !== "function" && typeof source[Symbol.iterator] !== "function")) {
-    throw new TypeError(`${what} must give diff text, an array of parts or an (async) iterable of them`);
+    const parts = textOnly ? "text or an (async) iterable of text" : "diff text, an array of parts or an (async) iterable of them";
+    throw new TypeError(`${what} must give ${parts}`);
   }
   let batch = [];
   let sending = null;
@@ -923,7 +969,7 @@ async function sendParts(id, source, signal, what) {
   const send = () => {
     const parts = batch;
     batch = [];
-    sending = call("forge.part", { call: id, parts }, { signal }).then(
+    sending = call("call.part", { call: id, parts }, { signal }).then(
       () => {
         sending = null;
       },
@@ -948,7 +994,7 @@ async function sendParts(id, source, signal, what) {
   }
 }
 
-const forgeCalls = new Map();
+const providerCalls = new Map();
 
 function deliver(event) {
   const { name, repo, ...rest } = event;
@@ -970,13 +1016,17 @@ async function answer(id, request) {
       case "command":
         await commandHandlers.get(request.id)(commandContext(request.context));
         break;
-      case "forge": {
+      case "forge":
+      case "ai": {
         const controller = new AbortController();
-        forgeCalls.set(id, controller);
+        providerCalls.set(id, controller);
         try {
-          value = (await askForge(id, new Repo(request.repo), request.call, controller.signal)) ?? null;
+          value =
+            (request.kind === "forge"
+              ? await askForge(id, new Repo(request.repo), request.call, controller.signal)
+              : await askAi(id, request.call, controller.signal)) ?? null;
         } finally {
-          forgeCalls.delete(id);
+          providerCalls.delete(id);
         }
         break;
       }
@@ -1011,7 +1061,7 @@ boot.dispatch = (json) => {
       answer(message.id, message.call);
       break;
     case "abort":
-      forgeCalls.get(message.id)?.abort();
+      providerCalls.get(message.id)?.abort();
       break;
   }
 };
@@ -1021,6 +1071,7 @@ boot.finishLoad = () => {
   return JSON.stringify({
     commands: [...commandHandlers.keys()],
     forge: forgeProvider && boot.forgeMethods.filter((method) => typeof forgeProvider[method] === "function"),
+    ai: aiProvider && boot.aiMethods.filter((method) => typeof aiProvider[method] === "function"),
     events: [...listeners.keys()],
   });
 };

@@ -729,11 +729,20 @@ fn check_manifest(manifest: Manifest, dir: &Path) -> Result<String, String> {
 fn permissions_line(manifest: &Manifest) -> String {
     let permissions = &manifest.permissions;
     let mut parts = Vec::new();
-    if !permissions.http.is_empty() || permissions.forge_hosts {
+    if !permissions.http.is_empty()
+        || permissions.forge_hosts
+        || !permissions.http_config.is_empty()
+    {
         let mut hosts: Vec<String> = permissions.http.iter().map(ToString::to_string).collect();
         if permissions.forge_hosts {
             hosts.push(diffui_plugins::FORGE_HOSTS.to_owned());
         }
+        hosts.extend(
+            permissions
+                .http_config
+                .iter()
+                .map(|key| format!("{{config.{key}}}")),
+        );
         parts.push(format!("http {}", hosts.join(", ")));
     }
     for argv in &permissions.exec {

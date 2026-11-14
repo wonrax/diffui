@@ -74,6 +74,10 @@ pub(crate) fn verdict(record: Option<&Record>, asked: &Permissions) -> Verdict {
 fn covers(granted: &Permissions, asked: &Permissions) -> bool {
     asked.jj <= granted.jj
         && (!asked.forge_hosts || granted.forge_hosts)
+        && asked
+            .http_config
+            .iter()
+            .all(|key| granted.http_config.contains(key))
         && asked.http.iter().all(|host| granted.http.contains(host))
         && asked.exec.iter().all(|argv| exec_covered(granted, argv))
         && asked.env.iter().all(|var| granted.env.contains(var))
@@ -133,6 +137,22 @@ pub(crate) fn lines(manifest: &Manifest, before: Option<&Permissions>) -> Vec<Li
                 "Send requests to every host it shows pull requests for",
                 None,
                 before.is_some_and(|before| !before.forge_hosts),
+            )
+        });
+    }
+    for key in &asked.http_config {
+        let setting = manifest
+            .config
+            .iter()
+            .find(|field| &field.key == key)
+            .map_or(key.as_str(), |field| field.title());
+        lines.push(Line {
+            tail: " setting",
+            ..line(
+                icons::EXTERNAL_LINK,
+                "Send requests to the address in its",
+                Some(setting.to_owned()),
+                before.is_some_and(|before| !before.http_config.contains(key)),
             )
         });
     }
@@ -234,6 +254,7 @@ mod tests {
                 .map(|argv| argv.iter().map(|word| (*word).to_owned()).collect())
                 .collect(),
             forge_hosts: false,
+            http_config: Vec::new(),
             env: Vec::new(),
             read: Vec::new(),
             jj,

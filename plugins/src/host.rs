@@ -125,6 +125,10 @@ pub struct Registration {
     /// The forge provider's methods (of [`crate::protocol::FORGE_METHODS`]),
     /// or `None` without a provider.
     pub forge: Option<Vec<String>>,
+    /// The AI provider's methods (of [`crate::protocol::AI_METHODS`]), or
+    /// `None` without a provider.
+    #[serde(default)]
+    pub ai: Option<Vec<String>>,
     /// Event names with at least one listener; the rest need not be sent.
     pub events: Vec<String>,
 }
@@ -154,8 +158,8 @@ pub enum PluginError {
     Threw(JsError),
     /// The plugin is in the failed state; the text says why.
     Failed(String),
-    /// Nothing is registered under that command id, forge method or the
-    /// plugin has no forge provider.
+    /// Nothing is registered under that command id or provider method, or
+    /// the plugin has no such provider.
     NotRegistered(String),
     /// The plugin was reloaded or shut down while the call was out.
     Gone,

@@ -476,7 +476,7 @@ impl Server {
     }
 }
 
-fn read_request(reader: &mut impl BufRead) -> Option<Request> {
+pub fn read_request(reader: &mut impl BufRead) -> Option<Request> {
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     let mut words = line.split_whitespace();

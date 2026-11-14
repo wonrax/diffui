@@ -78,6 +78,8 @@ pub struct Manifest {
     pub permissions: Permissions,
     /// `[provides] forge`: the hosts whose remotes this plugin answers for.
     pub forge: Option<ForgeClaim>,
+    /// `[provides] ai`: the plugin is an AI provider.
+    pub ai: Option<AiClaim>,
     pub commands: Vec<CommandDecl>,
     /// `[config.schema]`, by key.
     pub config: Vec<ConfigField>,
@@ -94,6 +96,11 @@ pub struct Permissions {
     /// are reachable too.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forge_hosts: bool,
+    /// `http` holds `{config.<key>}` words: the host of the address each of
+    /// those string settings holds is reachable too (an API's base URL the
+    /// user can point at a proxy or a local server).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_config: Vec<String>,
     /// Argv prefixes `exec` may run. A word `{config.<key>}` stands for
     /// that string setting, so the user can point the plugin at a program.
     #[serde(default)]
@@ -259,6 +266,22 @@ pub struct ForgeClaim {
     pub pull_request_path: Option<String>,
     /// A project's owner may be several segments (GitLab's groups).
     pub subgroups: bool,
+}
+
+/// What an AI provider tells the app before its script runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AiClaim {
+    /// The setting that says whether it is set up to run, for the app's
+    /// automatic pick and its AI commands: a `path` (the program is there),
+    /// a `secret` (one is stored, or its variable is set) or a `string`
+    /// (it isn't empty: a model a local server needs).
+    pub ready: Option<String>,
+    /// The string setting that holds what to call it, when the user names
+    /// it ("Ollama" for an OpenAI-compatible server).
+    pub label: Option<String>,
+    /// The string setting that names the model, which Settings fills from
+    /// the provider's `models()`.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -471,6 +494,15 @@ struct RawPermissions {
 #[serde(deny_unknown_fields)]
 struct RawProvides {
     forge: Option<RawForge>,
+    ai: Option<RawAi>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAi {
+    ready: Option<Spanned<String>>,
+    model: Option<Spanned<String>>,
+    label: Option<Spanned<String>>,
 }
 
 #[derive(Deserialize)]
@@ -678,6 +710,9 @@ impl Manifest {
             .iter()
             .cloned()
             .partition(|host| host.get_ref() == FORGE_HOSTS);
+        let (config_words, http_hosts): (Vec<_>, Vec<_>) = http_hosts
+            .into_iter()
+            .partition(|host| config_word(host.get_ref()).is_some());
         let http = hosts(&http_hosts, &mut report);
         if let Some(word) = forge_words.first()
             && raw.provides.forge.is_none()
@@ -1020,6 +1055,57 @@ impl Manifest {
             config.push(field);
         }
 
+        let string_setting = |key: &str| {
+            config.iter().any(|field: &ConfigField| {
+                field.key == key
+                    && !field.per_host
+                    && matches!(field.kind, ConfigKind::String | ConfigKind::Path)
+            })
+        };
+        let mut http_config = Vec::new();
+        for word in &config_words {
+            let key = config_word(word.get_ref()).unwrap_or_default();
+            if string_setting(key) {
+                http_config.push(key.to_owned());
+            } else {
+                report.at(
+                    word.span(),
+                    format!("http {}: [config.schema] must declare {key} = {{ type = \"string\" }}, an address like \"https://api.example.com\"", word.get_ref()),
+                );
+            }
+        }
+        let ai = raw.provides.ai.map(|ai| {
+            let mut setting = |key: Option<Spanned<String>>, what: &str, kinds: &[ConfigKind]| {
+                let key = key?;
+                let fits = config.iter().any(|field: &ConfigField| {
+                    field.key == *key.get_ref() && !field.per_host && kinds.contains(&field.kind)
+                });
+                if !fits {
+                    report.at(
+                        key.span(),
+                        format!(
+                            "ai.{what} \"{}\": [config.schema] must declare it, {}",
+                            key.get_ref(),
+                            match what {
+                                "ready" => "a path, a secret or a string",
+                                _ => "a string",
+                            }
+                        ),
+                    );
+                }
+                Some(key.into_inner())
+            };
+            AiClaim {
+                ready: setting(
+                    ai.ready,
+                    "ready",
+                    &[ConfigKind::Path, ConfigKind::Secret, ConfigKind::String],
+                ),
+                model: setting(ai.model, "model", &[ConfigKind::String]),
+                label: setting(ai.label, "label", &[ConfigKind::String]),
+            }
+        });
+
         for argv in &raw.permissions.exec {
             for word in argv.get_ref() {
                 let Some(key) = config_word(word) else {
@@ -1051,6 +1137,7 @@ impl Manifest {
             permissions: Permissions {
                 http,
                 forge_hosts: !forge_words.is_empty(),
+                http_config,
                 exec: raw
                     .permissions
                     .exec
@@ -1062,6 +1149,7 @@ impl Manifest {
                 jj,
             },
             forge,
+            ai,
             commands,
             config,
         })
@@ -1180,6 +1268,27 @@ fn home_dir() -> &'static Path {
 /// The setting an exec permission's word `{config.<key>}` stands for.
 pub(crate) fn config_word(word: &str) -> Option<&str> {
     word.strip_prefix("{config.")?.strip_suffix('}')
+}
+
+/// The hosts the `{config.<key>}` words of `[permissions] http` reach: the
+/// host (and port) of the address each of those settings holds. A setting
+/// that isn't an address reaches nothing.
+pub(crate) fn resolve_http(
+    keys: &[String],
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<HostPattern> {
+    keys.iter()
+        .filter_map(|key| {
+            let url = config.get(key)?.as_str()?.trim();
+            let rest = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))?;
+            let authority = rest.split(['/', '?', '#']).next()?;
+            let authority = authority.rsplit('@').next()?;
+            HostPattern::parse(&authority.to_ascii_lowercase()).ok()
+        })
+        .filter(|host| !host.to_string().starts_with('*'))
+        .collect()
 }
 
 /// The exec permissions with every `{config.<key>}` word replaced by that

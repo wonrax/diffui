@@ -5,9 +5,9 @@
 use std::collections::BTreeSet;
 
 use diffui_plugins::protocol::{
-    Bookmark, CheckState, Checks, Choice, CreatePullRequest, Diff, EVENT_NAMES, FORGE_METHODS,
-    JjRun, PrState, PullRequest, Remote, RemoteBookmark, RevisionRef, Row, Selection,
-    UpdatePullRequest,
+    AI_METHODS, AiAccount, AiModel, AiRequest, Bookmark, CheckState, Checks, Choice,
+    CreatePullRequest, Diff, EVENT_NAMES, FORGE_METHODS, JjRun, PrState, PullRequest, Remote,
+    RemoteBookmark, RevisionRef, Row, Selection, UpdatePullRequest,
 };
 use serde_json::{Value, json};
 
@@ -108,10 +108,14 @@ fn the_type_definitions_declare_exactly_what_the_runtime_installs() {
     );
     let server = Server::start(|_| Response::text(200, "ok"));
     let plugin = Setup::new(
-        &format!("[permissions]\nhttp = [\"{}\"]\nexec = [[\"true\"]]\n", server.host),
+        &format!(
+            "[permissions]\nhttp = [\"{}\"]\nexec = [[\"true\"]]\n\n[provides.ai]\n",
+            server.host
+        ),
         &format!(
             r#"import * as diffui from "diffui";
-const {{ auth, commands, config, events, exec, files, forge, http, kv, ui }} = diffui;
+const {{ ai, auth, commands, config, events, exec, files, forge, http, kv, ui }} = diffui;
+ai.register({{ complete: () => "" }});
 const own = (object) => Object.keys(object);
 const inherited = (object) => Object.getOwnPropertyNames(Object.getPrototypeOf(object)).filter((name) => name !== "constructor");
 const all = (object) => [...own(object), ...inherited(object)];
@@ -124,7 +128,7 @@ forge.register({{
     const controller = new AbortController();
     return {{
       module: own(diffui),
-      commands: own(commands), forge: own(forge), events: own(events), http: own(http), auth: own(auth), kv: own(kv), files: own(files),
+      commands: own(commands), forge: own(forge), ai: own(ai), events: own(events), http: own(http), auth: own(auth), kv: own(kv), files: own(files),
       ui: own(ui), prompt: own(ui.prompt), clipboard: own(ui.clipboard), status: own(ui.status),
       activity: own(await ui.activity("x")),
       context, repo: all(repo), jj: own(repo.jj), forgeRemote: own(repo.forgeRemote),
@@ -156,6 +160,7 @@ forge.register({{
     for (key, interface_name) in [
         ("commands", "Commands"),
         ("forge", "Forge"),
+        ("ai", "Ai"),
         ("events", "Events"),
         ("http", "Http"),
         ("auth", "Auth"),
@@ -182,6 +187,7 @@ forge.register({{
     }
     assert_eq!(interface("EventMap"), set(EVENT_NAMES));
     assert_eq!(interface("ForgeProvider"), set(FORGE_METHODS));
+    assert_eq!(interface("AiProvider"), set(AI_METHODS));
 
     // The globals: declared ones exist, and the host module adds no others.
     assert_eq!(names(&seen["globals"]), globals);
@@ -253,6 +259,15 @@ fn the_data_types_have_the_fields_the_protocol_sends() {
         interface("Remote")
     );
     assert_eq!(fields(Selection::default()), interface("Selection"));
+    assert_eq!(fields(AiRequest::default()), interface("AiRequest"));
+    assert_eq!(
+        fields(AiModel {
+            id: text(),
+            name: None
+        }),
+        interface("AiModel")
+    );
+    assert_eq!(fields(AiAccount { label: text() }), interface("AiAccount"));
     assert_eq!(
         fields(RevisionRef {
             change_id: text(),

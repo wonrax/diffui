@@ -741,6 +741,7 @@ pub(super) mod tests {
                     what: None,
                 })
             }),
+            ai: None,
         })
     }
 

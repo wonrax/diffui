@@ -11,8 +11,8 @@
 //! - Repository reads, jj commands and UI slots are [`protocol::HostCall`]s,
 //!   forwarded to the app's [`Host`].
 //! - The app drives a plugin with [`protocol::PluginCall`]s through
-//!   [`Plugin::call`]: run a command, ask the forge provider, deliver an
-//!   event.
+//!   [`Plugin::call`]: run a command, ask the forge or AI provider,
+//!   deliver an event.
 //!
 //! Plugin code never runs on the caller's thread and nothing here blocks it:
 //! every result arrives through a callback or a [`Host`] method.
@@ -43,9 +43,9 @@ pub use host::{
 };
 pub use js::{JsError, ThrownForgeError};
 pub use manifest::{
-    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, FORGE_HOSTS, ForgeClaim,
-    ForgeTerm, HOSTS, HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, PER_HOST,
-    Permissions, SecretField,
+    API_VERSION, AiClaim, CommandDecl, ConfigField, ConfigKind, Diagnostic, FORGE_HOSTS,
+    ForgeClaim, ForgeTerm, HOSTS, HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace,
+    PER_HOST, Permissions, SecretField,
 };
 use protocol::PluginCall;
 
@@ -88,6 +88,9 @@ pub struct Limits {
     pub load: Duration,
     /// How long a forge method may take to settle.
     pub forge_call: Duration,
+    /// How long an AI provider's `complete` may go without sending text
+    /// (a command-line agent prints its reply only at the end).
+    pub ai_call: Duration,
     /// `http.fetch`'s timeout unless the script passes `timeoutMs`.
     pub http_timeout: Duration,
     /// `exec`'s timeout unless the script passes `timeoutMs`.
@@ -104,6 +107,7 @@ impl Default for Limits {
             turn: Duration::from_millis(500),
             load: Duration::from_secs(10),
             forge_call: Duration::from_secs(60),
+            ai_call: Duration::from_secs(600),
             http_timeout: Duration::from_secs(60),
             exec_timeout: Duration::from_secs(300),
             max_response: 8 * 1024 * 1024,
@@ -194,7 +198,8 @@ impl Plugin {
         self.send_call(call, None, reply)
     }
 
-    /// [`Self::call`] for a forge method that streams ([`ForgeCall::streams`]):
+    /// [`Self::call`] for a method that streams ([`ForgeCall::streams`], an
+    /// AI provider's `complete`):
     /// `on_part` runs on the plugin's thread with the parts the script sends,
     /// a batch at a time (the ones that came while the last batch was being
     /// taken in), before `reply`. The script waits for each batch's
@@ -228,6 +233,7 @@ impl Plugin {
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let what = match &call {
             PluginCall::Forge { call, .. } => call.method(),
+            PluginCall::Ai { call } => call.method(),
             PluginCall::Command { .. } | PluginCall::Event { .. } => "the handler",
         };
         let typed = move |result: Result<serde_json::Value, PluginError>| {

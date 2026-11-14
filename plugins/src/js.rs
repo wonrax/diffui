@@ -24,7 +24,7 @@ use crate::Limits;
 use crate::host::Registration;
 use crate::manifest::Manifest;
 use crate::memory::Capped;
-use crate::protocol::{EVENT_NAMES, FORGE_METHODS};
+use crate::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS};
 use crate::typescript;
 
 /// The module a plugin imports, and the name its frames carry in a stack.
@@ -33,8 +33,10 @@ const HOST_SOURCE: &str = include_str!("js/diffui.js");
 
 /// What `import { … } from "diffui"` offers. A test holds this, the module
 /// and `assets/diffui.d.ts` to the same list.
-pub(crate) const EXPORTS: [&str; 11] = [
+pub(crate) const EXPORTS: [&str; 13] = [
+    "AiError",
     "ForgeError",
+    "ai",
     "auth",
     "commands",
     "config",
@@ -60,6 +62,10 @@ pub struct JsError {
     /// app should explain.
     #[serde(default)]
     pub forge: Option<Box<ThrownForgeError>>,
+    /// Set when the script threw an `AiError`: its kind (`missing-cli`,
+    /// `auth`, `rate-limited`, `unreachable` or `failed`).
+    #[serde(default)]
+    pub ai: Option<String>,
 }
 
 /// What a script's `new ForgeError(kind, message, { host, what })` carries.
@@ -81,6 +87,7 @@ impl JsError {
             message: message.into(),
             stack: String::new(),
             forge: None,
+            ai: None,
         }
     }
 
@@ -251,6 +258,8 @@ impl Js {
             "commands": manifest.commands.iter().map(|command| &command.id).collect::<Vec<_>>(),
             "forge": manifest.forge.is_some(),
             "forgeMethods": FORGE_METHODS,
+            "ai": manifest.ai.is_some(),
+            "aiMethods": AI_METHODS,
             "events": EVENT_NAMES,
         })
         .to_string();
@@ -483,6 +492,7 @@ fn describe<'js>(ctx: &Ctx<'js>, thrown: Value<'js>) -> JsError {
                 .flatten()
                 .unwrap_or_default(),
             forge: None,
+            ai: None,
         },
         None => {
             // Reading the value may itself throw; that must not stay pending.
@@ -676,6 +686,7 @@ mod tests {
             message: "boom".into(),
             stack: stack.into(),
             forge: None,
+            ai: None,
         }
     }
 
