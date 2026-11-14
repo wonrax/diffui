@@ -367,9 +367,8 @@ impl Manifest {
         let manifest = Manifest::parse(dir, &text)?;
         if !dir.join(&manifest.main).is_file() {
             return Err(whole_file(format!(
-                "main = \"{}\": no such file in {}",
-                manifest.main,
-                dir.display()
+                "main = \"{}\": no such file beside {MANIFEST_FILE}",
+                manifest.main
             )));
         }
         Ok(manifest)

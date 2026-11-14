@@ -200,18 +200,7 @@ impl Found {
                 }
             }
             Err(problems) => {
-                let problems: Vec<String> = problems
-                    .iter()
-                    .map(|problem| {
-                        format!(
-                            "{}:{}:{}: {}",
-                            display_path(&problem.path),
-                            problem.line,
-                            problem.col,
-                            problem.message
-                        )
-                    })
-                    .collect();
+                let problems: Vec<String> = problems.iter().map(placed).collect();
                 Self {
                     id: folder.clone(),
                     name: folder,
@@ -411,6 +400,18 @@ pub(crate) struct PluginCommand {
     pub(crate) keys: Vec<String>,
     /// Where the manifest declares it, `path:line:col`.
     pub(crate) source: String,
+}
+
+/// A manifest problem as the app and `diffui plugin` print it: its place
+/// first, the home directory folded.
+fn placed(problem: &diffui_plugins::Diagnostic) -> String {
+    format!(
+        "{}:{}:{}: {}",
+        display_path(&problem.path),
+        problem.line,
+        problem.col,
+        problem.message
+    )
 }
 
 /// `manifest`'s `[[commands]]` as registry rows, and what was wrong with

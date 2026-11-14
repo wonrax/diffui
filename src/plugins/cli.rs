@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use diffui_core::cli::tokenize::shell_quote;
 use diffui_plugins::protocol::{FORGE_METHODS, HostCall};
 use diffui_plugins::{
     API_VERSION, ForgeTerm, Host, JjAccess, Limits, LogLevel, MANIFEST_FILE, Manifest, Options,
     Plugin, PluginEvent, Registration, Reply,
 };
 
-use super::{commands_of, plugin_dirs, plugins_dir, trust};
+use super::{commands_of, placed, plugin_dirs, plugins_dir, trust};
 use crate::config::display_path;
 
 /// `diffui plugin …`, when that is how the process was started.
@@ -52,8 +53,9 @@ enum Verb {
     /// Load a plugin without the app: its manifest's problems, what its
     /// script registers, and why it doesn't load if it doesn't
     Check {
-        /// The plugin's directory (the current one when left out)
-        dir: Option<PathBuf>,
+        /// The plugin's directory, or the id of one in the plugins folder
+        /// (the current directory when left out)
+        plugin: Option<PathBuf>,
     },
     /// The plugins in the plugins folder, and whether each is allowed
     List,
@@ -73,7 +75,11 @@ fn plugin_main() -> i32 {
             };
             init(&id, ts, forge.as_deref(), &dir)
         }
-        Verb::Check { dir } => check(&dir.unwrap_or_else(|| PathBuf::from("."))),
+        Verb::Check { plugin } => plugin_dir(
+            &plugin.unwrap_or_else(|| PathBuf::from(".")),
+            plugins_dir().as_deref(),
+        )
+        .and_then(|dir| check(&dir)),
         Verb::List => Ok(list()),
     };
     match done {
@@ -263,19 +269,49 @@ fn init(id: &str, ts: bool, forge: Option<&str>, dir: &Path) -> Result<String, S
         (config_name, config.to_owned()),
     ];
     std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", display_path(dir)))?;
+    let dir = &std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut said = format!("Created {}\n", display_path(dir));
     for (name, text) in files {
         let path = dir.join(name);
         std::fs::write(&path, text).map_err(|error| format!("{}: {error}", display_path(&path)))?;
         let _ = writeln!(said, "  {name}");
     }
+    // The one line meant to be pasted: the id when `check` finds the plugin
+    // by it, else the whole path, quoted if a shell would split it.
+    let installed = plugins_dir().is_some_and(|folder| folder.join(id) == *dir);
+    let target = if installed {
+        id.to_owned()
+    } else {
+        shell_quote(&dir.display().to_string())
+    };
     let _ = write!(
         said,
-        "Next: edit {main}, then run `diffui plugin check {}`.\n\
-         diffui asks before it runs a new plugin; `diffui ctl reload` makes a running diffui look.\n",
-        dir.display()
+        "Next: edit {main}, then run `diffui plugin check {target}`.\n\
+         diffui asks before it runs a new plugin; `diffui ctl reload` makes a running diffui look.\n"
     );
     Ok(said)
+}
+
+/// The plugin directory `given` names: that directory, or, for a bare name
+/// with no directory of that name here, the plugin of that id in `folder`
+/// (the plugins folder). `Err` names every place it looked.
+fn plugin_dir(given: &Path, folder: Option<&Path>) -> Result<PathBuf, String> {
+    let here = std::path::absolute(given).unwrap_or_else(|_| given.to_path_buf());
+    if here.is_dir() {
+        return Ok(here);
+    }
+    let mut tried = vec![display_path(&here)];
+    let mut parts = given.components();
+    if let (Some(std::path::Component::Normal(id)), None, Some(folder)) =
+        (parts.next(), parts.next(), folder)
+    {
+        let installed = folder.join(id);
+        if installed.is_dir() {
+            return Ok(installed);
+        }
+        tried.push(display_path(&installed));
+    }
+    Err(format!("No plugin directory at {}", tried.join(" or ")))
 }
 
 /// The host `check` gives a plugin: it hears the plugin load, and answers
@@ -301,22 +337,20 @@ impl Host for NoApp {
 /// Load the plugin in `dir` the way the app would, without the app, and say
 /// what it is. `Err` with every problem, a line each.
 fn check(dir: &Path) -> Result<String, String> {
-    let dir = dir
-        .canonicalize()
-        .map_err(|error| format!("{}: {error}", dir.display()))?;
-    let manifest = Manifest::load(&dir).map_err(|problems| {
+    let manifest = Manifest::load(dir).map_err(|problems| {
         problems
             .iter()
-            .map(|problem| format!("{problem}\n"))
+            .map(|problem| format!("{}\n", placed(problem)))
             .collect::<String>()
     })?;
+    let shown = display_path(dir);
     let mut problems = commands_of(&manifest).1;
     let builtin = crate::commands::Registry::builtin();
     for command in &manifest.commands {
         if builtin.get(&command.id).is_some() {
             problems.push(format!(
                 "{}:{}:{}: [[commands]] {:?} is already a diffui command",
-                dir.join(MANIFEST_FILE).display(),
+                display_path(&dir.join(MANIFEST_FILE)),
                 command.line,
                 command.col,
                 command.id
@@ -346,15 +380,12 @@ fn check(dir: &Path) -> Result<String, String> {
         Ok(PluginEvent::Failed(why)) => {
             // A script's own position is relative to the plugin: name the
             // directory so the line resolves from anywhere.
-            problems.push(format!("{}: {why}", dir.display()));
+            problems.push(format!("{shown}: {why}"));
             failure = Some(why);
             None
         }
         Err(_) => {
-            problems.push(format!(
-                "{}: the plugin didn't finish loading",
-                dir.display()
-            ));
+            problems.push(format!("{shown}: the plugin didn't finish loading"));
             None
         }
     };
@@ -362,11 +393,8 @@ fn check(dir: &Path) -> Result<String, String> {
     let mut said = String::new();
     let _ = writeln!(
         said,
-        "{} {} (api {}) in {}",
-        manifest.id,
-        manifest.version,
-        manifest.api,
-        dir.display()
+        "{} {} (api {}) in {shown}",
+        manifest.id, manifest.version, manifest.api
     );
     let _ = writeln!(said, "permissions: {}", permissions_line(&manifest));
     if let Some(registration) = &registration {
@@ -484,20 +512,17 @@ fn list() -> String {
                     "{}\t{}\t{state}\t{}",
                     manifest.id,
                     manifest.version,
-                    dir.display()
+                    display_path(&dir)
                 );
             }
             Err(problems) => {
-                let why = problems
-                    .first()
-                    .map(ToString::to_string)
-                    .unwrap_or_default();
-                let _ = writeln!(said, "?\t\tbroken\t{}\t{why}", dir.display());
+                let why = problems.first().map(placed).unwrap_or_default();
+                let _ = writeln!(said, "?\t\tbroken\t{}\t{why}", display_path(&dir));
             }
         }
     }
     if said.is_empty() {
-        let _ = writeln!(said, "No plugins in {}", dir.display());
+        let _ = writeln!(said, "No plugins in {}", display_path(&dir));
     }
     said
 }
@@ -526,6 +551,9 @@ mod tests {
             let dir = scratch(name);
             let said = init("my-plugin", ts, forge, &dir).expect("init");
             assert!(said.contains("plugin.toml"), "{said}");
+            // Outside the plugins folder, the next step names the whole path.
+            let next = format!("run `diffui plugin check {}`", dir.display());
+            assert!(said.contains(&next), "{said}");
             let main = if ts { "main.ts" } else { "main.js" };
             for file in [
                 MANIFEST_FILE,
@@ -564,6 +592,39 @@ mod tests {
             assert!(again.contains("already holds a plugin"), "{again}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// `check` takes a directory or the id of an installed plugin, and says
+    /// where it looked when it finds neither.
+    #[test]
+    fn check_finds_a_plugin_by_directory_or_by_id() {
+        let folder = scratch("folder");
+        let installed = folder.join("stack-tools");
+        std::fs::create_dir_all(&installed).unwrap();
+        assert_eq!(
+            plugin_dir(Path::new("stack-tools"), Some(&folder)),
+            Ok(installed.clone())
+        );
+        assert_eq!(plugin_dir(&installed, None), Ok(installed));
+
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            plugin_dir(Path::new("no-such"), Some(&folder)),
+            Err(format!(
+                "No plugin directory at {} or {}",
+                display_path(&here.join("no-such")),
+                display_path(&folder.join("no-such"))
+            ))
+        );
+        // Anything but a bare name is a path, looked for where it says.
+        assert_eq!(
+            plugin_dir(Path::new("./stack-tools"), Some(&folder)),
+            Err(format!(
+                "No plugin directory at {}",
+                display_path(&here.join("stack-tools"))
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
