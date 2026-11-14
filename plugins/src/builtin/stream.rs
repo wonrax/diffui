@@ -123,15 +123,17 @@ pub(crate) fn serve(
     }
 }
 
-/// Where the next piece of `held` ends: after its last line break once it
-/// holds a piece's worth or a break past half of one, or at a character
-/// boundary when a piece's worth has no break at all. `None`: wait for more.
+/// Where the next piece of `held` ends: after the last line break in its
+/// first piece's worth, so what has arrived goes on at once, a line never
+/// split; or, when a piece's worth has no break at all, where a character
+/// ends. `None`: wait for more.
 fn cut_point(held: &[u8]) -> Option<usize> {
+    let window = &held[..held.len().min(PIECE)];
+    if let Some(at) = window.iter().rposition(|&b| b == b'\n') {
+        return Some(at + 1);
+    }
     if held.len() < PIECE {
         return None;
-    }
-    if let Some(at) = held[..PIECE].iter().rposition(|&b| b == b'\n') {
-        return Some(at + 1);
     }
     // No line break in a whole piece: cut where a character ends.
     let valid = match std::str::from_utf8(&held[..PIECE]) {
@@ -148,11 +150,12 @@ mod tests {
 
     #[test]
     fn pieces_end_on_line_breaks_and_characters() {
-        assert_eq!(cut_point(b"short\n"), None);
+        assert_eq!(cut_point(b"short\nand a half"), Some(6));
+        assert_eq!(cut_point(b"no break yet"), None);
         let mut lines = "line\n".repeat(PIECE / 5 + 10).into_bytes();
         let cut = cut_point(&lines).unwrap();
         assert!(cut <= PIECE && lines[cut - 1] == b'\n');
-        lines.truncate(0);
+        lines.clear();
         // One long line, an "é" straddling the piece's end.
         lines.extend(std::iter::repeat_n(b'a', PIECE - 1));
         lines.extend("é".as_bytes());

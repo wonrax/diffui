@@ -58,7 +58,7 @@ pub struct JsError {
     /// Set when the script threw a `ForgeError`: what kind of failure the
     /// app should explain.
     #[serde(default)]
-    pub forge: Option<ThrownForgeError>,
+    pub forge: Option<Box<ThrownForgeError>>,
 }
 
 /// What a script's `new ForgeError(kind, message, { host, what })` carries.

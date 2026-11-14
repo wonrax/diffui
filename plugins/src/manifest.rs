@@ -23,6 +23,10 @@ pub const MANIFEST_FILE: &str = "plugin.toml";
 /// declare it.
 pub(crate) const TOKEN_CMD: &str = "token_cmd";
 
+/// The user-config key that adds hosts to a forge's claim
+/// (`[plugins.<id>] hosts = ["git.acme.org"]`). A schema can't declare it.
+pub const HOSTS: &str = "hosts";
+
 /// A problem in a manifest, placed. Displays as `path:line:col: message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -761,6 +765,14 @@ impl Manifest {
                     key.span(),
                     format!(
                         "config key \"{TOKEN_CMD}\" is reserved: diffui reads it for auth.token"
+                    ),
+                );
+            }
+            if name == HOSTS {
+                report.at(
+                    key.span(),
+                    format!(
+                        "config key \"{HOSTS}\" is reserved: diffui reads it for the hosts a forge claims"
                     ),
                 );
             }

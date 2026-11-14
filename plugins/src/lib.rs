@@ -42,10 +42,15 @@ pub use host::{
 };
 pub use js::{JsError, ThrownForgeError};
 pub use manifest::{
-    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, ForgeTerm,
+    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, ForgeTerm, HOSTS,
     HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, Permissions,
 };
 use protocol::PluginCall;
+
+/// The plugins diffui ships, embedded when it is built from `bundled/<id>/`:
+/// each id with its files (`plugin.toml` and the modules) by path relative to
+/// the plugin's directory. Run one with [`Manifest::bundled`].
+pub const BUNDLED: &[(&str, &[(&str, &str)])] = include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
 
 /// The type definitions of the plugin API, for `diffui plugin init` to write
 /// next to a new plugin and for the agent docs.

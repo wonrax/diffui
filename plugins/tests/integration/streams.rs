@@ -275,3 +275,28 @@ fn a_diff_streams_at_the_hosts_pace_and_a_cancel_reaches_the_program() {
     assert_eq!(result["details"]["message"], "msg of c0ffee");
     assert_eq!(parts.lock().unwrap()[0]["path"], "a.rs");
 }
+
+/// Twenty megabytes of output through a plugin whose heap is capped at
+/// eight: the stream never holds more than a piece.
+#[test]
+fn a_stream_bigger_than_the_heap_goes_through() {
+    let plugin = probe(
+        "[permissions]\nexec = [[\"sh\"]]\n",
+        r#"
+  flood: async () => {
+    const out = await exec.stream(["sh", "-c", "yes 0123456789abcdefghijklmnopqrstuvwxyz | head -c 20000000"]);
+    let length = 0;
+    for await (const piece of out) length += piece.length;
+    return { length, ok: (await out.ended).ok };
+  },
+"#,
+    )
+    .limits(diffui_plugins::Limits {
+        memory: 8 * 1024 * 1024,
+        ..Default::default()
+    })
+    .spawn();
+    plugin.loaded();
+    let seen = plugin.case("flood").unwrap();
+    assert_eq!(seen, json!({ "length": 20_000_000, "ok": true }));
+}
