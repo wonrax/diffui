@@ -17,7 +17,8 @@
  *
  *     [permissions]
  *     http = ["codeberg.org"]          # hosts http.fetch and auth.token may use; "*.example.com" and "localhost:3000" work
- *     exec = [["git", "credential"]]   # argv prefixes exec may run
+ *     exec = [["git", "credential"]]   # argv prefixes exec may run; a word "{config.<key>}" is that string setting
+ *     env = ["GH_HOST"]                # variables exec may set for the programs it runs
  *     jj = "read"                      # "read": repo reads and repo.jj.query. "write": also repo.jj.run
  *
  *     [provides]
@@ -33,6 +34,31 @@
  *
  *     [config.schema]                  # defaults for `config`; the user overrides them under [plugins.<id>] in config.toml
  *     host = { type = "string", default = "codeberg.org", label = "Host" }
+ *
+ * A forge can say more about itself, all of it optional, so diffui names it, opens its links and explains its
+ * errors without asking the script:
+ *
+ *     [provides.forge]
+ *     hosts = ["github.com", "github.*", "*.github.*"]   # "*" is any one label or more, here
+ *     term = "pull request"                    # or "merge request"
+ *     sigil = "#"                              # in references (owner/name#12); "!" for a merge request by default
+ *     short = "PR"                             # the abbreviation; "MR" for a merge request by default
+ *     default_host = "github.com"              # the host a reference without one means
+ *     host_env = "GH_HOST"                     # a variable that, when set, names that host instead
+ *     cli = "gh"                               # the program errors tell the user to install and sign in with
+ *     pull_request_path = "{owner}/{name}/pull/{number}"   # a pull request's page, after the host
+ *     subgroups = false                        # whether an owner can be several segments (GitLab's groups)
+ *
+ * With `pull_request_path` the open dialog and `diffui <link>` take the forge's pull request links and
+ * `owner/name#12` references; with `default_host` a reference may leave the host out. A forge whose provider has
+ * `view`, `commits`, `commitDiff` and `diff` opens pull requests in a tab of their own.
+ *
+ * Bundled plugins (the GitHub and GitLab forges diffui ships) are trusted with their permissions as declared. A
+ * plugin in the plugins folder with the same id replaces a bundled one, and `[plugins.<id>] enabled = false` in
+ * settings turns one off. `diffui plugin eject <id>` copies a bundled plugin into the plugins folder to edit.
+ * A remote goes to the forge that claims its host, asking in this order: a plugin that replaces a bundled one,
+ * the bundled ones, the rest. A plugin can't claim a host a bundled forge claims unless that forge is turned off
+ * or replaced.
  *
  * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
  * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
@@ -117,8 +143,10 @@ declare module "diffui" {
 
   /**
    * What diffui asks a forge. Only `pullRequests` is required; a method left out turns the matching feature
-   * off for this forge. Every method gets the repository with `repo.forgeRemote` set. Throw to report a
-   * failure: the error's message is shown to the user. Each call must settle within a minute.
+   * off for this forge. The repository methods get the repository with `repo.forgeRemote` set; the pull request
+   * tab's get the pull request. Throw to report a failure: the error's message is shown to the user, and a
+   * `ForgeError` says what kind of failure it is so the app can say what to do about it. Each call must
+   * settle within a minute; `diff` and `commitDiff` must send a part at least once a minute.
    */
   export interface ForgeProvider {
     /**
@@ -136,7 +164,127 @@ declare module "diffui" {
     createPullRequest?(repo: Repo, request: CreatePullRequest): Promise<PullRequest>;
     /** Change the fields present in `patch` and return the pull request. */
     updatePullRequest?(repo: Repo, number: number, patch: UpdatePullRequest): Promise<PullRequest>;
+    /**
+     * Hosts this forge claims beyond `[provides] forge.hosts`, written the same way: say, the company hosts its
+     * command-line tool is signed in to. Asked once, after the plugin loads; diffui keeps the answer until the
+     * plugin reloads. A host a bundled forge claims stays that forge's.
+     */
+    hosts?(): Promise<string[]>;
+    /** A pull request tab: its header. The tab needs `view`, `commits`, `commitDiff` and `diff`, all four. */
+    view?(pr: PrRef): Promise<PrInfo>;
+    /** A pull request tab: its commits, oldest first. */
+    commits?(pr: PrRef): Promise<PrCommit[]>;
+    /**
+     * A pull request tab: one commit's diff (`oid` is one `commits` returned), and its full message. `signal`
+     * aborts when the user moves on; pass it to `exec.stream` and `http.fetch`.
+     */
+    commitDiff?(pr: PrRef, oid: string, options: { signal: AbortSignal }): Promise<CommitDiff>;
+    /**
+     * A pull request tab: the whole diff, base to head. Hand it over as it arrives rather than collecting it:
+     * diffui parses each part as it comes and shows each file once it is whole, and the part after waits until
+     * diffui has taken this one. `signal` aborts when the tab closes or loads something else.
+     *
+     *     async *diff(pr, { signal }) {
+     *       const out = await exec.stream(["gh", "pr", "diff", String(pr.number), "-R", `${pr.owner}/${pr.name}`], { signal });
+     *       yield* out;
+     *       const { ok, stderr } = await out.ended;
+     *       if (!ok) throw new ForgeError("failed", stderr);
+     *     }
+     */
+    diff?(pr: PrRef, options: { signal: AbortSignal }): DiffSource | Promise<DiffSource>;
   }
+
+  /**
+   * A diff as a provider hands it over: unified `git diff` text (`diff --git` headers, `---`/`+++`, `@@` hunks),
+   * whole or cut anywhere, or files as a forge's API lists them; or a list or an (async) iterable of those
+   * parts. Keep to one kind in one diff: text, or files.
+   */
+  export type DiffSource = string | DiffPart[] | Iterable<DiffPart> | AsyncIterable<DiffPart>;
+  export type DiffPart = string | FilePatch;
+
+  /** One file of a diff, its hunks without a `diff --git` header. */
+  export interface FilePatch {
+    /** The path after the change. */
+    path: string;
+    /** The path before, for a rename or a copy. */
+    oldPath?: string | null;
+    status: "added" | "deleted" | "modified" | "renamed" | "copied";
+    /** The `@@` hunks; leave it out for a binary or oversized file, which then shows as a row of its own. */
+    patch?: string | null;
+    /** The forge's counts, when it has them: they win over counting `patch` (APIs leave big patches out). */
+    additions?: number | null;
+    deletions?: number | null;
+  }
+
+  /** A pull request, as its tab names it. */
+  export interface PrRef {
+    /** As in the project's URL, with the port when it has one. */
+    readonly host: string;
+    readonly owner: string;
+    readonly name: string;
+    readonly number: number;
+    /** The project's page. */
+    readonly webUrl: string;
+  }
+
+  export interface PrInfo {
+    number: number;
+    title: string;
+    author?: string;
+    state: "open" | "draft" | "closed" | "merged";
+    /** Base branch name. */
+    base: string;
+    /** Head branch name. */
+    head: string;
+    /** Lines added and removed in the whole pull request, when the forge counts them (else the files are summed). */
+    additions?: number | null;
+    deletions?: number | null;
+    changedFiles?: number | null;
+    /** The page to open in a browser. */
+    url: string;
+  }
+
+  export interface PrCommit {
+    /** The full commit id. */
+    oid: string;
+    author?: string;
+    /** The first line of its message. */
+    headline: string;
+    /** When it was authored, RFC 3339 ("2026-11-14T09:30:00Z"). */
+    authoredAt?: string | null;
+  }
+
+  export interface CommitDiff {
+    diff: DiffSource;
+    details?: { message: string; author?: string; email?: string; date?: string | null } | null;
+    /** The commit's own counts, when the forge has them. */
+    additions?: number | null;
+    deletions?: number | null;
+  }
+
+  /**
+   * A failure a forge's provider throws to say what kind it is, so diffui can say what to do about it the way it
+   * does for its own forges ("gh isn't signed in to github.acme.com. Run `gh auth login --hostname …`"). The
+   * message is the forge's own words; `host` defaults to the remote's or pull request's host, and `what` (for
+   * "not-found") names what is missing ("team/app#12").
+   *
+   * - "missing-cli": the program in `[provides] forge.cli` isn't installed (exec rejects with "NotFoundError")
+   * - "auth": not signed in, or the token was refused
+   * - "not-found": the project or pull request isn't there, or the account can't see it
+   * - "rate-limited", "unreachable", "timeout"
+   * - "failed": anything else; the message is shown as it is
+   *
+   * Anything else a provider throws is shown as its message.
+   */
+  export class ForgeError extends Error {
+    constructor(kind: ForgeErrorKind, message?: string, options?: { host?: string; what?: string });
+    readonly name: "ForgeError";
+    readonly kind: ForgeErrorKind;
+    readonly host: string | null;
+    readonly what: string | null;
+  }
+
+  export type ForgeErrorKind = "missing-cli" | "auth" | "not-found" | "rate-limited" | "unreachable" | "timeout" | "failed";
 
   export interface PullRequest {
     number: number;
@@ -375,8 +523,10 @@ declare module "diffui" {
     /** Text only; `JSON.stringify` objects yourself. A `URLSearchParams` is sent as a form. */
     body?: string | URLSearchParams | null;
     signal?: AbortSignal;
-    /** Give up after this long. Defaults to 60 000. */
+    /** Give up after this long. Defaults to 60 000. With `stream`, the limit is on the response arriving and on each wait for a piece. */
     timeoutMs?: number;
+    /** Hand the body over a piece at a time, as `body`, instead of reading it whole (no 8 MB cap then). */
+    stream?: boolean;
   }
 
   export interface Response {
@@ -387,7 +537,12 @@ declare module "diffui" {
     /** The URL that answered, after redirects. */
     readonly url: string;
     readonly headers: Headers;
-    /** The body as text. May be called more than once. */
+    /**
+     * With `stream: true`, the body as text a piece at a time, read with `for await`; `null` otherwise. Breaking
+     * out of the loop closes the connection.
+     */
+    readonly body: AsyncIterable<string> | null;
+    /** The body as text. May be called more than once; on a streamed response it reads what `body` hasn't. */
     text(): Promise<string>;
     /** The body parsed as JSON. */
     json(): Promise<any>;
@@ -413,11 +568,33 @@ declare module "diffui" {
    */
   export function exec(argv: string[], options?: ExecOptions): Promise<ExecResult>;
 
+  export namespace exec {
+    /**
+     * Run a program and read its stdout a piece at a time, as it writes it: for output too big to hold, like a
+     * large diff. Resolves once the program has started (rejecting like `exec` when it can't: "NotFoundError" when
+     * there is no such program). Each piece is up to 64 KB of text and ends on a line break when it has one. The
+     * program writes on only as fast as the script reads, and is killed when the loop breaks, `signal` aborts or
+     * the plugin stops. `timeoutMs` is the longest wait for one piece. stdout has no cap; stderr is kept, up to 8 MB.
+     *
+     *     const out = await exec.stream(["gh", "pr", "diff", "12"], { env: { GH_HOST: host }, signal });
+     *     for await (const piece of out) consume(piece);
+     *     const { ok, code, stderr } = await out.ended;
+     */
+    function stream(argv: string[], options?: Omit<ExecOptions, "onStdout">): Promise<ExecStream>;
+  }
+
+  export interface ExecStream extends AsyncIterable<string> {
+    /** Settles once stdout has been read to its end and the program exited; rejects if the stream was closed early. */
+    readonly ended: Promise<{ readonly ok: boolean; readonly code: number | null; readonly stderr: string }>;
+  }
+
   export interface ExecOptions {
     /** Text to feed its stdin. Without it stdin is closed. */
     stdin?: string;
-    /** Defaults to the plugin's own directory. Pass `repo.root` to run in the repository. */
+    /** Defaults to the plugin's own directory (the home directory for a bundled plugin). Pass `repo.root` to run in the repository. */
     cwd?: string;
+    /** Variables to set for the program, on top of diffui's own environment. Each must be listed under `[permissions] env`. */
+    env?: Record<string, string>;
     signal?: AbortSignal;
     /** Called with each line of stdout as it arrives, without its newline. */
     onStdout?: (line: string) => void;

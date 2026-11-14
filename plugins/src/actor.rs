@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use crate::builtin::exec::{ExecRequest, Run};
 use crate::builtin::http::FetchRequest;
 use crate::builtin::kv::Kv;
+use crate::builtin::stream::Pull;
 use crate::builtin::{auth, exec, http};
 use crate::host::{
     Host, HostError, LogLevel, LogLine, PluginError, PluginEvent, PluginState, Registration, Reply,
@@ -51,10 +52,22 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub(crate) type ReplyFn = Box<dyn FnOnce(Result<Value, PluginError>) + Send>;
 
+/// Hears what a streaming call sends before it settles, and answers each
+/// part through its [`Reply`] once it has taken it in.
+pub(crate) type PartFn = Box<dyn FnMut(Value, Reply) + Send>;
+
 pub(crate) enum ToActor {
     Call {
+        /// The caller's id for it, for [`ToActor::Abort`].
+        id: u64,
         call: Box<PluginCall>,
+        parts: Option<PartFn>,
         reply: ReplyFn,
+    },
+    /// The caller gave up on a call: the script's handler sees its signal
+    /// abort, and the reply is [`PluginError::Gone`] if it hasn't settled.
+    Abort {
+        id: u64,
     },
     /// The answer to a host call the script made. `io` marks one that held a
     /// worker.
@@ -119,7 +132,7 @@ enum Phase {
         js: Js,
         deadline: Instant,
         /// Calls that arrived before the main module finished.
-        waiting: Vec<(PluginCall, ReplyFn)>,
+        waiting: Vec<Waiting>,
     },
     Ready {
         js: Js,
@@ -128,10 +141,19 @@ enum Phase {
     Failed(String),
 }
 
+struct Waiting {
+    id: u64,
+    call: PluginCall,
+    parts: Option<PartFn>,
+    reply: ReplyFn,
+}
+
 struct PendingCall {
     reply: ReplyFn,
     what: String,
     deadline: Option<Instant>,
+    /// A streaming call's parts; each one moves the deadline.
+    parts: Option<PartFn>,
 }
 
 type Job = Box<dyn FnOnce() -> Result<Value, HostError> + Send>;
@@ -146,10 +168,14 @@ pub(crate) struct Actor {
     /// For replies from workers and from the host.
     own: Sender<ToActor>,
     phase: Phase,
+    /// `[permissions] exec` with its `{config.<key>}` words filled in.
+    exec: Vec<Vec<String>>,
+    /// The open streams (`exec.stream`, a streamed `http.fetch`), by id: the
+    /// way to ask each for its next piece. Dropping one closes it.
+    streams: HashMap<u64, Sender<Pull>>,
     /// Bumped on every (re)load, so replies meant for an earlier load of the
     /// script are recognised and dropped.
     generation: u64,
-    next_call: u64,
     /// Calls into the script that haven't settled.
     calls: HashMap<u64, PendingCall>,
     /// Host calls the script is waiting on, by its id: their cancel flags.
@@ -175,6 +201,8 @@ impl Actor {
         let (config, problems) = manifest.resolve_config(&options.config);
         let actor = Self {
             kv: Kv::new(options.data_dir.join(format!("{}.json", manifest.id))),
+            exec: crate::manifest::resolve_exec(&manifest.permissions.exec, &config),
+            streams: HashMap::new(),
             manifest,
             config,
             limits: options.limits,
@@ -184,7 +212,6 @@ impl Actor {
             own,
             phase: Phase::Failed(String::new()),
             generation: 0,
-            next_call: 1,
             calls: HashMap::new(),
             host_calls: HashMap::new(),
             timers: BinaryHeap::new(),
@@ -358,8 +385,14 @@ impl Actor {
                 self.set_state(PluginState::Ready(registration.clone()));
                 self.host
                     .event(&self.manifest.id, PluginEvent::Loaded(registration));
-                for (call, reply) in waiting {
-                    self.call(call, reply);
+                for Waiting {
+                    id,
+                    call,
+                    parts,
+                    reply,
+                } in waiting
+                {
+                    self.call(id, call, parts, reply);
                 }
             }
         }
@@ -414,8 +447,8 @@ impl Actor {
         if let Phase::Loading { waiting, .. } =
             std::mem::replace(&mut self.phase, Phase::Failed(String::new()))
         {
-            for (_, reply) in waiting {
-                reply(Err(why.clone()));
+            for waiting in waiting {
+                (waiting.reply)(Err(why.clone()));
             }
         }
         for (_, call) in self.calls.drain() {
@@ -425,6 +458,7 @@ impl Actor {
             cancel.store(true, Ordering::Relaxed);
         }
         self.queued.clear();
+        self.streams.clear();
         self.timers.clear();
         lock(&self.tokens).clear();
     }
@@ -433,7 +467,13 @@ impl Actor {
 
     fn handle(&mut self, message: ToActor) {
         match message {
-            ToActor::Call { call, reply } => self.call(*call, reply),
+            ToActor::Call {
+                id,
+                call,
+                parts,
+                reply,
+            } => self.call(id, *call, parts, reply),
+            ToActor::Abort { id } => self.abort(id),
             ToActor::HostReply {
                 generation,
                 id,
@@ -497,11 +537,32 @@ impl Actor {
         self.check_loaded();
     }
 
+    /// The app gave up on call `id`.
+    fn abort(&mut self, id: u64) {
+        if let Phase::Loading { waiting, .. } = &mut self.phase
+            && let Some(at) = waiting.iter().position(|waiting| waiting.id == id)
+        {
+            (waiting.remove(at).reply)(Err(PluginError::Gone));
+            return;
+        }
+        if let Some(call) = self.calls.remove(&id) {
+            (call.reply)(Err(PluginError::Gone));
+            self.enter(&json!({ "t": "abort", "id": id }));
+        }
+    }
+
     /// A call from the app into the script.
-    fn call(&mut self, call: PluginCall, reply: ReplyFn) {
+    fn call(&mut self, id: u64, call: PluginCall, parts: Option<PartFn>, reply: ReplyFn) {
         let registration = match &mut self.phase {
             Phase::Failed(why) => return reply(Err(PluginError::Failed(why.clone()))),
-            Phase::Loading { waiting, .. } => return waiting.push((call, reply)),
+            Phase::Loading { waiting, .. } => {
+                return waiting.push(Waiting {
+                    id,
+                    call,
+                    parts,
+                    reply,
+                });
+            }
             Phase::Ready { registration, .. } => registration,
         };
         let (what, deadline) = match &call {
@@ -535,14 +596,13 @@ impl Actor {
                 (format!("event {}", event.name()), None)
             }
         };
-        let id = self.next_call;
-        self.next_call += 1;
         self.calls.insert(
             id,
             PendingCall {
                 reply,
                 what,
                 deadline,
+                parts,
             },
         );
         self.enter(&json!({ "t": "call", "id": id, "call": call }));
@@ -668,9 +728,107 @@ impl Actor {
         struct TokenFor {
             host: String,
         }
+        #[derive(Deserialize)]
+        struct StreamId {
+            stream: u64,
+        }
+        #[derive(Deserialize)]
+        struct ForgePart {
+            call: u64,
+            part: Value,
+        }
         let manifest = self.manifest.clone();
         let limits = self.limits;
         match op {
+            "http.fetch" if args.get("stream").and_then(Value::as_bool) == Some(true) => {
+                let request: FetchRequest = read(op, args)?;
+                http::check(&request.url, &manifest.permissions.http)?;
+                let agent = self.agent.clone();
+                let timeout = limits.http_timeout;
+                self.open_stream(id, move |reads, started, answer| {
+                    http::fetch_stream(
+                        &agent,
+                        request,
+                        &manifest.permissions.http,
+                        timeout,
+                        reads,
+                        |head| {
+                            started(head.map(|mut head| {
+                                head["stream"] = id.into();
+                                head
+                            }))
+                        },
+                        answer,
+                    )
+                });
+            }
+            "exec.stream" => {
+                let request: ExecRequest = read(op, args)?;
+                exec::check(&request.argv, &self.exec)?;
+                exec::check_env(&request.env, &manifest.permissions.env)?;
+                self.open_stream(id, move |reads, started, answer| {
+                    let run = Run {
+                        argv: &request.argv,
+                        stdin: request.stdin,
+                        cwd: request
+                            .cwd
+                            .as_deref()
+                            .map_or(manifest.cwd(), std::path::Path::new),
+                        env: &request.env,
+                        timeout: request
+                            .timeout_ms
+                            .map_or(limits.exec_timeout, Duration::from_millis),
+                        max_output: limits.max_response as usize,
+                    };
+                    exec::stream(
+                        run,
+                        reads,
+                        |outcome| started(outcome.map(|()| json!({ "stream": id }))),
+                        answer,
+                    )
+                });
+            }
+            "stream.read" => {
+                let StreamId { stream } = read(op, args)?;
+                let pull = Pull { id, cancel };
+                let open = self.streams.get(&stream).map(|to| to.send(pull).is_ok());
+                if open != Some(true) {
+                    self.streams.remove(&stream);
+                    return Err(HostError::new("Error", "the stream is closed"));
+                }
+            }
+            "stream.close" => {
+                let StreamId { stream } = read(op, args)?;
+                self.streams.remove(&stream);
+                self.answer(id, Ok(Value::Null));
+            }
+            "forge.part" => {
+                let ForgePart { call, part } = read(op, args)?;
+                let forge_call = limits.forge_call;
+                let pending = self.calls.get_mut(&call);
+                let Some((pending, parts)) =
+                    pending.and_then(|pending| pending.parts.take().map(|parts| (pending, parts)))
+                else {
+                    return Err(HostError::new(
+                        "Error",
+                        "this call takes no parts, or it has ended",
+                    ));
+                };
+                pending.deadline = Some(Instant::now() + forge_call);
+                let mut parts = parts;
+                parts(
+                    part,
+                    Reply {
+                        to: Some(self.own.clone()),
+                        generation: self.generation,
+                        id,
+                        cancelled: cancel,
+                    },
+                );
+                if let Some(pending) = self.calls.get_mut(&call) {
+                    pending.parts = Some(parts);
+                }
+            }
             "http.fetch" => {
                 let request: FetchRequest = read(op, args)?;
                 http::check(&request.url, &manifest.permissions.http)?;
@@ -693,7 +851,8 @@ impl Actor {
             }
             "exec" => {
                 let request: ExecRequest = read(op, args)?;
-                exec::check(&request.argv, &manifest.permissions.exec)?;
+                exec::check(&request.argv, &self.exec)?;
+                exec::check_env(&request.env, &manifest.permissions.env)?;
                 let chunks = request.stream.then(|| (self.own.clone(), self.generation));
                 self.spawn(
                     id,
@@ -701,8 +860,8 @@ impl Actor {
                         let run = Run {
                             argv: &request.argv,
                             stdin: request.stdin,
-                            cwd: request.cwd.as_deref().map_or(manifest.dir.as_path(), std::path::Path::new),
-                            env: &[],
+                            cwd: request.cwd.as_deref().map_or(manifest.cwd(), std::path::Path::new),
+                            env: &request.env,
                             timeout: request.timeout_ms.map_or(limits.exec_timeout, Duration::from_millis),
                             max_output: limits.max_response as usize,
                         };
@@ -796,6 +955,52 @@ impl Actor {
             }
         }
         Ok(())
+    }
+
+    /// Start a stream on a thread of its own (it lives as long as the script
+    /// reads it, so it holds no worker). `serve` answers host call `id`
+    /// through `started` once it is open, then each read through `answer`.
+    fn open_stream(
+        &mut self,
+        id: u64,
+        serve: impl FnOnce(
+            std::sync::mpsc::Receiver<Pull>,
+            &dyn Fn(Result<Value, HostError>),
+            &dyn Fn(u64, Result<Value, HostError>),
+        ) + Send
+        + 'static,
+    ) {
+        let (reads, from) = std::sync::mpsc::channel();
+        self.streams.insert(id, reads);
+        let own = self.own.clone();
+        let generation = self.generation;
+        let spawned = std::thread::Builder::new()
+            .name(format!("plugin-{}-stream", self.manifest.id))
+            .spawn(move || {
+                let answer = |id: u64, result: Result<Value, HostError>| {
+                    let _ = own.send(ToActor::HostReply {
+                        generation,
+                        id,
+                        result,
+                        io: false,
+                    });
+                };
+                let started = |result: Result<Value, HostError>| answer(id, result);
+                let outcome = catch_unwind(AssertUnwindSafe(|| serve(from, &started, &answer)));
+                if outcome.is_err() {
+                    answer(id, Err(HostError::new("Error", "the stream panicked")));
+                }
+            });
+        if let Err(error) = spawned {
+            self.streams.remove(&id);
+            self.answer(
+                id,
+                Err(HostError::new(
+                    "Error",
+                    format!("no thread for the stream: {error}"),
+                )),
+            );
+        }
     }
 
     /// Run `job` on a worker thread, or queue it while all are busy.

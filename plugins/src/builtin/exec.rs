@@ -9,11 +9,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::stream::{Ending, Pull};
 use crate::host::HostError;
 
 /// How often a wait looks at its cancel flag and deadline.
@@ -27,6 +28,9 @@ pub(crate) struct ExecRequest {
     pub stdin: Option<String>,
     pub cwd: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Variables to set for the program, each one the manifest allows.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
     /// The script passed `onStdout`: send lines as they come.
     #[serde(default)]
     pub stream: bool,
@@ -60,12 +64,22 @@ pub(crate) fn check(argv: &[String], allowed: &[Vec<String>]) -> Result<(), Host
     )))
 }
 
+/// Refuse a variable `[permissions] env` doesn't list.
+pub(crate) fn check_env(env: &[(String, String)], allowed: &[String]) -> Result<(), HostError> {
+    match env.iter().find(|(name, _)| !allowed.contains(name)) {
+        None => Ok(()),
+        Some((name, _)) => Err(HostError::denied(format!(
+            "exec can't set {name}: plugin.toml's [permissions] env must list it"
+        ))),
+    }
+}
+
 /// One program to run.
 pub(crate) struct Run<'a> {
     pub argv: &'a [String],
     pub stdin: Option<String>,
     pub cwd: &'a Path,
-    pub env: &'a [(&'a str, &'a str)],
+    pub env: &'a [(String, String)],
     pub timeout: Duration,
     /// The most either output stream may hold, in bytes.
     pub max_output: usize,
@@ -87,30 +101,7 @@ pub(crate) fn run(
         timeout,
         max_output,
     } = run;
-    let program = argv
-        .first()
-        .ok_or_else(|| HostError::new("TypeError", "exec needs a program"))?;
-    let mut child = Command::new(program)
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .envs(env.iter().copied())
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| HostError::new("Error", format!("can't run {program}: {error}")))?;
-
-    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // On its own thread: a child that fills its stdout before reading
-        // would otherwise deadlock against us.
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(text.as_bytes());
-        });
-    }
+    let (program, mut child) = start(argv, stdin, cwd, env)?;
     let (lines, incoming) = mpsc::channel();
     let out = child.stdout.take().expect("stdout is piped");
     std::thread::spawn(move || {
@@ -126,17 +117,7 @@ pub(crate) fn run(
             line.clear();
         }
     });
-    let mut err = child.stderr.take().expect("stderr is piped");
-    let errors = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        // One byte over, so the caller can tell "at the cap" from "past it".
-        let _ = (&mut err)
-            .take(max_output as u64 + 1)
-            .read_to_end(&mut bytes);
-        // Keep draining so the child never blocks on a full pipe.
-        let _ = std::io::copy(&mut err, &mut std::io::sink());
-        bytes
-    });
+    let errors = drain_stderr(&mut child, max_output);
 
     let deadline = Instant::now() + timeout;
     let mut stdout = String::new();
@@ -221,6 +202,116 @@ pub(crate) fn run(
     })
 }
 
+/// Spawn `argv` with its stdin fed from `stdin` (closed without it).
+fn start<'a>(
+    argv: &'a [String],
+    stdin: Option<String>,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<(&'a str, std::process::Child), HostError> {
+    let program = argv
+        .first()
+        .ok_or_else(|| HostError::new("TypeError", "exec needs a program"))?;
+    let mut child = Command::new(program)
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            // Its own name, so a forge can tell "not installed" from the rest.
+            let name = if error.kind() == std::io::ErrorKind::NotFound {
+                "NotFoundError"
+            } else {
+                "Error"
+            };
+            HostError::new(name, format!("can't run {program}: {error}"))
+        })?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // On its own thread: a child that fills its stdout before reading
+        // would otherwise deadlock against us.
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(text.as_bytes());
+        });
+    }
+    Ok((program, child))
+}
+
+/// Read the child's stderr on a thread, keeping at most one byte past
+/// `max_output` (so "at the cap" and "past it" differ) and draining the rest.
+fn drain_stderr(
+    child: &mut std::process::Child,
+    max_output: usize,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    let mut err = child.stderr.take().expect("stderr is piped");
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut err)
+            .take(max_output as u64 + 1)
+            .read_to_end(&mut bytes);
+        // Keep draining so the child never blocks on a full pipe.
+        let _ = std::io::copy(&mut err, &mut std::io::sink());
+        bytes
+    })
+}
+
+/// `exec.stream`: start the program, say so through `started`, then hand its
+/// stdout over a piece per read (see [`super::stream`]). The last read gets
+/// `{ done, code, stderr }`. The child is killed when the script closes the
+/// stream early, a read fails, or the plugin goes away. `run.timeout` is
+/// the longest a read waits for a piece.
+pub(crate) fn stream(
+    run: Run<'_>,
+    reads: Receiver<Pull>,
+    started: impl FnOnce(Result<(), HostError>),
+    answer: &dyn Fn(u64, Result<serde_json::Value, HostError>),
+) {
+    let (program, mut child) = match start(run.argv, run.stdin, run.cwd, run.env) {
+        Ok(started) => started,
+        Err(error) => return started(Err(error)),
+    };
+    let out = child.stdout.take().expect("stdout is piped");
+    let errors = drain_stderr(&mut child, run.max_output);
+    started(Ok(()));
+    let ending = super::stream::serve(out, program, run.timeout, &reads, answer);
+    let Ending::End(last) = ending else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    // Its stdout is closed; it is about to exit. Wait as a read would.
+    let deadline = Instant::now() + run.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if last.cancel.load(Ordering::Relaxed) || Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(HostError::new(
+                    "TimeoutError",
+                    format!("{program} closed its output but didn't exit"),
+                ));
+            }
+            Ok(None) => std::thread::sleep(POLL),
+            Err(error) => break Err(HostError::new("Error", format!("{program}: {error}"))),
+        }
+    };
+    let stderr = errors.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr[..stderr.len().min(run.max_output)]).into_owned();
+    answer(
+        last.id,
+        status.map(
+            |status| serde_json::json!({ "done": true, "code": status.code(), "stderr": stderr }),
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,7 +331,7 @@ mod tests {
                 argv: &sh(script),
                 stdin: stdin.map(str::to_string),
                 cwd: Path::new("/"),
-                env: &[("GREETING", "hi")],
+                env: &[("GREETING".into(), "hi".into())],
                 timeout,
                 max_output: 1024 * 1024,
             },

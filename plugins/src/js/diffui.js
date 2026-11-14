@@ -581,22 +581,85 @@ class Headers {
   }
 }
 
+// Streams: a program's stdout or a response body, read a piece at a time.
+// Each `next()` asks the host for one piece, so nothing piles up here.
+
+class TextStream {
+  #id;
+  #signal;
+  #closed = false;
+  #settle;
+  #onAbort = () => this.#close(abortError(this.#signal));
+  /** Resolves with what the host says last (exec: `{ code, stderr }`). */
+  ended;
+
+  constructor(id, signal) {
+    this.#id = id;
+    this.#signal = signal;
+    this.ended = new Promise((resolve, reject) => (this.#settle = { resolve, reject }));
+    // Nobody has to wait for the end.
+    this.ended.catch(() => {});
+    signal?.addEventListener("abort", this.#onAbort);
+  }
+  #close(error) {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#signal?.removeEventListener("abort", this.#onAbort);
+    call("stream.close", { stream: this.#id }).catch(() => {});
+    this.#settle.reject(error);
+  }
+  async next() {
+    if (this.#closed) return { done: true, value: undefined };
+    let piece;
+    try {
+      piece = await call("stream.read", { stream: this.#id }, { signal: this.#signal });
+    } catch (error) {
+      this.#close(error);
+      throw error;
+    }
+    if (piece.done) {
+      this.#closed = true;
+      this.#signal?.removeEventListener("abort", this.#onAbort);
+      this.#settle.resolve(piece);
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: piece.chunk };
+  }
+  async return() {
+    const closed = new Error("The stream was closed before its end");
+    closed.name = "AbortError";
+    this.#close(closed);
+    return { done: true, value: undefined };
+  }
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+}
+
+async function readAll(stream) {
+  let text = "";
+  for await (const piece of stream) text += piece;
+  return text;
+}
+
 class Response {
-  #body;
-  constructor(reply) {
+  #text;
+  constructor(reply, signal) {
     this.status = reply.status;
     this.statusText = reply.statusText;
     this.ok = reply.status >= 200 && reply.status < 300;
     this.url = reply.url;
     this.headers = new Headers(reply.headers);
-    this.#body = reply.body;
+    this.body = reply.stream == null ? null : new TextStream(reply.stream, signal);
+    this.#text = reply.stream == null ? Promise.resolve(reply.body) : null;
     Object.freeze(this);
   }
-  async text() {
-    return this.#body;
+  text() {
+    // A streamed body is read once, by whichever asks first.
+    return (this.#text ??= readAll(this.body));
   }
   async json() {
-    return JSON.parse(this.#body);
+    return JSON.parse(await this.text());
   }
 }
 
@@ -627,26 +690,59 @@ export const http = freezeDeep({
         headers,
         body,
         timeoutMs: init.timeoutMs ?? null,
+        stream: Boolean(init.stream),
       },
       { signal: init.signal },
     );
-    return new Response(reply);
+    return new Response(reply, init.signal);
   },
 });
+
+function execArgs(argv, options, what) {
+  const env = Object.entries(options.env ?? {}).map(([name, value]) => [String(name), String(value)]);
+  return {
+    argv: words(argv, what),
+    stdin: options.stdin ?? null,
+    cwd: options.cwd ?? null,
+    timeoutMs: options.timeoutMs ?? null,
+    env,
+  };
+}
 
 export async function exec(argv, options = {}) {
   const reply = await call(
     "exec",
-    {
-      argv: words(argv, "exec"),
-      stdin: options.stdin ?? null,
-      cwd: options.cwd ?? null,
-      timeoutMs: options.timeoutMs ?? null,
-      stream: typeof options.onStdout === "function",
-    },
+    { ...execArgs(argv, options, "exec"), stream: typeof options.onStdout === "function" },
     { signal: options.signal, onChunk: options.onStdout },
   );
   return Object.freeze({ ...reply, ok: reply.code === 0 });
+}
+
+exec.stream = async (argv, options = {}) => {
+  const reply = await call("exec.stream", execArgs(argv, options, "exec.stream"), { signal: options.signal });
+  const stream = new TextStream(reply.stream, options.signal);
+  const ended = stream.ended.then(({ code, stderr }) => Object.freeze({ ok: code === 0, code, stderr }));
+  ended.catch(() => {});
+  return Object.freeze({
+    [Symbol.asyncIterator]: () => stream,
+    ended,
+  });
+};
+Object.freeze(exec);
+
+const FORGE_ERROR_KINDS = ["missing-cli", "auth", "not-found", "rate-limited", "unreachable", "timeout", "failed"];
+
+export class ForgeError extends Error {
+  constructor(kind, message = "", options = {}) {
+    if (!FORGE_ERROR_KINDS.includes(kind)) {
+      throw new TypeError(`ForgeError kind "${kind}" is not one of ${FORGE_ERROR_KINDS.join(", ")}`);
+    }
+    super(String(message));
+    this.name = "ForgeError";
+    this.kind = kind;
+    this.host = options.host == null ? null : String(options.host);
+    this.what = options.what == null ? null : String(options.what);
+  }
 }
 
 export const auth = freezeDeep({
@@ -732,6 +828,10 @@ export const ui = freezeDeep({
 // Calls from the host.
 
 function describe(thrown) {
+  if (thrown instanceof ForgeError) {
+    const { kind, host, what } = thrown;
+    return { name: thrown.name, message: thrown.message, stack: thrown.stack ?? "", forge: { kind, host, what } };
+  }
   if (thrown instanceof Error) {
     return { name: thrown.name, message: thrown.message, stack: thrown.stack ?? "" };
   }
@@ -748,7 +848,9 @@ const commandContext = (c) =>
     line: c.line ?? null,
   });
 
-function askForge(repo, request) {
+const freezePr = (pr) => Object.freeze({ ...pr });
+
+async function askForge(id, repo, request, signal) {
   switch (request.method) {
     case "pullRequests":
       return forgeProvider.pullRequests(repo, { branches: request.branches });
@@ -758,8 +860,40 @@ function askForge(repo, request) {
       return forgeProvider.createPullRequest(repo, request.request);
     case "updatePullRequest":
       return forgeProvider.updatePullRequest(repo, request.number, request.patch);
+    case "hosts":
+      return forgeProvider.hosts();
+    case "view":
+      return forgeProvider.view(freezePr(request.pr));
+    case "commits":
+      return forgeProvider.commits(freezePr(request.pr));
+    case "diff":
+      await sendParts(id, await forgeProvider.diff(freezePr(request.pr), { signal }), signal, "diff");
+      return null;
+    case "commitDiff": {
+      const { diff, ...rest } = (await forgeProvider.commitDiff(freezePr(request.pr), request.oid, { signal })) ?? {};
+      await sendParts(id, diff, signal, "commitDiff");
+      return rest;
+    }
   }
 }
+
+/** Hand a diff to the host a part at a time, waiting for each to be taken. */
+async function sendParts(id, source, signal, what) {
+  const send = async (part) => {
+    signal.throwIfAborted();
+    if (typeof part !== "string" && (part === null || typeof part !== "object" || typeof part.path !== "string")) {
+      throw new TypeError(`${what} sent a part that is neither diff text nor a file ({ path, status, patch })`);
+    }
+    await call("forge.part", { call: id, part }, { signal });
+  };
+  if (typeof source === "string") return send(source);
+  if (source == null || (typeof source[Symbol.asyncIterator] !== "function" && typeof source[Symbol.iterator] !== "function")) {
+    throw new TypeError(`${what} must give diff text, an array of parts or an (async) iterable of them`);
+  }
+  for await (const part of source) await send(part);
+}
+
+const forgeCalls = new Map();
 
 function deliver(event) {
   const { name, repo, ...rest } = event;
@@ -781,9 +915,16 @@ async function answer(id, request) {
       case "command":
         await commandHandlers.get(request.id)(commandContext(request.context));
         break;
-      case "forge":
-        value = (await askForge(new Repo(request.repo), request.call)) ?? null;
+      case "forge": {
+        const controller = new AbortController();
+        forgeCalls.set(id, controller);
+        try {
+          value = (await askForge(id, new Repo(request.repo), request.call, controller.signal)) ?? null;
+        } finally {
+          forgeCalls.delete(id);
+        }
         break;
+      }
       case "event":
         deliver(request.event);
         break;
@@ -813,6 +954,9 @@ boot.dispatch = (json) => {
     }
     case "call":
       answer(message.id, message.call);
+      break;
+    case "abort":
+      forgeCalls.get(message.id)?.abort();
       break;
   }
 };

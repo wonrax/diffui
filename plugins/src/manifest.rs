@@ -71,9 +71,13 @@ pub struct Permissions {
     /// Hosts `http.fetch` may reach and `auth.token` may be asked for.
     #[serde(default)]
     pub http: Vec<HostPattern>,
-    /// Argv prefixes `exec` may run.
+    /// Argv prefixes `exec` may run. A word `{config.<key>}` stands for
+    /// that string setting, so the user can point the plugin at a program.
     #[serde(default)]
     pub exec: Vec<Vec<String>>,
+    /// Environment variables `exec` may set for the programs it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
     #[serde(default)]
     pub jj: JjAccess,
 }
@@ -91,42 +95,58 @@ pub enum JjAccess {
 /// A host a plugin may talk to: `codeberg.org`, `*.example.com` (any
 /// subdomain, not the bare domain) or `127.0.0.1:3000` (that port only).
 /// Without a port, any port matches.
+///
+/// A forge's claim ([`HostPattern::parse_claim`]) may put `*` in place of any
+/// label, standing for one label or more: `github.*` covers `github.com` and
+/// `github.acme.com`, `*.github.*` covers `ci.github.acme.com`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct HostPattern {
-    wildcard: bool,
-    host: String,
+    /// Lowercase labels; `*` is one label or more.
+    labels: Vec<String>,
     port: Option<u16>,
 }
 
 impl HostPattern {
+    /// A pattern a permission names: a host, maybe with `*.` in front.
     pub fn parse(text: &str) -> Result<Self, String> {
+        let pattern = Self::parse_claim(text)?;
+        let inner = pattern.labels.iter().skip(1).any(|label| label == "*");
+        if inner {
+            return Err(not_a_host(text));
+        }
+        Ok(pattern)
+    }
+
+    /// A pattern a forge claims remotes with: [`Self::parse`], where `*` may
+    /// stand in for any label.
+    pub fn parse_claim(text: &str) -> Result<Self, String> {
         let lower = text.trim().to_ascii_lowercase();
-        let (wildcard, rest) = match lower.strip_prefix("*.") {
-            Some(rest) => (true, rest),
-            None => (false, lower.as_str()),
-        };
         // A colon outside a bracketed IPv6 literal starts the port.
-        let (host, port) = match rest.rfind(':').filter(|at| !rest[*at..].contains(']')) {
-            Some(at) => (&rest[..at], Some(rest[at + 1..].parse::<u16>().ok())),
-            None => (rest, None),
+        let (host, port) = match lower.rfind(':').filter(|at| !lower[*at..].contains(']')) {
+            Some(at) => (&lower[..at], Some(lower[at + 1..].parse::<u16>().ok())),
+            None => (lower.as_str(), None),
         };
         let bracketed = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
-        let plain = !host.is_empty()
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        let labels: Vec<String> = if bracketed {
+            vec![host.to_string()]
+        } else {
+            host.split('.').map(str::to_string).collect()
+        };
+        let plain = bracketed
+            || labels.iter().all(|label| {
+                label == "*"
+                    || !label.is_empty()
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             });
-        if !(plain || bracketed && !wildcard) || port == Some(None) {
-            return Err(format!(
-                "\"{text}\" is not a host; write one like \"codeberg.org\", \"*.example.com\" or \"localhost:3000\""
-            ));
+        let named = labels.iter().any(|label| label != "*");
+        if host.is_empty() || !plain || !named || port == Some(None) {
+            return Err(not_a_host(text));
         }
         Ok(Self {
-            wildcard,
-            host: host.to_string(),
+            labels,
             port: port.flatten(),
         })
     }
@@ -135,22 +155,37 @@ impl HostPattern {
     /// `port` (the URL's, or its scheme's default) is covered.
     pub fn matches(&self, host: &str, port: u16) -> bool {
         let host = host.to_ascii_lowercase();
-        let host_ok = if self.wildcard {
-            host.strip_suffix(&self.host)
-                .is_some_and(|front| front.len() > 1 && front.ends_with('.'))
+        let labels: Vec<&str> = if host.starts_with('[') {
+            vec![host.as_str()]
         } else {
-            host == self.host
+            host.split('.').collect()
         };
-        host_ok && self.port.is_none_or(|p| p == port)
+        glob(&self.labels, &labels) && self.port.is_none_or(|p| p == port)
+    }
+}
+
+fn not_a_host(text: &str) -> String {
+    format!(
+        "\"{text}\" is not a host; write one like \"codeberg.org\", \"*.example.com\" or \"localhost:3000\""
+    )
+}
+
+/// Whether `labels` spell `pattern`, where a `*` takes one label or more.
+fn glob(pattern: &[String], labels: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => labels.is_empty(),
+        Some((first, rest)) if first == "*" => {
+            (1..=labels.len()).any(|taken| glob(rest, &labels[taken..]))
+        }
+        Some((first, rest)) => labels
+            .split_first()
+            .is_some_and(|(label, others)| first == label && glob(rest, others)),
     }
 }
 
 impl fmt::Display for HostPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.wildcard {
-            f.write_str("*.")?;
-        }
-        f.write_str(&self.host)?;
+        f.write_str(&self.labels.join("."))?;
         if let Some(port) = self.port {
             write!(f, ":{port}")?;
         }
@@ -173,10 +208,30 @@ impl From<HostPattern> for String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeClaim {
+    /// The remotes it answers for, by host ([`HostPattern::parse_claim`]).
     pub hosts: Vec<HostPattern>,
     /// What the forge calls a pull request: `term = "merge request"` makes
     /// the app say that in its menus, dialogs and badges.
     pub term: ForgeTerm,
+    /// What prefixes a number in the forge's own references: `#` for a
+    /// pull request, `!` for a merge request unless the manifest says.
+    pub sigil: char,
+    /// The abbreviation: `PR`, `MR`.
+    pub short: String,
+    /// The host a reference without one means (`github.com`).
+    pub default_host: Option<String>,
+    /// An environment variable that, when set, names that host instead
+    /// (`GH_HOST`).
+    pub host_env: Option<String>,
+    /// The command-line program the forge's errors tell the user to install
+    /// or sign in with (`gh`).
+    pub cli: Option<String>,
+    /// How the path of a pull request's page reads after the host, with
+    /// `{owner}`, `{name}` and `{number}`: `{owner}/{name}/pull/{number}`.
+    /// With it the app opens pasted links and `owner/name#12` references.
+    pub pull_request_path: Option<String>,
+    /// A project's owner may be several segments (GitLab's groups).
+    pub subgroups: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -279,6 +334,8 @@ struct RawPermissions {
     http: Vec<Spanned<String>>,
     #[serde(default)]
     exec: Vec<Spanned<Vec<String>>>,
+    #[serde(default)]
+    env: Vec<Spanned<String>>,
     jj: Option<Spanned<String>>,
 }
 
@@ -293,6 +350,14 @@ struct RawProvides {
 struct RawForge {
     hosts: Spanned<Vec<Spanned<String>>>,
     term: Option<Spanned<String>>,
+    sigil: Option<Spanned<String>>,
+    short: Option<Spanned<String>>,
+    default_host: Option<Spanned<String>>,
+    host_env: Option<Spanned<String>>,
+    cli: Option<Spanned<String>>,
+    pull_request_path: Option<Spanned<String>>,
+    #[serde(default)]
+    subgroups: bool,
 }
 
 #[derive(Deserialize)]
@@ -465,9 +530,84 @@ impl Manifest {
                     ForgeTerm::PullRequest
                 }
             };
+            let claims = forge
+                .hosts
+                .get_ref()
+                .iter()
+                .filter_map(|host| match HostPattern::parse_claim(host.get_ref()) {
+                    Ok(pattern) => Some(pattern),
+                    Err(why) => {
+                        report.at(host.span(), why);
+                        None
+                    }
+                })
+                .collect();
+            let merge = term == ForgeTerm::MergeRequest;
+            let sigil = match &forge.sigil {
+                None => if merge { '!' } else { '#' },
+                Some(sigil) => {
+                    let mut chars = sigil.get_ref().chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) if c.is_ascii_punctuation() && !"/.:-_".contains(c) => c,
+                        _ => {
+                            report.at(sigil.span(), "forge.sigil is one punctuation character, like \"#\" or \"!\"");
+                            '#'
+                        }
+                    }
+                }
+            };
+            let short = match &forge.short {
+                None => (if merge { "MR" } else { "PR" }).to_string(),
+                Some(short) => {
+                    let text = short.get_ref().trim();
+                    if text.is_empty() || text.chars().count() > 4 {
+                        report.at(short.span(), "forge.short is an abbreviation of one to four characters, like \"PR\"");
+                    }
+                    text.to_string()
+                }
+            };
+            let default_host = forge.default_host.map(|host| {
+                if let Err(why) = HostPattern::parse(host.get_ref()).and_then(|pattern| {
+                    if pattern.labels.iter().any(|label| label == "*") {
+                        Err(not_a_host(host.get_ref()))
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    report.at(host.span(), format!("forge.default_host: {why}"));
+                }
+                host.into_inner().to_ascii_lowercase()
+            });
+            let host_env = forge.host_env.map(|var| {
+                if !is_env_name(var.get_ref()) {
+                    report.at(var.span(), "forge.host_env is an environment variable's name, like \"GH_HOST\"");
+                }
+                var.into_inner()
+            });
+            let cli = forge.cli.map(|cli| {
+                let ok = !cli.get_ref().is_empty()
+                    && cli.get_ref().bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+                if !ok {
+                    report.at(cli.span(), "forge.cli is a program's name, like \"gh\"");
+                }
+                cli.into_inner()
+            });
+            let pull_request_path = forge.pull_request_path.map(|path| {
+                if let Err(why) = check_pull_request_path(path.get_ref()) {
+                    report.at(path.span(), format!("forge.pull_request_path: {why}"));
+                }
+                path.into_inner()
+            });
             ForgeClaim {
-                hosts: hosts(forge.hosts.get_ref(), &mut report),
+                hosts: claims,
                 term,
+                sigil,
+                short,
+                default_host,
+                host_env,
+                cli,
+                pull_request_path,
+                subgroups: forge.subgroups,
             }
         });
         for argv in &raw.permissions.exec {
@@ -476,6 +616,23 @@ impl Manifest {
                     argv.span(),
                     "an exec permission is an argv prefix like [\"git\", \"credential\"], with no empty words",
                 );
+            }
+        }
+        let mut env = Vec::new();
+        for var in &raw.permissions.env {
+            let name = var.get_ref();
+            if !is_env_name(name) {
+                report.at(
+                    var.span(),
+                    format!("env \"{name}\" is not an environment variable's name"),
+                );
+            } else if name.starts_with("DYLD_") || name.starts_with("LD_") {
+                report.at(
+                    var.span(),
+                    format!("env \"{name}\" is not allowed: it changes how every program loads"),
+                );
+            } else {
+                env.push(name.clone());
             }
         }
         let jj = match &raw.permissions.jj {
@@ -594,6 +751,23 @@ impl Manifest {
             });
         }
 
+        for argv in &raw.permissions.exec {
+            for word in argv.get_ref() {
+                let Some(key) = config_word(word) else {
+                    continue;
+                };
+                let string = config
+                    .iter()
+                    .any(|field| field.key == key && field.kind == ConfigKind::String);
+                if !string {
+                    report.at(
+                        argv.span(),
+                        format!("exec {word}: [config.schema] must declare {key} = {{ type = \"string\" }}"),
+                    );
+                }
+            }
+        }
+
         if !report.problems.is_empty() {
             return Err(report.problems);
         }
@@ -612,12 +786,24 @@ impl Manifest {
                     .into_iter()
                     .map(Spanned::into_inner)
                     .collect(),
+                env,
                 jj,
             },
             forge,
             commands,
             config,
         })
+    }
+
+    /// Where `exec` runs a program unless the script says: the plugin's
+    /// directory, or the home directory for a plugin with none on disk
+    /// (a bundled one).
+    pub fn cwd(&self) -> &Path {
+        if self.dir.is_dir() {
+            &self.dir
+        } else {
+            home_dir()
+        }
     }
 
     /// The table a script sees as `config`: the schema's defaults under the
@@ -649,6 +835,73 @@ impl Manifest {
         }
         (config, problems)
     }
+}
+
+fn home_dir() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_dir())
+            .unwrap_or_else(std::env::temp_dir)
+    })
+}
+
+/// The setting an exec permission's word `{config.<key>}` stands for.
+pub(crate) fn config_word(word: &str) -> Option<&str> {
+    word.strip_prefix("{config.")?.strip_suffix('}')
+}
+
+/// The exec permissions with every `{config.<key>}` word replaced by that
+/// setting. A prefix whose setting isn't a non-empty string allows nothing.
+pub(crate) fn resolve_exec(
+    prefixes: &[Vec<String>],
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<Vec<String>> {
+    prefixes
+        .iter()
+        .filter_map(|prefix| {
+            prefix
+                .iter()
+                .map(|word| match config_word(word) {
+                    None => Some(word.clone()),
+                    Some(key) => config
+                        .get(key)
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// An environment variable's name: letters, digits and underscores, not
+/// starting with a digit.
+fn is_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// A pull request page's path pattern: segments, each one literal or one of
+/// `{owner}`, `{name}`, `{number}`, all three present once.
+fn check_pull_request_path(path: &str) -> Result<(), String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err("write segments joined by /, like \"{owner}/{name}/pull/{number}\"".into());
+    }
+    for field in ["{owner}", "{name}", "{number}"] {
+        if segments.iter().filter(|segment| **segment == field).count() != 1 {
+            return Err(format!("{field} must be a whole segment, once"));
+        }
+    }
+    if let Some(odd) = segments.iter().find(|segment| {
+        segment.contains(['{', '}']) && !["{owner}", "{name}", "{number}"].contains(segment)
+    }) {
+        return Err(format!("{odd} is not {{owner}}, {{name}} or {{number}}"));
+    }
+    Ok(())
 }
 
 /// `main` names a JavaScript or TypeScript module inside the plugin
@@ -950,5 +1203,79 @@ limit = { type = "number", default = 50 }
         std::fs::write(dir.join("main.js"), "").unwrap();
         assert_eq!(Manifest::load(&dir).unwrap().dir, dir);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_forge_claims_hosts_by_label_and_names_itself() {
+        let claim = |text: &str| HostPattern::parse_claim(text).unwrap();
+        let named = claim("github.*");
+        assert!(named.matches("github.com", 443) && named.matches("github.acme.com", 443));
+        assert!(!named.matches("github", 443) && !named.matches("ci.github.com", 443));
+        let inner = claim("*.github.*");
+        assert!(inner.matches("ci.github.acme.com", 443) && !inner.matches("github.com", 443));
+        // A permission can't be that broad.
+        assert!(HostPattern::parse("github.*").is_err());
+        assert!(HostPattern::parse_claim("*.*").is_err());
+
+        let manifest = parse(&with(
+            "forge = { hosts = [\"codeberg.org\"] }",
+            r#"forge = { hosts = ["gitlab.com", "gitlab.*"], term = "merge request", default_host = "GitLab.com", host_env = "GITLAB_HOST", cli = "glab", pull_request_path = "{owner}/{name}/-/merge_requests/{number}", subgroups = true }"#,
+        ))
+        .unwrap();
+        let forge = manifest.forge.unwrap();
+        assert_eq!((forge.sigil, forge.short.as_str()), ('!', "MR"));
+        assert_eq!(forge.default_host.as_deref(), Some("gitlab.com"));
+        assert_eq!(forge.host_env.as_deref(), Some("GITLAB_HOST"));
+        assert_eq!(forge.cli.as_deref(), Some("glab"));
+        assert!(forge.subgroups && forge.hosts[1].matches("gitlab.acme.org", 443));
+
+        let problems = parse(&with(
+            "forge = { hosts = [\"codeberg.org\"] }",
+            r#"forge = { hosts = ["codeberg.org"], sigil = "%%", host_env = "1X", cli = "a b", pull_request_path = "{owner}/pulls/{number}" }"#,
+        ))
+        .unwrap_err();
+        assert_eq!(problems.len(), 4, "{problems:#?}");
+        assert!(
+            problems[3].contains("{name} must be a whole segment, once"),
+            "{problems:#?}"
+        );
+    }
+
+    #[test]
+    fn exec_may_name_a_setting_and_env_names_variables() {
+        let manifest = parse(
+            &with(
+                "exec = [[\"git\", \"credential\"]]",
+                "exec = [[\"{config.program}\", \"api\"]]\nenv = [\"GH_HOST\"]",
+            )
+            .replace(
+                "limit = {",
+                "program = { type = \"string\", default = \"gh\" }\nlimit = {",
+            ),
+        )
+        .unwrap();
+        assert_eq!(manifest.permissions.env, ["GH_HOST"]);
+        let (config, _) =
+            manifest.resolve_config(&toml::from_str("program = \"/opt/gh\"").unwrap());
+        assert_eq!(
+            resolve_exec(&manifest.permissions.exec, &config),
+            [["/opt/gh", "api"]]
+        );
+        let problems = parse(&with(
+            "exec = [[\"git\", \"credential\"]]",
+            "exec = [[\"{config.limit}\"]]\nenv = [\"DYLD_INSERT_LIBRARIES\", \"A-B\"]",
+        ))
+        .unwrap_err();
+        assert_eq!(problems.len(), 3, "{problems:#?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("changes how every program loads"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("must declare limit = { type = \"string\" }"))
+        );
     }
 }

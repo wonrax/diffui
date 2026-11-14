@@ -29,6 +29,7 @@ pub mod protocol;
 mod typescript;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,7 +40,7 @@ use actor::{Actor, Status, ToActor, lock};
 pub use host::{
     Host, LogLevel, LogLine, PluginError, PluginEvent, PluginState, Registration, Reply,
 };
-pub use js::JsError;
+pub use js::{JsError, ThrownForgeError};
 pub use manifest::{
     API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, ForgeTerm,
     HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, Permissions,
@@ -105,7 +106,11 @@ pub struct Plugin {
     manifest: Arc<Manifest>,
     status: Arc<Mutex<Status>>,
     to: Sender<ToActor>,
+    next_call: AtomicU64,
 }
+
+/// One call into a plugin, for [`Plugin::abort`].
+pub type CallId = u64;
 
 impl Plugin {
     /// Start the plugin on its own thread and begin loading its main module.
@@ -135,6 +140,7 @@ impl Plugin {
             manifest,
             status,
             to,
+            next_call: AtomicU64::new(1),
         }
     }
 
@@ -160,7 +166,40 @@ impl Plugin {
         &self,
         call: PluginCall,
         reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
-    ) {
+    ) -> CallId {
+        self.send_call(call, None, reply)
+    }
+
+    /// [`Self::call`] for a forge method that streams ([`ForgeCall::streams`]):
+    /// `on_part` runs on the plugin's thread with each part the script sends,
+    /// before `reply`. The script waits for each part's [`Reply`], so answer
+    /// it once the part is taken in (that is the backpressure), or reject it
+    /// to make the script stop.
+    ///
+    /// [`ForgeCall::streams`]: protocol::ForgeCall::streams
+    pub fn call_streaming<T: DeserializeOwned>(
+        &self,
+        call: PluginCall,
+        on_part: impl FnMut(serde_json::Value, Reply) + Send + 'static,
+        reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
+    ) -> CallId {
+        self.send_call(call, Some(Box::new(on_part)), reply)
+    }
+
+    /// Give up on a call: the script's handler sees its `signal` abort (which
+    /// reaches the `exec` and `http` calls it passed it to), and the call's
+    /// reply is [`PluginError::Gone`] unless it already settled.
+    pub fn abort(&self, id: CallId) {
+        let _ = self.to.send(ToActor::Abort { id });
+    }
+
+    fn send_call<T: DeserializeOwned>(
+        &self,
+        call: PluginCall,
+        parts: Option<actor::PartFn>,
+        reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
+    ) -> CallId {
+        let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let what = match &call {
             PluginCall::Forge { call, .. } => call.method(),
             PluginCall::Command { .. } | PluginCall::Event { .. } => "the handler",
@@ -173,12 +212,15 @@ impl Plugin {
             }));
         };
         let sent = self.to.send(ToActor::Call {
+            id,
             call: Box::new(call),
+            parts,
             reply: Box::new(typed),
         });
         if let Err(mpsc::SendError(ToActor::Call { reply, .. })) = sent {
             reply(Err(PluginError::Failed("its thread is gone".into())));
         }
+        id
     }
 
     /// Throw the script's context away and load the plugin's files again,

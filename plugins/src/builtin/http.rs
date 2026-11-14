@@ -21,6 +21,9 @@ pub(crate) struct FetchRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Hand the body over a piece at a time (see [`super::stream`]).
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// The agent a plugin's requests share (its connection pool). Redirects are
@@ -87,6 +90,72 @@ pub(crate) fn fetch(
     default_timeout: Duration,
     max_body: u64,
 ) -> Result<Value, HostError> {
+    let (uri, mut response) = send(agent, request, allowed, default_timeout)?;
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(max_body)
+        .lossy_utf8(true)
+        .read_to_string()
+        .map_err(|error| transport(&uri, error))?;
+    let mut reply = head(&uri, &response);
+    reply["body"] = text.into();
+    Ok(reply)
+}
+
+/// [`fetch`] with the body handed over a piece per read: `started` hears the
+/// status and headers (or why there are none), then each read of `reads`
+/// gets a piece, and the last one `{ done: true }`. A read waits at most the
+/// request's timeout for its piece.
+pub(crate) fn fetch_stream(
+    agent: &ureq::Agent,
+    request: FetchRequest,
+    allowed: &[HostPattern],
+    default_timeout: Duration,
+    reads: std::sync::mpsc::Receiver<super::stream::Pull>,
+    started: impl FnOnce(Result<Value, HostError>),
+    answer: &dyn Fn(u64, Result<Value, HostError>),
+) {
+    let idle = request
+        .timeout_ms
+        .map_or(default_timeout, Duration::from_millis);
+    let (uri, response) = match send(agent, request, allowed, default_timeout) {
+        Ok(sent) => sent,
+        Err(error) => return started(Err(error)),
+    };
+    started(Ok(head(&uri, &response)));
+    let body = response.into_body().into_reader();
+    if let super::stream::Ending::End(last) =
+        super::stream::serve(body, &uri.to_string(), idle, &reads, answer)
+    {
+        answer(last.id, Ok(json!({ "done": true })));
+    }
+}
+
+/// The status, headers and final URL of a response, as the script reads them.
+fn head(uri: &Uri, response: &ureq::http::Response<ureq::Body>) -> Value {
+    let status = response.status();
+    json!({
+        "status": status.as_u16(),
+        "statusText": status.canonical_reason().unwrap_or(""),
+        "url": uri.to_string(),
+        "headers": response
+            .headers()
+            .iter()
+            .map(|(name, value)| [name.as_str().to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()])
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Send the request, following redirects that stay on allowed hosts, and
+/// return the response whose body is still to be read. A streamed request's
+/// timeout covers getting the response, not reading all of the body.
+fn send(
+    agent: &ureq::Agent,
+    request: FetchRequest,
+    allowed: &[HostPattern],
+    default_timeout: Duration,
+) -> Result<(Uri, ureq::http::Response<ureq::Body>), HostError> {
     let mut uri = check(&request.url, allowed)?;
     let mut method = match request.method.as_str() {
         "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" => {
@@ -104,6 +173,18 @@ pub(crate) fn fetch(
     let timeout = request
         .timeout_ms
         .map_or(default_timeout, Duration::from_millis);
+    // A request's time limit: all of it, or, streamed, up to its response.
+    macro_rules! limited {
+        ($config:expr) => {
+            if request.stream {
+                $config
+                    .timeout_connect(Some(timeout))
+                    .timeout_recv_response(Some(timeout))
+            } else {
+                $config.timeout_global(Some(timeout))
+            }
+        };
+    }
 
     for _ in 0..=MAX_REDIRECTS {
         let mut builder = Request::builder().method(method.clone()).uri(uri.clone());
@@ -115,21 +196,11 @@ pub(crate) fn fetch(
         let sent = match &body {
             Some(text) => {
                 let request = builder.body(text.as_str()).map_err(invalid)?;
-                agent.run(
-                    agent
-                        .configure_request(request)
-                        .timeout_global(Some(timeout))
-                        .build(),
-                )
+                agent.run(limited!(agent.configure_request(request)).build())
             }
             None => {
                 let request = builder.body(()).map_err(invalid)?;
-                agent.run(
-                    agent
-                        .configure_request(request)
-                        .timeout_global(Some(timeout))
-                        .build(),
-                )
+                agent.run(limited!(agent.configure_request(request)).build())
             }
         };
         let mut response = sent.map_err(|error| transport(&uri, error))?;
@@ -165,24 +236,7 @@ pub(crate) fn fetch(
             continue;
         }
 
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(max_body)
-            .lossy_utf8(true)
-            .read_to_string()
-            .map_err(|error| transport(&uri, error))?;
-        return Ok(json!({
-            "status": status.as_u16(),
-            "statusText": status.canonical_reason().unwrap_or(""),
-            "url": uri.to_string(),
-            "headers": response
-                .headers()
-                .iter()
-                .map(|(name, value)| [name.as_str().to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()])
-                .collect::<Vec<_>>(),
-            "body": text,
-        }));
+        return Ok((uri, response));
     }
     Err(HostError::new(
         "NetworkError",

@@ -224,6 +224,20 @@ pub enum ForgeCall {
         number: u64,
         patch: UpdatePullRequest,
     },
+    /// Hosts the forge claims beyond its manifest's, asked once after it
+    /// loads. Reply: `Vec<String>`, each a host as `[provides] forge.hosts`
+    /// writes one.
+    Hosts,
+    /// The pull-request tab's header. Reply: [`PrInfo`].
+    View { pr: PrRef },
+    /// The pull request's commits, oldest first. Reply: `Vec<`[`PrCommit`]`>`.
+    Commits { pr: PrRef },
+    /// One commit's diff. Streams [`DiffPart`]s through the call's parts,
+    /// then replies [`CommitDiff`].
+    CommitDiff { pr: PrRef, oid: String },
+    /// The whole pull request's diff. Streams [`DiffPart`]s through the
+    /// call's parts, then replies `null`.
+    Diff { pr: PrRef },
 }
 
 impl ForgeCall {
@@ -234,18 +248,151 @@ impl ForgeCall {
             ForgeCall::Checks { .. } => "checks",
             ForgeCall::CreatePullRequest { .. } => "createPullRequest",
             ForgeCall::UpdatePullRequest { .. } => "updatePullRequest",
+            ForgeCall::Hosts => "hosts",
+            ForgeCall::View { .. } => "view",
+            ForgeCall::Commits { .. } => "commits",
+            ForgeCall::CommitDiff { .. } => "commitDiff",
+            ForgeCall::Diff { .. } => "diff",
         }
+    }
+
+    /// Whether the call streams parts before it settles. Its time limit is
+    /// then the longest wait between parts, not the whole call.
+    pub fn streams(&self) -> bool {
+        matches!(self, ForgeCall::CommitDiff { .. } | ForgeCall::Diff { .. })
     }
 }
 
 /// The provider methods a script can register, in the order the host lists
 /// them.
-pub const FORGE_METHODS: [&str; 4] = [
+pub const FORGE_METHODS: [&str; 9] = [
     "pullRequests",
     "checks",
     "createPullRequest",
     "updatePullRequest",
+    "hosts",
+    "view",
+    "commits",
+    "commitDiff",
+    "diff",
 ];
+
+/// The methods a pull request's tab needs, all of them.
+pub const TAB_METHODS: [&str; 4] = ["view", "commits", "commitDiff", "diff"];
+
+/// A pull request, as a tab names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrRef {
+    /// As in the project's URL, with the port when it has one.
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+    pub number: u64,
+    /// The project's page (`https://github.com/team/app`).
+    pub web_url: String,
+}
+
+/// A pull request's header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrInfo {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    pub state: PrState,
+    pub base: String,
+    pub head: String,
+    /// Lines added and removed in the whole pull request, when the forge
+    /// says. Without them the tab adds up the files.
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    #[serde(default)]
+    pub changed_files: Option<u64>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCommit {
+    /// The full commit id.
+    pub oid: String,
+    #[serde(default)]
+    pub author: String,
+    /// The first line of the message.
+    pub headline: String,
+    /// When it was authored, as RFC 3339 (`2026-11-14T09:30:00Z`).
+    #[serde(default)]
+    pub authored_at: Option<String>,
+}
+
+/// What `commitDiff` settles with, once its parts are all sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitDiff {
+    #[serde(default)]
+    pub details: Option<CommitDetails>,
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CommitDetails {
+    /// The whole message.
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub email: String,
+    /// RFC 3339.
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+/// One piece of a streamed diff: unified `git diff` text, cut anywhere
+/// (the host joins lines across pieces), or one file as a forge's API
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DiffPart {
+    Text(String),
+    File(FilePatch),
+}
+
+/// One file of a diff: its hunks without a `diff --git` header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePatch {
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    pub status: FileStatus,
+    /// `@@` hunks; absent for a binary or oversized file.
+    #[serde(default)]
+    pub patch: Option<String>,
+    /// The forge's own counts, which win over counting the patch (an API
+    /// that leaves a big file's patch out still counts its lines).
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileStatus {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    Copied,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatePullRequest {

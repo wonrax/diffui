@@ -234,7 +234,7 @@ pub fn probe(extra_manifest: &str, cases: &str) -> Setup<'static> {
         extra_manifest,
         &format!(
             r#"import * as diffui from "diffui";
-const {{ auth, commands, config, events, exec, forge, http, kv, ui }} = diffui;
+const {{ ForgeError, auth, commands, config, events, exec, forge, http, kv, ui }} = diffui;
 commands.register("t.run", async () => {{}});
 const cases = {{
 {cases}

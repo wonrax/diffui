@@ -377,6 +377,7 @@ mod tests {
             name: "Error".into(),
             message: "Forgejo 401: token required".into(),
             stack: String::new(),
+            forge: None,
         });
         assert_eq!(
             failure(thrown, "Forgejo", "codeberg.org".into()).to_string(),

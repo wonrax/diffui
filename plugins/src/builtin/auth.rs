@@ -69,11 +69,15 @@ fn run(
     cwd: &Path,
     cancel: &AtomicBool,
 ) -> Result<exec::Output, HostError> {
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     let run = Run {
         argv,
         stdin,
         cwd,
-        env,
+        env: &env,
         timeout: TIMEOUT,
         max_output: MAX_OUTPUT,
     };

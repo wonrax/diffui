@@ -4,5 +4,6 @@
 mod forgejo;
 mod host_api;
 mod lifecycle;
+mod streams;
 mod support;
 mod types;

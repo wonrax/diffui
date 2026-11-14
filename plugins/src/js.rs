@@ -33,8 +33,17 @@ const HOST_SOURCE: &str = include_str!("js/diffui.js");
 
 /// What `import { … } from "diffui"` offers. A test holds this, the module
 /// and `assets/diffui.d.ts` to the same list.
-pub(crate) const EXPORTS: [&str; 9] = [
-    "auth", "commands", "config", "events", "exec", "forge", "http", "kv", "ui",
+pub(crate) const EXPORTS: [&str; 10] = [
+    "ForgeError",
+    "auth",
+    "commands",
+    "config",
+    "events",
+    "exec",
+    "forge",
+    "http",
+    "kv",
+    "ui",
 ];
 
 /// An exception from a script.
@@ -46,6 +55,22 @@ pub struct JsError {
     /// QuickJS's stack: one `    at function (file:line:col)` line per frame.
     #[serde(default)]
     pub stack: String,
+    /// Set when the script threw a `ForgeError`: what kind of failure the
+    /// app should explain.
+    #[serde(default)]
+    pub forge: Option<ThrownForgeError>,
+}
+
+/// What a script's `new ForgeError(kind, message, { host, what })` carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ThrownForgeError {
+    /// `missing-cli`, `auth`, `not-found`, `rate-limited`, `unreachable`,
+    /// `timeout` or `failed`.
+    pub kind: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub what: Option<String>,
 }
 
 impl JsError {
@@ -54,6 +79,7 @@ impl JsError {
             name: "Error".into(),
             message: message.into(),
             stack: String::new(),
+            forge: None,
         }
     }
 
@@ -455,6 +481,7 @@ fn describe<'js>(ctx: &Ctx<'js>, thrown: Value<'js>) -> JsError {
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
+            forge: None,
         },
         None => {
             // Reading the value may itself throw; that must not stay pending.
@@ -599,6 +626,7 @@ mod tests {
             name: "TypeError".into(),
             message: "boom".into(),
             stack: stack.into(),
+            forge: None,
         }
     }
 
