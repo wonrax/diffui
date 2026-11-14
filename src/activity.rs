@@ -742,19 +742,24 @@ pub(crate) fn activity_popover(
     }
     let heading =
         |label: &'static str| crate::overlay_kit::group_heading(label, look).px(px(ROW_PAD_X));
+    // A sliver of the card between rows, so two failed rows' tints (and a
+    // hovered row's wash beside one) read as two rows.
+    let rows = || div().w_full().flex().flex_col().gap(px(theme::space::XXS));
     if !live.is_empty() {
         // In the order they run.
-        list = list.child(heading("In progress"));
+        let mut section = rows();
         for activity in live {
-            list = list.child(activity_row(ui, look, activity, window, cx));
+            section = section.child(activity_row(ui, look, activity, window, cx));
         }
+        list = list.child(heading("In progress")).child(section);
     }
     if !past.is_empty() {
         // Newest first, so the latest result is on top.
-        list = list.child(heading("Finished"));
+        let mut section = rows();
         for activity in past.into_iter().rev() {
-            list = list.child(activity_row(ui, look, activity, window, cx));
+            section = section.child(activity_row(ui, look, activity, window, cx));
         }
+        list = list.child(heading("Finished")).child(section);
     }
 
     // The card carries no padding of its own so the divider can run edge to
