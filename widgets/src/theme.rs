@@ -650,14 +650,26 @@ pub fn ghost_button_style(theme: ThemeSpec) -> ButtonStyle {
 /// The standard button: the panes' raised surface with a firm hairline ring
 /// and a faint lift. Hover and press deepen the fill without moving it.
 pub fn raised_button_style(theme: ThemeSpec) -> ButtonStyle {
+    let (hover, active) = pointer_states(theme.panel_background_elevated, theme);
     ButtonStyle {
         rest: Some(theme.panel_background_elevated),
-        hover: mix(theme.panel_background_elevated, theme.text, 0.035),
-        active: mix(theme.panel_background_elevated, theme.text, 0.07),
+        hover,
+        active,
         label: theme.text,
         ring: Some(firm_ring(theme)),
         lift: Some(lift(0.05, 1.0)),
     }
+}
+
+/// `fill` under the pointer and pressed: a step and two steps toward the
+/// text colour. A wash thickens by the same steps, so a translucent fill
+/// deepens over whatever it sits on instead of turning opaque.
+pub fn pointer_states(fill: Color, theme: ThemeSpec) -> (Color, Color) {
+    let toward = |t: f32| Color {
+        a: fill.a + (1.0 - fill.a) * t,
+        ..mix(fill, theme.text, t)
+    };
+    (toward(0.035), toward(0.07))
 }
 
 /// A faint drop one pixel under a control.
@@ -1109,5 +1121,38 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Under the pointer a fill deepens from where it rests. An opaque one (a
+    /// segment's raised face) stays opaque, by the raised button's steps; a
+    /// wash (a toggle that is on) stays a wash of the same hue, thicker.
+    #[test]
+    fn a_fill_deepens_under_the_pointer_from_where_it_rests() {
+        for theme in [
+            ResolvedTheme::Dark,
+            ResolvedTheme::Light,
+            ResolvedTheme::HighContrast,
+        ] {
+            let spec = theme.spec();
+            let face = spec.panel_background_elevated;
+            assert_eq!(
+                pointer_states(face, spec),
+                (mix(face, spec.text, 0.035), mix(face, spec.text, 0.07)),
+                "{theme:?}"
+            );
+
+            for wash in [press_wash(spec), chip_background(spec.accent)] {
+                let (hover, active) = pointer_states(wash, spec);
+                assert!(
+                    wash.a < hover.a && hover.a < active.a && active.a < 0.3,
+                    "{theme:?}: {wash:?} {hover:?} {active:?}"
+                );
+            }
+            let (hover, _) = pointer_states(press_wash(spec), spec);
+            assert_eq!(
+                (hover.r, hover.g, hover.b),
+                (spec.text.r, spec.text.g, spec.text.b)
+            );
+        }
     }
 }

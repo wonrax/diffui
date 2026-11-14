@@ -302,8 +302,8 @@ impl Button {
         self
     }
 
-    /// The fill and edge at rest, in place of the variant's: a toggle while
-    /// it's on. Hover and press keep the variant's.
+    /// The fill and edge in place of the variant's: a toggle while it's on.
+    /// Hover and press deepen this fill, under the same edge.
     pub fn resting(mut self, fill: Color, ring: Option<Color>) -> Self {
         self.rest = Some((fill, ring));
         self
@@ -349,9 +349,23 @@ impl RenderOnce for Button {
             }
             fill
         };
-        let rest = match self.rest {
-            Some((color, ring)) => fill(Some(color), ring),
-            None => fill(style.rest, style.ring),
+        let (rest, hover, active) = match self.rest {
+            // A fill of its own answers the pointer from that fill: under the
+            // variant's wash, a segment's raised face would sink back into
+            // its track on hover.
+            Some((color, ring)) => {
+                let (hover, active) = theme::pointer_states(color, theme);
+                (
+                    fill(Some(color), ring),
+                    fill(Some(hover), ring),
+                    fill(Some(active), ring),
+                )
+            }
+            None => (
+                fill(style.rest, style.ring),
+                fill(Some(style.hover), style.ring),
+                fill(Some(style.active), style.ring),
+            ),
         };
         // A disabled button doesn't answer the pointer.
         let states = if self.disabled {
@@ -363,8 +377,8 @@ impl RenderOnce for Button {
         } else {
             squircle::States {
                 rest,
-                hover: fill(Some(style.hover), style.ring),
-                active: fill(Some(style.active), style.ring),
+                hover,
+                active,
             }
         };
 
