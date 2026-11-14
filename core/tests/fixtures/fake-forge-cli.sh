@@ -5,13 +5,17 @@
 # arguments to `calls` (each field NUL-terminated, each call ended by \001 and
 # a newline). Then the first rule whose glob matches the arguments (joined by
 # spaces) answers: a rule line is `glob<TAB>response-file<TAB>exit-code`, and
-# the response goes to stdout on exit 0, to stderr otherwise.
+# the response goes to stdout on exit 0, to stderr otherwise. A call's record
+# is written whole, in one append, so calls running at once don't interleave.
 dir=$(dirname "$0")
+record="$dir/call.$$"
 {
   printf 'HOST=%s\0' "${GH_HOST:-$GITLAB_HOST}"
   for arg in "$@"; do printf '%s\0' "$arg"; done
   printf '\001\n'
-} >> "$dir/calls"
+} > "$record"
+cat "$record" >> "$dir/calls"
+rm -f "$record"
 all="$*"
 while IFS='	' read -r pattern response status; do
   case "$all" in
