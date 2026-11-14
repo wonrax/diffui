@@ -60,6 +60,27 @@ pull request tabs, `diffui plugin eject <id>` copies one out to change, and
 a folder plugin with the same id replaces it. `[plugins.github] program =
 "/path/to/gh"` in config.toml points one at another CLI.
 
+Each signs in to a host through its CLI (`gh`, `glab`) or with a personal
+access token. `auth = "auto"` (the default) uses the CLI where it is signed
+in to the host, else a token, else says how to sign in; `"cli"` or
+`"token"` forces one, for every host or per host under
+`[plugins.github.per_host."github.acme.com"]`. Tokens live in the macOS
+Keychain (service `diffui`, account `github@<host>`), never in a config
+file; `GH_TOKEN` / `GH_ENTERPRISE_TOKEN` / `GITLAB_TOKEN` are read the way
+the CLIs read them. Settings → Plugins → the plugin's pencil has an
+Account row per host. For scripts and agents:
+
+```sh
+diffui plugin auth github --status                     # how github.com signs in, as whom
+printf %s "$TOKEN" | diffui plugin auth github --host github.acme.com --token-stdin
+diffui plugin auth gitlab --host gitlab.acme.org --sign-out
+```
+
+`--token-stdin` keeps the token only once the forge says whose it is
+(`GET /user`). GitHub needs the `repo` scope (fine-grained: metadata,
+contents, commit statuses and checks read; pull requests read and write),
+GitLab `api`.
+
 ## Declaring commands
 
 `config.toml` lives at `$XDG_CONFIG_HOME/diffui/config.toml`, else
@@ -310,9 +331,22 @@ when = "repo.kind == 'jj'"       # optional; the same when-clauses as above
 menu = ["palette", "revision"]   # palette | revision | bookmark | file; default palette
 keys = ["cmd+shift+l"]           # optional
 
-[config.schema]                  # optional: defaults for `config`
+[config.schema]                  # optional: defaults for `config`, and Settings' controls
 team = { type = "string", default = "core", label = "Team" }
+mode = { type = "enum", values = ["fast", "safe"], default = "safe", per_host = true }
+program = { type = "path", default = "tool" }   # a field with Browse; "not found" shown inline
+api_key = { type = "secret", label = "API key" } # write-only; read with auth.secret("api_key")
 ```
+
+Types are `string`, `boolean`, `number`, `enum` (a segmented control),
+`path` (a field with Browse) and `secret` (kept in the Keychain, never in a
+file; `per_host = true` for one per host, and a forge's per-host `token`
+secret is what `auth.token(host)` reads, with `page`, `scopes` and `env`
+saying where to make one and which variables hold one). `per_host = true`
+values sit under `[plugins.<id>.per_host."<host>"]`; the script reads
+`config.per_host?.[host]?.mode ?? config.mode`. Settings writes values to
+settings.toml, config.toml wins per key, and the plugin restarts on a
+change.
 
 Unlike a `[[commands]]` row in config.toml, a plugin's row has no `exec`,
 `run`, `stdin`, `output`, `confirm` or prompts: the handler does all of
@@ -350,6 +384,7 @@ for, and the user sees the list before it runs:
 | Manifest | Lets the script |
 |---|---|
 | `http = ["host", "*.example.com", "localhost:3000"]` | `http.fetch` those hosts, and ask `auth.token` for their git credentials |
+| `http = ["{forge.hosts}"]` | the same for every host the forge claims: its patterns, `hosts()`, the user's `hosts`, the hosts it has a token for |
 | `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes; a word `"{config.program}"` is the string setting `program` (declare it in `[config.schema]`), so the user can point the plugin at a program |
 | `env = ["GH_HOST"]` | set these variables for the programs `exec` runs |
 | `read = ["${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml"]` | `files.read` these files, named as written or by the path they expand to; `~/`, `$NAME` and `${NAME:-default}` expand when read. Read-only, and nothing else on disk |
@@ -386,13 +421,13 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 | Import | For |
 |---|---|
 | `commands` | `commands.register(id, handler)`: the handler gets `{ repo, changeId, commitId, bookmark, path, line }` |
-| `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`, `hosts` (more hosts to claim, asked once after loading), and for a pull request in a tab of its own `view`, `commits`, `commitDiff` and `diff`; only `pullRequests` is required, and diffui hides what a missing method would serve |
+| `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`, `hosts` (more hosts to claim, asked once after loading), and for a pull request in a tab of its own `view`, `commits`, `commitDiff` and `diff`, and `account` (who the user is on a host, or whose a pasted token is, for Settings' Account rows); only `pullRequests` is required, and diffui hides what a missing method would serve |
 | `ForgeError` | `throw new ForgeError(kind, message, { host, what })` from a provider, `kind` one of `missing-cli`, `auth`, `not-found`, `rate-limited`, `unreachable`, `timeout`, `failed`: diffui then says what to do (`gh auth login --hostname …`) |
 | `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
 | `exec` | `exec(argv, options)`: no shell, an allowed argv prefix, `env` for allowed variables; `exec.stream(argv, options)` for output read a piece at a time with `for await`, then `await out.ended` for the exit |
 | `files` | `files.read(path)`: the text of a file `[permissions] read` lists, such as a CLI's own config |
-| `auth` | `auth.token(host)`: the user's `token_cmd`, else `git credential fill`; never prompts |
+| `auth` | `auth.token(host, { git })`: a token variable, the stored token, the user's `token_cmd`, else `git credential fill` (not with `git: false`); never prompts. `auth.secret(key, { host })`, `auth.hosts()` |
 | `kv` | a small JSON store that survives restarts |
 | `config` | the plugin's settings |
 | `ui` | `ui.toast`, `ui.activity`, `ui.prompt.input` / `confirm` / `choose`, `ui.openUrl`, `ui.clipboard.write`, `ui.status.set` |
