@@ -7,7 +7,6 @@
 mod harness;
 
 mod fetch_parity;
-mod forge_scenarios;
 mod git_scenarios;
 mod history;
 mod hunk_scenarios;

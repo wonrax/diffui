@@ -14,12 +14,10 @@
 //! `glab`), which keeps tokens out of diffui.
 
 mod cli;
-pub mod gitlab;
 mod remote;
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -598,16 +596,9 @@ impl Default for Forges {
 }
 
 impl Forges {
-    /// GitLab through `glab`, as found on the PATH. GitHub is a bundled
-    /// plugin.
+    /// None: GitHub and GitLab are bundled plugins (`plugins/bundled`).
     pub fn builtin() -> Self {
-        Self::with_programs("glab".into())
-    }
-
-    /// The built-in providers driving these programs: a test points them at
-    /// fakes.
-    pub fn with_programs(glab: PathBuf) -> Self {
-        Self::new(vec![Arc::new(gitlab::GitLab::new(glab))])
+        Self::new(Vec::new())
     }
 
     pub fn new(providers: Vec<Arc<dyn ForgeProvider>>) -> Self {
@@ -942,29 +933,54 @@ pub fn pr_revision_details(kind: ForgeKind, info: &PrInfo) -> RevisionDetails {
 mod tests {
     use super::*;
 
-    fn forges() -> Forges {
-        Forges::with_programs("glab-absent".into())
+    /// A forge that hosts everything on `gitlab.com`.
+    struct Claims;
+
+    impl ForgeProvider for Claims {
+        fn kind(&self) -> ForgeKind {
+            ForgeKind::Script(ScriptForge::new(ForgeSpec {
+                id: "test".into(),
+                ..ForgeSpec::default()
+            }))
+        }
+
+        fn claims(&self, remote_url: &str) -> Option<ForgeRemote> {
+            let (host, owner, name) = parse_remote_url(remote_url)?;
+            (host == "gitlab.com").then(|| ForgeRemote::new(self.kind(), &host, &owner, &name))
+        }
+
+        fn pull_requests(
+            &self,
+            _remote: ForgeRemote,
+            _branches: Vec<String>,
+        ) -> ForgeFuture<'_, Vec<PullRequest>> {
+            Box::pin(async { Err(ForgeError::Unsupported) })
+        }
+
+        fn checks(&self, _remote: ForgeRemote, _sha: String) -> ForgeFuture<'_, Checks> {
+            Box::pin(async { Err(ForgeError::Unsupported) })
+        }
+
+        fn create_pull_request(
+            &self,
+            _remote: ForgeRemote,
+            _create: CreatePr,
+        ) -> ForgeFuture<'_, PullRequest> {
+            Box::pin(async { Err(ForgeError::Unsupported) })
+        }
+
+        fn update_pull_request(
+            &self,
+            _remote: ForgeRemote,
+            _number: u64,
+            _update: UpdatePr,
+        ) -> ForgeFuture<'_, PullRequest> {
+            Box::pin(async { Err(ForgeError::Unsupported) })
+        }
     }
 
-    /// GitHub's claims are its bundled plugin's: the app's
-    /// `the_bundled_github_claims_its_hosts`.
-    #[test]
-    fn providers_claim_their_hosts() {
-        let forges = forges();
-        let gitlab = forges
-            .claim("https://gitlab.com/group/sub/app.git")
-            .expect("claimed");
-        assert_eq!(gitlab.kind, ForgeKind::GitLab);
-        assert_eq!(
-            (gitlab.owner.as_str(), gitlab.name.as_str()),
-            ("group/sub", "app")
-        );
-        let company = forges
-            .claim("git@gitlab.acme.org:infra/tools.git")
-            .expect("claimed");
-        assert_eq!(company.kind, ForgeKind::GitLab);
-        assert!(forges.claim("git@example.org:team/app.git").is_none());
-        assert!(forges.claim("/srv/git/app.git").is_none());
+    fn forges() -> Forges {
+        Forges::new(vec![Arc::new(Claims)])
     }
 
     #[test]

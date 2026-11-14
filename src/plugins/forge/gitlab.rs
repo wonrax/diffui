@@ -402,6 +402,27 @@ fn projects_are_addressed_by_their_encoded_path() {
     block_on(gitlab.view(mr)).expect("viewed");
 }
 
+/// glab names a host without the port an https remote can carry.
+#[test]
+fn glab_is_asked_about_the_host_without_its_port() {
+    let fake = Fake::new(
+        "port",
+        &[(
+            "api --hostname gitlab.acme.org projects/group%2Fapp/repository/commits/abc",
+            r#"{"id": "abc", "last_pipeline": {"status": "success"}}"#,
+            0,
+        )],
+    );
+    let gitlab = gitlab(&fake.program());
+    let remote = gitlab
+        .claims("https://gitlab.acme.org:8443/group/app.git")
+        .expect("claimed");
+    assert_eq!(remote.web_url, "https://gitlab.acme.org:8443/group/app");
+    let checks = block_on(gitlab.checks(remote, "abc".into())).expect("checks");
+    assert_eq!(checks.state, CheckState::Success);
+    assert!(has(&fake.calls()[0], &["HOST=gitlab.acme.org"]));
+}
+
 #[test]
 fn a_merge_request_tab_reads_through_the_plugin() {
     let mr_diffs = r#"[{"old_path": "a", "new_path": "a", "diff": "@@ -1 +1 @@\n-x\n+y\n"},
@@ -532,12 +553,42 @@ fn commits_and_a_commits_diff_read_through_the_plugin() {
     assert_eq!(details.expect("its details").description, "Second");
 }
 
+/// The hosts glab is signed in to are GitLab's too, whatever they're named:
+/// the plugin's `hosts()` reads them from glab's config file.
+#[test]
+fn hosts_glab_is_configured_for_are_gitlabs() {
+    use crate::harness::Harness;
+    let config = "git_protocol: ssh\nhosts:\n  gitlab.com:\n    token: x\n    api_host: gitlab.com\n  \"code.corp.invalid\":\n    token: y\nother: 1\n";
+    let mut h = Harness::open_prepared(None, (1280.0, 800.0), "", "", |home| {
+        let dir = home.join(".config/glab-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yml"), config).unwrap();
+    });
+    let claimed = |ui: &crate::Diffui, url: &str| {
+        ui.forge
+            .forges
+            .claim(url)
+            .filter(|remote| matches!(remote.kind, ForgeKind::Script(_)))
+            .map(|remote| remote.kind.id())
+    };
+    h.wait_until("hosts() to answer", |ui| {
+        claimed(ui, "git@code.corp.invalid:infra/tools.git") == Some("gitlab")
+    });
+    h.read(|ui| {
+        assert_eq!(claimed(ui, "git@gitlab.com:group/app.git"), Some("gitlab"));
+        assert_eq!(claimed(ui, "git@api.corp.invalid:infra/tools.git"), None);
+    });
+    drop(h);
+    // Other tests share the home.
+    let _ = std::fs::remove_dir_all(crate::harness::scratch_home().join(".config/glab-cli"));
+}
+
 /// Not a check: the numbers in the forge-gitlab report. A badge refresh of
 /// 20 bookmarks (one listing, then the checks of the open ones, four at a
 /// time, as the app asks) and a merge request tab (header, commits, and a
 /// diff of `MEASURE_FILES` files, 300 by default, in pages of 100), against
-/// the fake `glab`. `MEASURE_PATH=native` measures the built-in provider
-/// this plugin replaced, where it still exists.
+/// the fake `glab`. The change that added this test also ran it against the
+/// built-in provider the plugin replaced (`MEASURE_PATH=native`).
 #[test]
 #[ignore = "a measurement, run by hand"]
 fn measure_badges_and_a_merge_request_tab() {
@@ -546,7 +597,6 @@ fn measure_badges_and_a_merge_request_tab() {
         .ok()
         .and_then(|files| files.parse().ok())
         .unwrap_or(300);
-    let path = std::env::var("MEASURE_PATH").unwrap_or_else(|_| "plugin".into());
     let branches: Vec<String> = (0..20).map(|n| format!("feature-{n}")).collect();
     let listed: Vec<String> = branches
         .iter()
@@ -594,24 +644,16 @@ fn measure_badges_and_a_merge_request_tab() {
     let fake = Fake::new("measure", &rules);
     // A new program's first start pays for the system's check of it.
     let _ = std::process::Command::new(fake.program()).output();
-    let plugin = gitlab(&fake.program());
-    let native = native(&fake.program());
-    let provider: &dyn ForgeProvider = match path.as_str() {
-        "native" => native.as_deref().expect("no built-in GitLab provider here"),
-        _ => &plugin,
-    };
-    let remote = ForgeRemote {
-        kind: provider.kind(),
-        ..ForgeRemote::new(provider.kind(), "gitlab.com", "group", "app")
-    };
+    let provider = gitlab(&fake.program());
+    let remote = ForgeRemote::new(provider.kind, "gitlab.com", "group", "app");
     let mr = ForgePr {
-        kind: provider.kind(),
+        kind: provider.kind,
         host: Some("gitlab.com".into()),
         owner: "group".into(),
         name: "app".into(),
         number: 1,
     };
-    // Warm: the plugin has loaded, both have run glab once.
+    // Warm: the plugin has loaded and run glab once.
     block_on(provider.checks(remote.clone(), "warm".into())).expect("warm");
     for run in 0..3 {
         let started = std::time::Instant::now();
@@ -647,16 +689,10 @@ fn measure_badges_and_a_merge_request_tab() {
         let all = started.elapsed();
         assert_eq!(count, files);
         eprintln!(
-            "MEASURE {path} run {run}: badges for {} prs ({} checks) {badges:?}; tab header+commits {header:?}, first file {:?}, all {files} files {all:?}",
+            "MEASURE run {run}: badges for {} prs ({} checks) {badges:?}; tab header+commits {header:?}, first file {:?}, all {files} files {all:?}",
             prs.len(),
             checks.len(),
             first.lock().unwrap().unwrap(),
         );
     }
-}
-
-fn native(program: &Path) -> Option<Box<dyn ForgeProvider>> {
-    Some(Box::new(diffui_core::forge::gitlab::GitLab::new(
-        program.to_path_buf(),
-    )))
 }
