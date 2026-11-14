@@ -247,6 +247,16 @@ pub(crate) fn dialog_input(
     window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
+    dialog_input_with_focus(spec, look, window, cx).0
+}
+
+/// [`dialog_input`], and whether it has the keyboard.
+pub(crate) fn dialog_input_with_focus(
+    spec: input::FieldSpec<'_>,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> (AnyElement, bool) {
     let Look { theme, font, .. } = look;
     // The well is drawn here, around the input's own row: see [`INPUT_ROW`].
     let (input, focused) = input::single_line_with_focus(spec, font, window, cx);
@@ -255,10 +265,11 @@ pub(crate) fn dialog_input(
         .text_size(px(theme::text_size::BODY))
         .py(px(0.0))
         .h_full();
-    field_well(focused, theme)
+    let field = field_well(focused, theme)
         .h(px(DIALOG_FIELD_HEIGHT))
         .flex()
         .items_center()
         .child(div().w_full().h(px(INPUT_ROW)).child(input))
-        .into_any_element()
+        .into_any_element();
+    (field, focused)
 }

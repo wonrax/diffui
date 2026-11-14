@@ -107,6 +107,8 @@ modes! {
         NamePrompt(crate::bookmarks::NamePrompt) => Prompt,
         /// The create / update pull request dialog.
         PullRequest(crate::forge_dialog::PrDialog) => PullRequest,
+        /// Submit stack's preview, and its progress once confirmed.
+        StackSubmit(crate::forge_dialog::StackDialog; stack_dialog, stack_dialog_mut) => StackSubmit,
         /// The keyboard-shortcut cheat sheet.
         Shortcuts => Shortcuts,
         /// The settings dialog.

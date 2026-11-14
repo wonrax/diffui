@@ -89,6 +89,8 @@ contexts! {
     ConflictEdit = "conflict-edit",
     /// The create / update pull request dialog.
     PullRequest = "pull-request",
+    /// Submit stack's preview.
+    StackSubmit = "submit-stack",
     /// The dialog that asks whether a plugin may run.
     PluginPermission = "plugin-permission",
 }
@@ -248,6 +250,11 @@ fn font_arg(arg: CommandArg, default: crate::theme::Font) -> Option<Option<Strin
 
 fn font_unlocked(ui: &Diffui, key: crate::config::Key) -> Availability {
     require(!ui.config.locked.contains(key), "Set in config.toml")
+}
+
+/// A Submit stack preview action.
+fn stack_action(action: crate::forge_dialog::StackAction) -> Action {
+    Action::Forge(crate::forge_dialog::ForgeAction::Stack(action))
 }
 
 fn always(_: &Diffui, _: &CommandArg) -> Availability {
@@ -3171,9 +3178,9 @@ pub(crate) static REGISTRY: &[Command] = &[
     },
     Command {
         id: "forge.submit-stack",
-        label: "Submit stack",
-        hint: "Push the bookmarks from trunk to here and open or update a pull request for \
-               each, based on the one below",
+        label: "Submit stack\u{2026}",
+        hint: "Preview a pull request for each bookmark from trunk to here, based on the one \
+               below, then push and open or update them",
         contexts: &[Context::Base],
         chords: &[],
         mac_chords: &[],
@@ -3233,6 +3240,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "forge.dialog-submit",
+        label: "Create or update",
+        hint: "Push, then create or update the pull request as the dialog says",
+        contexts: &[Context::PullRequest],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Submit)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "forge.dialog-cancel",
         label: "Cancel",
         hint: "Close the pull request dialog",
@@ -3241,6 +3259,58 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Cancel)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-confirm",
+        label: "Submit",
+        hint: "Push the stack and open or update its pull requests as previewed",
+        contexts: &[Context::StackSubmit],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: |ui, _arg| match ui.stack_dialog().map(|dialog| dialog.blocked()) {
+            Some(None) => Ok(()),
+            Some(Some(why)) => Err(why),
+            None => Err("Submit stack isn't open"),
+        },
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::Confirm)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-cancel",
+        label: "Cancel",
+        hint: "Close Submit stack; once submitted, the submission goes on",
+        contexts: &[Context::StackSubmit],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::Close)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-next-field",
+        label: "Next field",
+        hint: "Move to the next title or description, opening its pull request",
+        contexts: &[Context::StackSubmit],
+        chords: &["tab"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::NextField)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-previous-field",
+        label: "Previous field",
+        hint: "Move to the previous title or description",
+        contexts: &[Context::StackSubmit],
+        chords: &["shift+tab"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(stack_action(
+                crate::forge_dialog::StackAction::PreviousField,
+            ))
+        },
         palette: PaletteScope::Hidden,
     },
     // ── Plugins ─────────────────────────────────────────────────────────

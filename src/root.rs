@@ -851,6 +851,9 @@ fn floats_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Any
         .child(tab_bar::build_open_repo_dialog(ui, look, window, cx))
         .child(crate::bookmarks::build_name_prompt(ui, look, window, cx))
         .child(crate::forge_dialog::build_dialog(ui, look, window, cx))
+        .child(crate::forge_dialog::build_stack_dialog(
+            ui, look, window, cx,
+        ))
         .child(crate::changes::split_modal(ui, look, window, cx))
         .child(tab_bar::build_confirm_dialog(ui, look, window, cx))
         .child(crate::plugins::build_permission_dialog(

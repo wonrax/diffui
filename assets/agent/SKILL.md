@@ -45,14 +45,15 @@ revision (select one first with `diffui ctl select`):
 |---|---|
 | `forge.create` | Open the create dialog for the revision's bookmark (or a generated one), pushing first. |
 | `forge.update` | Open the dialog to change an open pull request's base, title or description. |
-| `forge.submit-stack` | Push every bookmark from trunk to the revision and open or update a pull request for each, each based on the one below. |
+| `forge.submit-stack` | Preview a pull request for every bookmark from trunk to the revision, each based on the one below, then push and open or update them once the user confirms. |
 | `forge.open` | Open the pull request in the browser. |
 | `forge.open-tab` | Open the pull request as a tab. |
 | `forge.copy-url` | Copy the pull request's URL. |
 | `forge.refresh` | Ask the forge again for every bookmark's pull request and checks. |
 
-The dialog waits for the user; `forge.submit-stack` doesn't. Watch `state`'s
-activity for the outcome.
+Both wait for the user: nothing is pushed or sent to the forge until they
+confirm (Submit stack only reads the stack and asks the forge which pull
+requests exist). Watch `state`'s activity for the outcome.
 
 GitHub and GitLab are bundled plugins (`github`, `gitlab`; see Plugins),
 not built into the app: turning one off leaves that forge without badges or

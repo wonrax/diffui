@@ -1517,6 +1517,24 @@ section of `assets/agent/SKILL.md`). New in the port.
 - State: The create pull request dialog with its description in Preview: the Markdown body rendered (a heading, a list, inline code, a link), Edit | Preview above it.
 - Steps: Create pull request on fix/changelog-note, write a Markdown description, press Preview.
 
+### `forge-stack-preview`
+
+- Window: 1440x900, light
+- State: Submit stack's preview: three rows bottom to top, a new draft one, an update whose long bookmark ellipsises and whose history is force-pushed, and one up to date; what it pushes, the force-push callout, Cancel and Submit.
+- Steps: Submit stack on a stack of three bookmarks, one new, one rewritten with an open pull request, one up to date.
+
+### `forge-stack-editing`
+
+- Window: 1440x900, light
+- State: Submit stack's preview with the update's row open: its title, its description, and Generate, the other rows collapsed.
+- Steps: Submit stack, then open the second row and edit its title and description.
+
+### `forge-stack-progress`
+
+- Window: 1440x900, light
+- State: Submit stack after Submit: Talking to GitHub, the first row Opened #43, the second Updating, the third skipped as up to date; Close, and the note that closing doesn't stop it.
+- Steps: Submit stack and Submit; caught while the second pull request is being updated.
+
 ### `plugins-remove-host`
 
 - Window: 1440x900, light

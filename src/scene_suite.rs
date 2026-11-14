@@ -602,6 +602,13 @@ fn forge_badges(c: &mut Ctx) {
     c.settle();
 }
 
+/// Submit stack's preview, as `scene` shows it, over the badged fixture.
+fn stack_scene(c: &mut Ctx, scene: crate::forge_dialog::stack_tests::Scene) {
+    forge_badges(c);
+    c.h.act(move |ui, _| crate::forge_dialog::stack_tests::show(ui, scene));
+    c.settle();
+}
+
 /// The fake `glab`'s answers for `acme/render-toolkit!7` on gitlab.com.
 fn answer_merge_request() {
     let project = "api --hostname gitlab.com projects/acme%2Frender-toolkit/merge_requests/7";
@@ -2982,6 +2989,26 @@ fn all() -> Vec<Scene> {
             c.act(Action::Ai(crate::ai::AiAction::PrPreview(true)));
         },
     ));
+    t.add(s(
+        "forge-stack-preview",
+        "Submit stack's preview: three rows bottom to top, a new draft one, an update whose long bookmark ellipsises and whose history is force-pushed, and one up to date; what it pushes, the force-push callout, Cancel and Submit.",
+        "Submit stack on a stack of three bookmarks, one new, one rewritten with an open pull request, one up to date.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Preview),
+    ));
+    t.add(s(
+        "forge-stack-editing",
+        "Submit stack's preview with the update's row open: its title, its description, and Generate, the other rows collapsed.",
+        "Submit stack, then open the second row and edit its title and description.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Editing),
+    ));
+    t.add(s(
+        "forge-stack-progress",
+        "Submit stack after Submit: Talking to GitHub, the first row Opened #43, the second Updating, the third skipped as up to date; Close, and the note that closing doesn't stop it.",
+        "Submit stack and Submit; caught while the second pull request is being updated.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Running),
+    )
+    // The toolbar's activity spinner turns.
+    .animated());
     t.add(
         s(
             "plugins-remove-host",

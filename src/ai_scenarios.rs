@@ -61,7 +61,7 @@ const REPLIES: &[(&str, &str)] = &[
 /// stream-json --include-partial-messages` does, a text delta event, a
 /// pause, the rest and the result; else (as `[ai] command`) plain text. It
 /// lives in the part of the scratch home a launch keeps.
-fn fake_claude() -> PathBuf {
+pub(crate) fn fake_claude() -> PathBuf {
     let dir = crate::harness::scratch_home().join("repos");
     std::fs::create_dir_all(&dir).expect("a bin dir");
     let script = dir.join("fake-claude");

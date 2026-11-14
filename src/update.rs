@@ -585,7 +585,7 @@ impl Diffui {
             (Pending::DetailCopy(field, fallback), Payload::DetailsLoaded { details, .. }) => {
                 crate::write_clipboard(format_detail(&details, field).unwrap_or(fallback), cx)
             }
-            (Pending::Forge(query), payload) => self.forge_job_done(tab, query, payload),
+            (Pending::Forge(query), payload) => self.forge_job_done(tab, query, payload, cx),
             (Pending::CommitSearch(_), Payload::CommitsFound { hits, .. }) => {
                 self.palette_history_found(tab, job, hits)
             }
@@ -2687,10 +2687,12 @@ impl Diffui {
         {
             self.pop_mode(ModeKind::CliOutput);
         }
-        // A confirmation for a closed tab has nothing left to run.
+        // A confirmation for a closed tab has nothing left to run, and its
+        // stack has nothing left to submit.
         let tabs = &self.tabs;
         self.modes.retain(|mode| match mode {
             Mode::Confirm(dialog) => tabs.iter().any(|tab| tab.id == dialog.pending.tab_id()),
+            Mode::StackSubmit(dialog) => tabs.iter().any(|tab| tab.id == dialog.tab),
             _ => true,
         });
         let stale = {
@@ -4822,18 +4824,24 @@ mod tests {
     use diffui_core::commit_search::CommitHit;
 
     #[test]
-    fn a_cancelled_stack_read_ends_its_submission_row() {
+    fn a_cancelled_stack_read_says_so_in_the_preview() {
         crate::tabs::tests::with_cx(|cx| {
             let mut ui = app();
             let tab = push_tab(&mut ui, "/tmp/forge-cancelled");
-            let (activity, _) = ui.begin_activity(tab, "Submit stack", false);
+            let serial = crate::forge_dialog::stack_tests::open_preview(&mut ui, tab);
             let job = ui.tab_mut(tab).unwrap().session.next_job();
-            let query = crate::forge_dialog::ForgeQuery::Stack(activity);
+            let query = crate::forge_dialog::ForgeQuery::Stack(serial);
             ui.cancel_own_job(tab, job, Pending::Forge(query), cx);
-            assert_eq!(
-                ui.tab(tab).unwrap().activities.status(activity),
-                Some(activity::ActivityStatus::Error)
+            let dialog = ui.stack_dialog().expect("the preview stays open");
+            assert!(
+                dialog
+                    .problem
+                    .as_deref()
+                    .is_some_and(|problem| problem.contains("canceled")),
+                "{:?}",
+                dialog.problem
             );
+            assert!(dialog.blocked().is_some(), "nothing to confirm");
         });
     }
 

@@ -1,11 +1,19 @@
-//! Opening and updating pull requests: the dialog for one, stack submission
-//! for a run of them, and the [`Submission`] both become.
+//! Opening and updating pull requests: the dialog for one, the stack preview
+//! for a run of them ([`stack`]), and the [`Submission`] both become once
+//! the user confirms.
 //!
 //! A submission pushes first, through the ordinary push path with its checks
 //! and confirmations, then asks the forge which of its branches already have
-//! a pull request, then creates or updates each in order, one activity row
-//! line per pull request. It stops at the first failure. Run again, it finds
-//! the pull requests it made and only moves their bases, so it is idempotent.
+//! a pull request (unless the stack preview already did), then creates or
+//! updates each in order, one activity row line per pull request. It stops at
+//! the first failure. Run again, it finds the pull requests it made and only
+//! changes what differs, so it is idempotent.
+
+mod stack;
+
+#[cfg(test)]
+pub(crate) use stack::tests as stack_tests;
+pub(crate) use stack::{StackAction, StackDialog, build_dialog as build_stack_dialog};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +30,6 @@ use gpui_kit::{AnyElement, Window, div, px};
 
 use crate::activity::{ActivityId, ActivityStatus};
 use crate::commands::CommandArg;
-use crate::forge::bookmark_targets;
 use crate::modes::{Mode, ModeKind};
 use crate::prose::Prose;
 use crate::theme::{self, text_size};
@@ -52,9 +59,11 @@ pub(crate) enum ForgeAction {
     Draft(bool),
     Submit,
     Cancel,
-    /// Push the bookmarks in `trunk()..rev` and open or update their pull
-    /// requests, each based on the one before.
+    /// Preview the bookmarks in `trunk()..rev` as pull requests, each based
+    /// on the one before, to push and open or update once confirmed.
     SubmitStack(CommandArg),
+    /// The stack preview.
+    Stack(StackAction),
 }
 
 /// What a pull request's head is.
@@ -120,10 +129,11 @@ pub(crate) enum ForgeQuery {
     /// The commits between trunk and the dialog head's parents, nearest
     /// first, for its base.
     DialogAncestors,
-    /// `trunk()..rev`, for the stack submission with this activity row.
-    Stack(ActivityId),
-    /// One stack commit's description.
-    StackDetails(ActivityId, String),
+    /// `trunk()..rev`, for the stack preview opened as this one.
+    Stack(u64),
+    /// One stack commit's description, for the stack preview opened as this
+    /// one.
+    StackDetails(u64, String),
 }
 
 /// One pull request a submission opens or updates.
@@ -134,8 +144,6 @@ pub(crate) struct Step {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) draft: bool,
-    /// The commit it's for: what a stack reads the description of.
-    commit: Option<String>,
 }
 
 /// Give each generated step the branch the push made for it: the bookmarks
@@ -164,8 +172,6 @@ fn name_generated(steps: &mut [Step], pushed: &[String]) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Reading the stack's descriptions.
-    Gathering,
     /// Waiting on the push with this activity row.
     Pushing(ActivityId),
     /// Talking to the forge.
@@ -180,15 +186,10 @@ pub(crate) struct Submission {
     remote: ForgeRemote,
     phase: Phase,
     steps: Vec<Step>,
-    /// An update rewrites the title and body, not only the base: the dialog's
-    /// update does, a stack resubmission doesn't.
-    rewrite: bool,
     /// What the forge already has, by head branch, once asked.
     existing: Option<HashMap<String, PullRequest>>,
     next: usize,
     running: bool,
-    /// Descriptions a stack still waits on.
-    awaiting: usize,
     /// What was done, by step.
     opened: usize,
     updated: usize,
@@ -207,14 +208,17 @@ impl Submission {
             remote,
             phase: Phase::Talking,
             steps,
-            rewrite: false,
             existing: None,
             next: 0,
             running: false,
-            awaiting: 0,
             opened: 0,
             updated: 0,
         }
+    }
+
+    /// Waiting on its push.
+    fn pushing(&self) -> bool {
+        matches!(self.phase, Phase::Pushing(_))
     }
 }
 
@@ -303,7 +307,8 @@ impl Diffui {
                 self.pop_mode(ModeKind::PullRequest);
             }
             ForgeAction::Submit => self.submit_dialog(),
-            ForgeAction::SubmitStack(arg) => self.submit_stack(arg),
+            ForgeAction::SubmitStack(arg) => self.open_stack(arg, HashMap::new()),
+            ForgeAction::Stack(action) => self.update_stack(action, cx),
         }
     }
 
@@ -448,6 +453,7 @@ impl Diffui {
         tab: TabId,
         query: ForgeQuery,
         payload: diffui_core::Payload,
+        cx: &mut Cx,
     ) {
         use diffui_core::Payload;
         match (query, payload) {
@@ -469,13 +475,12 @@ impl Diffui {
             (ForgeQuery::DialogAncestors, Payload::RevsetResolved { result, .. }) => {
                 self.dialog_ancestors(tab, result)
             }
-            (ForgeQuery::Stack(activity), Payload::RevsetResolved { result, .. }) => {
-                self.stack_resolved(tab, activity, result)
+            (ForgeQuery::Stack(serial), Payload::RevsetResolved { result, .. }) => {
+                self.stack_resolved(tab, serial, result, cx)
             }
-            (
-                ForgeQuery::StackDetails(activity, commit),
-                Payload::DetailsLoaded { details, .. },
-            ) => self.stack_description(tab, activity, &commit, Some(&details.description)),
+            (ForgeQuery::StackDetails(serial, commit), Payload::DetailsLoaded { details, .. }) => {
+                self.stack_description(tab, serial, &commit, Some(&details.description))
+            }
             _ => {}
         }
     }
@@ -485,12 +490,10 @@ impl Diffui {
         match query {
             // The dialog keeps what it guessed.
             ForgeQuery::DialogDetails | ForgeQuery::DialogAncestors => {}
-            ForgeQuery::Stack(activity) => {
-                self.fail_submission(tab, activity, format!("Couldn't read the stack: {error}"))
-            }
-            // The step keeps its title, without a body.
-            ForgeQuery::StackDetails(activity, commit) => {
-                self.stack_description(tab, activity, &commit, None)
+            ForgeQuery::Stack(serial) => self.stack_unreadable(tab, serial, error),
+            // The row keeps its title, without a body.
+            ForgeQuery::StackDetails(serial, commit) => {
+                self.stack_description(tab, serial, &commit, None)
             }
         }
     }
@@ -537,11 +540,8 @@ impl Diffui {
             title: dialog.title.trim().to_owned(),
             body: dialog.body.trim().to_owned(),
             draft: dialog.draft,
-            commit: None,
         };
-        let mut submission =
-            Submission::new(activity, dialog.remote_name, dialog.remote, vec![step]);
-        submission.rewrite = true;
+        let submission = Submission::new(activity, dialog.remote_name, dialog.remote, vec![step]);
         self.start_submission(dialog.tab, submission);
     }
 
@@ -668,7 +668,6 @@ impl Diffui {
         }
         let activity = submission.activity;
         match submission.phase {
-            Phase::Gathering => {}
             Phase::Pushing(push) => {
                 if matches!(
                     state.activities.status(push),
@@ -717,9 +716,9 @@ impl Diffui {
                             );
                         };
                         let open = existing.get(&head).filter(|pr| pr.state.is_open()).cloned();
-                        let rewrite = submission.rewrite;
+                        self.stack_progress(tab, activity, &head, stack::Progress::Running);
                         Self::run_async(
-                            run_step(provider, remote, head, step, open, rewrite),
+                            run_step(provider, remote, head, step, open),
                             cx,
                             move |this, done, _| this.submission_stepped(tab, activity, done),
                         );
@@ -759,43 +758,37 @@ impl Diffui {
         };
         submission.running = false;
         let kind = submission.remote.kind;
-        let line = match done {
+        let head = match submission.steps.get(submission.next).map(|step| &step.head) {
+            Some(Head::Bookmark(name)) => name.clone(),
+            _ => String::new(),
+        };
+        let (line, progress) = match done {
             Ok(StepDone::Opened(pr)) => {
                 submission.opened += 1;
-                format!(
-                    "Opened {}{} {} \u{2192} {}",
-                    kind.sigil(),
-                    pr.number,
-                    pr.head,
-                    pr.base
+                let number = format!("{}{}", kind.sigil(), pr.number);
+                (
+                    format!("Opened {number} {} \u{2192} {}", pr.head, pr.base),
+                    stack::Progress::Done(format!("Opened {number}")),
                 )
             }
             Ok(StepDone::Updated(pr)) => {
                 submission.updated += 1;
-                format!(
-                    "Updated {}{} {} \u{2192} {}",
-                    kind.sigil(),
-                    pr.number,
-                    pr.head,
-                    pr.base
+                let number = format!("{}{}", kind.sigil(), pr.number);
+                (
+                    format!("Updated {number} {} \u{2192} {}", pr.head, pr.base),
+                    stack::Progress::Done(format!("Updated {number}")),
                 )
             }
-            Ok(StepDone::Unchanged(pr)) => {
-                format!("{}{} {} is up to date", kind.sigil(), pr.number, pr.head)
-            }
+            Ok(StepDone::Unchanged(pr)) => (
+                format!("{}{} {} is up to date", kind.sigil(), pr.number, pr.head),
+                stack::Progress::Unchanged,
+            ),
             Err(error) => {
-                let head = submission
-                    .steps
-                    .get(submission.next)
-                    .map(|step| match &step.head {
-                        Head::Bookmark(name) => name.clone(),
-                        Head::Generated(_) => String::new(),
-                    })
-                    .unwrap_or_default();
                 return self.fail_submission(tab, activity, format!("{head}: {error}"));
             }
         };
         submission.next += 1;
+        self.stack_progress(tab, activity, &head, progress);
         if let Some(log) = self.activity_log_for(tab) {
             log.append_output(activity, line);
         }
@@ -823,8 +816,9 @@ impl Diffui {
         };
         state
             .activities
-            .finish(activity, ActivityStatus::Done, Some(summary));
+            .finish(activity, ActivityStatus::Done, Some(summary.clone()));
         state.forge.wanted = true;
+        self.stack_finished(tab, activity, Ok(summary));
     }
 
     pub(crate) fn fail_submission(&mut self, tab: TabId, activity: ActivityId, error: String) {
@@ -849,176 +843,13 @@ impl Diffui {
         state
             .activities
             .finish(activity, ActivityStatus::Error, Some(error.clone()));
+        self.stack_finished(tab, activity, Err(error.clone()));
         self.push_error_toast(title, &error);
-    }
-
-    /// Submit the stack under the revision `arg` names.
-    fn submit_stack(&mut self, arg: CommandArg) {
-        let Some(tab) = self.active_tab_id() else {
-            return;
-        };
-        let state = self.active();
-        if !state.session.capabilities.mutate {
-            return;
-        }
-        let Some((remote_name, remote)) = state.forge.home.clone() else {
-            return;
-        };
-        let revision = crate::forge::selection_of(&arg, self);
-        let (activity, _) = self.begin_activity(tab, "Submit stack", false);
-        let mut submission = Submission::new(activity, remote_name, remote, Vec::new());
-        submission.phase = Phase::Gathering;
-        let Some(state) = self.tab_mut(tab) else {
-            return;
-        };
-        state.forge.submission = Some(submission);
-        let query = RevsetQuery {
-            limit: STACK_LIMIT,
-            ..RevsetQuery::new(format!("trunk()..({})", revset_of(&revision)))
-        };
-        let (job, effects) = state.session.resolve_revset(query);
-        state
-            .jobs
-            .issue(job, Pending::Forge(ForgeQuery::Stack(activity)));
-        self.run_effects(tab, effects);
-    }
-
-    /// The stack's commits are known: one step per bookmarked commit, oldest
-    /// first, each based on the one before and the first on trunk. Then read
-    /// their descriptions.
-    fn stack_resolved(
-        &mut self,
-        tab: TabId,
-        activity: ActivityId,
-        result: Result<RevsetMatch, RevsetError>,
-    ) {
-        let found = match result {
-            Ok(found) => found,
-            Err(error) => {
-                return self.fail_submission(
-                    tab,
-                    activity,
-                    format!("Couldn't read the stack: {error}"),
-                );
-            }
-        };
-        let Some(state) = self.tab(tab) else {
-            return;
-        };
-        let steps = match stack_steps(&found.commits, state) {
-            Ok(steps) => steps,
-            Err(error) => return self.fail_submission(tab, activity, error.to_owned()),
-        };
-        let commits: Vec<String> = steps
-            .iter()
-            .filter_map(|step| step.commit.clone())
-            .collect();
-        let Some(state) = self.tab_mut(tab) else {
-            return;
-        };
-        let Some(submission) = state
-            .forge
-            .submission
-            .as_mut()
-            .filter(|submission| submission.activity == activity)
-        else {
-            return;
-        };
-        submission.steps = steps;
-        if !state.session.capabilities.details || commits.is_empty() {
-            return self.push_submission(tab);
-        }
-        submission.awaiting = commits.len();
-        for commit in commits {
-            let job = state.session.next_job();
-            state.jobs.issue(
-                job,
-                Pending::Forge(ForgeQuery::StackDetails(activity, commit.clone())),
-            );
-            if let Some(handle) = &state.handle {
-                handle.send(diffui_core::Command::RevisionDetails {
-                    job,
-                    revision: RevisionSelection::Commit(commit),
-                });
-            }
-        }
-    }
-
-    /// A stack commit's description arrived (or couldn't): once every one
-    /// has, push.
-    fn stack_description(
-        &mut self,
-        tab: TabId,
-        activity: ActivityId,
-        commit: &str,
-        description: Option<&str>,
-    ) {
-        let Some(submission) = self.submission_mut(tab, activity) else {
-            return;
-        };
-        if let Some(description) = description {
-            let (title, body) = title_and_body(description);
-            for step in submission
-                .steps
-                .iter_mut()
-                .filter(|step| step.commit.as_deref() == Some(commit))
-            {
-                if !title.is_empty() {
-                    step.title = title.clone();
-                }
-                step.body = body.clone();
-            }
-        }
-        submission.awaiting = submission.awaiting.saturating_sub(1);
-        if submission.awaiting == 0 && submission.phase == Phase::Gathering {
-            self.push_submission(tab);
-        }
     }
 }
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
-}
-
-/// The steps of a stack whose commits are `commits` (`trunk()..rev`, newest
-/// first): one per commit carrying a local bookmark, oldest first, the one
-/// with a pull request preferred where a commit has several.
-fn stack_steps(commits: &[String], state: &crate::TabState) -> Result<Vec<Step>, &'static str> {
-    let info = &state.session.bookmarks;
-    let trunk = trunk_branch(info).ok_or("There's no trunk bookmark to base the stack on.")?;
-    let targets = bookmark_targets(info);
-    let mut at: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (name, target) in &targets {
-        at.entry(target.as_str()).or_default().push(name.as_str());
-    }
-    let mut steps: Vec<Step> = Vec::new();
-    let mut base = trunk;
-    for commit in commits.iter().rev() {
-        let Some(names) = at.get_mut(commit.as_str()) else {
-            continue;
-        };
-        names.sort_by_key(|name| (state.forge.of(name).is_none(), *name));
-        let name = names[0].to_owned();
-        let title = state
-            .session
-            .commits
-            .find_by_commit_id(commit)
-            .filter(|row| row.has_description())
-            .map(|row| row.description().to_owned())
-            .unwrap_or_else(|| name.clone());
-        steps.push(Step {
-            head: Head::Bookmark(name.clone()),
-            base: std::mem::replace(&mut base, name),
-            title,
-            body: String::new(),
-            draft: false,
-            commit: Some(commit.clone()),
-        });
-    }
-    if steps.is_empty() {
-        return Err("There are no bookmarks between trunk and this revision.");
-    }
-    Ok(steps)
 }
 
 /// What one step did.
@@ -1028,15 +859,15 @@ enum StepDone {
     Unchanged(PullRequest),
 }
 
-/// Open `step`'s pull request, or bring the `open` one in line: its base,
-/// and with `rewrite` its title and body.
+/// Open `step`'s pull request, or bring the `open` one in line: what differs
+/// of its base and title, and its body when the step has one. A field that
+/// doesn't change isn't sent.
 async fn run_step(
     provider: Arc<dyn ForgeProvider>,
     remote: ForgeRemote,
     head: String,
     step: Step,
     open: Option<PullRequest>,
-    rewrite: bool,
 ) -> Result<StepDone, ForgeError> {
     let Some(open) = open else {
         let created = provider
@@ -1055,8 +886,8 @@ async fn run_step(
     };
     let patch = UpdatePr {
         base: (open.base != step.base).then_some(step.base),
-        title: (rewrite && open.title != step.title).then_some(step.title),
-        body: (rewrite && !step.body.is_empty()).then_some(step.body),
+        title: (open.title != step.title).then_some(step.title),
+        body: (!step.body.is_empty()).then_some(step.body),
     };
     if patch.is_empty() {
         return Ok(StepDone::Unchanged(open));
@@ -1277,7 +1108,12 @@ pub(crate) fn build_dialog(
         .cancel_button("pull-request-cancel")
         .on_click(Diffui::on_action(Action::Forge(ForgeAction::Cancel), cx));
     let card = card
-        .hint(&[crate::keymap::key_label("enter")], verb)
+        .bound_hint(
+            ui,
+            crate::commands::Context::PullRequest,
+            &["forge.dialog-submit"],
+            verb,
+        )
         .bound_hint(
             ui,
             crate::commands::Context::PullRequest,
@@ -1324,7 +1160,6 @@ pub(crate) mod tests {
             title: String::new(),
             body: String::new(),
             draft: false,
-            commit: None,
         };
         let generated = || Head::Generated(RevisionSelection::Commit("abc".to_owned()));
         // `ready` was in sync, so the push named only the branch it made.
@@ -1530,7 +1365,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn rest_pr(number: u64, head: &str, base: &str) -> String {
+    pub(crate) fn rest_pr(number: u64, head: &str, base: &str) -> String {
         format!(
             r#"{{"number": {number}, "html_url": "https://github.invalid/team/app/pull/{number}",
             "title": "t", "state": "open", "draft": false, "merged_at": null,
@@ -1538,7 +1373,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn listed(prs: &[(u64, &str, &str)]) -> String {
+    pub(crate) fn listed(prs: &[(u64, &str, &str)]) -> String {
         let rows: Vec<String> = prs
             .iter()
             .map(|(number, head, base)| {
@@ -1553,7 +1388,7 @@ pub(crate) mod tests {
         format!("[{}]", rows.join(","))
     }
 
-    fn has(call: &[String], args: &[&str]) -> bool {
+    pub(crate) fn has(call: &[String], args: &[&str]) -> bool {
         call.windows(args.len())
             .any(|window| window.iter().zip(args).all(|(a, b)| a == b))
     }
@@ -1562,8 +1397,9 @@ pub(crate) mod tests {
     /// and an empty `@` on top), opened, its `origin` looking like a GitHub
     /// project that git sends to the fixture's bare remote, and the app's
     /// GitHub plugin going through `fake`. `.invalid` never resolves, whatever
-    /// happens. Returns the harness and `stack-2`'s commit.
-    fn stacked_repo(fake: &FakeCli) -> (crate::harness::Harness, String) {
+    /// happens. `extra` goes on the end of config.toml. Returns the harness
+    /// and `stack-2`'s commit.
+    pub(crate) fn stacked_repo(fake: &FakeCli, extra: &str) -> (crate::harness::Harness, String) {
         use crate::harness::{Harness, fixture_jj, fixture_repo};
         let repo = fixture_repo();
         let jj = |args: &[&str]| {
@@ -1591,7 +1427,7 @@ pub(crate) mod tests {
 
         // GitHub is the bundled plugin, and its `gh` is the fake.
         let config = format!(
-            "[plugins.github]\nprogram = \"{}\"\n",
+            "[plugins.github]\nprogram = \"{}\"\n{extra}",
             fake.program().display()
         );
         let mut h = Harness::open_fresh(Some(&repo), (1280.0, 800.0), &config, "");
@@ -1627,7 +1463,10 @@ pub(crate) mod tests {
     }
 
     /// Waits for the activity row `activity` to finish, and says how.
-    fn finished(h: &mut crate::harness::Harness, activity: ActivityId) -> Option<ActivityStatus> {
+    pub(crate) fn finished(
+        h: &mut crate::harness::Harness,
+        activity: ActivityId,
+    ) -> Option<ActivityStatus> {
         h.wait_until("the submission", |ui| {
             !matches!(
                 ui.active().activities.status(activity),
@@ -1636,97 +1475,6 @@ pub(crate) mod tests {
         });
         h.settle();
         h.read(|ui| ui.active().activities.status(activity))
-    }
-
-    /// Submit stack against a fake `gh`: the first run pushes both bookmarks
-    /// in one push and opens a pull request for each, the second based on
-    /// the first; a rerun changes nothing; a base moved on the forge is moved
-    /// back.
-    #[test]
-    fn submit_stack_chains_bases_and_is_idempotent() {
-        use crate::harness::Harness;
-        let fake = FakeCli::new(
-            "submit-stack",
-            &[
-                ("pr list *", "[]"),
-                (
-                    "api -X POST repos/team/app/pulls *head=stack-1 *",
-                    &rest_pr(1, "stack-1", "main"),
-                ),
-                (
-                    "api -X POST repos/team/app/pulls *head=stack-2 *",
-                    &rest_pr(2, "stack-2", "stack-1"),
-                ),
-                ("api graphql *", "SUCCESS\n"),
-            ],
-        );
-        let (mut h, top) = stacked_repo(&fake);
-        let submit = |h: &mut Harness| {
-            h.perform(Action::Forge(ForgeAction::SubmitStack(
-                CommandArg::Revision(RevisionSelection::Commit(top.clone())),
-            )));
-            let activity = h
-                .read(|ui| ui.active().forge.submission.as_ref().map(|s| s.activity))
-                .expect("a submission");
-            finished(h, activity)
-        };
-
-        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
-        let calls = fake.calls();
-        let posts: Vec<&Vec<String>> = calls.iter().filter(|call| has(call, &["POST"])).collect();
-        assert_eq!(posts.len(), 2, "{calls:?}");
-        assert!(has(posts[0], &["-f", "head=stack-1"]) && has(posts[0], &["-f", "base=main"]));
-        assert!(has(posts[0], &["-f", "title=Stack one"]));
-        assert!(has(posts[0], &["-f", "body=The first body."]));
-        assert!(has(posts[1], &["-f", "head=stack-2"]) && has(posts[1], &["-f", "base=stack-1"]));
-        h.read(|ui| {
-            let info = &ui.active().session.bookmarks;
-            assert!(in_sync(info, "stack-1", "origin") && in_sync(info, "stack-2", "origin"));
-        });
-
-        // Again, with both open as asked: nothing to push, nothing to change.
-        fake.answer(&[
-            (
-                "pr list *",
-                &listed(&[(1, "stack-1", "main"), (2, "stack-2", "stack-1")]),
-            ),
-            ("api graphql *", "SUCCESS\n"),
-        ]);
-        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
-        let calls = fake.calls();
-        assert!(
-            !calls
-                .iter()
-                .any(|call| has(call, &["POST"]) || has(call, &["PATCH"])),
-            "{calls:?}"
-        );
-
-        // Someone retargeted the second onto main: only its base moves back.
-        fake.answer(&[
-            (
-                "pr list *",
-                &listed(&[(1, "stack-1", "main"), (2, "stack-2", "main")]),
-            ),
-            (
-                "api -X PATCH repos/team/app/pulls/2 *",
-                &rest_pr(2, "stack-2", "stack-1"),
-            ),
-            ("api graphql *", "SUCCESS\n"),
-        ]);
-        assert_eq!(submit(&mut h), Some(ActivityStatus::Done));
-        let patches: Vec<Vec<String>> = fake
-            .calls()
-            .into_iter()
-            .filter(|call| has(call, &["PATCH"]))
-            .collect();
-        assert_eq!(patches.len(), 1);
-        assert!(has(&patches[0], &["-f", "base=stack-1"]));
-        assert!(
-            !patches[0]
-                .iter()
-                .any(|arg| arg.starts_with("body=") || arg.starts_with("title=")),
-            "a resubmission leaves the text alone"
-        );
     }
 
     /// The dialog on a revision without a bookmark: its title and body come
@@ -1746,7 +1494,7 @@ pub(crate) mod tests {
                 ("api graphql *", "PENDING\n"),
             ],
         );
-        let (mut h, _) = stacked_repo(&fake);
+        let (mut h, _) = stacked_repo(&fake, "");
         h.wait_until("the badge", |ui| ui.active().forge.of("stack-1").is_some());
         // `@`, the empty change on stack-2, has no bookmark; describe it.
         let commit = h.read(|ui| {

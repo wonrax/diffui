@@ -520,6 +520,13 @@ impl Diffui {
                 }
             }
             Output::PullRequest => {
+                // A row of the open Submit stack preview, if it has this
+                // commit; else the pull request dialog.
+                if let Some(row) = self.stack_row_for(launch.tab, &launch.arg) {
+                    let before = format!("{}\n\n{}", row.title, row.body);
+                    row.generating = Some(generation(before));
+                    return;
+                }
                 if self.pull_request_dialog().is_none() {
                     self.perform(
                         Action::Forge(crate::forge_dialog::ForgeAction::Open(launch.arg.clone())),
@@ -727,10 +734,10 @@ impl Diffui {
                 }
             }
             Output::PullRequest => {
-                if let Some(dialog) = self.generating_dialog(activity) {
+                if let Some(fields) = self.generating_pr_fields(activity) {
                     let (title, body) = crate::forge_dialog::title_and_body(&shown);
-                    dialog.title = title;
-                    dialog.body = body;
+                    *fields.title = title;
+                    *fields.body = body;
                 }
             }
             _ => {}
@@ -762,14 +769,14 @@ impl Diffui {
         }
         // Kept, stopped: the head's description, should it come after,
         // doesn't overwrite what was written.
-        if let Some(dialog) = self.generating_dialog(activity)
-            && let Some(generation) = dialog.generating.as_mut()
+        if let Some(fields) = self.generating_pr_fields(activity)
+            && let Some(generation) = fields.generating.as_mut()
         {
             generation.running = false;
             let (title, body) =
                 crate::forge_dialog::title_and_body(if ok { &text } else { &generation.before });
-            dialog.title = title;
-            dialog.body = body;
+            *fields.title = title;
+            *fields.body = body;
         }
         if let Some(prompt) = self.name_prompt_mut()
             && let Some(generation) = prompt
@@ -837,24 +844,6 @@ impl Diffui {
             })
     }
 
-    /// The pull request dialog `activity` is writing into.
-    fn generating_dialog(
-        &mut self,
-        activity: ActivityId,
-    ) -> Option<&mut crate::forge_dialog::PrDialog> {
-        match self.mode_mut(ModeKind::PullRequest) {
-            Some(Mode::PullRequest(dialog))
-                if dialog
-                    .generating
-                    .as_ref()
-                    .is_some_and(|generation| generation.activity == activity) =>
-            {
-                Some(dialog)
-            }
-            _ => None,
-        }
-    }
-
     fn program_last_error(&self, tab: TabId, job: diffui_core::JobId) -> Option<String> {
         self.cli_run(tab, job)?
             .lines
@@ -865,7 +854,7 @@ impl Diffui {
     }
 
     /// Stop what writes into the active tab's description editor, the pull
-    /// request dialog or the bookmark name prompt.
+    /// request dialog, Submit stack's rows or the bookmark name prompt.
     pub(crate) fn stop_generating(&mut self) {
         let editor = self
             .active()
@@ -877,7 +866,8 @@ impl Diffui {
         let prompt = self
             .name_prompt()
             .and_then(|prompt| prompt.generating.as_ref());
-        for generation in [editor, dialog, prompt].into_iter().flatten() {
+        let rows = self.stack_generations();
+        for generation in [editor, dialog, prompt].into_iter().flatten().chain(rows) {
             if generation.running {
                 generation.cancel.cancel();
             }
