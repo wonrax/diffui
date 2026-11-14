@@ -53,8 +53,8 @@ enum Verb {
     /// Load a plugin without the app: its manifest's problems, what its
     /// script registers, and why it doesn't load if it doesn't
     Check {
-        /// The plugin's directory, or the id of one in the plugins folder
-        /// (the current directory when left out)
+        /// The plugin's directory, or the id of one in the plugins folder or
+        /// of a bundled one (the current directory when left out)
         plugin: Option<PathBuf>,
     },
     /// The plugins: the bundled ones and those in the plugins folder, and
@@ -82,11 +82,17 @@ fn plugin_main() -> i32 {
             };
             init(&id, ts, forge.as_deref(), &dir)
         }
-        Verb::Check { plugin } => plugin_dir(
-            &plugin.unwrap_or_else(|| PathBuf::from(".")),
-            plugins_dir().as_deref(),
-        )
-        .and_then(|dir| check(&dir)),
+        Verb::Check { plugin } => {
+            let plugin = plugin.unwrap_or_else(|| PathBuf::from("."));
+            match plugin_dir(&plugin, plugins_dir().as_deref()) {
+                Ok(dir) => check(&dir),
+                // No folder by that name: a bundled plugin by its id.
+                Err(not_found) => plugin
+                    .to_str()
+                    .and_then(|id| check_bundled(id, super::bundled::bundled()))
+                    .unwrap_or(Err(not_found)),
+            }
+        }
         Verb::List => Ok(list()),
         Verb::Eject { id } => match plugins_dir() {
             Some(folder) => super::bundled::eject(&id, &folder),
@@ -426,12 +432,35 @@ impl Host for NoApp {
 /// Load the plugin in `dir` the way the app would, without the app, and say
 /// what it is. `Err` with every problem, a line each.
 fn check(dir: &Path) -> Result<String, String> {
-    let manifest = Manifest::load(dir).map_err(|problems| {
-        problems
-            .iter()
-            .map(|problem| format!("{}\n", placed(problem)))
-            .collect::<String>()
-    })?;
+    check_manifest(
+        Manifest::load(dir).map_err(|problems| placed_all(&problems))?,
+        dir,
+    )
+}
+
+/// [`check`] for the plugin `id` among `bundled`; `None` when there is none.
+fn check_bundled(
+    id: &str,
+    bundled: Vec<super::bundled::Bundled>,
+) -> Option<Result<String, String>> {
+    let plugin = bundled.into_iter().find(|plugin| plugin.id == id)?;
+    let dir = super::bundled::place(id);
+    Some(
+        Manifest::bundled(&dir, plugin.files)
+            .map_err(|problems| placed_all(&problems))
+            .and_then(|manifest| check_manifest(manifest, &dir)),
+    )
+}
+
+fn placed_all(problems: &[diffui_plugins::Diagnostic]) -> String {
+    problems
+        .iter()
+        .map(|problem| format!("{}\n", placed(problem)))
+        .collect()
+}
+
+/// [`check`] of `manifest`, read from `dir`.
+fn check_manifest(manifest: Manifest, dir: &Path) -> Result<String, String> {
     let shown = display_path(dir);
     let mut problems = commands_of(&manifest).1;
     let builtin = crate::commands::Registry::builtin();
@@ -747,6 +776,29 @@ mod tests {
             ))
         );
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// `check github` loads the bundled GitHub plugin when no folder is
+    /// named that.
+    #[test]
+    fn check_finds_a_bundled_plugin_by_id() {
+        let built_in = super::super::bundled::built_in;
+        let said = check_bundled("github", built_in())
+            .expect("GitHub is bundled")
+            .expect("it loads");
+        assert!(
+            said.starts_with("github 1.0.0 (api 0) in (bundled)/github\n"),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "forge github.com, github.*, *.github.*: pullRequests, checks, createPullRequest, \
+                 updatePullRequest, hosts, view, commits, commitDiff, diff\n"
+            ),
+            "{said}"
+        );
+        assert!(said.ends_with("ok\n"), "{said}");
+        assert!(check_bundled("nope", built_in()).is_none());
     }
 
     #[test]
