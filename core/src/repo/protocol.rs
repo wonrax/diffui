@@ -463,6 +463,18 @@ pub enum Payload {
         job: JobId,
         tail: GraphTail,
     },
+    /// The next files of a diff that arrives in pieces (a pull request's,
+    /// downloaded as it is shown), with the totals as far as they are known.
+    /// Any number of these come before the job's [`Self::DiffLoaded`], whose
+    /// document holds only the files after the last part, and the final
+    /// totals.
+    DiffPart {
+        job: JobId,
+        files: Vec<DiffFile>,
+        total_additions: usize,
+        total_deletions: usize,
+    },
+    /// A diff, or the end of one that came in [`Self::DiffPart`]s.
     DiffLoaded {
         job: JobId,
         revision: RevisionSelection,
@@ -628,6 +640,7 @@ impl Payload {
         match self {
             Self::Batch { job, .. }
             | Self::GraphLoaded { job, .. }
+            | Self::DiffPart { job, .. }
             | Self::DiffLoaded { job, .. }
             | Self::SnapshotDone { job, .. }
             | Self::MutationDone { job, .. }

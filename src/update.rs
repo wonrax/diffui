@@ -337,6 +337,18 @@ impl Diffui {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
+        // More of a diff that arrives in parts slots into the tree's order,
+        // which moves the files listed after it: the selected file is kept
+        // by its path, not by where it was.
+        let selected_path = match &event.payload {
+            Payload::DiffPart { .. } | Payload::DiffLoaded { .. } => target
+                .session
+                .diff_streaming()
+                .then(|| target.session.document.files.get(target.selected_file))
+                .flatten()
+                .map(|file| file.path.clone()),
+            _ => None,
+        };
         // A browsed working copy re-lists when a snapshot lands that moved it,
         // or one a refresh asked for: ignored files never move it, and an
         // open `target/` should still track the disk.
@@ -362,6 +374,16 @@ impl Diffui {
             .iter()
             .any(|effect| matches!(effect, diffui_core::Effect::GraphReplaced));
         self.run_effects(tab, effects);
+        if let Some(path) = selected_path
+            && let Some(target) = self.tab_mut(tab)
+            && let files = &target.session.document.files
+            && files
+                .get(target.selected_file)
+                .is_none_or(|file| file.path != path)
+            && let Some(index) = files.iter().position(|file| file.path == path)
+        {
+            target.selected_file = index;
+        }
         if replaced {
             self.rearm_draft_candidate(tab, candidate);
         }

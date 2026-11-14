@@ -160,9 +160,9 @@ async fn pr_info<'a>(
     Ok(info.as_ref().expect("just filled"))
 }
 
-/// Stream the whole-PR diff (or one commit's) back as batches. A cancel kills
-/// the `gh` download rather than leaving it to run to completion against a
-/// tab the user has already navigated away from.
+/// Stream the whole-PR diff back in parts (or one commit's, whole). A cancel
+/// kills the `gh` download rather than leaving it to run to completion
+/// against a tab the user has already navigated away from.
 #[allow(clippy::too_many_arguments)]
 async fn stream_diff(
     id: &RepoId,
@@ -220,16 +220,11 @@ async fn stream_diff(
             .sum::<usize>();
         batch.push(file);
         if batch_lines >= BATCH_LINE_LIMIT {
-            emit(Payload::DiffLoaded {
+            emit(Payload::DiffPart {
                 job,
-                revision: RevisionSelection::WorkingCopy,
-                document: DiffDocument {
-                    files: std::mem::take(&mut batch),
-                    total_additions: totals.0,
-                    total_deletions: totals.1,
-                    range: None,
-                },
-                details: None,
+                files: std::mem::take(&mut batch),
+                total_additions: totals.0,
+                total_deletions: totals.1,
             });
             batch_lines = 0;
         }
@@ -255,5 +250,212 @@ async fn stream_diff(
             job,
             error: RepoError::Other(error.to_string()),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forge::{
+        Checks, CreatePr, ForgeFuture, ForgeKind, ForgeRemote, OnFile, PullRequest, UpdatePr,
+    };
+    use crate::model::{DiffFileStatus, DiffHunkView, DiffLine, DiffLineKind};
+    use crate::session::Session;
+
+    /// A forge whose pull request is `files`, each `lines` lines long, under
+    /// a header that counts `totals`.
+    struct Streams {
+        files: Vec<&'static str>,
+        lines: usize,
+        totals: (usize, usize),
+    }
+
+    impl ForgeProvider for Streams {
+        fn kind(&self) -> ForgeKind {
+            ForgeKind::GitHub
+        }
+
+        fn claims(&self, _remote_url: &str) -> Option<ForgeRemote> {
+            None
+        }
+
+        fn pull_requests(
+            &self,
+            _remote: ForgeRemote,
+            _branches: Vec<String>,
+        ) -> ForgeFuture<'_, Vec<PullRequest>> {
+            unreachable!("a pull-request tab doesn't ask")
+        }
+
+        fn checks(&self, _remote: ForgeRemote, _sha: String) -> ForgeFuture<'_, Checks> {
+            unreachable!("a pull-request tab doesn't ask")
+        }
+
+        fn create_pull_request(
+            &self,
+            _remote: ForgeRemote,
+            _request: CreatePr,
+        ) -> ForgeFuture<'_, PullRequest> {
+            unreachable!("a pull-request tab doesn't ask")
+        }
+
+        fn update_pull_request(
+            &self,
+            _remote: ForgeRemote,
+            _number: u64,
+            _patch: UpdatePr,
+        ) -> ForgeFuture<'_, PullRequest> {
+            unreachable!("a pull-request tab doesn't ask")
+        }
+
+        fn view(&self, _pr: ForgePr) -> ForgeFuture<'_, PrInfo> {
+            let totals = self.totals;
+            let changed_files = self.files.len();
+            Box::pin(async move {
+                Ok(PrInfo {
+                    number: 7,
+                    title: "Big".to_owned(),
+                    author: "someone".to_owned(),
+                    state: "open".to_owned(),
+                    base_ref: "main".to_owned(),
+                    head_ref: "big".to_owned(),
+                    totals: Some(totals),
+                    changed_files,
+                    url: String::new(),
+                })
+            })
+        }
+
+        fn stream_diff<'a>(
+            &'a self,
+            _pr: ForgePr,
+            _cancel: CancelFlag,
+            mut on_file: OnFile<'a>,
+        ) -> ForgeFuture<'a, ()> {
+            Box::pin(async move {
+                for path in &self.files {
+                    on_file(file(path, self.lines));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn file(path: &str, lines: usize) -> DiffFile {
+        DiffFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![DiffHunkView {
+                header: String::new(),
+                lines: (0..lines)
+                    .map(|line| DiffLine {
+                        kind: DiffLineKind::Addition,
+                        old_line: None,
+                        new_line: Some(line + 1),
+                        content: String::new(),
+                        syntax: Vec::new(),
+                        emphasis: Vec::new(),
+                    })
+                    .collect(),
+            }],
+            additions: lines,
+            deletions: 0,
+            collapsed: None,
+            blob: None,
+            mode_change: None,
+        }
+    }
+
+    /// A pull request whose diff is longer than one batch reaches the tab
+    /// whole: every file, in the tree's order, under the header's totals.
+    #[tokio::test]
+    async fn a_diff_longer_than_one_batch_lands_whole() {
+        // Git's path order, which is how a forge sends them. Three files fill
+        // a batch, so this is three batches and a last file.
+        let provider = Streams {
+            files: vec![
+                "README.md",
+                "a.rs",
+                "src/lib.rs",
+                "src/main.rs",
+                "src/nested/a.rs",
+                "src/nested/b.rs",
+                "src/z.rs",
+                "tests/t.rs",
+                "zeta/deep/x.rs",
+                "zz.rs",
+            ],
+            lines: BATCH_LINE_LIMIT / 3 + 1,
+            totals: (123_000, 45),
+        };
+        let spec = ForgePr {
+            kind: ForgeKind::GitHub,
+            host: None,
+            owner: "o".to_owned(),
+            name: "r".to_owned(),
+            number: 7,
+        };
+        let id = RepoId(spec.key());
+        let mut session = Session::unloaded(String::new());
+        let job = session
+            .load_diff(RevisionSelection::WorkingCopy)
+            .iter()
+            .find_map(|effect| match effect {
+                crate::session::Effect::Send(Command::LoadDiff { job, .. }) => Some(*job),
+                _ => None,
+            })
+            .expect("a diff load");
+
+        let (events, mut sent) = mpsc::unbounded_channel();
+        stream_diff(
+            &id,
+            &provider,
+            &spec,
+            &mut None,
+            job,
+            RevisionSelection::WorkingCopy,
+            &CancelFlag::default(),
+            &events,
+        )
+        .await;
+        drop(events);
+        let mut count = 0;
+        while let Some(event) = sent.recv().await {
+            count += 1;
+            session.apply(event);
+            // Each batch shows as it arrives, and the load isn't over until
+            // the last one.
+            assert_eq!(session.diff_in_flight(), count < 4, "after event {count}");
+            assert!(!session.document.files.is_empty());
+        }
+        assert_eq!(count, 4);
+
+        let mut whole = DiffDocument {
+            files: provider.files.iter().map(|path| file(path, 1)).collect(),
+            ..DiffDocument::default()
+        };
+        whole.sort_in_tree_order();
+        let paths = |document: &DiffDocument| -> Vec<String> {
+            document
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect()
+        };
+        assert_ne!(
+            paths(&whole)[0],
+            "README.md",
+            "the tree's order isn't git's"
+        );
+        assert_eq!(paths(&session.document), paths(&whole));
+        assert_eq!(
+            (
+                session.document.total_additions,
+                session.document.total_deletions
+            ),
+            provider.totals
+        );
+        assert_eq!(session.selected_revision, RevisionSelection::WorkingCopy);
     }
 }

@@ -21,8 +21,8 @@ use std::time::Instant;
 
 use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::model::{
-    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, DiffRequest, LoadProgress,
-    RevisionDetails, RevisionSelection, StreamRow,
+    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, DiffFile, DiffRequest,
+    LoadProgress, RevisionDetails, RevisionSelection, StreamRow,
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repo::{
@@ -42,6 +42,18 @@ use crate::revset::{
 pub struct CachedDiff {
     pub document: DiffDocument,
     pub details: Option<RevisionDetails>,
+}
+
+/// The diff switch in flight.
+#[derive(Debug, Clone)]
+struct DiffJob {
+    id: JobId,
+    /// The revision and the base it was asked for.
+    revision: RevisionSelection,
+    base: DiffBase,
+    /// Parts of it have landed ([`Payload::DiffPart`]): the document on
+    /// screen is this diff as far as it has come, and nobody else's.
+    streaming: bool,
 }
 
 /// Files with more diff rows than this are left uncoloured.
@@ -283,6 +295,9 @@ pub struct Session {
     pub revset: String,
     /// Parked documents for sources that flip between several (PR tabs).
     pub pr_diffs: HashMap<String, CachedDiff>,
+    /// The document on screen is what a diff cut off between its parts left:
+    /// empty, and no revision's diff, so it is never parked as one.
+    document_cut: bool,
     /// Identity of the displayed document. Background per-file results carry
     /// it so they route to the session still showing that document.
     pub document_id: u64,
@@ -304,8 +319,7 @@ pub struct Session {
 
     // ── inflight slots ──────────────────────────────────────────────────
     graph_job: Option<GraphJob>,
-    /// The diff switch in flight: the revision and the base it was asked for.
-    diff_job: Option<(JobId, RevisionSelection, DiffBase)>,
+    diff_job: Option<DiffJob>,
     snapshot_job: Option<(JobId, RefreshOrigin)>,
     /// The sweep in flight, with the graph job whose rows it addresses.
     empty_status_job: Option<(JobId, JobId)>,
@@ -383,7 +397,7 @@ impl Session {
     /// frontend picks which tab an arriving event is for.
     pub fn owns_job(&self, job: JobId) -> bool {
         self.graph_job.as_ref().is_some_and(|load| load.id == job)
-            || self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job)
+            || self.diff_job.as_ref().is_some_and(|diff| diff.id == job)
             || self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job)
             || self.empty_status_job.is_some_and(|(id, _)| id == job)
             || self.mutation_job == Some(job)
@@ -403,11 +417,17 @@ impl Session {
     /// flight. The toolbar's progress line reads it; so does the guard that
     /// keeps a cold load's initial `@` diff from overwriting a palette jump.
     pub fn diff_pending(&self) -> Option<&RevisionSelection> {
-        self.diff_job.as_ref().map(|(_, revision, _)| revision)
+        self.diff_job.as_ref().map(|diff| &diff.revision)
     }
 
     pub fn diff_in_flight(&self) -> bool {
         self.diff_job.is_some()
+    }
+
+    /// Whether the document on screen is a diff still arriving in parts, so
+    /// more files are about to join it.
+    pub fn diff_streaming(&self) -> bool {
+        self.diff_job.as_ref().is_some_and(|diff| diff.streaming)
     }
 
     /// Whether a graph load is streaming into the live store right now. The
@@ -464,6 +484,9 @@ impl Session {
         if !self.capabilities.graph
             && let Some(cached) = self.pr_diffs.remove(&document_key(&revision))
         {
+            // Whatever was still loading would land on top of this one, or
+            // go on streaming into it.
+            let mut effects = self.cancel_diff();
             self.park_displayed_document();
             self.document = cached.document;
             self.revision_details = cached.details;
@@ -471,20 +494,22 @@ impl Session {
             self.selected_commit_index = self.find_selected_commit_index();
             // An instant swap lands no event, so the follow-ups a `DiffLoaded`
             // would have produced are issued here.
-            let mut effects = self.drop_expand_jobs();
+            effects.extend(self.drop_expand_jobs());
             effects.extend([Effect::RepaintDocument, Effect::RevealSelection]);
             return effects;
         }
-        let mut effects = Vec::new();
-        if let Some((job, ..)) = self.diff_job.take() {
-            effects.push(Effect::Send(Command::Cancel { job }));
-        }
+        let mut effects = self.cancel_diff();
         let job = self.next_job();
         let base = self.diff_base.clone();
         if revision != self.selected_revision || base != self.document_base {
             self.expanded_paths.clear();
         }
-        self.diff_job = Some((job, revision.clone(), base.clone()));
+        self.diff_job = Some(DiffJob {
+            id: job,
+            revision: revision.clone(),
+            base: base.clone(),
+            streaming: false,
+        });
         self.loading_since = Some(Instant::now());
         effects.push(Effect::Send(Command::LoadDiff {
             job,
@@ -518,6 +543,27 @@ impl Session {
             base: self.document_base.clone(),
             path: path.to_owned(),
         })]
+    }
+
+    /// Give up the diff switch in flight, if there is one.
+    fn cancel_diff(&mut self) -> Vec<Effect> {
+        let Some(diff) = self.diff_job.take() else {
+            return Vec::new();
+        };
+        let mut effects = vec![Effect::Send(Command::Cancel { job: diff.id })];
+        effects.extend(self.drop_partial_document(&diff));
+        effects
+    }
+
+    /// `diff` ended before its last part: what did arrive is half a diff, and
+    /// goes rather than be read, or parked, as its revision's whole one.
+    fn drop_partial_document(&mut self, diff: &DiffJob) -> Option<Effect> {
+        diff.streaming.then(|| {
+            self.document = DiffDocument::default();
+            self.revision_details = None;
+            self.document_cut = true;
+            Effect::RepaintDocument
+        })
     }
 
     /// Cancel the expands asked of the document being replaced. Their files
@@ -974,6 +1020,12 @@ impl Session {
             Payload::Ready { .. } => Vec::new(),
             Payload::Batch { job, rows } => self.on_batch(job, rows),
             Payload::GraphLoaded { job, tail } => self.on_graph_loaded(job, tail),
+            Payload::DiffPart {
+                job,
+                files,
+                total_additions,
+                total_deletions,
+            } => self.on_diff_part(job, files, total_additions, total_deletions),
             Payload::DiffLoaded {
                 job,
                 revision,
@@ -1028,8 +1080,9 @@ impl Session {
             } => self.on_diff_resolved(job, revision, base),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),
             Payload::Cancelled { job } => {
-                self.clear_slot(job);
-                self.drain_pending_refresh()
+                let mut effects = self.clear_slot(job);
+                effects.extend(self.drain_pending_refresh());
+                effects
             }
             // Results the frontend routes by job on its own (previews, source
             // browsing, file pairs, details, fetch): the projection has no
@@ -1152,6 +1205,61 @@ impl Session {
         effects
     }
 
+    /// The next files of the diff in flight. The first part starts the
+    /// document, as a whole diff landing would; later ones join it. The slot
+    /// stays taken until the job's `DiffLoaded`.
+    fn on_diff_part(
+        &mut self,
+        job: JobId,
+        files: Vec<DiffFile>,
+        total_additions: usize,
+        total_deletions: usize,
+    ) -> Vec<Effect> {
+        let Some(diff) = self.diff_job.as_mut().filter(|diff| diff.id == job) else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        if !std::mem::replace(&mut diff.streaming, true) {
+            let (revision, base) = (diff.revision.clone(), diff.base.clone());
+            effects = self.replace_document(revision, base, None);
+        }
+        self.document.files.extend(files);
+        self.document.total_additions = total_additions;
+        self.document.total_deletions = total_deletions;
+        // A forge sends files in git's order, so a later part can hold a file
+        // the tree lists before one already here.
+        self.document.sort_in_tree_order();
+        effects.push(Effect::RepaintDocument);
+        effects
+    }
+
+    /// Make room for the diff of `revision` against `base`: the document it
+    /// replaces is parked or dropped, and the selection moves to it.
+    fn replace_document(
+        &mut self,
+        revision: RevisionSelection,
+        base: DiffBase,
+        details: Option<RevisionDetails>,
+    ) -> Vec<Effect> {
+        // A reload of the revision on screen replaces its document; parking
+        // the old one would leave it to be flipped back to later.
+        if !self.capabilities.graph && revision != self.selected_revision {
+            self.park_displayed_document();
+        }
+        let mut effects = Vec::new();
+        if revision != self.selected_revision || base != self.document_base {
+            effects.extend(self.drop_expand_jobs());
+        }
+        self.selected_revision = revision;
+        self.document_base = base;
+        self.status = LoadStatus::Loaded;
+        self.document = DiffDocument::default();
+        self.document_cut = false;
+        self.revision_details = details;
+        self.selected_commit_index = self.find_selected_commit_index();
+        effects
+    }
+
     fn on_diff_loaded(
         &mut self,
         job: JobId,
@@ -1159,10 +1267,18 @@ impl Session {
         document: DiffDocument,
         details: Option<RevisionDetails>,
     ) -> Vec<Effect> {
-        let Some((_, _, base)) = self.diff_job.take_if(|(id, ..)| *id == job) else {
+        let Some(diff) = self.diff_job.take_if(|diff| diff.id == job) else {
             return Vec::new();
         };
+        let base = diff.base;
         self.loading_since = None;
+        let mut document = document;
+        if diff.streaming {
+            // The parts are on screen; these are the files after the last.
+            let mut files = std::mem::take(&mut self.document.files);
+            files.append(&mut document.files);
+            document.files = files;
+        }
 
         // A working-copy diff is the definitive emptiness signal for `@` (files
         // present ⇒ not empty), so an edit flips the chip without a re-walk.
@@ -1178,24 +1294,17 @@ impl Session {
                     .all(|file| file.status == crate::model::DiffFileStatus::Conflicted)
             });
 
-        if !self.capabilities.graph {
-            self.park_displayed_document();
-        }
-        let mut effects = Vec::new();
-        if revision != self.selected_revision || base != self.document_base {
-            effects.extend(self.drop_expand_jobs());
-        }
+        let mut effects = if diff.streaming {
+            self.revision_details = details;
+            Vec::new()
+        } else {
+            self.replace_document(revision, base, details)
+        };
         // Every backend's document lands here, so this is the one place that
         // makes file order mean the same thing to the diff view, the tree and
         // next/previous file.
-        let mut document = document;
         document.sort_in_tree_order();
-        self.selected_revision = revision;
-        self.document_base = base;
-        self.status = LoadStatus::Loaded;
         self.document = document;
-        self.revision_details = details;
-        self.selected_commit_index = self.find_selected_commit_index();
         if let Some(empty) = wc_empty
             && self.capabilities.graph
             && let Some(index) = self.selected_commit_index
@@ -1383,21 +1492,20 @@ impl Session {
         let failed_compare = self
             .diff_job
             .as_ref()
-            .is_some_and(|(id, _, base)| *id == job && base.is_compare());
+            .is_some_and(|diff| diff.id == job && diff.base.is_compare());
         let failed_range = self
             .diff_job
             .as_ref()
-            .is_some_and(|(id, _, base)| *id == job && base.range().is_some());
+            .is_some_and(|diff| diff.id == job && diff.base.range().is_some());
         let failed_resolve = self.diff_resolve_job == Some(job);
         // A mutation's failure is reported by whoever started it (an immutable
         // rejection turns into an offer, not a toast), so only the slot is
         // cleared here.
         let owned_mutation = self.mutation_job == Some(job);
-        self.clear_slot(job);
+        let mut effects = self.clear_slot(job);
         self.loading_since = None;
         let message = error.to_string();
 
-        let mut effects = Vec::new();
         if owned_graph {
             // Only a graph load failing means the tab has nothing to show. An
             // operation failing leaves the graph exactly where it was, so it
@@ -1436,13 +1544,15 @@ impl Session {
     }
 
     /// Clear whichever slot `job` owns. Called from every terminal event, so a
-    /// failure or a cancel can never strand a slot.
-    fn clear_slot(&mut self, job: JobId) {
+    /// failure or a cancel can never strand a slot. A diff that was cut off
+    /// between its parts takes what it had shown with it.
+    fn clear_slot(&mut self, job: JobId) -> Vec<Effect> {
+        let mut effects = Vec::new();
         if self.graph_job.as_ref().is_some_and(|load| load.id == job) {
             self.graph_job = None;
         }
-        if self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job) {
-            self.diff_job = None;
+        if let Some(diff) = self.diff_job.take_if(|diff| diff.id == job) {
+            effects.extend(self.drop_partial_document(&diff));
         }
         if self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job) {
             self.snapshot_job = None;
@@ -1461,6 +1571,7 @@ impl Session {
             self.span_job = None;
         }
         self.expand_jobs.retain(|(id, _)| *id != job);
+        effects
     }
 
     /// Run a refresh coalesced while the session was busy, now that it is idle.
@@ -1488,6 +1599,9 @@ impl Session {
     fn park_displayed_document(&mut self) {
         const PARKED_DIFF_CAP: usize = 16;
 
+        if std::mem::take(&mut self.document_cut) {
+            return;
+        }
         let key = document_key(&self.selected_revision);
         self.pr_diffs.insert(
             key,
@@ -2650,6 +2764,230 @@ mod tests {
         let found = session.revset_completer(&history).complete_revset("wi", 2);
         let inserts: Vec<&str> = found.iter().map(|c| c.insert.as_str()).collect();
         assert_eq!(inserts, ["wip & mine()", "wip"]);
+    }
+
+    // ── a diff in parts ─────────────────────────────────────────────────
+
+    /// A session on a source that streams its diff: a pull request, which
+    /// has no graph and parks the documents it flips between.
+    fn streamed_session() -> (Session, RepoId) {
+        let repo = RepoId("github.com/o/r#7".to_owned());
+        (Session::unloaded(String::new()), repo)
+    }
+
+    fn files(paths: &[&str]) -> Vec<DiffFile> {
+        paths
+            .iter()
+            .map(|path| DiffFile {
+                collapsed: None,
+                ..collapsed_file(path)
+            })
+            .collect()
+    }
+
+    fn part(paths: &[&str], job: JobId, totals: (usize, usize)) -> Payload {
+        Payload::DiffPart {
+            job,
+            files: files(paths),
+            total_additions: totals.0,
+            total_deletions: totals.1,
+        }
+    }
+
+    fn whole(paths: &[&str], job: JobId, revision: RevisionSelection) -> Payload {
+        Payload::DiffLoaded {
+            job,
+            revision,
+            document: DiffDocument {
+                files: files(paths),
+                total_additions: 7,
+                total_deletions: 3,
+                range: None,
+            },
+            details: None,
+        }
+    }
+
+    fn shown(session: &Session) -> Vec<&str> {
+        session
+            .document
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect()
+    }
+
+    fn repaints(effects: &[Effect]) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RepaintDocument))
+    }
+
+    fn cancels(effects: &[Effect], job: JobId) -> bool {
+        effects.iter().any(
+            |effect| matches!(effect, Effect::Send(Command::Cancel { job: sent }) if *sent == job),
+        )
+    }
+
+    /// Parts show as they land and the load stays in flight; the last message
+    /// brings the rest. Every file is there, in the tree's order, under the
+    /// final totals.
+    #[test]
+    fn a_diff_in_parts_lands_every_file_in_tree_order() {
+        let (mut session, repo) = streamed_session();
+        let effects = session.load_diff(RevisionSelection::WorkingCopy);
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+
+        let effects = session.apply(Event::new(
+            repo.clone(),
+            part(&["README.md", "src/lib.rs"], job, (100, 10)),
+        ));
+        assert!(repaints(&effects));
+        assert!(session.diff_in_flight() && session.owns_job(job));
+        assert_eq!(session.status, LoadStatus::Loaded);
+        assert_eq!(shown(&session), ["src/lib.rs", "README.md"]);
+        assert_eq!(session.document.total_additions, 100);
+
+        // A later part holds a file the tree lists before ones already here.
+        let effects = session.apply(Event::new(
+            repo.clone(),
+            part(&["src/nested/a.rs"], job, (100, 10)),
+        ));
+        assert!(repaints(&effects));
+        assert_eq!(
+            shown(&session),
+            ["src/nested/a.rs", "src/lib.rs", "README.md"]
+        );
+        session.apply(Event::new(
+            repo.clone(),
+            part(&["tests/t.rs"], job, (100, 10)),
+        ));
+        assert!(session.diff_in_flight());
+
+        let effects = session.apply(Event::new(
+            repo,
+            whole(&["a.rs"], job, RevisionSelection::WorkingCopy),
+        ));
+        assert!(repaints(&effects));
+        assert!(!session.diff_in_flight());
+        assert_eq!(
+            shown(&session),
+            [
+                "src/nested/a.rs",
+                "src/lib.rs",
+                "tests/t.rs",
+                "README.md",
+                "a.rs"
+            ]
+        );
+        assert_eq!(
+            (
+                session.document.total_additions,
+                session.document.total_deletions
+            ),
+            (7, 3)
+        );
+        assert_eq!(session.selected_revision, RevisionSelection::WorkingCopy);
+    }
+
+    /// A diff superseded between its parts is cancelled and what it had shown
+    /// goes: it is not the new revision's, and half of it must not be parked
+    /// as the old one's. What still arrives for it is dropped.
+    #[test]
+    fn a_stale_jobs_parts_are_dropped() {
+        let (mut session, repo) = streamed_session();
+        let effects = session.load_diff(commit("aaa"));
+        let (stale, ..) = sent_diff(&effects).expect("a diff load");
+        session.apply(Event::new(repo.clone(), part(&["a.rs"], stale, (1, 0))));
+        assert_eq!(shown(&session), ["a.rs"]);
+
+        let effects = session.load_diff(commit("bbb"));
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+        assert!(
+            cancels(&effects, stale) && repaints(&effects),
+            "{effects:?}"
+        );
+        assert!(session.document.files.is_empty());
+
+        for late in [
+            part(&["b.rs"], stale, (2, 0)),
+            whole(&["c.rs"], stale, commit("aaa")),
+        ] {
+            assert!(session.apply(Event::new(repo.clone(), late)).is_empty());
+            assert!(session.document.files.is_empty());
+            assert!(session.owns_job(job));
+        }
+
+        session.apply(Event::new(repo, whole(&["z.rs"], job, commit("bbb"))));
+        assert_eq!(shown(&session), ["z.rs"]);
+        assert_eq!(session.selected_revision, commit("bbb"));
+        assert!(
+            !session.pr_diffs.contains_key("aaa"),
+            "half of aaa was parked"
+        );
+    }
+
+    /// A stream that is cancelled or fails between its parts leaves no
+    /// document: the files that came are not the revision's diff, and asking
+    /// again loads it again.
+    #[test]
+    fn a_diff_cut_off_between_its_parts_leaves_nothing() {
+        for failed in [false, true] {
+            let (mut session, repo) = streamed_session();
+            let effects = session.load_diff(RevisionSelection::WorkingCopy);
+            let (job, ..) = sent_diff(&effects).expect("a diff load");
+            session.apply(Event::new(repo.clone(), part(&["a.rs"], job, (1, 0))));
+
+            let end = if failed {
+                Payload::Failed {
+                    job,
+                    error: RepoError::Other("the connection dropped".to_owned()),
+                }
+            } else {
+                Payload::Cancelled { job }
+            };
+            let effects = session.apply(Event::new(repo, end));
+            assert!(repaints(&effects), "{effects:?}");
+            assert!(!session.diff_in_flight());
+            assert!(session.document.files.is_empty());
+            assert!(session.pr_diffs.is_empty());
+
+            let effects = session.load_diff(RevisionSelection::WorkingCopy);
+            assert!(sent_diff(&effects).is_some(), "served from a half document");
+        }
+    }
+
+    /// Flipping to a parked document while another diff streams stops the
+    /// stream: its later parts would land in the document flipped to.
+    #[test]
+    fn flipping_to_a_parked_diff_stops_the_stream() {
+        let (mut session, repo) = streamed_session();
+        let load = |session: &mut Session, revision: RevisionSelection| {
+            let effects = session.load_diff(revision);
+            sent_diff(&effects).expect("a diff load").0
+        };
+        let job = load(&mut session, commit("aaa"));
+        session.apply(Event::new(
+            repo.clone(),
+            whole(&["a.rs"], job, commit("aaa")),
+        ));
+        let streaming = load(&mut session, commit("bbb"));
+        session.apply(Event::new(repo.clone(), part(&["b.rs"], streaming, (1, 0))));
+        assert_eq!(shown(&session), ["b.rs"]);
+
+        let effects = session.load_diff(commit("aaa"));
+        assert!(sent_diff(&effects).is_none(), "aaa was parked");
+        assert!(cancels(&effects, streaming), "{effects:?}");
+        assert!(!session.diff_in_flight());
+        assert_eq!(shown(&session), ["a.rs"]);
+        assert!(
+            !session.pr_diffs.contains_key("bbb"),
+            "half of bbb was parked"
+        );
+
+        let late = session.apply(Event::new(repo, part(&["c.rs"], streaming, (2, 0))));
+        assert!(late.is_empty());
+        assert_eq!(shown(&session), ["a.rs"]);
     }
 
     // ── size caps ───────────────────────────────────────────────────────

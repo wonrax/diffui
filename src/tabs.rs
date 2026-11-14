@@ -582,6 +582,62 @@ pub(crate) mod tests {
         });
     }
 
+    /// A diff that arrives in parts slots each one into the tree's order, so
+    /// the files after it move down: the selected file is still the one the
+    /// user picked.
+    #[test]
+    fn the_selected_file_holds_while_a_diff_streams_in() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/streams");
+            let revision = RevisionSelection::Commit("abc".to_owned());
+            let effects = ui.tab_mut(tab).unwrap().session.load_diff(revision.clone());
+            let job = match effects.first() {
+                Some(diffui_core::Effect::Send(diffui_core::Command::LoadDiff { job, .. })) => *job,
+                other => panic!("expected a diff load, got {other:?}"),
+            };
+            let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+            let part = |paths: &[&str]| diffui_core::Payload::DiffPart {
+                job,
+                files: (paths.iter())
+                    .flat_map(|path| document(path).files)
+                    .collect(),
+                total_additions: 9,
+                total_deletions: 0,
+            };
+            let mut land = |ui: &mut Diffui, payload| {
+                ui.act(cx, |ui, cx| {
+                    ui.on_repo_event(diffui_core::Event::new(repo.clone(), payload), cx)
+                })
+            };
+            let selected = |ui: &Diffui| {
+                let state = ui.active();
+                state.session.document.files[state.selected_file]
+                    .path
+                    .clone()
+            };
+
+            land(&mut ui, part(&["README.md", "a.rs"]));
+            ui.active_mut().selected_file = 1;
+            assert_eq!(selected(&ui), "a.rs");
+            // Directories list before files, so this one goes first.
+            land(&mut ui, part(&["src/lib.rs"]));
+            assert_eq!(ui.active().session.document.files[0].path, "src/lib.rs");
+            assert_eq!(selected(&ui), "a.rs");
+            land(
+                &mut ui,
+                diffui_core::Payload::DiffLoaded {
+                    job,
+                    revision,
+                    document: document("docs/x.md"),
+                    details: None,
+                },
+            );
+            assert_eq!(ui.active().session.document.files.len(), 4);
+            assert_eq!(selected(&ui), "a.rs");
+        });
+    }
+
     fn details(description: &str) -> diffui_core::RevisionDetails {
         diffui_core::RevisionDetails {
             commit_id: "abc".to_owned(),
