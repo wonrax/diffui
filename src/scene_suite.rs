@@ -1233,6 +1233,22 @@ fn all() -> Vec<Scene> {
         },
     ));
     t.add(s(
+        "palette-history-search",
+        "A ':' revision search after Enter: the loaded rows' hits with all history merged in, rows the log leaves out marked.",
+        "cmd+K, type ':render', Enter, wait for the history search.",
+        |c| {
+            c.key("cmd+k");
+            c.typed(":render");
+            c.send_enter();
+            c.h.wait_until("the history search", |ui| {
+                ui.palette()
+                    .and_then(|state| state.top())
+                    .is_some_and(|column| column.searched && column.history.is_none())
+            });
+            c.settle();
+        },
+    ));
+    t.add(s(
         "palette-no-results",
         "A query that matches nothing.",
         "cmd+K, type a miss.",

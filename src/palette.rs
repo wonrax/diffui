@@ -30,7 +30,9 @@ use crate::commands::{self, CommandArg, CommandId, PaletteScope};
 use crate::theme::{self, ThemeSpec};
 use crate::typography::{self, Aligned};
 use crate::ui::Look;
-use diffui_core::RevisionSelection;
+use diffui_core::commit_search::{self, CommitHit};
+use diffui_core::{JobId, RevisionSelection};
+use std::sync::Arc;
 
 /// `Id` for the active palette text input. Refocused whenever the
 /// rightmost column changes (open, push, pop) so keystrokes always land in
@@ -76,8 +78,9 @@ const SCOPES_HEIGHT: f32 = 40.0;
 
 /// Cap on rows rendered per column. Beyond this the column would still
 /// scroll, but for big repos (10k+ commits) capping keeps the layout pass
-/// cheap and the user can refine the query to surface what they want.
-const MAX_RESULT_ROWS: usize = 200;
+/// cheap and the user can refine the query to surface what they want. A
+/// history search keeps as many.
+const MAX_RESULT_ROWS: usize = commit_search::MAX_HITS;
 
 const RECENTS_CAPACITY: usize = 32;
 const RECENCY_TOP_N: usize = 5;
@@ -180,6 +183,10 @@ pub struct PaletteColumn {
     /// query resets it so the "press ⏎ to search" prompt comes back. Ignored in
     /// other modes (they search live).
     pub searched: bool,
+    /// `:` commit-search only: the search of all history the last ⏎ started,
+    /// while it runs. Its hits merge into the loaded rows' when they land;
+    /// editing the query cancels it, so an old query's never lands.
+    pub history: Option<JobId>,
     /// The command line, while the query starts with `jj `.
     pub command: Option<Box<crate::cmdline::CommandLine>>,
     /// How many results each scope tab would show for the current needle.
@@ -260,6 +267,9 @@ pub struct PaletteMatch {
     /// nucleo's match positions in the row's label, by char, for the row to
     /// pick out what was typed. Empty when the label isn't what was matched.
     pub indices: Vec<u32>,
+    /// A history search's hit for a commit the graph hasn't loaded: what its
+    /// row shows, and how opening it goes.
+    pub found: Option<Arc<CommitHit>>,
 }
 
 /// In-memory MRU bookkeeping. Two tracks: recently-jumped revisions and
@@ -470,6 +480,7 @@ impl PaletteState {
             searched: false,
             command: None,
             counts: ScopeCounts::default(),
+            history: None,
         };
         recompute_matches(&mut column, ui, false);
         // The first column doesn't animate — it just appears. Push/pop
@@ -511,6 +522,7 @@ impl PaletteState {
             searched: false,
             command: None,
             counts: ScopeCounts::default(),
+            history: None,
         };
         recompute_matches(&mut column, ui, false);
         Self {
@@ -551,6 +563,7 @@ impl PaletteState {
             searched: false,
             command: None,
             counts: ScopeCounts::default(),
+            history: None,
         };
         recompute_matches(&mut column, ui, false);
         self.stack.push(column);
@@ -696,6 +709,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
                 score: total,
                 disabled: candidate.disabled,
                 indices: Vec::new(),
+                found: None,
             },
             candidate.haystack,
         ));
@@ -706,9 +720,11 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
         let commits = &ui.active().session.commits;
         let mut hits: Vec<(u32, usize)> = Vec::new();
         let mut haystack = String::new();
+        // The history search's scorer, so a commit ranks alike in both.
+        let mut scorer = commit_search::Scorer::new(needle);
         for (index, commit) in commits.iter().enumerate() {
             commit_haystack(&commit, &mut haystack);
-            if let Some(score) = score_of(&haystack) {
+            if let Some(score) = scorer.score(&haystack) {
                 // The commit category's tie-break is 3, as in the loop above.
                 let total = score as u32 * 100 + ui.recents.revision_bonus(commit.change_id()) + 3;
                 hits.push((total, index));
@@ -728,6 +744,7 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
                 score,
                 disabled: None,
                 indices: Vec::new(),
+                found: None,
             };
             // A commit row's label isn't its haystack, so no positions to find.
             matches.push((entry, String::new()));
@@ -762,6 +779,52 @@ pub fn recompute_matches(column: &mut PaletteColumn, ui: &Diffui, search_revisio
     }
     column.matches = matches;
     column.selected = column.selected.min(column.matches.len().saturating_sub(1));
+}
+
+/// Fold a history search's `hits` into a `:` column's rows: a commit already
+/// listed keeps its row, the rest rank among them as the loaded rows rank, and
+/// the highlight stays on the row it was on.
+pub fn merge_found(column: &mut PaletteColumn, ui: &Diffui, hits: Vec<CommitHit>) {
+    let commits = &ui.active().session.commits;
+    let highlighted = column
+        .matches
+        .get(column.selected)
+        .map(|entry| entry.item.clone());
+    let listed: std::collections::HashSet<String> = column
+        .matches
+        .iter()
+        .filter_map(|entry| match &entry.item {
+            ResultRef::Commit { commit, .. } => Some(commit.clone()),
+            _ => None,
+        })
+        .collect();
+    for hit in hits {
+        if listed.contains(&hit.commit_id) {
+            continue;
+        }
+        // The commit category's tie-break is 3, as in `recompute_matches`.
+        let score = hit.score as u32 * 100 + ui.recents.revision_bonus(&hit.change_id) + 3;
+        let loaded = commits.find_by_commit_id(&hit.commit_id).is_some();
+        column.matches.push(PaletteMatch {
+            item: ResultRef::Commit {
+                change: ChangeId(hit.change_id.clone()),
+                commit: hit.commit_id.clone(),
+            },
+            score,
+            disabled: None,
+            indices: Vec::new(),
+            found: (!loaded).then(|| Arc::new(hit)),
+        });
+    }
+    column
+        .matches
+        .sort_by_key(|entry| (entry.disabled.is_some(), std::cmp::Reverse(entry.score)));
+    column.matches.truncate(MAX_RESULT_ROWS);
+    group_rows(&ui.registry, &mut column.matches);
+    column.counts.revisions = Some(column.matches.len());
+    column.selected = highlighted
+        .and_then(|item| column.matches.iter().position(|entry| entry.item == item))
+        .unwrap_or(0);
 }
 
 impl Mode {
@@ -852,20 +915,14 @@ struct Candidate {
 /// What a commit is searched by: its ids, description, author and
 /// bookmarks, written into `out`.
 fn commit_haystack(commit: &diffui_core::RowView<'_>, out: &mut String) {
-    out.clear();
-    out.push_str(commit.change_id());
-    out.push(' ');
-    out.push_str(commit.commit_id());
-    out.push(' ');
-    if commit.has_description() {
-        out.push_str(commit.description());
-        out.push(' ');
-    }
-    out.push_str(commit.author());
-    for bookmark in commit.bookmarks() {
-        out.push(' ');
-        out.push_str(bookmark);
-    }
+    commit_search::haystack(
+        commit.change_id(),
+        commit.commit_id(),
+        commit.has_description().then(|| commit.description()),
+        commit.author(),
+        commit.bookmarks().iter().map(String::as_str),
+        out,
+    );
 }
 
 fn push_bookmark_candidates(out: &mut Vec<Candidate>, ui: &Diffui) {
@@ -991,6 +1048,17 @@ fn revision_prefix(row: Option<&diffui_core::RowView<'_>>, change: &ChangeId) ->
     let len = row.shortest_change_id_len().unwrap_or(8).max(8);
     let mut prefix: String = row.change_id().chars().take(len).collect();
     if let Some(offset) = row.change_offset() {
+        prefix.push('/');
+        prefix.push_str(&offset.to_string());
+    }
+    prefix
+}
+
+/// [`revision_prefix`] for a history search's hit.
+fn found_prefix(hit: &CommitHit) -> String {
+    let len = hit.shortest_change_id_len.unwrap_or(8).max(8);
+    let mut prefix: String = hit.change_id.chars().take(len).collect();
+    if let Some(offset) = hit.change_offset {
         prefix.push('/');
         prefix.push_str(&offset.to_string());
     }
@@ -1304,7 +1372,15 @@ fn column_footer(ui: &Diffui, look: Look, column: &PaletteColumn) -> AnyElement 
                 .children(bound(&["palette.previous", "palette.next"], "Select"))
                 .child(hint(&[crate::keymap::key_label("enter")], enter))
                 .children(bound(&["palette.actions"], "Actions"))
-                .child(
+                .child(if column.history.is_some() {
+                    div()
+                        .ml_auto()
+                        .flex_none()
+                        .child(crate::overlay_kit::footer_note(
+                            "Searching all history…",
+                            look,
+                        ))
+                } else {
                     div()
                         .ml_auto()
                         .flex()
@@ -1314,8 +1390,8 @@ fn column_footer(ui: &Diffui, look: Look, column: &PaletteColumn) -> AnyElement 
                         .gap(px(theme::space::SM))
                         .child(crate::overlay_kit::footer_note("Type", look))
                         .child(ui::keycap("jj", look).view())
-                        .child(crate::overlay_kit::footer_note("for a jj command", look)),
-                )
+                        .child(crate::overlay_kit::footer_note("for a jj command", look))
+                })
                 .into_any_element()
         }
         ColumnSource::Choose { title, .. } => {
@@ -1486,7 +1562,9 @@ fn build_results(
         });
     if revision_prompt.is_some() || column.matches.is_empty() {
         let label = revision_prompt.unwrap_or_else(|| {
-            if column.dirty {
+            if column.history.is_some() {
+                "Searching all history…".to_owned()
+            } else if column.dirty {
                 "Searching…".to_owned()
             } else {
                 "No matches".to_owned()
@@ -1726,6 +1804,30 @@ fn result_row_body(
                 None,
                 Vec::new(),
             ),
+            ResultRef::Commit { .. } if let Some(hit) = &row.found => {
+                let prefix = found_prefix(hit);
+                let unique = hit
+                    .shortest_change_id_len
+                    .unwrap_or(prefix.len())
+                    .min(prefix.len());
+                let description = if hit.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &hit.description
+                };
+                // Quiet, ahead of the author so an ellipsis never takes it.
+                let whereabouts = if hit.in_log {
+                    "Not loaded yet"
+                } else {
+                    "Not in the log"
+                };
+                (
+                    change_id_label(&prefix, unique, look),
+                    highlighted(description, &[], primary, look),
+                    hint(format!("{whereabouts} · {}", hit.author)),
+                    Vec::new(),
+                )
+            }
             ResultRef::Commit { change, commit } => {
                 let commit = ui.active().session.commits.find_by_commit_id(commit);
                 let prefix = revision_prefix(commit.as_ref(), change);
@@ -2171,6 +2273,7 @@ mod tests {
             score,
             disabled: None,
             indices: Vec::new(),
+            found: None,
         };
         let mut rows = vec![
             row(ResultRef::Command("theme.dark".into()), 9),

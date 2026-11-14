@@ -1084,6 +1084,8 @@ pub(crate) enum Pending {
     DetailCopy(DetailField, String),
     /// A pull-request dialog's or submission's question.
     Forge(forge_dialog::ForgeQuery),
+    /// The palette's search of all history, for this needle.
+    CommitSearch(String),
 }
 
 impl Pending {

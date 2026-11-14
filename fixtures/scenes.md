@@ -566,6 +566,12 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: A highlighted revision result with its actions column pushed to the right.
 - Steps: cmd+K, type 'pipeline', Tab.
 
+### `palette-history-search`
+
+- Window: 1440x900, light
+- State: A ':' revision search after Enter: the loaded rows' hits with all history merged in, rows the log leaves out marked.
+- Steps: cmd+K, type ':render', Enter, wait for the history search.
+
 ### `palette-no-results`
 
 - Window: 1440x900, light

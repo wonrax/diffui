@@ -580,6 +580,9 @@ impl Diffui {
                 crate::write_clipboard(format_detail(&details, field).unwrap_or(fallback), cx)
             }
             (Pending::Forge(query), payload) => self.forge_job_done(tab, query, payload),
+            (Pending::CommitSearch(_), Payload::CommitsFound { hits, .. }) => {
+                self.palette_history_found(tab, job, hits)
+            }
             // A fetch or mutation reporting how far it got: the job runs on.
             (Pending::Fetch(activity, target), Payload::Progress { loaded, total, .. }) => {
                 if let Some(state) = self.tab_mut(tab) {
@@ -653,6 +656,11 @@ impl Diffui {
             // Copy what the graph knows instead.
             Pending::DetailCopy(_, fallback) => crate::write_clipboard(fallback, cx),
             Pending::Forge(query) => self.forge_job_failed(tab, query, error.to_string()),
+            // The loaded rows' hits stay; only the searching state goes.
+            Pending::CommitSearch(needle) => {
+                tracing::warn!(%needle, %error, "the history search failed");
+                self.palette_history_found(tab, job, Vec::new())
+            }
         }
     }
 
@@ -688,6 +696,7 @@ impl Diffui {
             | Pending::File(_)
             | Pending::CommandRevset(_)
             | Pending::RevsetField(_)
+            | Pending::CommitSearch(_)
             | Pending::DetailCopy(..) => return,
         };
         if let Some(log) = self.activity_log_for(tab) {
@@ -1769,6 +1778,9 @@ impl Diffui {
             // Editing resets `:` commit-search back to its "press ⏎"
             // prompt (the prior results are for a stale query).
             column.searched = false;
+            if let Some(job) = column.history.take() {
+                self.cancel_history_search(job);
+            }
             column.query_version = column.query_version.wrapping_add(1);
             // Debounce: the matcher scans every commit, so coalesce
             // fast typing rather than re-matching on each keystroke.
@@ -3565,6 +3577,12 @@ impl Diffui {
                 // this borrows `self` cleanly while mutating the detached
                 // column.
                 palette::recompute_matches(column, self, true);
+                // The loaded rows answer at once; all history follows.
+                let needle = palette::revision_mode_needle(&column.query).unwrap_or_default();
+                if let Some(job) = column.history.take() {
+                    self.cancel_history_search(job);
+                }
+                column.history = self.start_history_search(needle.trim());
             }
             self.push_mode(Mode::Palette(state));
             return;
@@ -3644,6 +3662,19 @@ impl Diffui {
                 self.pop_mode(ModeKind::Palette);
                 self.run_command(&id, CommandArg::None, cx)
             }
+            // A history search's hit the graph hasn't loaded since.
+            (None, ResultRef::Commit { commit, .. })
+                if let Some(hit) = selected.found.clone()
+                    && self
+                        .active()
+                        .session
+                        .commits
+                        .find_by_commit_id(commit)
+                        .is_none() =>
+            {
+                self.pop_mode(ModeKind::Palette);
+                self.open_found_commit(&hit)
+            }
             (None, ResultRef::WorkingCopy | ResultRef::Commit { .. } | ResultRef::Bookmark(_)) => {
                 self.pop_mode(ModeKind::Palette);
                 self.perform(Action::JumpToResult(item), cx)
@@ -3667,10 +3698,83 @@ impl Diffui {
     }
 
     pub(crate) fn jump_to_revision_ref(&mut self, target: &ResultRef) {
-        let Some(selection) = revision_selection(target, self) else {
+        if let Some(selection) = revision_selection(target, self) {
+            self.jump_to_selection(selection);
+        }
+    }
+
+    /// Ask the active tab's repository to search all history for `needle`.
+    /// `None` when it has no history to search (a pull request).
+    fn start_history_search(&mut self, needle: &str) -> Option<diffui_core::JobId> {
+        let tab = self.active_tab_id()?;
+        let state = self.tab_mut(tab)?;
+        if !state.session.capabilities.graph {
+            return None;
+        }
+        let (job, effects) = state.session.search_commits(needle);
+        if let Some(old) = state
+            .jobs
+            .issue(job, Pending::CommitSearch(needle.to_owned()))
+            && let Some(handle) = &state.handle
+        {
+            handle.send(diffui_core::Command::Cancel { job: old });
+        }
+        self.run_effects(tab, effects);
+        Some(job)
+    }
+
+    /// Stop a history search the palette no longer wants.
+    fn cancel_history_search(&mut self, job: diffui_core::JobId) {
+        let Some(tab) = self.active_tab_id() else {
             return;
         };
+        if let Some(state) = self.tab_mut(tab)
+            && state.jobs.take(job).is_some()
+            && let Some(handle) = &state.handle
+        {
+            handle.send(diffui_core::Command::Cancel { job });
+        }
+    }
 
+    /// A history search answered: merge its hits into the `:` column that
+    /// asked, if that column still waits on this very search.
+    fn palette_history_found(
+        &mut self,
+        tab: TabId,
+        job: diffui_core::JobId,
+        hits: Vec<diffui_core::commit_search::CommitHit>,
+    ) {
+        if !self.is_active(tab) {
+            return;
+        }
+        let Some(mut state) = self.take_palette() else {
+            return;
+        };
+        if let Some(column) = state.stack.first_mut()
+            && column.history == Some(job)
+        {
+            column.history = None;
+            palette::merge_found(column, self, hits);
+        }
+        self.push_mode(Mode::Palette(state));
+    }
+
+    /// Open a history search's hit that the graph hasn't loaded: show its
+    /// diff by commit id. A hit the log holds selects once the walk still
+    /// streaming reaches it; one outside the log is shown as is, and the
+    /// toast says so rather than the log quietly widening.
+    pub(crate) fn open_found_commit(&mut self, hit: &diffui_core::commit_search::CommitHit) {
+        self.recents.push_revision(hit.change_id.clone());
+        self.recents.save();
+        let streaming = self.active().session.streaming();
+        self.jump_to_selection(RevisionSelection::Commit(hit.commit_id.clone()));
+        if !(hit.in_log && streaming) {
+            self.push_info_toast("Not in the current log", "Showing its diff.");
+        }
+    }
+
+    /// Show `selection`, revealing its row once its diff lands.
+    fn jump_to_selection(&mut self, selection: RevisionSelection) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
@@ -4707,6 +4811,7 @@ mod tests {
     use crate::commands::Context;
     use crate::modes::{Mode, ModeKind};
     use crate::tabs::tests::{app, push_tab};
+    use diffui_core::commit_search::CommitHit;
 
     #[test]
     fn a_cancelled_stack_read_ends_its_submission_row() {
@@ -4822,6 +4927,140 @@ mod tests {
             .resolve_chord(ui.key_context(), &chord, false)
             .unwrap_or_else(|| panic!("{chord:?} is bound to nothing"));
         ui.run_command(&id, CommandArg::None, cx);
+    }
+
+    fn summary(change: &str, commit: &str, description: &str) -> diffui_core::CommitSummary {
+        diffui_core::CommitSummary {
+            change_id: change.to_owned(),
+            commit_id: commit.to_owned(),
+            shortest_change_id_len: Some(1),
+            description: description.to_owned(),
+            author: "Ann".to_owned(),
+            author_timestamp: None,
+            has_description: true,
+            is_empty: None,
+            has_conflict: false,
+            is_divergent: false,
+            is_hidden: false,
+            change_offset: None,
+            is_working_copy: false,
+            is_immutable: false,
+            on_trunk: false,
+            bookmarks: Vec::new(),
+            parent_ids: Vec::new(),
+        }
+    }
+
+    fn hit(change: &str, commit: &str, description: &str, score: u16) -> CommitHit {
+        CommitHit {
+            change_id: change.to_owned(),
+            commit_id: commit.to_owned(),
+            shortest_change_id_len: Some(2),
+            change_offset: None,
+            description: description.to_owned(),
+            author: "Bo".to_owned(),
+            score,
+            in_log: false,
+        }
+    }
+
+    fn search_job(ui: &Diffui, tab: TabId) -> Option<diffui_core::JobId> {
+        ui.tab(tab)?
+            .jobs
+            .find(|pending| matches!(pending, Pending::CommitSearch(_)))
+    }
+
+    fn found(
+        ui: &mut Diffui,
+        tab: TabId,
+        job: diffui_core::JobId,
+        hits: Vec<CommitHit>,
+        cx: &mut Cx,
+    ) {
+        let repo = ui.tabs[0].repo_id().expect("a repo tab has an id");
+        let payload = diffui_core::Payload::CommitsFound { job, hits };
+        ui.act(cx, |ui, cx| {
+            ui.on_repo_event(diffui_core::Event::new(repo, payload), cx)
+        });
+        assert!(search_job(ui, tab).is_none(), "the search is settled");
+    }
+
+    /// ⏎ in `:` mode lists the loaded rows' hits at once and searches all
+    /// history behind them. A hit the graph hasn't loaded merges in, the
+    /// highlight stays put, and opening it shows its diff and says it's
+    /// outside the log. An edited query's search never lands.
+    #[test]
+    fn enter_in_revision_mode_finds_and_opens_an_unloaded_commit() {
+        crate::tabs::tests::with_cx(|cx| {
+            let mut ui = app();
+            let tab = push_tab(&mut ui, "/tmp/history-search");
+            let state = ui.tab_mut(tab).unwrap();
+            state.session.capabilities.graph = true;
+            let mut builder = diffui_core::CommitStoreBuilder::with_capacity(1);
+            builder.push(summary("kkkkkkkk", "aaaaaaaaaaaa", "parser loaded"));
+            state.session.commits = builder.finish();
+            ui.perform(Action::OpenPalette, cx);
+
+            // An older query's search is cancelled by the edit and drops.
+            ui.act(cx, |ui, cx| {
+                ui.palette_on_query_changed(":pars".to_owned(), cx)
+            });
+            ui.palette_submit(cx);
+            let stale = search_job(&ui, tab).expect("⏎ searches all history");
+            ui.act(cx, |ui, cx| {
+                ui.palette_on_query_changed(":parser".to_owned(), cx)
+            });
+            assert!(search_job(&ui, tab).is_none(), "the edit cancels it");
+            let repo = ui.tabs[0].repo_id().unwrap();
+            let late = diffui_core::Payload::CommitsFound {
+                job: stale,
+                hits: vec![hit("zzzzzzzz", "ffffffffffff", "parser stale", 900)],
+            };
+            ui.act(cx, |ui, cx| {
+                ui.on_repo_event(diffui_core::Event::new(repo, late), cx)
+            });
+
+            ui.palette_submit(cx);
+            let job = search_job(&ui, tab).expect("⏎ searches all history");
+            let column = ui.palette().and_then(|state| state.top()).unwrap();
+            assert_eq!(column.history, Some(job));
+            assert_eq!(column.matches.len(), 1, "the loaded row answers at once");
+            assert!(column.matches.iter().all(|row| row.found.is_none()));
+
+            // The loaded commit again, and one the graph doesn't hold, ranked
+            // above it.
+            found(
+                &mut ui,
+                tab,
+                job,
+                vec![
+                    hit("mmmmmmmm", "bbbbbbbbbbbb", "parser deep", 900),
+                    hit("kkkkkkkk", "aaaaaaaaaaaa", "parser loaded", 10),
+                ],
+                cx,
+            );
+            let column = ui.palette().and_then(|state| state.top()).unwrap();
+            assert_eq!(column.history, None);
+            let rows: Vec<(&str, bool)> = column
+                .matches
+                .iter()
+                .filter_map(|row| match &row.item {
+                    ResultRef::Commit { commit, .. } => {
+                        Some((commit.as_str(), row.found.is_some()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rows, [("bbbbbbbbbbbb", true), ("aaaaaaaaaaaa", false)]);
+            assert_eq!(column.selected, 1, "the highlight stays on its row");
+
+            ui.palette_on_select_index(0, 0);
+            ui.palette_accept_current(cx);
+            assert!(ui.palette().is_none());
+            let opened = RevisionSelection::Commit("bbbbbbbbbbbb".to_owned());
+            assert_eq!(ui.active().session.diff_pending(), Some(&opened));
+            assert!(ui.toasts.iter().any(|toast| toast.info));
+        });
     }
 
     /// Matching is debounced, so between a keystroke and its recompute the
