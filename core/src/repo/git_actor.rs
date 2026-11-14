@@ -215,6 +215,13 @@ async fn run(repository: &Repository, command: Command, cancel: &CancelFlag) -> 
                 new,
             }]
         }
+        Command::SearchCommits { job, needle, .. } => {
+            match crate::git::search_git_commits(repository, &needle, cancel).await {
+                Ok(Some(hits)) => vec![Payload::CommitsFound { job, hits }],
+                Ok(None) => vec![Payload::Cancelled { job }],
+                Err(error) => failed(job, error),
+            }
+        }
         // Emptiness is cosmetic and the git loader never populates it, so an
         // empty answer is the honest one rather than an error.
         Command::EmptyStatus { job, .. } => vec![Payload::EmptyStatus {

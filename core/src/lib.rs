@@ -7,6 +7,7 @@
 
 pub mod askpass;
 pub mod cli;
+pub mod commit_search;
 pub mod completion;
 pub mod diff_parse;
 pub mod forge;

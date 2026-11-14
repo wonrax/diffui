@@ -843,6 +843,18 @@ impl Session {
         )
     }
 
+    /// Search all history for `needle` ([`Command::SearchCommits`]), each hit
+    /// saying whether the log's revset holds it.
+    pub fn search_commits(&mut self, needle: &str) -> (JobId, Vec<Effect>) {
+        let job = self.next_job();
+        let command = Command::SearchCommits {
+            job,
+            needle: needle.to_owned(),
+            revset: self.revset.clone(),
+        };
+        (job, vec![Effect::Send(command)])
+    }
+
     /// Revset completion over this session's graph, bookmarks and aliases.
     /// `history` is the caller's previously used revsets, newest first.
     pub fn revset_completer<'a>(&'a self, history: &'a [String]) -> RevsetCompleter<'a> {
@@ -1100,7 +1112,8 @@ impl Session {
             | Payload::OpLogBatch { .. }
             | Payload::History { .. }
             | Payload::CliOutput { .. }
-            | Payload::CliExited { .. } => Vec::new(),
+            | Payload::CliExited { .. }
+            | Payload::CommitsFound { .. } => Vec::new(),
             Payload::RevsetResolved { job, result, .. } => self.on_span_checked(job, result),
         }
     }
@@ -1147,6 +1160,7 @@ impl Session {
             return Vec::new();
         };
         let swapped = load.staging.is_some();
+        let was_found = self.selected_commit_index.is_some();
         // The change the selected row stands for, read off the store about to
         // be replaced: a rewrite gives the commit a new id, and the selection
         // should follow the change rather than fall off the graph.
@@ -1199,6 +1213,10 @@ impl Session {
         if followed && !self.diff_in_flight() {
             let revision = self.selected_revision.clone();
             effects.extend(self.load_diff(revision));
+        } else if !was_found && self.selected_commit_index.is_some() {
+            // A revision picked before its row loaded (a history search's
+            // hit, mid-walk) has a row now: bring it into view.
+            effects.push(Effect::RevealSelection);
         }
         effects.extend(self.resolve_empty_status());
         effects.extend(self.drain_pending_refresh());
@@ -1843,6 +1861,56 @@ mod tests {
             },
             frame: LaneFrame::solo(),
         }
+    }
+
+    /// A revision picked before the walk reached it (a history search's hit,
+    /// opened mid-load) is revealed once its row is in; a refresh of a
+    /// selection that had its row all along doesn't scroll to it again.
+    #[test]
+    fn a_selection_whose_row_lands_late_is_revealed() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/late-row".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = |session: &mut Session, progressive: bool| {
+            let job = session
+                .load_graph(progressive)
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::Send(Command::LoadGraph { job, .. }) => Some(*job),
+                    _ => None,
+                })
+                .expect("a graph load");
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::Batch {
+                    job,
+                    rows: (0..3).map(row).collect(),
+                },
+            ));
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::GraphLoaded {
+                    job,
+                    tail: crate::repo::GraphTail::default(),
+                },
+            ))
+        };
+        session.selected_revision = RevisionSelection::Commit("commit0002".to_owned());
+        let effects = load(&mut session, true);
+        assert_eq!(session.selected_commit_index, Some(2));
+        let reveals = |effects: &[Effect]| {
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RevealSelection))
+        };
+        assert!(reveals(&effects), "{effects:?}");
+
+        // A refresh keeps the rows up until the new ones land.
+        let effects = load(&mut session, false);
+        assert!(!reveals(&effects), "{effects:?}");
     }
 
     /// Folding a walk one batch at a time must land exactly where folding it in

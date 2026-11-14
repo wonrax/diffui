@@ -210,6 +210,78 @@ pub async fn load_git_commits(
     Ok(summaries)
 }
 
+/// Every commit reachable from a branch, tag, remote branch, `HEAD` or a
+/// worktree's `HEAD`, scored against `needle` (see [`crate::commit_search`]),
+/// past the graph's [`DEFAULT_LOG_LIMIT`]. The best few come back, best first.
+/// No hit claims to be in the log: git's graph loads in one go, so a commit it
+/// doesn't hold isn't on its way. `None` when cancelled.
+pub async fn search_git_commits(
+    repository: &Repository,
+    needle: &str,
+    cancel: &crate::repo::CancelFlag,
+) -> Result<Option<Vec<crate::commit_search::CommitHit>>> {
+    use crate::commit_search::{Best, CommitHit, MAX_HITS, Scorer, haystack};
+
+    let worktree_output = run_command_bytes(
+        &repository.root,
+        "git",
+        git_args(&["worktree", "list", "--porcelain", "-z"]),
+    )
+    .await?;
+    let worktrees = parse_git_worktrees(&worktree_output);
+    let head = git_head(&repository.root).await;
+    let mut args = git_args(&[
+        "log",
+        "--no-color",
+        "--pretty=format:%h%x09%H%x09%an%x09%s",
+        "--branches",
+        "--tags",
+        "--remotes",
+    ]);
+    args.extend(head.iter().map(OsString::from));
+    args.extend(worktrees.iter().map(|tree| OsString::from(&tree.head)));
+    args.push(OsString::from("--"));
+    let output = run_command(&repository.root, "git", args).await?;
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let mut scorer = Scorer::new(needle);
+    let mut best = Best::new(MAX_HITS);
+    let mut text = String::new();
+    for (order, line) in output.lines().enumerate() {
+        let mut parts = line.splitn(4, '\t');
+        let (Some(short), Some(commit_id), Some(author)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let description = parts.next().unwrap_or("").trim();
+        haystack(
+            short,
+            commit_id,
+            (!description.is_empty()).then_some(description),
+            author,
+            [],
+            &mut text,
+        );
+        if let Some(score) = scorer.score(&text) {
+            best.offer(score, order, || CommitHit {
+                change_id: short.to_owned(),
+                commit_id: commit_id.to_owned(),
+                shortest_change_id_len: None,
+                change_offset: None,
+                description: description.to_owned(),
+                author: author.to_owned(),
+                score,
+                in_log: false,
+            });
+        }
+    }
+    Ok(Some(
+        best.into_sorted().into_iter().map(|(_, hit)| hit).collect(),
+    ))
+}
+
 /// `git log` options the revision field may carry, as `--name` or
 /// `--name=value`: revision selection and filtering only. Anything else —
 /// `--output=<file>` writes a file, `-p`/`--format` reshape what the parser

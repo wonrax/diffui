@@ -138,6 +138,7 @@ async fn run(
         | Command::ExpandFile { job, .. }
         | Command::ResolveRevset { job, .. }
         | Command::ResolveDiff { job, .. }
+        | Command::SearchCommits { job, .. }
         | Command::RunCli { job, .. } => emit(Payload::Failed {
             job,
             error: RepoError::Unsupported,

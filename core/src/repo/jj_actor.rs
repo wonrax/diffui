@@ -741,6 +741,14 @@ impl Actor {
                 });
                 Ok(())
             }
+            Command::SearchCommits {
+                job,
+                needle,
+                revset,
+            } => {
+                self.search_detached(repository, job, needle, revset, ticket)
+                    .await
+            }
             Command::RunCli { job, invocation } => {
                 crate::cli::passthrough::run(
                     job,
@@ -1037,6 +1045,54 @@ impl Actor {
         Ok(())
     }
 
+    /// Search all history on a thread of its own: on a big repository it
+    /// reads every commit, and the tab's diffs and loads would queue behind
+    /// it on the actor. The thread loads the repo at the operation the actor
+    /// is at, and sends the terminal event itself.
+    async fn search_detached(
+        &mut self,
+        repository: &Repository,
+        job: JobId,
+        needle: String,
+        revset: String,
+        ticket: JobTicket,
+    ) -> Result<()> {
+        let operation = self.repo_at_head(repository).await?.op_id().hex();
+        let settings = self.slot(repository)?.settings.clone();
+        let root = repository.root.clone();
+        let (events, id) = (self.events.clone(), self.id.clone());
+        std::thread::Builder::new()
+            .name("diffui-search".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let result = match runtime {
+                    Ok(runtime) => runtime.block_on(jj::search::search_at_operation(
+                        &settings,
+                        &root,
+                        &operation,
+                        &needle,
+                        &revset,
+                        ticket.flag(),
+                    )),
+                    Err(error) => Err(error.into()),
+                };
+                let payload = match result {
+                    _ if ticket.flag().is_cancelled() => Payload::Cancelled { job },
+                    Ok(Some(hits)) => Payload::CommitsFound { job, hits },
+                    Ok(None) => Payload::Cancelled { job },
+                    Err(error) => Payload::Failed {
+                        job,
+                        error: classify(error),
+                    },
+                };
+                let _ = events.send(Event::new(id, payload));
+            })
+            .context("failed to spawn the search thread")?;
+        Ok(())
+    }
+
     /// The history views' reads. All run against the repo at head; none take
     /// the working-copy lock.
     async fn history(
@@ -1116,6 +1172,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::History { .. } => "history",
         Command::ExpandFile { .. } => "expand_file",
         Command::ResolveRevset { .. } => "resolve_revset",
+        Command::SearchCommits { .. } => "search_commits",
         Command::ResolveDiff { .. } => "resolve_diff",
         Command::RunCli { .. } => "run_cli",
         Command::Cancel { .. } => "cancel",

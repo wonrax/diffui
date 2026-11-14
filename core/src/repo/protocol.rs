@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cli::{CliInvocation, CliLine};
+use crate::commit_search::CommitHit;
 use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
     BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, DiffRequest, RevisionDetails,
@@ -319,6 +320,16 @@ pub enum Command {
         job: JobId,
         request: DiffRequest,
     },
+    /// Score every visible commit against `needle` ([`crate::commit_search`])
+    /// and answer the best [`crate::commit_search::MAX_HITS`] as
+    /// [`Payload::CommitsFound`], each saying whether `revset` (the log's)
+    /// holds it. Walks all history, so it runs off the actor and polls its
+    /// cancel; a newer query cancels the one before.
+    SearchCommits {
+        job: JobId,
+        needle: String,
+        revset: String,
+    },
     /// Run the jj CLI in the workspace root (a typed command diffui doesn't
     /// run itself). Output streams back as [`Payload::CliOutput`], then
     /// [`Payload::CliExited`]; a cancel kills the child. Serialized with
@@ -366,6 +377,7 @@ impl Command {
             | Self::ExpandFile { job, .. }
             | Self::ResolveRevset { job, .. }
             | Self::ResolveDiff { job, .. }
+            | Self::SearchCommits { job, .. }
             | Self::RunCli { job, .. } => Some(*job),
             Self::Cancel { .. } | Self::SetRefreshMode { .. } => None,
         }
@@ -615,6 +627,12 @@ pub enum Payload {
         revision: RevisionSelection,
         base: DiffBase,
     },
+    /// The answer to a [`Command::SearchCommits`]: the best matches, best
+    /// first.
+    CommitsFound {
+        job: JobId,
+        hits: Vec<CommitHit>,
+    },
     /// Output of a [`Command::RunCli`], in order. Not terminal.
     CliOutput {
         job: JobId,
@@ -661,6 +679,7 @@ impl Payload {
             | Self::History { job, .. }
             | Self::RevsetResolved { job, .. }
             | Self::DiffResolved { job, .. }
+            | Self::CommitsFound { job, .. }
             | Self::CliOutput { job, .. }
             | Self::CliExited { job, .. }
             | Self::Failed { job, .. }

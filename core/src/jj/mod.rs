@@ -23,6 +23,7 @@ pub(crate) mod remote;
 pub(crate) mod resolve;
 pub(crate) mod revops;
 pub(crate) mod revset;
+pub(crate) mod search;
 pub(crate) mod settings;
 pub(crate) mod undo;
 pub(crate) mod walk;
