@@ -1,0 +1,32 @@
+# GitLab, through the `glab` CLI's `glab api` (on the PATH and signed in to
+# the host: gitlab.com, or a self-hosted GitLab glab is configured for).
+# Bundled with diffui; `diffui plugin eject gitlab` copies it out to edit.
+id = "gitlab"
+name = "GitLab"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+exec = [
+  ["{config.program}", "api"],
+  # The hosts glab is configured for, from its config file, found the way
+  # glab finds it.
+  ["sh", "-c", 'cat "${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}/config.yml"'],
+]
+env = ["GITLAB_HOST"]
+
+# gitlab.com, and any host named like a GitLab (`gitlab.acme.org`).
+[provides.forge]
+hosts = ["gitlab", "gitlab.*", "*.gitlab", "*.gitlab.*"]
+term = "merge request"
+sigil = "!"
+short = "MR"
+default_host = "gitlab.com"
+host_env = "GITLAB_HOST"
+cli = "glab"
+pull_request_path = "{owner}/{name}/-/merge_requests/{number}"
+subgroups = true
+
+[config.schema]
+program = { type = "string", default = "glab", label = "The glab program" }

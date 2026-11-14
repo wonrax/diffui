@@ -686,6 +686,9 @@ impl Diffui {
 }
 
 #[cfg(test)]
+mod gitlab;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
 
