@@ -1,12 +1,19 @@
-// GitHub, through the `gh` CLI (on the PATH and signed in to the host:
-// github.com or a GitHub Enterprise Server).
+// GitHub (github.com or a GitHub Enterprise Server), through the `gh` CLI
+// or a token.
 //
-// A pull request's diff **streams**: `gh pr diff` stdout is handed to diffui
-// a piece at a time as it arrives, and diffui shows each file once its last
-// hunk is in, so a huge PR paints progressively while the download is still
-// running. Lists and writes go through `gh pr list --json` and `gh api`.
-import { ForgeError, config, exec, files, forge } from "diffui";
-import type { Checks, FilePatch, ForgeRemote, PrCommit, PrInfo, PrRef, PullRequest, Repo } from "diffui";
+// Each host is reached one of two ways, the `auth` setting's (per host, or
+// for all): `cli` runs gh, signed in to the host; `token` calls the REST and
+// GraphQL APIs with a token (`rest.ts`). `auto`, the default, takes gh when
+// gh's own list has the host, else a token when there is one, else gh, whose
+// errors say how to sign in.
+//
+// A pull request's diff **streams**: `gh pr diff` stdout (or the API's diff)
+// is handed to diffui a piece at a time as it arrives, and diffui shows each
+// file once its last hunk is in, so a huge PR paints progressively while the
+// download is still running.
+import { ForgeError, auth, config, exec, files, forge } from "diffui";
+import type { Account, Checks, FilePatch, ForgeRemote, PrCommit, PrInfo, PrRef, PullRequest, Repo } from "diffui";
+import * as rest from "./rest.ts";
 
 /**
  * GitHub's REST API caps `per_page` at 100; we always request the max and
@@ -257,8 +264,13 @@ interface ApiCommit {
   commit?: { message?: string; author?: { name?: string; email?: string; date?: string } | null } | null;
 }
 
-/** `gh api path` for a pull request, parsed; `what` names the response in an error. */
+/**
+ * `GET path` of the REST API for a pull request (`gh api path`, or the API
+ * with a token), parsed; `what` names the response in an error.
+ */
 async function api<T>(pr: PrRef, path: string, what: string, signal: AbortSignal): Promise<T> {
+  const viaToken = await tokenApi(pr.host, pr.webUrl);
+  if (viaToken !== null) return rest.get<T>(viaToken, path, signal);
   const stdout = await run(pr.host, ["api", path], signal);
   try {
     return JSON.parse(stdout) as T;
@@ -290,6 +302,54 @@ function isDiffTooLarge(text: string): boolean {
 /** gh's own list of the hosts it is signed in to, found where gh looks. */
 const HOSTS_FILE = "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml";
 
+/** gh's hosts, read once per load. */
+let ghHosts: Promise<string[]> | null = null;
+function signedInHosts(): Promise<string[]> {
+  // No file (gh never signed in): none.
+  ghHosts ??= files
+    .read(HOSTS_FILE)
+    .catch(() => "")
+    .then(yamlHosts);
+  return ghHosts;
+}
+
+/** How `host` is reached: the `auth` setting, with `auto` decided once per load. */
+const chosen = new Map<string, Promise<"cli" | "token">>();
+function methodFor(host: string): Promise<"cli" | "token"> {
+  const mode: string = config.per_host?.[host.toLowerCase()]?.auth ?? config.auth ?? "auto";
+  if (mode === "cli" || mode === "token") return Promise.resolve(mode);
+  let method = chosen.get(host);
+  if (method === undefined) {
+    method = (async () => {
+      if ((await signedInHosts()).includes(host.toLowerCase().replace(/:\d+$/, ""))) return "cli";
+      return (await storedToken(host)) === null ? "cli" : "token";
+    })();
+    chosen.set(host, method);
+  }
+  return method;
+}
+
+/** A token the user gave diffui for `host` (or set in GH_TOKEN), not git's. */
+function storedToken(host: string): Promise<string | null> {
+  return auth.token(host, { git: false }).catch(() => null);
+}
+
+/**
+ * The APIs of `host` with its token, for a host reached with one. The
+ * `token` mode also takes git's credential for the host.
+ */
+async function apiFor(host: string, webUrl?: string): Promise<rest.Api> {
+  const explicit = (config.per_host?.[host.toLowerCase()]?.auth ?? config.auth) === "token";
+  const token = await auth.token(host, { git: explicit }).catch(() => null);
+  if (token === null) throw new ForgeError("auth", `No GitHub token for ${host}`, { host });
+  return rest.apiOf(host, token, webUrl);
+}
+
+/** The API, when `host` is reached with a token; `null` for gh. */
+async function tokenApi(host: string, webUrl?: string): Promise<rest.Api | null> {
+  return (await methodFor(host)) === "token" ? apiFor(host, webUrl) : null;
+}
+
 /**
  * The host keys of gh's `hosts.yml`, each at the top level with its account
  * indented under it. What lets this forge claim a company host whose name
@@ -303,21 +363,94 @@ function yamlHosts(text: string): string[] {
     .filter((key) => key.includes(".") && !key.startsWith(".") && !/[~ ]/.test(key));
 }
 
+/** The GraphQL query of a commit's check rollup. */
+const CHECKS_QUERY =
+  "query($owner:String!,$name:String!,$sha:GitObjectID!){" +
+  "repository(owner:$owner,name:$name){object(oid:$sha){" +
+  "... on Commit{statusCheckRollup{state}}}}}";
+
+/** The GraphQL query `gh pr list --json` makes, a page of 100 at a time. */
+const LIST_QUERY =
+  "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){" +
+  "pullRequests(first:100,after:$after,orderBy:{field:CREATED_AT,direction:DESC}){" +
+  "nodes{number url title headRefName baseRefName headRefOid state isDraft reviewDecision isCrossRepository}" +
+  "pageInfo{hasNextPage endCursor}}}}";
+
+/** `gh pr list --limit 200`'s listing through the GraphQL API. */
+async function listWithToken(remote: ForgeRemote, via: rest.Api): Promise<ListedPr[]> {
+  const listed: ListedPr[] = [];
+  let after: string | null = null;
+  while (listed.length < Number(LIST_LIMIT)) {
+    type Page = {
+      repository: {
+        pullRequests: { nodes: ListedPr[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+      } | null;
+    };
+    const page: Page = await rest.graphql<Page>(via, LIST_QUERY, {
+      owner: remote.owner,
+      name: remote.name,
+      after,
+    });
+    if (page.repository === null) {
+      throw new ForgeError("not-found", `${slugOf(remote)} wasn't found`, { host: remote.host });
+    }
+    const prs = page.repository.pullRequests;
+    listed.push(...prs.nodes);
+    if (!prs.pageInfo.hasNextPage) break;
+    after = prs.pageInfo.endCursor;
+  }
+  return listed;
+}
+
+/** The state the tab shows, from a REST pull request. */
+function restState(pr: { state: string; draft?: boolean; merged_at?: string | null }): PrInfo["state"] {
+  return pr.merged_at != null ? "merged" : pr.state === "closed" ? "closed" : pr.draft ? "draft" : "open";
+}
+
+/** A commit of `GET /pulls/{n}/commits`. */
+interface ApiPrCommit {
+  sha: string;
+  author?: { login?: string } | null;
+  commit: { message: string; author?: { date?: string } | null };
+}
+
+/** Who `host` knows the user as, and through what. */
+async function account(host: string, token?: string): Promise<Account> {
+  if (token !== undefined) {
+    return { method: "token", login: await rest.login(rest.apiOf(host, token)) };
+  }
+  const signedOut = (error: unknown) =>
+    error instanceof ForgeError && (error.kind === "auth" || error.kind === "missing-cli");
+  const method = await methodFor(host);
+  try {
+    if (method === "token") return { method, login: await rest.login(await apiFor(host)) };
+    const login = (await run(host, ["api", "user", "--jq", ".login"])).trim();
+    return { method, login: login || null };
+  } catch (error) {
+    if (signedOut(error)) return { method: null, login: null };
+    throw error;
+  }
+}
+
 forge.register({
   async pullRequests(repo, { branches }) {
     const remote = projectOf(repo);
-    const listed = await json<ListedPr[]>(remote.host, [
-      "pr",
-      "list",
-      "--repo",
-      repoArg(remote.host, slugOf(remote)),
-      "--state",
-      "all",
-      "--limit",
-      LIST_LIMIT,
-      "--json",
-      "number,url,title,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,isCrossRepository",
-    ]);
+    const via = await tokenApi(remote.host, remote.webUrl);
+    const listed =
+      via !== null
+        ? await listWithToken(remote, via)
+        : await json<ListedPr[]>(remote.host, [
+            "pr",
+            "list",
+            "--repo",
+            repoArg(remote.host, slugOf(remote)),
+            "--state",
+            "all",
+            "--limit",
+            LIST_LIMIT,
+            "--json",
+            "number,url,title,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,isCrossRepository",
+          ]);
     // A fork's branch can have the same name as one of ours.
     return listed
       .filter((pr) => !pr.isCrossRepository && branches.includes(pr.headRefName))
@@ -326,24 +459,29 @@ forge.register({
 
   async checks(repo, sha): Promise<Checks> {
     const remote = projectOf(repo);
-    const query =
-      "query($owner:String!,$name:String!,$sha:GitObjectID!){" +
-      "repository(owner:$owner,name:$name){object(oid:$sha){" +
-      "... on Commit{statusCheckRollup{state}}}}}";
-    const stdout = await run(remote.host, [
-      "api",
-      "graphql",
-      "-f",
-      `query=${query}`,
-      "-f",
-      `owner=${remote.owner}`,
-      "-f",
-      `name=${remote.name}`,
-      "-f",
-      `sha=${sha}`,
-      "--jq",
-      ".data.repository.object.statusCheckRollup.state",
-    ]);
+    const via = await tokenApi(remote.host, remote.webUrl);
+    let said: string;
+    if (via !== null) {
+      type Rollup = { repository: { object: { statusCheckRollup?: { state: string } | null } | null } | null };
+      const data = await rest.graphql<Rollup>(via, CHECKS_QUERY, { owner: remote.owner, name: remote.name, sha });
+      said = data.repository?.object?.statusCheckRollup?.state ?? "";
+    } else {
+      const stdout = await run(remote.host, [
+        "api",
+        "graphql",
+        "-f",
+        `query=${CHECKS_QUERY}`,
+        "-f",
+        `owner=${remote.owner}`,
+        "-f",
+        `name=${remote.name}`,
+        "-f",
+        `sha=${sha}`,
+        "--jq",
+        ".data.repository.object.statusCheckRollup.state",
+      ]);
+      said = stdout.trim();
+    }
     const states = {
       SUCCESS: "success",
       FAILURE: "failure",
@@ -351,17 +489,22 @@ forge.register({
       PENDING: "pending",
       EXPECTED: "pending",
     } as const;
-    const said = stdout.trim();
     const state: Checks["state"] = said in states ? states[said as keyof typeof states] : "none";
     return { state, url: state === "none" ? null : `${remote.webUrl}/commit/${sha}` };
   },
 
   async createPullRequest(repo, request) {
     const remote = projectOf(repo);
+    const path = `repos/${slugOf(remote)}/pulls`;
+    const via = await tokenApi(remote.host, remote.webUrl);
+    if (via !== null) {
+      const { head, base, title, body, draft } = request;
+      return restPr((await rest.rest<RestPr>(via, "POST", path, { body: { head, base, title, body, draft } })).data);
+    }
     return writePr(
       remote,
       "POST",
-      `repos/${slugOf(remote)}/pulls`,
+      path,
       [
         ["head", request.head],
         ["base", request.base],
@@ -374,22 +517,50 @@ forge.register({
 
   async updatePullRequest(repo, number, patch) {
     const remote = projectOf(repo);
+    const path = `repos/${slugOf(remote)}/pulls/${number}`;
     const fields: [string, string][] = [];
     for (const key of ["base", "title", "body"] as const) {
       const value = patch[key];
       if (value !== undefined) fields.push([key, value]);
     }
-    return writePr(remote, "PATCH", `repos/${slugOf(remote)}/pulls/${number}`, fields, []);
+    const via = await tokenApi(remote.host, remote.webUrl);
+    if (via !== null) {
+      return restPr((await rest.rest<RestPr>(via, "PATCH", path, { body: Object.fromEntries(fields) })).data);
+    }
+    return writePr(remote, "PATCH", path, fields, []);
   },
 
   async hosts() {
     // Read offline, as gh keeps it: `gh auth status` would ask every host.
-    // No file (gh never signed in): no hosts beyond the manifest's.
-    const text = await files.read(HOSTS_FILE).catch(() => "");
-    return yamlHosts(text);
+    // And the hosts the user gave diffui a token for.
+    const [cli, tokens] = await Promise.all([signedInHosts(), auth.hosts()]);
+    return [...new Set([...cli, ...tokens])];
   },
 
   async view(pr): Promise<PrInfo> {
+    const via = await tokenApi(pr.host, pr.webUrl);
+    if (via !== null) {
+      type Pull = RestPr & {
+        user?: { login?: string } | null;
+        additions?: number;
+        deletions?: number;
+        changed_files?: number;
+      };
+      const pull = await rest.get<Pull>(via, `repos/${slugOf(pr)}/pulls/${pr.number}`);
+      const totals = typeof pull.additions === "number" && typeof pull.deletions === "number";
+      return {
+        number: pull.number,
+        title: pull.title,
+        author: pull.user?.login ?? "",
+        state: restState(pull),
+        base: pull.base.ref,
+        head: pull.head.ref,
+        additions: totals ? pull.additions : null,
+        deletions: totals ? pull.deletions : null,
+        changedFiles: pull.changed_files ?? 0,
+        url: pull.html_url,
+      };
+    }
     // `\u001f` (the unit separator) frames the fields, so titles with tabs
     // or quotes can't break them; titles can't hold newlines.
     const jq =
@@ -429,6 +600,21 @@ forge.register({
   },
 
   async commits(pr): Promise<PrCommit[]> {
+    const via = await tokenApi(pr.host, pr.webUrl);
+    if (via !== null) {
+      const commits: PrCommit[] = [];
+      for await (const page of rest.pages<ApiPrCommit>(via, `repos/${slugOf(pr)}/pulls/${pr.number}/commits?per_page=${PAGE_SIZE}`)) {
+        for (const commit of page) {
+          commits.push({
+            oid: commit.sha,
+            author: commit.author?.login ?? "",
+            headline: commit.commit.message.split("\n")[0] ?? "",
+            authoredAt: commit.commit.author?.date || null,
+          });
+        }
+      }
+      return commits;
+    }
     const jq =
       '.commits[] | [.oid, (.authors[0].login // ""), .messageHeadline, (.authoredDate // "")] | join("\\u001f")';
     const stdout = await run(pr.host, [
@@ -482,13 +668,29 @@ forge.register({
   },
 
   /**
-   * Prefers `gh pr diff` (one request, true streaming); when GitHub refuses
-   * to serve the unified diff outright (HTTP 406, more than 300 changed
-   * files), pages through the REST files endpoint, which serves per-file
-   * patches up to GitHub's 3,000-file listing cap.
+   * Prefers the unified diff (`gh pr diff`, or the API's diff media type:
+   * one request, true streaming); when GitHub refuses to serve it outright
+   * (HTTP 406, more than 300 changed files), pages through the REST files
+   * endpoint, which serves per-file patches up to GitHub's 3,000-file
+   * listing cap.
    */
   async *diff(pr, { signal }) {
     const host = pr.host;
+    const via = await tokenApi(host, pr.webUrl);
+    if (via !== null) {
+      const response = await rest.stream(
+        via,
+        `repos/${slugOf(pr)}/pulls/${pr.number}`,
+        "application/vnd.github.diff",
+        signal,
+      );
+      if (response.status === 406) {
+        yield* filesApi(pr, signal);
+        return;
+      }
+      if (response.body !== null) yield* response.body;
+      return;
+    }
     let ended;
     try {
       const out = await exec.stream([program, "pr", "diff", String(pr.number), "--repo", repoArg(host, slugOf(pr))], {
@@ -510,5 +712,9 @@ forge.register({
       return;
     }
     throw failure(host, ended.stderr, "");
+  },
+
+  async account(host, { token }) {
+    return account(host, token);
   },
 });

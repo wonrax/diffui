@@ -1,18 +1,28 @@
-// GitLab, through the `glab` CLI's `glab api` (on the PATH and signed in to
-// the host: gitlab.com, or a self-hosted GitLab glab is configured for).
-// Projects are addressed by their URL-encoded path, so a project in a
-// subgroup works like any other.
+// GitLab (gitlab.com, or a self-hosted GitLab), through the `glab` CLI's
+// `glab api` or a token. Projects are addressed by their URL-encoded path,
+// so a project in a subgroup works like any other.
+//
+// Each host is reached one of two ways, the `auth` setting's (per host, or
+// for all): `cli` runs glab, signed in to the host; `token` calls the REST
+// API with a token (`rest.ts`), on the same paths. `auto`, the default,
+// takes glab when glab's config has the host, else a token when there is
+// one, else glab, whose errors say how to sign in.
 
 import {
+  ForgeError,
+  auth,
+  config,
   files,
   forge,
+  type Account,
   type Checks,
   type FilePatch,
   type ForgeRemote,
   type PrRef,
   type PullRequest,
 } from "diffui";
-import { api, apiStreamed } from "./glab.ts";
+import * as glab from "./glab.ts";
+import * as rest from "./rest.ts";
 
 /** GitLab's largest page. */
 const PAGE_SIZE = 100;
@@ -133,19 +143,80 @@ function filePatch(file: MrDiff): FilePatch {
  */
 async function* diffs(pr: PrRef, path: string, signal: AbortSignal): AsyncGenerator<FilePatch> {
   for (let page = 1; ; page++) {
-    const files = await apiStreamed<MrDiff[]>(pr.host, [`${path}?per_page=${PAGE_SIZE}&page=${page}`], signal);
+    const files = await getBig<MrDiff[]>(pr.host, `${path}?per_page=${PAGE_SIZE}&page=${page}`, pr.webUrl, signal);
     for (const file of files) yield filePatch(file);
     if (files.length < PAGE_SIZE) return;
   }
 }
 
-/** The hosts glab has been signed in to, from its config file's `hosts`. */
-async function configuredHosts(): Promise<string[]> {
+/** The hosts glab has been signed in to, from its config file's `hosts`, read once per load. */
+let glabHosts: Promise<string[]> | null = null;
+function configuredHosts(): Promise<string[]> {
   // No file (glab never configured): no hosts beyond the manifest's.
-  const text = await files.read("${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/glab-cli}/config.yml").catch(
-    () => "",
-  );
-  return yamlHosts(text);
+  glabHosts ??= files
+    .read("${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/glab-cli}/config.yml")
+    .catch(() => "")
+    .then(yamlHosts);
+  return glabHosts;
+}
+
+/** The `auth` setting for `host`. */
+const mode = (host: string): string => config.per_host?.[host.toLowerCase()]?.auth ?? config.auth ?? "auto";
+
+/** How `host` is reached: the `auth` setting, with `auto` decided once per load. */
+const chosen = new Map<string, Promise<"cli" | "token">>();
+function methodFor(host: string): Promise<"cli" | "token"> {
+  const set = mode(host);
+  if (set === "cli" || set === "token") return Promise.resolve(set);
+  let method = chosen.get(host);
+  if (method === undefined) {
+    method = (async () => {
+      if ((await configuredHosts()).includes(host.toLowerCase().replace(/:\d+$/, ""))) return "cli";
+      const token = await auth.token(host, { git: false }).catch(() => null);
+      return token === null ? "cli" : "token";
+    })();
+    chosen.set(host, method);
+  }
+  return method;
+}
+
+/** The API of `host` with its token. The `token` mode also takes git's credential. */
+async function apiFor(host: string, webUrl?: string): Promise<rest.Api> {
+  const token = await auth.token(host, { git: mode(host) === "token" }).catch(() => null);
+  if (token === null) throw new ForgeError("auth", `No GitLab token for ${host}`, { host });
+  return rest.apiOf(host, token, webUrl);
+}
+
+/** The API, when `host` is reached with a token; `null` for glab. */
+async function tokenApi(host: string, webUrl?: string): Promise<rest.Api | null> {
+  return (await methodFor(host)) === "token" ? apiFor(host, webUrl) : null;
+}
+
+/** `GET path` on `host`'s API, through glab or with a token. */
+async function get<T>(host: string, path: string, webUrl: string, signal?: AbortSignal): Promise<T> {
+  const via = await tokenApi(host, webUrl);
+  return via !== null ? rest.call<T>(via, "GET", path, { signal }) : glab.api<T>(host, [path], signal);
+}
+
+/** `get` for an answer that can be big, read a piece at a time. */
+async function getBig<T>(host: string, path: string, webUrl: string, signal: AbortSignal): Promise<T> {
+  const via = await tokenApi(host, webUrl);
+  return via !== null ? rest.streamed<T>(via, path, signal) : glab.apiStreamed<T>(host, [path], signal);
+}
+
+/** Who `host` knows the user as, and through what. */
+async function account(host: string, token?: string): Promise<Account> {
+  if (token !== undefined) return { method: "token", login: await rest.login(rest.apiOf(host, token)) };
+  const method = await methodFor(host);
+  try {
+    if (method === "token") return { method, login: await rest.login(await apiFor(host)) };
+    return { method, login: (await glab.api<{ username: string }>(host, ["user"])).username };
+  } catch (error) {
+    if (error instanceof ForgeError && (error.kind === "auth" || error.kind === "missing-cli")) {
+      return { method: null, login: null };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -180,27 +251,33 @@ const remoteOf = (remote: ForgeRemote | null): ForgeRemote => {
   return remote;
 };
 
-/** Write a merge request: `fields` as `-f key=value`. */
+/** Write a merge request: `fields` as `-f key=value`, or a JSON body with a token. */
 async function writeMr(
   remote: ForgeRemote,
   method: string,
   path: string,
   fields: [string, string][],
 ): Promise<PullRequest> {
+  const via = await tokenApi(remote.host, remote.webUrl);
+  if (via !== null) return pullRequest(await rest.call<Mr>(via, method, path, { fields }));
   const args = [path, "-X", method];
   for (const [key, value] of fields) args.push("-f", `${key}=${value}`);
-  return pullRequest(await api<Mr>(remote.host, args));
+  return pullRequest(await glab.api<Mr>(remote.host, args));
 }
 
 const prProject = (pr: PrRef) => project(pr.owner, pr.name);
 
 forge.register({
-  hosts: configuredHosts,
+  async hosts() {
+    // And the hosts the user gave diffui a token for.
+    const [cli, tokens] = await Promise.all([configuredHosts(), auth.hosts()]);
+    return [...new Set([...cli, ...tokens])];
+  },
 
   async pullRequests(repo, { branches }) {
     const remote = remoteOf(repo.forgeRemote);
     const path = `${project(remote.owner, remote.name)}/merge_requests?state=all&order_by=updated_at&per_page=${PAGE_SIZE}`;
-    const listed = await api<Mr[]>(remote.host, [path]);
+    const listed = await get<Mr[]>(remote.host, path, remote.webUrl);
     const prs = listed
       // A fork's merge request names the fork's branch.
       .filter((mr) => (mr.source_project_id ?? null) === (mr.target_project_id ?? null))
@@ -211,7 +288,7 @@ forge.register({
   async checks(repo, sha): Promise<Checks> {
     const remote = remoteOf(repo.forgeRemote);
     const path = `${project(remote.owner, remote.name)}/repository/commits/${sha}`;
-    const commit = await api<Commit>(remote.host, [path]);
+    const commit = await get<Commit>(remote.host, path, remote.webUrl);
     const pipeline = commit.last_pipeline;
     if (pipeline == null) return { state: "none", url: null };
     let state: Checks["state"];
@@ -267,7 +344,7 @@ forge.register({
   },
 
   async view(pr) {
-    const mr = await api<Mr>(pr.host, [`${prProject(pr)}/merge_requests/${pr.number}`]);
+    const mr = await get<Mr>(pr.host, `${prProject(pr)}/merge_requests/${pr.number}`, pr.webUrl);
     const changed = parseInt((mr.changes_count ?? "").replace(/\+$/, ""), 10);
     return {
       number: mr.iid,
@@ -285,7 +362,7 @@ forge.register({
     const commits = [];
     for (let page = 1; ; page++) {
       const path = `${prProject(pr)}/merge_requests/${pr.number}/commits?per_page=${PAGE_SIZE}&page=${page}`;
-      const listed = await api<Commit[]>(pr.host, [path]);
+      const listed = await get<Commit[]>(pr.host, path, pr.webUrl);
       for (const commit of listed) {
         commits.push({
           oid: commit.id,
@@ -303,7 +380,7 @@ forge.register({
 
   async commitDiff(pr, oid, { signal }) {
     const base = `${prProject(pr)}/repository/commits/${oid}`;
-    const commit = await api<Commit>(pr.host, [base], signal);
+    const commit = await get<Commit>(pr.host, base, pr.webUrl, signal);
     return {
       diff: diffs(pr, `${base}/diff`, signal),
       // Without the commit's own counts, diffui sums the files'.
@@ -320,5 +397,9 @@ forge.register({
 
   diff(pr, { signal }) {
     return diffs(pr, `${prProject(pr)}/merge_requests/${pr.number}/diffs`, signal);
+  },
+
+  account(host, { token }) {
+    return account(host, token);
   },
 });
