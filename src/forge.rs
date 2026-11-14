@@ -326,7 +326,10 @@ impl Diffui {
             if manual {
                 self.push_error_toast(
                     "No forge remote",
-                    "None of this repository's remotes is on GitHub or GitLab.",
+                    &format!(
+                        "None of this repository's remotes is on {}.",
+                        self.forge.forges.names()
+                    ),
                 );
             }
             return;
@@ -427,7 +430,7 @@ impl Diffui {
         }
         state.forge.last_error = error.clone();
         if manual && let Some(error) = error {
-            let noun = state.forge.kind().unwrap_or(ForgeKind::GitHub).noun();
+            let noun = state.forge.kind().map_or("pull request", ForgeKind::noun);
             self.push_error_toast(format!("Couldn't refresh {noun}s"), &error.to_string());
         }
     }
@@ -597,7 +600,7 @@ async fn read_pull_requests(
 pub(crate) fn has_forge(ui: &Diffui, _arg: &CommandArg) -> Availability {
     require(
         ui.active().forge.home.is_some(),
-        "No GitHub or GitLab remote",
+        "No remote on a forge diffui knows",
     )
 }
 
@@ -681,7 +684,10 @@ pub(crate) fn copy_url(ui: &Diffui, arg: CommandArg) -> Option<Action> {
 /// What a bookmark row's `noun` says on this tab: `pull request`, or
 /// `merge request` on GitLab.
 pub(crate) fn noun(ui: &Diffui) -> &'static str {
-    ui.active().forge.kind().unwrap_or(ForgeKind::GitHub).noun()
+    ui.active()
+        .forge
+        .kind()
+        .map_or("pull request", ForgeKind::noun)
 }
 
 /// A forge command's label as the active tab's forge words it: `Create pull

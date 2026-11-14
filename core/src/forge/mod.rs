@@ -45,70 +45,126 @@ pub enum ForgeKind {
     Script(ScriptForge),
 }
 
-/// A plugin's forge: who it is and how it words things. `Copy` like the
-/// built-in kinds, so its strings are interned for the life of the process
-/// (one small allocation per distinct plugin id and name).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScriptForge {
-    /// The plugin's id.
-    pub id: &'static str,
-    /// The plugin's name, for messages.
-    pub name: &'static str,
+/// What a forge is called and how its references read: everything the app
+/// says about a forge without asking it. A plugin's comes from its
+/// manifest; the built-in forges have theirs here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ForgeSpec {
+    /// What a when-clause's `repo.forge` reads: `github`, `gitlab`, or a
+    /// plugin's id.
+    pub id: String,
+    /// The forge's name, for messages.
+    pub name: String,
     /// It says "merge request" rather than "pull request".
     pub merge_requests: bool,
+    /// What prefixes a number in the forge's own references: `#12`, `!12`.
+    pub sigil: char,
+    /// The abbreviation: `PR`, `MR`.
+    pub short: String,
+    /// The program its errors tell the user to install and sign in with
+    /// (`gh`); empty when it has none.
+    pub cli: String,
+    /// The host a reference without one means; empty when it has none.
+    pub default_host: String,
+    /// The environment variable that names another host for that.
+    pub host_env: Option<String>,
+    /// A pull request page's path after the host, with `{owner}`, `{name}`
+    /// and `{number}`; `None` when the forge's links aren't known.
+    pub pull_request_path: Option<String>,
+    /// An owner may be several segments (GitLab's groups).
+    pub subgroups: bool,
 }
 
-impl ScriptForge {
-    pub fn new(id: &str, name: &str, merge_requests: bool) -> Self {
+impl ForgeSpec {
+    fn github() -> Self {
         Self {
-            id: intern(id),
-            name: intern(name),
-            merge_requests,
+            id: "github".into(),
+            name: "GitHub".into(),
+            merge_requests: false,
+            sigil: '#',
+            short: "PR".into(),
+            cli: "gh".into(),
+            default_host: "github.com".into(),
+            host_env: Some("GH_HOST".into()),
+            pull_request_path: Some("{owner}/{name}/pull/{number}".into()),
+            subgroups: false,
+        }
+    }
+
+    fn gitlab() -> Self {
+        Self {
+            id: "gitlab".into(),
+            name: "GitLab".into(),
+            merge_requests: true,
+            sigil: '!',
+            short: "MR".into(),
+            cli: "glab".into(),
+            default_host: "gitlab.com".into(),
+            host_env: Some("GITLAB_HOST".into()),
+            pull_request_path: Some("{owner}/{name}/-/merge_requests/{number}".into()),
+            subgroups: true,
         }
     }
 }
 
-/// `text` for the life of the process, the same allocation for the same text.
-fn intern(text: &str) -> &'static str {
-    static INTERNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+/// A plugin's forge. `Copy` like the built-in kinds, so its spec is interned
+/// for the life of the process (one small allocation per distinct spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScriptForge(&'static ForgeSpec);
+
+impl ScriptForge {
+    pub fn new(spec: ForgeSpec) -> Self {
+        Self(intern(spec))
+    }
+}
+
+impl std::ops::Deref for ScriptForge {
+    type Target = ForgeSpec;
+    fn deref(&self) -> &ForgeSpec {
+        self.0
+    }
+}
+
+/// `spec` for the life of the process, the same allocation for the same spec.
+fn intern(spec: ForgeSpec) -> &'static ForgeSpec {
+    static INTERNED: std::sync::Mutex<Vec<&'static ForgeSpec>> = std::sync::Mutex::new(Vec::new());
     let mut interned = INTERNED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(known) = interned.iter().find(|known| **known == text) {
+    if let Some(known) = interned.iter().find(|known| ***known == spec) {
         return known;
     }
-    let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
+    let leaked: &'static ForgeSpec = Box::leak(Box::new(spec));
     interned.push(leaked);
     leaked
 }
 
 impl ForgeKind {
+    /// What the app says about this forge.
+    pub fn spec(self) -> &'static ForgeSpec {
+        static GITHUB: std::sync::LazyLock<ForgeSpec> = std::sync::LazyLock::new(ForgeSpec::github);
+        static GITLAB: std::sync::LazyLock<ForgeSpec> = std::sync::LazyLock::new(ForgeSpec::gitlab);
+        match self {
+            Self::GitHub => &GITHUB,
+            Self::GitLab => &GITLAB,
+            Self::Script(script) => script.0,
+        }
+    }
+
     /// The forge's name, for messages.
     pub fn name(self) -> &'static str {
-        match self {
-            Self::GitHub => "GitHub",
-            Self::GitLab => "GitLab",
-            Self::Script(script) => script.name,
-        }
+        &self.spec().name
     }
 
     /// What a when-clause's `repo.forge` reads: `github`, `gitlab`, or a
     /// plugin's id.
     pub fn id(self) -> &'static str {
-        match self {
-            Self::GitHub => "github",
-            Self::GitLab => "gitlab",
-            Self::Script(script) => script.id,
-        }
+        &self.spec().id
     }
 
     /// Whether the forge says "merge request" for a pull request.
     pub fn merge_requests(self) -> bool {
-        match self {
-            Self::GitHub => false,
-            Self::GitLab => true,
-            Self::Script(script) => script.merge_requests,
-        }
+        self.spec().merge_requests
     }
 
     /// What the forge calls a pull request, lowercase.
@@ -131,39 +187,27 @@ impl ForgeKind {
 
     /// The abbreviation: `PR`, `MR`.
     pub fn short(self) -> &'static str {
-        if self.merge_requests() { "MR" } else { "PR" }
+        &self.spec().short
     }
 
     /// What prefixes a number in the forge's own references: `#12`, `!12`.
     pub fn sigil(self) -> char {
-        if self.merge_requests() { '!' } else { '#' }
+        self.spec().sigil
     }
 
-    /// The CLI the built-in provider drives. A plugin's forge has none.
+    /// The program the forge's errors name; empty when it has none.
     pub fn cli(self) -> &'static str {
-        match self {
-            Self::GitHub => "gh",
-            Self::GitLab => "glab",
-            Self::Script(_) => "",
-        }
+        &self.spec().cli
     }
 
-    /// The host a reference without one means. A plugin's forge has none.
+    /// The host a reference without one means; empty when it has none.
     pub fn default_host(self) -> &'static str {
-        match self {
-            Self::GitHub => "github.com",
-            Self::GitLab => "gitlab.com",
-            Self::Script(_) => "",
-        }
+        &self.spec().default_host
     }
 
     /// The environment variable that points the CLI at a host.
     fn host_env(self) -> Option<&'static str> {
-        match self {
-            Self::GitHub => Some("GH_HOST"),
-            Self::GitLab => Some("GITLAB_HOST"),
-            Self::Script(_) => None,
-        }
+        self.spec().host_env.as_deref()
     }
 
     /// The host a reference without one resolves to: the CLI's environment
@@ -385,6 +429,9 @@ pub enum ForgeError {
 impl fmt::Display for ForgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingCli { kind } if kind.cli().is_empty() => {
+                write!(f, "{}'s command-line tool wasn't found.", kind.name())
+            }
             Self::MissingCli { kind } => {
                 let cli = kind.cli();
                 write!(
@@ -397,12 +444,21 @@ impl fmt::Display for ForgeError {
                     kind.name()
                 )
             }
+            Self::NotAuthenticated { kind, host } if kind.cli().is_empty() => write!(
+                f,
+                "diffui isn't signed in to {} on {host}. Sign in, then try again.",
+                kind.name()
+            ),
             Self::NotAuthenticated { kind, host } => write!(
                 f,
                 "{} isn't signed in to {host}. Run `{} auth login --hostname {host}` in a \
                  terminal, then try again.",
                 kind.cli(),
                 kind.cli()
+            ),
+            Self::NotFound { kind, host, what } if kind.cli().is_empty() => write!(
+                f,
+                "{what} wasn't found on {host}, or the account diffui uses there can't see it."
             ),
             Self::NotFound { kind, host, what } => write!(
                 f,
@@ -582,6 +638,42 @@ impl Forges {
         Self { providers }
     }
 
+    /// The forges, in the order they're asked to claim a remote.
+    pub fn kinds(&self) -> Vec<ForgeKind> {
+        self.providers
+            .iter()
+            .map(|provider| provider.kind())
+            .collect()
+    }
+
+    /// The pull request a pasted link or reference names, on one of these
+    /// forges (see [`ForgePr::parse_with`]).
+    pub fn parse_pr(&self, input: &str) -> Option<ForgePr> {
+        let pr = ForgePr::parse_with(input, &self.kinds())?;
+        // A link on a host another forge claims is that forge's, when its
+        // links read the same way (a GitHub-like forge on a company host).
+        let Some(host) = pr.host.as_deref() else {
+            return Some(pr);
+        };
+        let claimed = self.claim(&format!("https://{host}/{}/{}", pr.owner, pr.name));
+        match claimed {
+            Some(remote) if remote.kind != pr.kind => {
+                ForgePr::parse_with(input, &[remote.kind]).or(Some(pr))
+            }
+            _ => Some(pr),
+        }
+    }
+
+    /// The forges' names for a sentence: "GitHub, GitLab or Forgejo".
+    pub fn names(&self) -> String {
+        let names: Vec<&str> = self.kinds().iter().map(|kind| kind.name()).collect();
+        match names.split_last() {
+            None => "a forge".to_owned(),
+            Some((last, [])) => (*last).to_owned(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        }
+    }
+
     /// Whether `kind`'s provider can do `ability`.
     pub fn can(&self, kind: ForgeKind, ability: ForgeAbility) -> bool {
         self.provider(kind)
@@ -647,7 +739,7 @@ pub(crate) fn latest_per_branch(
 /// `diff --git` header) fed through the streaming parser, so row numbering
 /// and highlighting match a streamed unified diff. A file without one
 /// (binary, oversized) keeps its row.
-pub(crate) fn patch_to_file(
+pub fn patch_to_file(
     path: String,
     old_path: Option<String>,
     status: DiffFileStatus,
@@ -678,6 +770,88 @@ pub(crate) fn patch_to_file(
     parser
         .finish()
         .expect("begin_file seeded a file, so finish returns it")
+}
+
+/// A diff that arrives in parts, as a plugin's forge sends one: unified diff
+/// text cut anywhere, or one file at a time with its bare hunks. Each file
+/// is handed on once it is whole.
+#[derive(Default)]
+pub struct DiffParts {
+    parser: DiffStreamParser,
+    /// The end of the last text part, up to its first unfinished line.
+    carry: String,
+}
+
+impl DiffParts {
+    /// A piece of `git diff` text. Lines may be split across pieces; `\r\n`
+    /// reads as `\n`.
+    pub fn push_text(&mut self, text: &str, on_file: &mut dyn FnMut(DiffFile)) {
+        let mut text = text;
+        if !self.carry.is_empty() {
+            match text.find('\n') {
+                Some(end) => {
+                    let mut line = std::mem::take(&mut self.carry);
+                    line.push_str(&text[..end]);
+                    self.line(&line, on_file);
+                    text = &text[end + 1..];
+                }
+                None => {
+                    self.carry.push_str(text);
+                    return;
+                }
+            }
+        }
+        let (whole, rest) = match text.rfind('\n') {
+            Some(end) => (&text[..end], &text[end + 1..]),
+            None => ("", text),
+        };
+        if !whole.is_empty() || text.starts_with('\n') {
+            for line in whole.split('\n') {
+                self.line(line, on_file);
+            }
+        }
+        self.carry.push_str(rest);
+    }
+
+    fn line(&mut self, line: &str, on_file: &mut dyn FnMut(DiffFile)) {
+        if let Some(file) = self
+            .parser
+            .push_line(line.strip_suffix('\r').unwrap_or(line))
+        {
+            on_file(file);
+        }
+    }
+
+    /// One file, as a forge's API lists it: `patch` holds its `@@` hunks
+    /// (absent for a binary or oversized file), `counts` the forge's own
+    /// line counts, which win over the patch's.
+    pub fn push_file(
+        &mut self,
+        path: String,
+        old_path: Option<String>,
+        status: DiffFileStatus,
+        patch: Option<&str>,
+        counts: Option<(usize, usize)>,
+        on_file: &mut dyn FnMut(DiffFile),
+    ) {
+        let mut file = patch_to_file(path, old_path, status, patch);
+        if let Some((additions, deletions)) = counts {
+            file.additions = additions;
+            file.deletions = deletions;
+        }
+        on_file(file);
+    }
+
+    /// The text ended: hand on the file it was in.
+    pub fn finish(mut self, on_file: &mut dyn FnMut(DiffFile)) {
+        if !self.carry.is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.line(&line, on_file);
+        }
+        if let Some(file) = self.parser.finish() {
+            on_file(file);
+        }
+    }
 }
 
 /// Lower a pull request's commits into the tab's graph, newest first
@@ -832,6 +1006,48 @@ mod tests {
             Some("fork")
         );
         assert!(forges.pick_remote(&remotes[..1], None).is_none());
+    }
+
+    #[test]
+    fn a_diff_cut_anywhere_parses_like_a_whole_one() {
+        let text = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\r\ndiff --git a/b.rs b/b.rs\nnew file mode 100644\n--- /dev/null\n+++ b/b.rs\n@@ -0,0 +1 @@\n+x\n";
+        let whole = crate::diff_parse::parse_unified_diff(&text.replace('\r', ""));
+        for cut in [1, 3, 7, 40] {
+            let mut parts = DiffParts::default();
+            let mut files = Vec::new();
+            let chars: Vec<char> = text.chars().collect();
+            for piece in chars.chunks(cut) {
+                parts.push_text(&piece.iter().collect::<String>(), &mut |file| {
+                    files.push(file)
+                });
+            }
+            parts.finish(&mut |file| files.push(file));
+            let paths: Vec<_> = files
+                .iter()
+                .map(|file| (file.path.clone(), file.additions, file.deletions))
+                .collect();
+            let expected: Vec<_> = whole
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.additions, file.deletions))
+                .collect();
+            assert_eq!(paths, expected, "pieces of {cut}");
+            assert_eq!(
+                files[0].hunks[0].lines[2].content,
+                whole.files[0].hunks[0].lines[2].content
+            );
+        }
+        let mut parts = DiffParts::default();
+        let mut files = Vec::new();
+        parts.push_file(
+            "big.bin".into(),
+            None,
+            DiffFileStatus::Added,
+            None,
+            Some((0, 0)),
+            &mut |file| files.push(file),
+        );
+        assert!(files[0].hunks[0].header.contains("diff unavailable"));
     }
 
     #[test]

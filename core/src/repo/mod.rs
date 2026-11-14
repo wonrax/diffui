@@ -366,13 +366,18 @@ impl std::fmt::Debug for SettingsSource {
 /// Spawn the actor for `spec` and return its event stream. The first event is
 /// [`Payload::Ready`], which carries the command sender — everything else the
 /// frontend needs travels as protocol data.
-pub fn open(spec: OpenSpec) -> RepoEvents {
-    open_with(spec, SettingsSource::Layered)
+/// A pull request is served by its forge's provider among `forges`.
+pub fn open(spec: OpenSpec, forges: &crate::forge::Forges) -> RepoEvents {
+    open_with(spec, SettingsSource::Layered, forges)
 }
 
 /// [`open`], with the jj configuration named rather than discovered. Only a
 /// test needs this; see [`SettingsSource`].
-pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
+pub fn open_with(
+    spec: OpenSpec,
+    settings: SettingsSource,
+    forges: &crate::forge::Forges,
+) -> RepoEvents {
     let id = repo_id(&spec);
     let capabilities = capabilities_for(&spec);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
@@ -414,7 +419,10 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         OpenSpec::Local { root, .. } => {
             git_actor::spawn(id, root, cmd_rx, cmd_tx.clone(), event_tx)
         }
-        OpenSpec::ForgePr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),
+        OpenSpec::ForgePr(pr) => {
+            let provider = forges.provider(pr.kind);
+            pr_actor::spawn(id, pr, provider, cmd_rx, event_tx)
+        }
     }
 
     RepoEvents {

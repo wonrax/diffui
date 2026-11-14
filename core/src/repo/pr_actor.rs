@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use super::cancel::CancelFlag;
 use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
 use super::{Envelope, Jobs, route_commands, run_job};
-use crate::forge::{self, ForgePr, ForgeProvider, Forges, PrInfo};
+use std::sync::Arc;
+
+use crate::forge::{self, ForgePr, ForgeProvider, PrInfo};
 use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
 
 /// Flush the pending file batch once it holds this many diff lines. Small
@@ -21,6 +23,7 @@ const BATCH_LINE_LIMIT: usize = 4_096;
 pub(super) fn spawn(
     id: RepoId,
     spec: ForgePr,
+    provider: Option<Arc<dyn ForgeProvider>>,
     commands: mpsc::UnboundedReceiver<Envelope>,
     events: mpsc::UnboundedSender<Event>,
 ) {
@@ -28,12 +31,17 @@ pub(super) fn spawn(
     // still streaming, which is the whole point of cancelling one.
     let jobs: Jobs = Jobs::default();
     let (work_tx, mut work) = mpsc::unbounded_channel();
-    tokio::spawn(route_commands(commands, work_tx, jobs.clone()));
+    let routed = jobs.clone();
     tokio::spawn(async move {
-        let Some(provider) = Forges::builtin().provider(spec.kind) else {
-            return;
-        };
-        let provider = provider.as_ref();
+        route_commands(commands, work_tx, routed.clone()).await;
+        // The tab is gone: stop the download it was waiting on rather than
+        // let it run to its end.
+        if let Ok(mut jobs) = routed.lock() {
+            jobs.cancel_all();
+        }
+    });
+    tokio::spawn(async move {
+        let provider = provider.as_deref();
         // The PR header, read once: the details pane and the diff's totals
         // both start from it. A graph load (opening or refreshing the tab)
         // reads it afresh.
@@ -51,7 +59,25 @@ pub(super) fn spawn(
                     };
                     let (id, spec, events, info) = (&id, &spec, &events, &mut info);
                     run_job(&jobs, job, span, emit, |ticket| async move {
-                        run(id, provider, spec, info, *command, ticket.flag(), events).await;
+                        match provider {
+                            Some(provider) => {
+                                run(id, provider, spec, info, *command, ticket.flag(), events).await
+                            }
+                            // The forge's plugin is off, or failed: say so
+                            // rather than leave the tab waiting.
+                            None => {
+                                let _ = events.send(Event::new(
+                                    id.clone(),
+                                    Payload::Failed {
+                                        job,
+                                        error: RepoError::Other(format!(
+                                            "{} isn't available: its plugin is off or didn't load.",
+                                            spec.kind.name()
+                                        )),
+                                    },
+                                ));
+                            }
+                        }
                         Ok(())
                     })
                     .await;

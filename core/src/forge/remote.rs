@@ -19,52 +19,78 @@ pub struct ForgePr {
 }
 
 impl ForgePr {
-    /// Parse the forms people paste:
+    /// Parse the forms people paste, for GitHub and GitLab:
     /// - GitHub: a PR URL (`https://github.com/o/r/pull/123`, trailing
     ///   `/files`-style segments and queries tolerated), `o/r#123`,
     ///   `host/o/r#123` and `o/r/pull/123`;
     /// - GitLab: an MR URL (`https://host/group/sub/name/-/merge_requests/7`),
     ///   `group/name!7` and `host/group/name!7`.
     ///
+    /// See [`Self::parse_with`].
+    pub fn parse(input: &str) -> Option<Self> {
+        Self::parse_with(input, &[ForgeKind::GitHub, ForgeKind::GitLab])
+    }
+
+    /// Parse a pull request link or reference for one of `kinds`, asked in
+    /// order, each by its [`ForgeSpec`](super::ForgeSpec): a URL whose path
+    /// reads like its `pull_request_path` (with or without the scheme, or
+    /// without the host for a forge with a default host), or
+    /// `[host/]owner/name<sigil>number`.
+    ///
     /// Returns `None` for anything that doesn't unambiguously name one, so
     /// the open dialog can fall back to treating the input as a local path.
     /// A host without a scheme must look like one (contain a dot) so a
     /// relative path can't be mistaken for it.
-    pub fn parse(input: &str) -> Option<Self> {
+    pub fn parse_with(input: &str, kinds: &[ForgeKind]) -> Option<Self> {
         let input = input.trim().trim_end_matches('/');
+        // A forge whose default host the input names is asked first, so
+        // two forges that write references alike part by host.
+        let named = input
+            .split_once("://")
+            .map_or(input, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let mut kinds = kinds.to_vec();
+        kinds.sort_by_key(|kind| kind.default_host() != named.trim_start_matches("www."));
+        let kinds = kinds.as_slice();
+        let by_path = |path: &str| kinds.iter().find_map(|kind| Self::parse_path(*kind, path));
 
         if let Some(rest) = input
             .strip_prefix("https://")
             .or_else(|| input.strip_prefix("http://"))
         {
             let (host, path) = rest.split_once('/')?;
-            return Self::parse_path(path).map(|pr| pr.on_host(host));
+            return by_path(path).map(|pr| pr.on_host(host));
         }
 
-        // `o/r#123`, `group/name!7`, with or without a host in front.
-        for (sigil, kind) in [('#', ForgeKind::GitHub), ('!', ForgeKind::GitLab)] {
-            let Some((slug, number)) = input.split_once(sigil) else {
-                continue;
-            };
+        // `o/r#123`, `group/name!7`, with or without a host in front: the
+        // first forge whose sigil is there decides.
+        if let Some(kind) = kinds
+            .iter()
+            .find(|kind| kind.spec().pull_request_path.is_some() && input.contains(kind.sigil()))
+        {
+            let (slug, number) = input.split_once(kind.sigil())?;
             let number = number.parse().ok()?;
             let parts: Vec<&str> = slug.split('/').collect();
             if parts.iter().any(|part| part.is_empty()) {
                 return None;
             }
-            let (host, path) = match (kind, parts.as_slice()) {
-                (ForgeKind::GitHub, [_, _]) => (None, &parts[..]),
-                (ForgeKind::GitHub, [host, _, _]) if looks_like_host(host) => {
-                    (Some(*host), &parts[1..])
+            let hosted = parts.len() >= 3 && looks_like_host(parts[0]);
+            let (host, path) = match (kind.spec().subgroups, parts.len()) {
+                (_, _) if hosted && (kind.spec().subgroups || parts.len() == 3) => {
+                    (Some(parts[0]), &parts[1..])
                 }
-                (ForgeKind::GitLab, [host, _, _, ..]) if looks_like_host(host) => {
-                    (Some(*host), &parts[1..])
-                }
-                (ForgeKind::GitLab, [_, _, ..]) => (None, &parts[..]),
+                (false, 2) | (true, 2..) => (None, &parts[..]),
                 _ => return None,
             };
+            if host.is_none() && kind.default_host().is_empty() {
+                return None;
+            }
             let (name, owner) = path.split_last()?;
             let pr = Self {
-                kind,
+                kind: *kind,
                 host: None,
                 owner: owner.join("/"),
                 name: (*name).to_owned(),
@@ -79,55 +105,31 @@ impl ForgePr {
         // `host/o/r/pull/123` (URL form without the scheme).
         if let Some((host, path)) = input.split_once('/')
             && looks_like_host(host)
-            && let Some(pr) = Self::parse_path(path)
+            && let Some(pr) = by_path(path)
         {
             return Some(pr.on_host(host));
         }
 
         // Bare `o/r/pull/123` (URL form without the host).
-        if input.contains("/pull/") {
-            return Self::parse_path(input);
-        }
-        None
+        by_path(input).filter(|pr| !pr.kind.default_host().is_empty())
     }
 
-    /// `owner/name/pull/number[...]` or `group/…/name/-/merge_requests/number[...]`.
-    fn parse_path(path: &str) -> Option<Self> {
-        let leading_number = |segment: &str| -> Option<u64> {
-            // The number segment may drag a query or fragment along
-            // (`123?diff=split`); the leading digit run is the number.
-            segment
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()
-        };
-        if let Some((project, rest)) = path.split_once("/-/merge_requests/") {
-            let number = leading_number(rest.split('/').next()?)?;
-            let (owner, name) = project.rsplit_once('/')?;
-            if owner.is_empty() || name.is_empty() || owner.split('/').any(str::is_empty) {
-                return None;
-            }
-            return Some(Self {
-                kind: ForgeKind::GitLab,
-                host: None,
-                owner: owner.to_owned(),
-                name: name.to_owned(),
-                number,
-            });
-        }
-        let mut parts = path.split('/');
-        let owner = parts.next().filter(|s| !s.is_empty())?;
-        let name = parts.next().filter(|s| !s.is_empty())?;
-        if parts.next()? != "pull" {
+    /// `kind`'s pull request path (`owner/name/pull/number[...]`), segments
+    /// after it tolerated, a query or fragment after the number too.
+    fn parse_path(kind: ForgeKind, path: &str) -> Option<Self> {
+        let pattern = kind.spec().pull_request_path.as_deref()?;
+        let pattern: Vec<&str> = pattern.split('/').collect();
+        let segments: Vec<&str> = path.split('/').collect();
+        let mut found = Found::default();
+        if !match_path(&pattern, &segments, kind.spec().subgroups, &mut found) {
             return None;
         }
         Some(Self {
-            kind: ForgeKind::GitHub,
+            kind,
             host: None,
-            owner: owner.to_owned(),
-            name: name.to_owned(),
-            number: leading_number(parts.next()?)?,
+            owner: found.owner?,
+            name: found.name?,
+            number: found.number?,
         })
     }
 
@@ -136,7 +138,8 @@ impl ForgePr {
     fn on_host(mut self, host: &str) -> Self {
         let host = host.to_ascii_lowercase();
         let host = host.strip_prefix("www.").unwrap_or(&host);
-        self.host = (host != self.kind.default_host()).then(|| host.to_owned());
+        self.host = (host != self.kind.default_host() || self.kind.default_host().is_empty())
+            .then(|| host.to_owned());
         self
     }
 
@@ -195,6 +198,70 @@ impl ForgePr {
             Some(host) => format!("{host}/{}", self.reference()),
             None => self.reference(),
         }
+    }
+}
+
+/// What a pull request path pattern captured.
+#[derive(Default)]
+struct Found {
+    owner: Option<String>,
+    name: Option<String>,
+    number: Option<u64>,
+}
+
+/// Whether `segments` start the way `pattern` reads, filling in `found`.
+/// `{owner}` takes one segment, or several with `subgroups`; `{number}` is the
+/// segment's leading digits (`123?diff=split`).
+fn match_path(pattern: &[&str], segments: &[&str], subgroups: bool, found: &mut Found) -> bool {
+    let Some((first, rest)) = pattern.split_first() else {
+        return true;
+    };
+    match *first {
+        "{owner}" => {
+            let most = if subgroups {
+                segments.len()
+            } else {
+                1.min(segments.len())
+            };
+            (1..=most).rev().any(|taken| {
+                let owner = &segments[..taken];
+                !owner.iter().any(|segment| segment.is_empty())
+                    && match_path(rest, &segments[taken..], subgroups, found)
+                    && {
+                        found.owner = Some(owner.join("/"));
+                        true
+                    }
+            })
+        }
+        "{name}" => match segments.split_first() {
+            Some((name, others)) if !name.is_empty() => {
+                found.name = Some((*name).to_owned());
+                match_path(rest, others, subgroups, found)
+            }
+            _ => false,
+        },
+        "{number}" => match segments.split_first() {
+            Some((segment, others)) => {
+                let digits = segment
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("");
+                match digits.parse() {
+                    Ok(number) => {
+                        found.number = Some(number);
+                        match_path(rest, others, subgroups, found)
+                    }
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        },
+        literal => match segments.split_first() {
+            Some((segment, others)) if *segment == literal => {
+                match_path(rest, others, subgroups, found)
+            }
+            _ => false,
+        },
     }
 }
 
@@ -358,6 +425,40 @@ mod tests {
         let mr = gitlab(None, "group/sub", "app", 7).expect("an MR");
         assert_eq!(mr.label(), "app!7");
         assert_eq!(mr.reference(), "group/sub/app!7");
+    }
+
+    #[test]
+    fn a_plugins_forge_reads_its_own_links() {
+        let forgejo = ForgeKind::Script(crate::forge::ScriptForge::new(crate::forge::ForgeSpec {
+            id: "forgejo".into(),
+            name: "Forgejo".into(),
+            sigil: '#',
+            short: "PR".into(),
+            pull_request_path: Some("{owner}/{name}/pulls/{number}".into()),
+            ..Default::default()
+        }));
+        let kinds = [ForgeKind::GitHub, forgejo];
+        let pr = ForgePr::parse_with("https://codeberg.org/team/app/pulls/12/files", &kinds)
+            .expect("a pull request");
+        assert_eq!(pr.kind, forgejo);
+        assert_eq!(pr.host.as_deref(), Some("codeberg.org"));
+        assert_eq!(
+            (pr.owner.as_str(), pr.name.as_str(), pr.number),
+            ("team", "app", 12)
+        );
+        assert_eq!(pr.host_label(), "codeberg.org");
+        // A host-less reference needs a forge with a default host: GitHub's.
+        assert_eq!(
+            ForgePr::parse_with("team/app#3", &kinds).unwrap().kind,
+            ForgeKind::GitHub
+        );
+        let alone = [forgejo];
+        assert_eq!(ForgePr::parse_with("team/app#3", &alone), None);
+        assert_eq!(
+            ForgePr::parse_with("codeberg.org/team/app#3", &alone).map(|pr| pr.key()),
+            Some("codeberg.org/team/app#3".to_owned())
+        );
+        assert_eq!(ForgePr::parse_with("team/app/pulls/3", &alone), None);
     }
 
     #[test]

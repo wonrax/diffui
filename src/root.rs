@@ -344,7 +344,7 @@ impl Diffui {
             self.background
                 .repos
                 .entry(spec.clone())
-                .or_insert_with(|| repository_loop(spec, cx));
+                .or_insert_with(|| repository_loop(spec, &self.forge.forges, cx));
         }
 
         // While anything is in flight (a load, a diff switch, or any running
@@ -488,9 +488,9 @@ fn sync_ticker(
 /// One repository's actor and its event loop. The actor runs on its own thread
 /// and reports through a channel; this folds what it says into the app. Events
 /// that arrived together fold in one update, so a burst costs one reconcile.
-fn repository_loop(spec: OpenSpec, cx: &mut Cx) -> Task<()> {
+fn repository_loop(spec: OpenSpec, forges: &diffui_core::forge::Forges, cx: &mut Cx) -> Task<()> {
     use futures::{FutureExt as _, StreamExt as _};
-    let mut events = diffui_core::repo::open(spec);
+    let mut events = diffui_core::repo::open(spec, forges);
     cx.spawn(async move |this, cx| {
         while let Some(first) = events.next().await {
             let mut batch = vec![first];

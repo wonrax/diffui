@@ -167,6 +167,7 @@ impl TestRepo {
                 scope: PathBuf::new(),
             },
             SettingsSource::Fixed(Box::new(test_settings_for(root))),
+            &diffui_core::forge::Forges::default(),
         ));
         let handle = runtime.block_on(async {
             match events.next().await.map(|event| event.payload) {

@@ -298,10 +298,13 @@ fn the_git_actor_starts_and_forwards_its_watch() {
     write(&root, "file.txt", b"base\n");
     commit(&root, "base");
     block_on(async {
-        let mut events = Box::pin(repo::open(OpenSpec::Local {
-            root: root.clone(),
-            scope: PathBuf::new(),
-        }));
+        let mut events = Box::pin(repo::open(
+            OpenSpec::Local {
+                root: root.clone(),
+                scope: PathBuf::new(),
+            },
+            &Default::default(),
+        ));
         assert!(matches!(
             events.next().await.unwrap().payload,
             Payload::Ready { .. }

@@ -230,7 +230,7 @@ impl Diffui {
         }
         // A PR or MR URL, `owner/repo#123` or `group/repo!7` opens a PR tab;
         // anything else is a path.
-        if let Some(spec) = diffui_core::forge::ForgePr::parse(trimmed) {
+        if let Some(spec) = self.forge.forges.parse_pr(trimmed) {
             // A bare `owner/repo#123` typed from a repository whose remote
             // lives on a company host means that host's PR.
             let remotes = self

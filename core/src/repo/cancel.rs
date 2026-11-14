@@ -74,6 +74,13 @@ impl CancelRegistry {
         }
     }
 
+    /// Raise every running job's flag: the actor is shutting down.
+    pub fn cancel_all(&mut self) {
+        for flag in self.flags.values() {
+            flag.cancel();
+        }
+    }
+
     pub fn finish(&mut self, job: JobId) {
         self.flags.remove(&job);
     }

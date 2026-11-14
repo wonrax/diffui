@@ -331,7 +331,7 @@ impl Diffui {
         if input.is_empty() {
             return None;
         }
-        if let Some(spec) = ForgePr::parse(input) {
+        if let Some(spec) = self.forge.forges.parse_pr(input) {
             return Some(Status::PullRequest(spec));
         }
         let Some(query) = Query::parse(input) else {
