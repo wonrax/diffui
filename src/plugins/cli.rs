@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use diffui_plugins::protocol::{FORGE_METHODS, HostCall};
 use diffui_plugins::{
-    API_VERSION, Host, JjAccess, Limits, LogLevel, MANIFEST_FILE, Manifest, Options, Plugin,
-    PluginEvent, Registration, Reply,
+    API_VERSION, ForgeTerm, Host, JjAccess, Limits, LogLevel, MANIFEST_FILE, Manifest, Options,
+    Plugin, PluginEvent, Registration, Reply,
 };
 
 use super::{commands_of, plugin_dirs, plugins_dir, trust};
@@ -433,20 +433,25 @@ fn registered(manifest: &Manifest, registration: &Registration) -> String {
     }
     if let (Some(claim), Some(methods)) = (&manifest.forge, &registration.forge) {
         let hosts: Vec<String> = claim.hosts.iter().map(ToString::to_string).collect();
-        let missing: Vec<&str> = FORGE_METHODS
-            .iter()
-            .copied()
-            .filter(|method| !methods.iter().any(|registered| registered == method))
-            .collect();
-        let _ = write!(said, "forge {}: {}", hosts.join(", "), methods.join(", "));
-        if !missing.is_empty() {
-            let _ = write!(
-                said,
-                " (not {}; diffui hides what needs them)",
-                missing.join(", ")
-            );
+        let _ = writeln!(said, "forge {}: {}", hosts.join(", "), methods.join(", "));
+        let request = match claim.term {
+            ForgeTerm::PullRequest => "pull request",
+            ForgeTerm::MergeRequest => "merge request",
+        };
+        for method in FORGE_METHODS {
+            if methods.iter().any(|registered| registered == method) {
+                continue;
+            }
+            // What `ScriptForge::can` and the refresh make of a method the
+            // script left out.
+            let without = match method {
+                "checks" => format!("a {request} shows no check state"),
+                "createPullRequest" => format!("Create {request} and Submit stack are off"),
+                "updatePullRequest" => format!("Update {request} and Submit stack are off"),
+                _ => continue,
+            };
+            let _ = writeln!(said, "  no {method}: {without}");
         }
-        said.push('\n');
     }
     if !registration.events.is_empty() {
         let _ = writeln!(said, "events: {}", registration.events.join(", "));
@@ -547,7 +552,9 @@ mod tests {
             if forge.is_some() {
                 assert!(
                     checked.contains(
-                        ": pullRequests, checks (not createPullRequest, updatePullRequest;"
+                        ": pullRequests, checks\n  \
+                         no createPullRequest: Create pull request and Submit stack are off\n  \
+                         no updatePullRequest: Update pull request and Submit stack are off\n"
                     ),
                     "{checked}"
                 );
