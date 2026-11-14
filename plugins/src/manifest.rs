@@ -204,6 +204,10 @@ pub struct CommandDecl {
     /// Where the row's `id` is in the manifest, 1-based.
     pub line: usize,
     pub col: usize,
+    /// Where the first character of `when` is, 1-based, when the clause is
+    /// written on one line without escapes: then a place in the clause is a
+    /// place in the file, and a problem in it can point at the character.
+    pub when_at: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -535,6 +539,13 @@ impl Manifest {
                 }
             }
             let (line, col) = line_col(text, row.id.span().start);
+            let when_at = row.when.as_ref().and_then(|when| {
+                // Between the quotes, as written.
+                let span = when.span();
+                let written = text.get(span.start + 1..span.end.checked_sub(1)?)?;
+                (written == when.get_ref() && !written.contains('\n'))
+                    .then(|| line_col(text, span.start + 1))
+            });
             commands.push(CommandDecl {
                 id: command,
                 label: row.label.into_inner(),
@@ -545,6 +556,7 @@ impl Manifest {
                 keys: row.keys.into_iter().map(Spanned::into_inner).collect(),
                 line,
                 col,
+                when_at,
             });
         }
 
@@ -728,7 +740,27 @@ limit = { type = "number", default = 50 }
         assert_eq!(command.menu, [MenuPlace::Bookmark, MenuPlace::Palette]);
         assert_eq!(command.keys, ["cmd+shift+o"]);
         assert_eq!((command.line, command.col), (17, 6));
+        assert_eq!(command.when_at, Some((19, 9)));
         assert_eq!(manifest.config.len(), 2);
+    }
+
+    /// A clause's characters are the file's only when it is written as it
+    /// reads: one line, no escapes.
+    #[test]
+    fn a_when_clause_is_placed_only_when_written_plainly() {
+        let when_at = |written: &str| {
+            parse(&with(
+                "when = \"bookmark.pr\"",
+                &format!("when = {written}"),
+            ))
+            .unwrap()
+            .commands[0]
+                .when_at
+        };
+        assert_eq!(when_at(r#"'repo.kind == "jj"'"#), Some((19, 9)));
+        assert_eq!(when_at(r#""repo.kind == \"jj\"""#), None);
+        assert_eq!(when_at(r#""""bookmark.pr""""#), None);
+        assert_eq!(when_at("'''\nbookmark.pr'''"), None);
     }
 
     #[test]

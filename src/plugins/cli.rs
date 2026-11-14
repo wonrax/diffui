@@ -679,9 +679,31 @@ mod tests {
             ),
         )
         .unwrap();
+        // The place is the character the clause stops making sense at: here
+        // its end, where a value should follow.
         let problems = check(&dir).unwrap_err();
         assert!(
-            problems.contains("[[commands]] \"broken.hello\": when:"),
+            problems.contains("plugin.toml:19:21: [[commands]] \"broken.hello\": when: "),
+            "{problems}"
+        );
+        assert!(!problems.contains("of the clause"), "{problems}");
+        // Written with an escape, the clause's characters aren't the file's:
+        // the row's place, and how far into the clause.
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest.replace(
+                "# when = \"repo.kind == 'jj'\"",
+                r#"when = "repo.kind == \"jj""#,
+            ),
+        )
+        .unwrap();
+        let problems = check(&dir).unwrap_err();
+        assert!(
+            problems.contains("plugin.toml:16:6: [[commands]] \"broken.hello\": when: "),
+            "{problems}"
+        );
+        assert!(
+            problems.contains(" (at character 14 of the clause)"),
             "{problems}"
         );
         let _ = std::fs::remove_dir_all(&dir);

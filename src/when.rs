@@ -24,8 +24,6 @@
 //! The keys are [`KEYS`]: one table, so adding a key (a plugin's own, say)
 //! is one row.
 
-use std::fmt;
-
 use crate::Diffui;
 use crate::commands::CommandArg;
 
@@ -278,12 +276,6 @@ enum Op {
 pub(crate) struct WhenError {
     pub(crate) message: String,
     pub(crate) offset: usize,
-}
-
-impl fmt::Display for WhenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (at {})", self.message, self.offset + 1)
-    }
 }
 
 impl When {
@@ -589,7 +581,7 @@ mod tests {
 
     fn holds(clause: &str) -> bool {
         When::parse(clause)
-            .unwrap_or_else(|error| panic!("{clause}: {error}"))
+            .unwrap_or_else(|error| panic!("{clause}: {error:?}"))
             .eval(&keys())
     }
 

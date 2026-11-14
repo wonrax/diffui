@@ -434,8 +434,22 @@ fn commands_of(manifest: &Manifest) -> (Vec<Arc<PluginCommand>>, Vec<String>) {
                 }
                 Some((text.to_owned(), when))
             }
-            Some((_, Err(error))) => {
-                say(format!("when: {error}"));
+            Some((text, Err(error))) => {
+                let before = text[..error.offset].chars().count();
+                match decl.when_at {
+                    // The place of the character the parser stopped at.
+                    Some((line, col)) => problems.push(format!(
+                        "{file}:{line}:{}: [[commands]] {:?}: when: {}",
+                        col + before,
+                        decl.id,
+                        error.message
+                    )),
+                    None => say(format!(
+                        "when: {} (at character {} of the clause)",
+                        error.message,
+                        before + 1
+                    )),
+                }
                 continue;
             }
         };
