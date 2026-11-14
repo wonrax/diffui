@@ -176,16 +176,18 @@ impl Plugin {
     }
 
     /// [`Self::call`] for a forge method that streams ([`ForgeCall::streams`]):
-    /// `on_part` runs on the plugin's thread with each part the script sends,
-    /// before `reply`. The script waits for each part's [`Reply`], so answer
-    /// it once the part is taken in (that is the backpressure), or reject it
-    /// to make the script stop.
+    /// `on_part` runs on the plugin's thread with the parts the script sends,
+    /// a batch at a time (the ones that came while the last batch was being
+    /// taken in), before `reply`. The script waits for each batch's
+    /// [`Reply`] before it sends another, so answer it once the parts are
+    /// taken in (that is the backpressure), or reject it to make the script
+    /// stop.
     ///
     /// [`ForgeCall::streams`]: protocol::ForgeCall::streams
     pub fn call_streaming<T: DeserializeOwned>(
         &self,
         call: PluginCall,
-        on_part: impl FnMut(serde_json::Value, Reply) + Send + 'static,
+        on_part: impl FnMut(Vec<serde_json::Value>, Reply) + Send + 'static,
         reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
     ) -> CallId {
         self.send_call(call, Some(Box::new(on_part)), reply)

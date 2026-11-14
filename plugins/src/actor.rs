@@ -52,9 +52,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub(crate) type ReplyFn = Box<dyn FnOnce(Result<Value, PluginError>) + Send>;
 
-/// Hears what a streaming call sends before it settles, and answers each
-/// part through its [`Reply`] once it has taken it in.
-pub(crate) type PartFn = Box<dyn FnMut(Value, Reply) + Send>;
+/// Hears what a streaming call sends before it settles, a batch of parts at
+/// a time, and answers each batch through its [`Reply`] once it has taken
+/// it in.
+pub(crate) type PartFn = Box<dyn FnMut(Vec<Value>, Reply) + Send>;
 
 pub(crate) enum ToActor {
     Call {
@@ -735,7 +736,7 @@ impl Actor {
         #[derive(Deserialize)]
         struct ForgePart {
             call: u64,
-            part: Value,
+            parts: Vec<Value>,
         }
         let manifest = self.manifest.clone();
         let limits = self.limits;
@@ -803,7 +804,7 @@ impl Actor {
                 self.answer(id, Ok(Value::Null));
             }
             "forge.part" => {
-                let ForgePart { call, part } = read(op, args)?;
+                let ForgePart { call, parts: sent } = read(op, args)?;
                 let forge_call = limits.forge_call;
                 let pending = self.calls.get_mut(&call);
                 let Some((pending, parts)) =
@@ -817,7 +818,7 @@ impl Actor {
                 pending.deadline = Some(Instant::now() + forge_call);
                 let mut parts = parts;
                 parts(
-                    part,
+                    sent,
                     Reply {
                         to: Some(self.own.clone()),
                         generation: self.generation,

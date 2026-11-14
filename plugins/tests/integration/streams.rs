@@ -183,9 +183,9 @@ fn a_diff_streams_at_the_hosts_pace_and_a_cancel_reaches_the_program() {
         ["pullRequests", "commitDiff", "diff"]
     );
 
-    // Take three parts, then sit on the fourth.
+    // Take three batches of parts, then sit on the fourth.
     let held: Arc<Mutex<Vec<Reply>>> = Arc::default();
-    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::default();
     let (done, finished) = mpsc::channel();
     let id = plugin.plugin.call_streaming::<Value>(
         PluginCall::Forge {
@@ -194,9 +194,9 @@ fn a_diff_streams_at_the_hosts_pace_and_a_cancel_reaches_the_program() {
         },
         {
             let (held, seen) = (held.clone(), seen.clone());
-            move |part, reply| {
+            move |sent, reply| {
                 let mut seen = seen.lock().unwrap();
-                seen.push(part);
+                seen.push(sent);
                 if seen.len() < 4 {
                     reply.ok(Value::Null);
                 } else {
@@ -217,8 +217,10 @@ fn a_diff_streams_at_the_hosts_pace_and_a_cancel_reaches_the_program() {
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 4, "the script didn't wait for the host");
-        assert_eq!(seen[0], "diff --git a/x b/x\n");
-        assert!(seen[1].as_str().unwrap().starts_with("+line 0 of 7\n"));
+        assert!(seen.iter().all(|sent| !sent.is_empty() && sent.len() <= 64));
+        let parts: Vec<&Value> = seen.iter().flatten().collect();
+        assert_eq!(parts[0], "diff --git a/x b/x\n");
+        assert!(parts[1].as_str().unwrap().starts_with("+line 0 of 7\n"));
     }
     let pid = std::fs::read_to_string(&pid_file)
         .unwrap()
@@ -262,8 +264,8 @@ fn a_diff_streams_at_the_hosts_pace_and_a_cancel_reaches_the_program() {
         },
         {
             let parts = parts.clone();
-            move |part, reply| {
-                parts.lock().unwrap().push(part);
+            move |sent, reply| {
+                parts.lock().unwrap().extend(sent);
                 reply.ok(Value::Null);
             }
         },

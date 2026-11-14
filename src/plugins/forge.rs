@@ -147,15 +147,15 @@ impl ScriptForge {
             return Err(ForgeError::Unsupported);
         }
         let (part_to, mut parts) =
-            futures::channel::mpsc::unbounded::<(serde_json::Value, Reply)>();
+            futures::channel::mpsc::unbounded::<(Vec<serde_json::Value>, Reply)>();
         let (answer, answered) = futures::channel::oneshot::channel();
         let repo = no_repository(Some(to_script_remote(&pr.remote())));
         let id = self.plugin.call_streaming::<serde_json::Value>(
             PluginCall::Forge { repo, call },
-            move |part, reply| {
+            move |sent, reply| {
                 // A host that stopped listening drops the reply, which
                 // rejects the script's wait and ends its loop.
-                let _ = part_to.unbounded_send((part, reply));
+                let _ = part_to.unbounded_send((sent, reply));
             },
             move |result| {
                 let _ = answer.send(result);
@@ -169,13 +169,10 @@ impl ScriptForge {
             let tick = tokio::time::sleep(std::time::Duration::from_millis(25)).fuse();
             futures::pin_mut!(tick);
             futures::select! {
-                part = parts.next() => {
-                    if let Some((part, reply)) = part {
-                        match serde_json::from_value::<protocol::DiffPart>(part) {
-                            Ok(part) => {
-                                take_part(&mut diff, part, on_file);
-                                reply.ok(serde_json::Value::Null);
-                            }
+                sent = parts.next() => {
+                    if let Some((sent, reply)) = sent {
+                        match take_parts(&mut diff, sent, on_file) {
+                            Ok(()) => reply.ok(serde_json::Value::Null),
                             Err(error) => reply.err(format!("not a diff part: {error}")),
                         }
                     }
@@ -190,10 +187,8 @@ impl ScriptForge {
             }
         };
         // Every part was acknowledged before the script could settle.
-        while let Ok((part, reply)) = parts.try_recv() {
-            if let Ok(part) = serde_json::from_value::<protocol::DiffPart>(part) {
-                take_part(&mut diff, part, on_file);
-            }
+        while let Ok((sent, reply)) = parts.try_recv() {
+            let _ = take_parts(&mut diff, sent, on_file);
             reply.ok(serde_json::Value::Null);
         }
         diff.finish(on_file);
@@ -243,6 +238,19 @@ fn lock(handles: &Handles) -> std::sync::MutexGuard<'_, HashMap<String, RepoHand
     handles
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A batch of a streamed diff's parts into `diff`, up to the first that
+/// isn't one.
+fn take_parts(
+    diff: &mut DiffParts,
+    sent: Vec<serde_json::Value>,
+    on_file: &mut dyn FnMut(DiffFile),
+) -> Result<(), serde_json::Error> {
+    for part in sent {
+        take_part(diff, serde_json::from_value(part)?, on_file);
+    }
+    Ok(())
 }
 
 /// One part of a streamed diff into `diff`.

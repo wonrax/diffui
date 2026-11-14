@@ -877,20 +877,57 @@ async function askForge(id, repo, request, signal) {
   }
 }
 
-/** Hand a diff to the host a part at a time, waiting for each to be taken. */
+/** The most parts one `forge.part` hands over. */
+const PART_BATCH = 64;
+
+/**
+ * Hand a diff to the host as it comes, in batches: the parts that arrive
+ * while one batch is with the host go in the next. Waits for a batch to be
+ * taken before sending another, and stops pulling once a batch is full.
+ */
 async function sendParts(id, source, signal, what) {
-  const send = async (part) => {
+  const check = (part) => {
     signal.throwIfAborted();
     if (typeof part !== "string" && (part === null || typeof part !== "object" || typeof part.path !== "string")) {
       throw new TypeError(`${what} sent a part that is neither diff text nor a file ({ path, status, patch })`);
     }
-    await call("forge.part", { call: id, part }, { signal });
   };
-  if (typeof source === "string") return send(source);
+  if (typeof source === "string") {
+    check(source);
+    return call("forge.part", { call: id, parts: [source] }, { signal });
+  }
   if (source == null || (typeof source[Symbol.asyncIterator] !== "function" && typeof source[Symbol.iterator] !== "function")) {
     throw new TypeError(`${what} must give diff text, an array of parts or an (async) iterable of them`);
   }
-  for await (const part of source) await send(part);
+  let batch = [];
+  let sending = null;
+  let failed = null;
+  const send = () => {
+    const parts = batch;
+    batch = [];
+    sending = call("forge.part", { call: id, parts }, { signal }).then(
+      () => {
+        sending = null;
+      },
+      (error) => {
+        failed ??= error;
+        sending = null;
+      },
+    );
+  };
+  for await (const part of source) {
+    if (failed) throw failed;
+    check(part);
+    batch.push(part);
+    if (sending !== null && batch.length >= PART_BATCH) await sending;
+    if (failed) throw failed;
+    if (sending === null) send();
+  }
+  while (sending !== null || batch.length > 0) {
+    await sending;
+    if (failed) throw failed;
+    if (batch.length > 0) send();
+  }
 }
 
 const forgeCalls = new Map();
