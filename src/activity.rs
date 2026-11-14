@@ -296,6 +296,34 @@ impl ActivityLog {
         }
     }
 
+    /// Drop the finished row just before `id` when `id` failed exactly as it
+    /// did: the same label, the same error. A load is retried each time its
+    /// tab comes forward, and one that keeps failing the same way (a forge
+    /// CLI that isn't installed) then keeps one failed row, the latest,
+    /// instead of adding one per try.
+    pub fn fold_repeated_failure(&mut self, id: ActivityId) {
+        let finished = |activity: &Activity| {
+            !matches!(
+                activity.status,
+                ActivityStatus::Running | ActivityStatus::Queued
+            )
+        };
+        let Some(index) = self.activities.iter().position(|it| it.id == id) else {
+            return;
+        };
+        let Some(before) = self.activities[..index].iter().rposition(finished) else {
+            return;
+        };
+        let (now, then) = (&self.activities[index], &self.activities[before]);
+        if now.status == ActivityStatus::Error
+            && then.status == ActivityStatus::Error
+            && now.label == then.label
+            && now.result == then.result
+        {
+            self.activities.remove(before);
+        }
+    }
+
     /// Where an entry stands, while the log still has it.
     pub fn status(&self, id: ActivityId) -> Option<ActivityStatus> {
         self.activities
@@ -1535,6 +1563,47 @@ mod tests {
         assert!(log.activities[0].expanded);
         assert!(log.activities[0].detail_editor.is_some());
         assert_eq!(log.failed_count(), 1);
+    }
+
+    /// A retry that fails the way the last try did leaves one row, the
+    /// newer; a different error, or another row finished in between, is news.
+    #[test]
+    fn a_load_that_fails_the_same_way_again_keeps_one_row() {
+        const MISSING: &str = "The GitLab CLI (`glab`) wasn't found.";
+        let mut log = ActivityLog::default();
+        let fail = |log: &mut ActivityLog, id: u64, label: &str, why: &str| {
+            log.start(ActivityId(id), label.to_owned(), true);
+            log.finish(ActivityId(id), ActivityStatus::Error, Some(why.to_owned()));
+            log.fold_repeated_failure(ActivityId(id));
+        };
+        let ids = |log: &ActivityLog| -> Vec<u64> {
+            log.activities
+                .iter()
+                .map(|activity| activity.id.0)
+                .collect()
+        };
+
+        fail(&mut log, 1, "Load pull request", MISSING);
+        fail(&mut log, 2, "Load pull request", MISSING);
+        fail(&mut log, 3, "Load pull request", MISSING);
+        assert_eq!(ids(&log), [3]);
+
+        fail(&mut log, 4, "Load pull request", "glab: not signed in");
+        assert_eq!(ids(&log), [3, 4]);
+        fail(&mut log, 5, "Fetch from origin", "glab: not signed in");
+        assert_eq!(ids(&log), [3, 4, 5]);
+
+        // Something else finished since: the same failure is listed again.
+        log.start(ActivityId(6), "Refresh", false);
+        log.finish(ActivityId(6), ActivityStatus::Done, None);
+        fail(&mut log, 7, "Fetch from origin", "glab: not signed in");
+        assert_eq!(ids(&log), [3, 4, 5, 6, 7]);
+
+        // A row still running is passed over: the failure before it is the
+        // one this replaces.
+        log.start(ActivityId(8), "Push", false);
+        fail(&mut log, 9, "Fetch from origin", "glab: not signed in");
+        assert_eq!(ids(&log), [3, 4, 5, 6, 8, 9]);
     }
 
     #[test]

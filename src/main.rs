@@ -926,6 +926,7 @@ impl TabState {
     ) {
         if let Some(id) = self.pending_load_activity.take() {
             self.activities.finish(id, status, result);
+            self.activities.fold_repeated_failure(id);
         }
     }
 
