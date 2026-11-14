@@ -27,6 +27,16 @@ pub(crate) const TOKEN_CMD: &str = "token_cmd";
 /// (`[plugins.<id>] hosts = ["git.acme.org"]`). A schema can't declare it.
 pub const HOSTS: &str = "hosts";
 
+/// The user-config table of per-host values, by host:
+/// `[plugins.<id>.per_host."github.acme.com"] auth = "token"`. A schema can't
+/// declare it.
+pub const PER_HOST: &str = "per_host";
+
+/// The word in `[permissions] http` that lets a forge reach every host it
+/// claims: its patterns, its `hosts()` answer, the user's `hosts` setting
+/// and the hosts it has a token for.
+pub const FORGE_HOSTS: &str = "{forge.hosts}";
+
 /// A problem in a manifest, placed. Displays as `path:line:col: message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -80,6 +90,10 @@ pub struct Permissions {
     /// Hosts `http.fetch` may reach and `auth.token` may be asked for.
     #[serde(default)]
     pub http: Vec<HostPattern>,
+    /// `http` holds [`FORGE_HOSTS`]: the hosts the plugin claims as a forge
+    /// are reachable too.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forge_hosts: bool,
     /// Argv prefixes `exec` may run. A word `{config.<key>}` stands for
     /// that string setting, so the user can point the plugin at a program.
     #[serde(default)]
@@ -287,6 +301,12 @@ pub enum MenuPlace {
     File,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One setting of `[config.schema]`: what the script reads as `config.<key>`
+/// (a secret it reads through `auth`), and how Settings shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigField {
     pub key: String,
@@ -294,6 +314,85 @@ pub struct ConfigField {
     pub default: Option<serde_json::Value>,
     pub label: Option<String>,
     pub hint: Option<String>,
+    /// An `enum`'s values, in the order Settings offers them.
+    pub values: Vec<String>,
+    /// The user may set it per host, under `[plugins.<id>.per_host."<host>"]`.
+    pub per_host: bool,
+    /// A `secret`'s extras.
+    pub secret: Option<SecretField>,
+}
+
+impl ConfigField {
+    /// What Settings calls it: its label, else its key.
+    pub fn title(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.key)
+    }
+
+    /// Whether `value` may be this setting's.
+    pub fn admits(&self, value: &serde_json::Value) -> bool {
+        match self.kind {
+            ConfigKind::Enum => value
+                .as_str()
+                .is_some_and(|value| self.values.iter().any(|known| known == value)),
+            kind => kind.admits(value),
+        }
+    }
+
+    fn noun(&self) -> String {
+        match self.kind {
+            ConfigKind::Enum => format!(
+                "one of {}",
+                self.values
+                    .iter()
+                    .map(|value| format!("\"{value}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            kind => kind.noun().to_string(),
+        }
+    }
+}
+
+/// What a `secret` setting says beyond its type.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecretField {
+    /// Where the user makes one, with `{host}` and `{scopes}` filled in:
+    /// `https://{host}/settings/tokens/new?scopes={scopes}`.
+    pub page: Option<String>,
+    /// The scopes the plugin needs, for the page and for Settings to say.
+    pub scopes: Vec<String>,
+    /// Environment variables that hold it, by the host they are for (a
+    /// host pattern, or `*` for any), as the forge's CLI reads them. Each
+    /// is listed under `[permissions] env` too.
+    pub env: Vec<(String, Vec<String>)>,
+}
+
+impl SecretField {
+    /// The page for `host`, its scopes filled in.
+    pub fn page_for(&self, host: &str) -> Option<String> {
+        let page = self.page.as_ref()?;
+        Some(
+            page.replace("{host}", host)
+                .replace("{scopes}", &self.scopes.join(",")),
+        )
+    }
+
+    /// The variables to look in for `host`'s secret, in order: those of the
+    /// first entry that names `host`, else those of `*`.
+    pub fn env_for(&self, host: &str) -> &[String] {
+        let (name, port) = match host.rsplit_once(':') {
+            Some((name, port)) if !port.contains(']') => (name, port.parse().unwrap_or(443)),
+            _ => (host, 443),
+        };
+        let named = self.env.iter().find(|(pattern, _)| {
+            pattern != "*"
+                && HostPattern::parse_claim(pattern)
+                    .is_ok_and(|pattern| pattern.matches(name, port))
+        });
+        named
+            .or_else(|| self.env.iter().find(|(pattern, _)| pattern == "*"))
+            .map_or(&[], |(_, vars)| vars.as_slice())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -302,22 +401,36 @@ pub enum ConfigKind {
     String,
     Boolean,
     Number,
+    /// One of the field's `values`; Settings shows them as a segmented
+    /// control.
+    Enum,
+    /// A program or file, by path or by name on the `PATH`; Settings shows
+    /// a field with Browse and says when it isn't there.
+    Path,
+    /// Write-only: kept in the secret store (the Keychain), never in
+    /// config.toml. The script reads it with `auth.secret`, or `auth.token`
+    /// for the per-host `token`.
+    Secret,
 }
 
 impl ConfigKind {
     fn admits(self, value: &serde_json::Value) -> bool {
         match self {
-            ConfigKind::String => value.is_string(),
+            ConfigKind::String | ConfigKind::Path | ConfigKind::Enum => value.is_string(),
             ConfigKind::Boolean => value.is_boolean(),
             ConfigKind::Number => value.is_number(),
+            ConfigKind::Secret => false,
         }
     }
 
     fn noun(self) -> &'static str {
         match self {
-            ConfigKind::String => "a string",
+            ConfigKind::String | ConfigKind::Path | ConfigKind::Enum => "a string",
             ConfigKind::Boolean => "true or false",
             ConfigKind::Number => "a number",
+            ConfigKind::Secret => {
+                "set in Settings or with `diffui plugin auth`, not in config.toml"
+            }
         }
     }
 }
@@ -404,6 +517,12 @@ struct RawField {
     default: Option<toml::Value>,
     label: Option<String>,
     hint: Option<String>,
+    values: Option<Vec<String>>,
+    #[serde(default)]
+    per_host: bool,
+    page: Option<String>,
+    scopes: Option<Vec<String>>,
+    env: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// Collects problems against one file's text.
@@ -553,7 +672,21 @@ impl Manifest {
                 })
                 .collect::<Vec<_>>()
         };
-        let http = hosts(&raw.permissions.http, &mut report);
+        let (forge_words, http_hosts): (Vec<_>, Vec<_>) = raw
+            .permissions
+            .http
+            .iter()
+            .cloned()
+            .partition(|host| host.get_ref() == FORGE_HOSTS);
+        let http = hosts(&http_hosts, &mut report);
+        if let Some(word) = forge_words.first()
+            && raw.provides.forge.is_none()
+        {
+            report.at(
+                word.span(),
+                format!("http {FORGE_HOSTS} is for a forge: add [provides.forge]"),
+            );
+        }
         let forge = raw.provides.forge.map(|forge| {
             if forge.hosts.get_ref().is_empty() {
                 report.at(
@@ -773,6 +906,78 @@ impl Manifest {
             let span = field.span();
             let field = field.into_inner();
             let name = key.get_ref().clone();
+            if name == PER_HOST {
+                report.at(
+                    key.span(),
+                    format!(
+                        "config key \"{PER_HOST}\" is reserved: diffui reads it for per-host values"
+                    ),
+                );
+            }
+            let kind = field.kind;
+            let values = field.values.unwrap_or_default();
+            match kind {
+                ConfigKind::Enum if values.is_empty() => report.at(
+                    span.clone(),
+                    format!("config \"{name}\": an enum lists its values = [\"a\", \"b\"]"),
+                ),
+                ConfigKind::Enum => {}
+                _ if !values.is_empty() => report.at(
+                    span.clone(),
+                    format!("config \"{name}\": only an enum has values"),
+                ),
+                _ => {}
+            }
+            let secret_only = field.page.is_some() || field.scopes.is_some() || field.env.is_some();
+            let secret = match kind {
+                ConfigKind::Secret => {
+                    if field.default.is_some() {
+                        report.at(
+                            span.clone(),
+                            format!("config \"{name}\": a secret has no default"),
+                        );
+                    }
+                    let env: Vec<(String, Vec<String>)> =
+                        field.env.unwrap_or_default().into_iter().collect();
+                    for (pattern, vars) in &env {
+                        if pattern != "*" && HostPattern::parse_claim(pattern).is_err() {
+                            report.at(
+                                span.clone(),
+                                format!(
+                                    "config \"{name}\": env \"{pattern}\" is not a host or \"*\""
+                                ),
+                            );
+                        }
+                        for var in vars {
+                            if !raw
+                                .permissions
+                                .env
+                                .iter()
+                                .any(|listed| listed.get_ref() == var)
+                            {
+                                report.at(
+                                    span.clone(),
+                                    format!("config \"{name}\": env {var} must be listed under [permissions] env"),
+                                );
+                            }
+                        }
+                    }
+                    Some(SecretField {
+                        page: field.page,
+                        scopes: field.scopes.unwrap_or_default(),
+                        env,
+                    })
+                }
+                _ => {
+                    if secret_only {
+                        report.at(
+                            span.clone(),
+                            format!("config \"{name}\": page, scopes and env are a secret's"),
+                        );
+                    }
+                    None
+                }
+            };
             if name == TOKEN_CMD {
                 report.at(
                     key.span(),
@@ -789,25 +994,30 @@ impl Manifest {
                     ),
                 );
             }
-            let default = field.default.map(toml_to_json);
-            if let Some(default) = &default
-                && !field.kind.admits(default)
+            let field = ConfigField {
+                key: name,
+                kind,
+                default: field.default.map(toml_to_json),
+                label: field.label,
+                hint: field.hint,
+                values,
+                per_host: field.per_host,
+                secret,
+            };
+            if let Some(default) = &field.default
+                && kind != ConfigKind::Secret
+                && !field.admits(default)
             {
                 report.at(
                     span,
                     format!(
-                        "config \"{name}\": the default must be {}",
-                        field.kind.noun()
+                        "config \"{}\": the default must be {}",
+                        field.key,
+                        field.noun()
                     ),
                 );
             }
-            config.push(ConfigField {
-                key: name,
-                kind: field.kind,
-                default,
-                label: field.label,
-                hint: field.hint,
-            });
+            config.push(field);
         }
 
         for argv in &raw.permissions.exec {
@@ -815,13 +1025,13 @@ impl Manifest {
                 let Some(key) = config_word(word) else {
                     continue;
                 };
-                let string = config
-                    .iter()
-                    .any(|field| field.key == key && field.kind == ConfigKind::String);
+                let string = config.iter().any(|field| {
+                    field.key == key && matches!(field.kind, ConfigKind::String | ConfigKind::Path)
+                });
                 if !string {
                     report.at(
                         argv.span(),
-                        format!("exec {word}: [config.schema] must declare {key} = {{ type = \"string\" }}"),
+                        format!("exec {word}: [config.schema] must declare {key} = {{ type = \"path\" }} (or \"string\")"),
                     );
                 }
             }
@@ -840,6 +1050,7 @@ impl Manifest {
             main,
             permissions: Permissions {
                 http,
+                forge_hosts: !forge_words.is_empty(),
                 exec: raw
                     .permissions
                     .exec
@@ -882,12 +1093,17 @@ impl Manifest {
             }
         }
         for (key, value) in user {
+            if key == PER_HOST {
+                let hosts = self.resolve_per_host(value, &mut problems);
+                config.insert(key.clone(), hosts.into());
+                continue;
+            }
             let value = toml_to_json(value.clone());
             match self.config.iter().find(|field| &field.key == key) {
-                Some(field) if !field.kind.admits(&value) => problems.push(format!(
+                Some(field) if !field.admits(&value) => problems.push(format!(
                     "[plugins.{}] {key} must be {}",
                     self.id,
-                    field.kind.noun()
+                    field.noun()
                 )),
                 _ => {
                     config.insert(key.clone(), value);
@@ -895,6 +1111,59 @@ impl Manifest {
             }
         }
         (config, problems)
+    }
+
+    /// `[plugins.<id>.per_host."<host>"]` tables: each value one a per-host
+    /// setting admits, by host (lowercase).
+    fn resolve_per_host(
+        &self,
+        table: &toml::Value,
+        problems: &mut Vec<String>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut hosts = serde_json::Map::new();
+        let Some(table) = table.as_table() else {
+            problems.push(format!(
+                "[plugins.{}] {PER_HOST} is a table of hosts, like [plugins.{}.{PER_HOST}.\"github.acme.com\"]",
+                self.id, self.id
+            ));
+            return hosts;
+        };
+        for (host, values) in table {
+            let Some(values) = values.as_table() else {
+                problems.push(format!(
+                    "[plugins.{}.{PER_HOST}.\"{host}\"] must be a table",
+                    self.id
+                ));
+                continue;
+            };
+            let mut kept = serde_json::Map::new();
+            for (key, value) in values {
+                let value = toml_to_json(value.clone());
+                match self.config.iter().find(|field| &field.key == key) {
+                    Some(field) if field.per_host && field.admits(&value) => {
+                        kept.insert(key.clone(), value);
+                    }
+                    Some(field) if field.per_host => problems.push(format!(
+                        "[plugins.{}.{PER_HOST}.\"{host}\"] {key} must be {}",
+                        self.id,
+                        field.noun()
+                    )),
+                    _ => problems.push(format!(
+                        "[plugins.{}.{PER_HOST}.\"{host}\"] {key} isn't a per-host setting of this plugin",
+                        self.id
+                    )),
+                }
+            }
+            hosts.insert(host.to_ascii_lowercase(), kept.into());
+        }
+        hosts
+    }
+
+    /// The `secret` setting `key`, if the schema declares one.
+    pub fn secret(&self, key: &str) -> Option<&ConfigField> {
+        self.config
+            .iter()
+            .find(|field| field.key == key && field.kind == ConfigKind::Secret)
     }
 }
 
@@ -1207,6 +1476,135 @@ limit = { type = "number", default = 50 }
         );
     }
 
+    const AUTHED: &str = r#"
+id = "hub"
+name = "Hub"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+http = ["api.hub.test", "{forge.hosts}"]
+exec = [["{config.program}"]]
+env = ["HUB_TOKEN", "HUB_ENTERPRISE_TOKEN"]
+
+[provides.forge]
+hosts = ["hub.test"]
+
+[config.schema]
+auth = { type = "enum", values = ["auto", "cli", "token"], default = "auto", per_host = true }
+program = { type = "path", default = "hub" }
+
+[config.schema.token]
+type = "secret"
+per_host = true
+page = "https://{host}/tokens/new?scopes={scopes}"
+scopes = ["repo", "read:org"]
+env = { "hub.test" = ["HUB_TOKEN"], "*" = ["HUB_ENTERPRISE_TOKEN"] }
+"#;
+
+    #[test]
+    fn enums_paths_and_per_host_secrets_read() {
+        let manifest = parse(AUTHED).unwrap();
+        assert!(manifest.permissions.forge_hosts);
+        assert_eq!(manifest.permissions.http.len(), 1);
+        let auth = &manifest.config[0];
+        assert_eq!((auth.kind, auth.per_host), (ConfigKind::Enum, true));
+        assert_eq!(auth.values, ["auto", "cli", "token"]);
+        let token = manifest.secret("token").unwrap();
+        let secret = token.secret.as_ref().unwrap();
+        assert_eq!(
+            secret.page_for("hub.acme.com").as_deref(),
+            Some("https://hub.acme.com/tokens/new?scopes=repo,read:org")
+        );
+        assert_eq!(secret.env_for("hub.test"), ["HUB_TOKEN"]);
+        assert_eq!(
+            secret.env_for("hub.acme.com:8443"),
+            ["HUB_ENTERPRISE_TOKEN"]
+        );
+        assert_eq!(
+            resolve_exec(
+                &manifest.permissions.exec,
+                &manifest.resolve_config(&toml::Table::new()).0
+            ),
+            [["hub"]]
+        );
+
+        let user: toml::Table = toml::from_str(
+            "auth = \"cli\"\ntoken = \"leaked\"\n[per_host.\"Hub.Acme.com\"]\nauth = \"token\"\nprogram = \"x\"\n[per_host.\"b.test\"]\nauth = \"sometimes\"\n",
+        )
+        .unwrap();
+        let (config, problems) = manifest.resolve_config(&user);
+        assert_eq!(config["auth"], "cli");
+        assert!(
+            config.get("token").is_none(),
+            "a secret never reaches config"
+        );
+        assert_eq!(config["per_host"]["hub.acme.com"]["auth"], "token");
+        assert_eq!(
+            problems,
+            [
+                "[plugins.hub.per_host.\"Hub.Acme.com\"] program isn't a per-host setting of this plugin",
+                "[plugins.hub.per_host.\"b.test\"] auth must be one of \"auto\", \"cli\", \"token\"",
+                "[plugins.hub] token must be set in Settings or with `diffui plugin auth`, not in config.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_and_enums_are_checked() {
+        let cases = [
+            (
+                "default = \"auto\", per_host",
+                "default = \"never\", per_host",
+                "the default must be one of",
+            ),
+            (
+                "values = [\"auto\", \"cli\", \"token\"], ",
+                "",
+                "an enum lists its values",
+            ),
+            (
+                "type = \"secret\"\n",
+                "type = \"secret\"\ndefault = \"x\"\n",
+                "a secret has no default",
+            ),
+            (
+                "env = [\"HUB_TOKEN\", \"HUB_ENTERPRISE_TOKEN\"]",
+                "env = [\"HUB_TOKEN\"]",
+                "env HUB_ENTERPRISE_TOKEN must be listed under [permissions] env",
+            ),
+            (
+                "program = { type = \"path\", default = \"hub\" }",
+                "program = { type = \"path\", default = \"hub\", scopes = [] }",
+                "page, scopes and env are a secret's",
+            ),
+            (
+                "program = { type = \"path\", default = \"hub\" }",
+                "program = { type = \"path\" }\nper_host = { type = \"string\" }",
+                "\"per_host\" is reserved",
+            ),
+        ];
+        for (from, to, problem) in cases {
+            assert!(AUTHED.contains(from), "{from}");
+            let problems = parse(&AUTHED.replace(from, to)).unwrap_err();
+            assert!(
+                problems.iter().any(|p| p.contains(problem)),
+                "{problem}: {problems:?}"
+            );
+        }
+        let no_forge = with(
+            "http = [\"codeberg.org\",",
+            "http = [\"{forge.hosts}\", \"codeberg.org\",",
+        )
+        .replace("forge = { hosts = [\"codeberg.org\"] }\n", "");
+        let problems = parse(&no_forge).unwrap_err();
+        assert!(
+            problems[0].contains("http {forge.hosts} is for a forge: add [provides.forge]"),
+            "{problems:?}"
+        );
+    }
+
     #[test]
     fn host_patterns_match_hosts_and_ports() {
         let exact = HostPattern::parse("Codeberg.org").unwrap();
@@ -1336,7 +1734,7 @@ limit = { type = "number", default = 50 }
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("must declare limit = { type = \"string\" }"))
+                .any(|p| p.contains("must declare limit = { type = \"path\" }"))
         );
     }
 }

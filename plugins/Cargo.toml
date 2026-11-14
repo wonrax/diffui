@@ -20,3 +20,13 @@ tracing = "0.1"
 # are checked by the platform's verifier (about 20 KB more), so a forge
 # behind a company CA is trusted the way the user's browser and git trust it.
 ureq = { version = "3", features = ["platform-verifier"] }
+
+# The secret store (`secrets.rs`): the account's home directory, to tell a
+# scratch HOME from the user's own.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Keychain, for a forge's token. Already built for the platform verifier
+# above, so it costs no build time; its passwords and item APIs add a few KB.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

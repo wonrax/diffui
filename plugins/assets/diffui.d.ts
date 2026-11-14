@@ -33,8 +33,27 @@
  *     menu = ["bookmark", "palette"]   # palette | revision | bookmark | file
  *     keys = ["cmd+shift+o"]
  *
- *     [config.schema]                  # defaults for `config`; the user overrides them under [plugins.<id>] in config.toml
+ *     [config.schema]                  # defaults for `config`; the user overrides them in Settings or under [plugins.<id>] in config.toml
  *     host = { type = "string", default = "codeberg.org", label = "Host" }
+ *
+ * A setting's `type` is "string", "boolean", "number", "enum", "path" or "secret", and Settings draws a control
+ * for each (Settings → Plugins → the plugin's gear):
+ *
+ *     auth = { type = "enum", values = ["auto", "cli", "token"], default = "auto", label = "Sign in with", per_host = true }
+ *     program = { type = "path", default = "gh", label = "The gh program" }   # a field with Browse; says when it isn't there
+ *
+ *     [config.schema.token]            # write-only: kept in the Keychain, never in config.toml
+ *     type = "secret"
+ *     per_host = true                  # one per host; `token` is what auth.token(host) reads
+ *     label = "Token"
+ *     page = "https://{host}/settings/tokens/new?scopes={scopes}&description=diffui"   # where to make one
+ *     scopes = ["repo"]                # what it needs, filled into {scopes} and shown beside the field
+ *     env = { "github.com" = ["GH_TOKEN"], "*" = ["GH_ENTERPRISE_TOKEN"] }   # variables that hold one, by host; each also under [permissions] env
+ *
+ * An "enum" is a segmented control, a "path" a field with Browse, a "secret" a field that never shows what it
+ * holds. `per_host = true` lets the user set a value per host, under `[plugins.<id>.per_host."<host>"]`; the
+ * script reads `config.per_host?.[host]?.auth ?? config.auth`. A per-host secret is set in the plugin's
+ * Account area, one row per host, and validated with the forge's `account` before it is kept.
  *
  * A forge can say more about itself, all of it optional, so diffui names it, opens its links and explains its
  * errors without asking the script:
@@ -61,6 +80,10 @@
  * A remote goes to the forge that claims its host, asking in this order: a plugin that replaces a bundled one,
  * the bundled ones, the rest. A plugin can't claim a host a bundled forge claims unless that forge is turned off
  * or replaced.
+ *
+ * A forge that talks to its hosts' APIs itself lists `"{forge.hosts}"` under `[permissions] http`: then every
+ * host it claims is reachable, the patterns, what `hosts()` answered, the user's `hosts` setting and the hosts it
+ * has a token for (GitHub Enterprise's `https://<host>/api/v3`).
  *
  * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
  * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
@@ -196,6 +219,20 @@ declare module "diffui" {
      *     }
      */
     diff?(pr: PrRef, options: { signal: AbortSignal }): DiffSource | Promise<DiffSource>;
+    /**
+     * Who the user is on `host`, and how this forge reaches it: for Settings' Account area. With `token`, check
+     * that one instead (one the user pasted, before diffui keeps it): ask the API who it belongs to and throw a
+     * `ForgeError` "auth" when the forge refuses it. Without, answer `{ method: null, login: null }` when
+     * nothing signs in to the host, rather than throwing.
+     */
+    account?(host: string, options: { token?: string }): Promise<Account>;
+  }
+
+  export interface Account {
+    /** What calls to the host go through: the forge's command-line tool, a token, or nothing. */
+    method: "cli" | "token" | null;
+    /** The user's name on the forge. */
+    login: string | null;
   }
 
   /**
@@ -633,18 +670,26 @@ declare module "diffui" {
     read(path: string, options?: { signal?: AbortSignal }): Promise<string>;
   }
 
-  /** Credentials. diffui stores none. */
+  /** Credentials. Scripts read them; only the user (Settings, `diffui plugin auth`) stores one. */
   export const auth: Auth;
 
   export interface Auth {
     /**
-     * A token for `host`, which must be listed under `[permissions] http`. It comes from the user's
-     * `token_cmd` for this plugin when set (`[plugins.<id>] token_cmd = ["pass", "show", "{host}"]` in
-     * config.toml), otherwise from git's credential helpers (`git credential fill`). It never prompts:
-     * with nothing stored it rejects with a message telling the user how to store one. Cached for five
-     * minutes.
+     * A token for `host`, which must be reachable (`[permissions] http`, or a host the forge claims with
+     * `"{forge.hosts}"`). In order: a variable the `token` secret's `env` names for the host (`GH_TOKEN`), the
+     * token the user stored for the host (Settings, or `diffui plugin auth <id> --host <host> --token-stdin`),
+     * the user's `token_cmd` (`[plugins.<id>] token_cmd = ["pass", "show", "{host}"]` in config.toml), and
+     * git's credential helpers (`git credential fill`), unless `git` is false. It never prompts: with none it
+     * rejects ("NotFoundError" when only git was left out). Cached for five minutes.
      */
-    token(host: string): Promise<string>;
+    token(host: string, options?: { git?: boolean }): Promise<string>;
+    /**
+     * The `secret` setting `key` of `[config.schema]`: from its `env` variables, else the store; `null` when
+     * neither has it. A per-host secret takes `{ host }`.
+     */
+    secret(key: string, options?: { host?: string }): Promise<string | null>;
+    /** The hosts the user stored a token for, for this plugin: a forge's `hosts()` adds them. */
+    hosts(): Promise<string[]>;
   }
 
   /** A small JSON store that belongs to this plugin and survives restarts. At most 1 MB in total. */
@@ -659,8 +704,10 @@ declare module "diffui" {
   }
 
   /**
-   * The plugin's settings: the defaults from `[config.schema]` in `plugin.toml`, under whatever the user
-   * wrote in `[plugins.<id>]` in config.toml. Frozen; read once when the plugin loads.
+   * The plugin's settings: the defaults from `[config.schema]` in `plugin.toml`, under what the user set in
+   * Settings, under `[plugins.<id>]` in config.toml (which wins). Per-host values are under
+   * `config.per_host[host]`. Secrets aren't here: read them with `auth`. Frozen; read when the plugin loads,
+   * and the plugin reloads when a setting changes.
    */
   export const config: Readonly<Record<string, any>>;
 

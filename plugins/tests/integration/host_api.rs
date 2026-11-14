@@ -1,6 +1,7 @@
 //! The host functions a script calls: what the manifest lets through, what
 //! reaches the app, and the web-style globals.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diffui_plugins::protocol::{
@@ -476,6 +477,87 @@ fn a_token_comes_from_token_cmd_and_is_asked_for_once() {
     assert_eq!(
         std::fs::read_to_string(plugin.dir.join("asked.log")).unwrap(),
         "asked\n"
+    );
+}
+
+/// A per-host token the user stored is what `auth.token` answers, before
+/// `token_cmd`; `{forge.hosts}` makes the hosts the app says the forge
+/// claims reachable; `auth.secret` and `auth.hosts` read the store.
+#[test]
+fn stored_tokens_and_the_hosts_a_forge_claims() {
+    use diffui_plugins::secrets::{FileStore, SecretStore};
+    let dir = scratch("secrets");
+    let store: Arc<dyn SecretStore> = Arc::new(FileStore::new(dir.join("secrets.json")));
+    store.set("t@forge.test", "stored-tok").unwrap();
+    store.set("t@git.acme.test", "acme-tok").unwrap();
+    store.set("t.signing", "shh").unwrap();
+    let server = Server::start(|request| {
+        let said = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        Response::text(200, &said)
+    });
+    let plugin = probe(
+        "[permissions]\nhttp = [\"{forge.hosts}\"]\n\n[config.schema]\nsigning = { type = \"secret\" }\n\n[config.schema.token]\ntype = \"secret\"\nper_host = true\n",
+        &format!(
+            r#"
+  token: () => auth.token("forge.test"),
+  acme: () => auth.token("git.acme.test"),
+  none: () => auth.token("other.forge.test", {{ git: false }}),
+  secret: () => auth.secret("signing"),
+  hosts: () => auth.hosts(),
+  fetch: async () => (await http.fetch("http://{host}/", {{ headers: {{ authorization: "token " + await auth.token("{host}") }} }})).text(),
+"#,
+            host = server.host
+        ),
+    )
+    .config("token_cmd = [\"echo\", \"from-cmd\"]\n")
+    .secrets(store.clone())
+    .spawn();
+    plugin.loaded();
+    assert_eq!(plugin.case("token").unwrap(), json!("stored-tok"));
+    assert_eq!(plugin.case("secret").unwrap(), json!("shh"));
+    assert_eq!(
+        plugin.case("hosts").unwrap(),
+        json!(["forge.test", "git.acme.test"])
+    );
+    let refused = threw(plugin.case("acme"));
+    assert_eq!(refused.name, "PermissionError", "{}", refused.message);
+    let refused = threw(plugin.case("fetch"));
+    assert_eq!(refused.name, "PermissionError", "{}", refused.message);
+
+    // The app tells the plugin what else its forge claims.
+    plugin.plugin.set_forge_hosts(vec![
+        diffui_plugins::HostPattern::parse_claim("git.acme.test").unwrap(),
+        diffui_plugins::HostPattern::parse_claim(&server.host).unwrap(),
+    ]);
+    assert_eq!(plugin.case("acme").unwrap(), json!("acme-tok"));
+    assert_eq!(plugin.case("fetch").unwrap(), json!("token from-cmd"));
+    store.delete("t@forge.test").unwrap();
+    assert_eq!(
+        plugin.case("token").unwrap(),
+        json!("stored-tok"),
+        "cached for five minutes"
+    );
+}
+
+/// Without a store, and with git's helpers left out, there is no token.
+#[test]
+fn no_store_no_token() {
+    let plugin = probe(
+        "[permissions]\nhttp = [\"forge.test\"]\n",
+        "none: () => auth.token(\"forge.test\", { git: false }),",
+    )
+    .spawn();
+    plugin.loaded();
+    let error = threw(plugin.case("none"));
+    assert_eq!(error.name, "NotFoundError");
+    assert_eq!(
+        error.message,
+        "No token for forge.test: none is stored for it"
     );
 }
 

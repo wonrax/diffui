@@ -27,8 +27,9 @@ use crate::host::{
     Host, HostError, LogLevel, LogLine, PluginError, PluginEvent, PluginState, Registration, Reply,
 };
 use crate::js::{Fault, Js, JsError, MainState, StartError, Turn};
-use crate::manifest::{JjAccess, Manifest};
+use crate::manifest::{HostPattern, JjAccess, Manifest};
 use crate::protocol::{HostCall, PluginCall, RepoCall};
+use crate::secrets::{self, SecretStore};
 use crate::{Limits, Options};
 
 /// How many `http`, `exec` and `auth` calls of one plugin run at once; more
@@ -188,6 +189,9 @@ pub(crate) struct Actor {
     kv: Kv,
     /// Tokens `auth.token` fetched, by host, with when. Workers fill it.
     tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    secrets: Option<Arc<dyn SecretStore>>,
+    /// The hosts the app says the forge claims beyond its manifest's.
+    forge_hosts: Arc<Mutex<Vec<HostPattern>>>,
 }
 
 impl Actor {
@@ -198,6 +202,7 @@ impl Actor {
         status: Arc<Mutex<Status>>,
         inbox: Receiver<ToActor>,
         own: Sender<ToActor>,
+        forge_hosts: Arc<Mutex<Vec<HostPattern>>>,
     ) -> Self {
         let (config, problems) = manifest.resolve_config(&options.config);
         let actor = Self {
@@ -220,11 +225,27 @@ impl Actor {
             queued: VecDeque::new(),
             agent: http::agent(),
             tokens: Arc::default(),
+            secrets: options.secrets,
+            forge_hosts,
         };
         for problem in problems {
             actor.log(LogLevel::Warn, problem);
         }
         actor
+    }
+
+    /// The hosts `http.fetch` and `auth.token` may use now: `[permissions]
+    /// http`, and with `{forge.hosts}` every host the forge claims.
+    fn reach(&self) -> Vec<HostPattern> {
+        let permissions = &self.manifest.permissions;
+        let mut hosts = permissions.http.clone();
+        if permissions.forge_hosts {
+            if let Some(forge) = &self.manifest.forge {
+                hosts.extend(forge.hosts.iter().cloned());
+            }
+            hosts.extend(lock(&self.forge_hosts).iter().cloned());
+        }
+        hosts
     }
 
     pub(crate) fn run(mut self) {
@@ -728,6 +749,16 @@ impl Actor {
         #[derive(Deserialize)]
         struct TokenFor {
             host: String,
+            #[serde(default = "yes")]
+            git: bool,
+        }
+        fn yes() -> bool {
+            true
+        }
+        #[derive(Deserialize)]
+        struct SecretFor {
+            key: String,
+            host: Option<String>,
         }
         #[derive(Deserialize)]
         struct FilePath {
@@ -747,14 +778,15 @@ impl Actor {
         match op {
             "http.fetch" if args.get("stream").and_then(Value::as_bool) == Some(true) => {
                 let request: FetchRequest = read(op, args)?;
-                http::check(&request.url, &manifest.permissions.http)?;
+                let reach = self.reach();
+                http::check(&request.url, &reach)?;
                 let agent = self.agent.clone();
                 let timeout = limits.http_timeout;
                 self.open_stream(id, move |reads, started, answer| {
                     http::fetch_stream(
                         &agent,
                         request,
-                        &manifest.permissions.http,
+                        &reach,
                         timeout,
                         reads,
                         |head| {
@@ -836,7 +868,8 @@ impl Actor {
             }
             "http.fetch" => {
                 let request: FetchRequest = read(op, args)?;
-                http::check(&request.url, &manifest.permissions.http)?;
+                let reach = self.reach();
+                http::check(&request.url, &reach)?;
                 let agent = self.agent.clone();
                 self.spawn(
                     id,
@@ -847,7 +880,7 @@ impl Actor {
                         http::fetch(
                             &agent,
                             request,
-                            &manifest.permissions.http,
+                            &reach,
                             limits.http_timeout,
                             limits.max_response,
                         )
@@ -892,32 +925,108 @@ impl Actor {
                 );
             }
             "auth.token" => {
-                let TokenFor { host } = read(op, args)?;
-                auth::check(&host, &manifest.permissions.http)?;
+                let TokenFor { host, git } = read(op, args)?;
+                auth::check(&host, &self.reach())?;
+                let cached = format!("{host}\n{git}");
                 let fresh = lock(&self.tokens)
-                    .get(&host)
+                    .get(&cached)
                     .filter(|(_, fetched)| fetched.elapsed() < TOKEN_TTL)
                     .map(|(token, _)| token.clone());
                 match fresh {
                     Some(token) => self.answer(id, Ok(json!(token))),
                     None => {
                         let token_cmd = auth::token_cmd(&self.config)?;
+                        let sources = auth::Sources {
+                            env: manifest
+                                .secret("token")
+                                .and_then(|field| field.secret.as_ref())
+                                .map(|secret| secret.env_for(&host).to_vec())
+                                .unwrap_or_default(),
+                            stored: self.secrets.clone().map(|store| {
+                                (store, secrets::account(&manifest.id, "token", Some(&host)))
+                            }),
+                            // A scratch store means a scratch home: git's
+                            // helpers would still reach the real Keychain.
+                            git: git && self.secrets.as_ref().is_some_and(|store| store.is_real()),
+                        };
                         let tokens = self.tokens.clone();
                         self.spawn(
                             id,
                             Box::new(move || {
                                 let token = auth::token(
                                     &host,
+                                    &sources,
                                     token_cmd.as_deref(),
                                     &manifest.dir,
                                     &cancel,
                                 )?;
-                                lock(&tokens).insert(host, (token.clone(), Instant::now()));
+                                lock(&tokens).insert(cached, (token.clone(), Instant::now()));
                                 Ok(json!(token))
                             }),
                         );
                     }
                 }
+            }
+            "auth.secret" => {
+                let SecretFor { key, host } = read(op, args)?;
+                let Some(field) = manifest.secret(&key) else {
+                    return Err(HostError::new(
+                        "TypeError",
+                        format!("auth.secret: [config.schema] has no secret \"{key}\""),
+                    ));
+                };
+                match (&host, field.per_host) {
+                    (Some(host), true) => auth::check(host, &self.reach())?,
+                    (None, false) => {}
+                    (None, true) => {
+                        return Err(HostError::new(
+                            "TypeError",
+                            format!("auth.secret: \"{key}\" is per host: pass {{ host }}"),
+                        ));
+                    }
+                    (Some(_), false) => {
+                        return Err(HostError::new(
+                            "TypeError",
+                            format!("auth.secret: \"{key}\" isn't per host"),
+                        ));
+                    }
+                }
+                let env = field
+                    .secret
+                    .as_ref()
+                    .map(|secret| secret.env_for(host.as_deref().unwrap_or("")).to_vec())
+                    .unwrap_or_default();
+                let store = self.secrets.clone();
+                let account = secrets::account(&manifest.id, &key, host.as_deref());
+                self.spawn(
+                    id,
+                    Box::new(move || {
+                        if let Some(value) = auth::from_env(&env) {
+                            return Ok(json!(value));
+                        }
+                        let Some(store) = store else {
+                            return Ok(Value::Null);
+                        };
+                        store
+                            .get(&account)
+                            .map(|value| json!(value))
+                            .map_err(|error| HostError::new("Error", error))
+                    }),
+                );
+            }
+            "auth.hosts" => {
+                let store = self.secrets.clone();
+                let plugin = manifest.id.clone();
+                self.spawn(
+                    id,
+                    Box::new(move || {
+                        Ok(json!(
+                            store
+                                .map(|store| secrets::token_hosts(&*store, &plugin))
+                                .unwrap_or_default()
+                        ))
+                    }),
+                );
             }
             "kv.get" => {
                 let result = self.kv.get(&read::<Key>(op, args)?.key);

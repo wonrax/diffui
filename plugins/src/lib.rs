@@ -26,6 +26,7 @@ mod js;
 mod manifest;
 mod memory;
 pub mod protocol;
+pub mod secrets;
 mod typescript;
 
 use std::path::PathBuf;
@@ -42,8 +43,9 @@ pub use host::{
 };
 pub use js::{JsError, ThrownForgeError};
 pub use manifest::{
-    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, ForgeClaim, ForgeTerm, HOSTS,
-    HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, Permissions,
+    API_VERSION, CommandDecl, ConfigField, ConfigKind, Diagnostic, FORGE_HOSTS, ForgeClaim,
+    ForgeTerm, HOSTS, HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace, PER_HOST,
+    Permissions, SecretField,
 };
 use protocol::PluginCall;
 
@@ -59,13 +61,16 @@ pub const TYPES: &str = include_str!("../assets/diffui.d.ts");
 /// What a plugin is started with, beyond its manifest.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// The user's `[plugins.<id>]` table from config.toml. The script sees it
-    /// as `config`, over the manifest's schema defaults; its `token_cmd`, an
-    /// argv, answers `auth.token`.
+    /// The user's `[plugins.<id>]` table. The script sees it as `config`,
+    /// over the manifest's schema defaults; its `token_cmd`, an argv,
+    /// answers `auth.token`.
     pub config: toml::Table,
     /// Where `kv` keeps this plugin's `<id>.json`.
     pub data_dir: PathBuf,
     pub limits: Limits,
+    /// Where its `secret` settings are kept ([`secrets::store`] in the app).
+    /// `None`: it has none, and `auth.token` asks no git credential helper.
+    pub secrets: Option<Arc<dyn secrets::SecretStore>>,
 }
 
 /// The bounds a plugin runs inside.
@@ -112,6 +117,9 @@ pub struct Plugin {
     status: Arc<Mutex<Status>>,
     to: Sender<ToActor>,
     next_call: AtomicU64,
+    /// The hosts it claims beyond its manifest's, which `{forge.hosts}`
+    /// lets it reach. Shared with its thread.
+    forge_hosts: Arc<Mutex<Vec<HostPattern>>>,
 }
 
 /// One call into a plugin, for [`Plugin::abort`].
@@ -128,11 +136,13 @@ impl Plugin {
             log: Default::default(),
         }));
         let (to, inbox) = mpsc::channel();
+        let forge_hosts = Arc::new(Mutex::new(Vec::new()));
         // Room for the script's stack limit plus the engine's own frames.
         let stack = options.limits.stack + 1024 * 1024;
         let actor = {
             let (manifest, status, own) = (manifest.clone(), status.clone(), to.clone());
-            move || Actor::new(manifest, options, host, status, inbox, own).run()
+            let reach = forge_hosts.clone();
+            move || Actor::new(manifest, options, host, status, inbox, own, reach).run()
         };
         let spawned = std::thread::Builder::new()
             .name(format!("plugin-{}", manifest.id))
@@ -146,7 +156,16 @@ impl Plugin {
             status,
             to,
             next_call: AtomicU64::new(1),
+            forge_hosts,
         }
+    }
+
+    /// Every host the plugin claims as a forge beyond its manifest's
+    /// patterns (its `hosts()` answer, the user's `hosts`, the hosts it has
+    /// a token for). With `{forge.hosts}` under `[permissions] http` it may
+    /// reach them and ask `auth.token` for them.
+    pub fn set_forge_hosts(&self, hosts: Vec<HostPattern>) {
+        *lock(&self.forge_hosts) = hosts;
     }
 
     pub fn manifest(&self) -> &Manifest {

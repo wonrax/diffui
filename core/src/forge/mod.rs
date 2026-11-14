@@ -66,6 +66,8 @@ pub struct ForgeSpec {
     pub pull_request_path: Option<String>,
     /// An owner may be several segments (GitLab's groups).
     pub subgroups: bool,
+    /// It also signs in with a token the user adds in Settings.
+    pub tokens: bool,
 }
 
 impl std::ops::Deref for ForgeKind {
@@ -374,6 +376,17 @@ impl fmt::Display for ForgeError {
             Self::MissingCli { kind } if kind.cli().is_empty() => {
                 write!(f, "{}'s command-line tool wasn't found.", kind.name())
             }
+            Self::MissingCli { kind } if kind.tokens => {
+                let cli = kind.cli();
+                write!(
+                    f,
+                    "The {} CLI (`{cli}`) wasn't found. Add a token in Settings, or install it \
+                     (`brew install {cli}`) and run `{cli} auth login`. An app opened from Finder or \
+                     the Dock only sees the system PATH, so a {cli} in /opt/homebrew/bin is \
+                     invisible to it: point Settings at it, or launch diffui from a terminal.",
+                    kind.name()
+                )
+            }
             Self::MissingCli { kind } => {
                 let cli = kind.cli();
                 write!(
@@ -391,6 +404,13 @@ impl fmt::Display for ForgeError {
                 "diffui isn't signed in to {} on {host}. Sign in, then try again.",
                 kind.name()
             ),
+            Self::NotAuthenticated { kind, host } if kind.tokens => write!(
+                f,
+                "diffui isn't signed in to {} on {host}. Add a token in Settings, or run \
+                 `{} auth login --hostname {host}` in a terminal, then try again.",
+                kind.name(),
+                kind.cli()
+            ),
             Self::NotAuthenticated { kind, host } => write!(
                 f,
                 "{} isn't signed in to {host}. Run `{} auth login --hostname {host}` in a \
@@ -398,7 +418,7 @@ impl fmt::Display for ForgeError {
                 kind.cli(),
                 kind.cli()
             ),
-            Self::NotFound { kind, host, what } if kind.cli().is_empty() => write!(
+            Self::NotFound { kind, host, what } if kind.cli().is_empty() || kind.tokens => write!(
                 f,
                 "{what} wasn't found on {host}, or the account diffui uses there can't see it."
             ),
@@ -868,6 +888,7 @@ pub(crate) mod fixtures {
             host_env: Some("GH_HOST".into()),
             pull_request_path: Some("{owner}/{name}/pull/{number}".into()),
             subgroups: false,
+            tokens: true,
         })
     }
 
@@ -883,6 +904,7 @@ pub(crate) mod fixtures {
             host_env: Some("GITLAB_HOST".into()),
             pull_request_path: Some("{owner}/{name}/-/merge_requests/{number}".into()),
             subgroups: true,
+            tokens: true,
         })
     }
 }
@@ -1031,5 +1053,19 @@ mod tests {
             auth.contains("gh auth login --hostname github.acme.com"),
             "{auth}"
         );
+        assert!(auth.contains("Add a token in Settings"), "{auth}");
+        assert!(missing.contains("Add a token in Settings"), "{missing}");
+        let cli_only = ForgeKind::new(ForgeSpec {
+            id: "cli-only".into(),
+            cli: "hub".into(),
+            tokens: false,
+            ..ForgeSpec::clone(&fixtures::github())
+        });
+        let auth = ForgeError::NotAuthenticated {
+            kind: cli_only,
+            host: "h.test".to_owned(),
+        }
+        .to_string();
+        assert!(!auth.contains("token"), "{auth}");
     }
 }

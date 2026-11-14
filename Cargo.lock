@@ -1839,7 +1839,9 @@ dependencies = [
 name = "diffui-plugins"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rquickjs",
+ "security-framework",
  "serde",
  "serde_json",
  "swc_next_type_strip",

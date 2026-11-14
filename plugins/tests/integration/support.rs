@@ -146,6 +146,7 @@ pub struct Setup<'a> {
     pub files: Vec<(&'a str, String)>,
     pub config: String,
     pub limits: Limits,
+    pub secrets: Option<Arc<dyn diffui_plugins::secrets::SecretStore>>,
 }
 
 impl<'a> Setup<'a> {
@@ -168,7 +169,14 @@ impl<'a> Setup<'a> {
             files: vec![("main.js", main.to_string())],
             config: String::new(),
             limits: Limits::default(),
+            secrets: None,
         }
+    }
+
+    /// Keep its secrets in `store`.
+    pub fn secrets(mut self, store: Arc<dyn diffui_plugins::secrets::SecretStore>) -> Self {
+        self.secrets = Some(store);
+        self
     }
 
     pub fn file(mut self, name: &'a str, text: &str) -> Self {
@@ -236,6 +244,7 @@ impl<'a> Setup<'a> {
             config: toml::from_str(&self.config).unwrap(),
             data_dir: root.join("data"),
             limits: self.limits,
+            secrets: self.secrets.clone(),
         };
         TestPlugin {
             plugin: Plugin::spawn(manifest, options, host.clone()),

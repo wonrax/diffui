@@ -1,10 +1,14 @@
 //! `auth.token`: a credential for a host the plugin may talk to.
 //!
-//! diffui keeps no token store. The user's `[plugins.<id>] token_cmd` argv
-//! answers when set; otherwise git's credential helpers do, with every way
-//! of prompting turned off: this runs on a worker thread nobody is watching.
+//! In order: an environment variable the plugin's `token` secret names for
+//! the host (`GH_TOKEN`, as the forge's CLI reads it), the token the user
+//! stored for the host (the secret store, see [`crate::secrets`]), the
+//! user's `[plugins.<id>] token_cmd` argv, and last git's credential
+//! helpers, with every way of prompting turned off: this runs on a worker
+//! thread nobody is watching.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -13,6 +17,7 @@ use serde_json::{Map, Value};
 use super::exec::{self, Run};
 use crate::host::HostError;
 use crate::manifest::{HostPattern, TOKEN_CMD};
+use crate::secrets::SecretStore;
 
 /// A credential helper is local; one that hangs is asking for something.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,14 +89,48 @@ fn run(
     exec::run(run, cancel, |_| {})
 }
 
+/// Where `auth.token` may look for one host's token, besides `token_cmd`.
+pub(crate) struct Sources {
+    /// The variables to read, in order.
+    pub env: Vec<String>,
+    /// The store, and the account the host's token is under there.
+    pub stored: Option<(Arc<dyn SecretStore>, String)>,
+    /// Ask git's credential helpers when nothing else has one.
+    pub git: bool,
+}
+
+/// The first of `vars` that is set and not empty.
+pub(crate) fn from_env(vars: &[String]) -> Option<String> {
+    vars.iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
 /// Ask for `host`'s token. `{host}` in a `token_cmd` word is replaced.
 pub(crate) fn token(
     host: &str,
+    sources: &Sources,
     token_cmd: Option<&[String]>,
     cwd: &Path,
     cancel: &AtomicBool,
 ) -> Result<String, HostError> {
+    if let Some(token) = from_env(&sources.env) {
+        return Ok(token);
+    }
+    if let Some((store, account)) = &sources.stored {
+        let stored = store
+            .get(account)
+            .map_err(|error| HostError::new("Error", format!("No token for {host}: {error}")))?;
+        if let Some(token) = stored.filter(|token| !token.trim().is_empty()) {
+            return Ok(token.trim().to_string());
+        }
+    }
     match token_cmd {
+        None if !sources.git => Err(HostError::new(
+            "NotFoundError",
+            format!("No token for {host}: none is stored for it"),
+        )),
         Some(argv) => {
             let argv: Vec<String> = argv
                 .iter()
@@ -178,8 +217,14 @@ mod tests {
             serde_json::from_str(r#"{ "token_cmd": ["sh", "-c", "echo tok-for-$0", "{host}"] }"#)
                 .unwrap();
         let argv = token_cmd(&config).unwrap().unwrap();
+        let none = Sources {
+            env: Vec::new(),
+            stored: None,
+            git: true,
+        };
         let token = token(
             "codeberg.org",
+            &none,
             Some(&argv),
             Path::new("/"),
             &AtomicBool::new(false),
@@ -190,6 +235,7 @@ mod tests {
         let failing = ["sh", "-c", "echo locked >&2; exit 1"].map(String::from);
         let error = super::token(
             "codeberg.org",
+            &none,
             Some(&failing),
             Path::new("/"),
             &AtomicBool::new(false),
@@ -240,6 +286,40 @@ mod tests {
             "{}",
             error.message
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The variable wins over the stored token, which wins over token_cmd;
+    /// with neither and git's helpers off, it is a NotFoundError.
+    #[test]
+    fn the_env_then_the_store_then_token_cmd() {
+        let dir = std::env::temp_dir().join(format!("diffui-auth-order-{}", std::process::id()));
+        let store: Arc<dyn SecretStore> =
+            Arc::new(crate::secrets::FileStore::new(dir.join("secrets.json")));
+        store.set("forge@forge.test", "stored").unwrap();
+        let cancel = AtomicBool::new(false);
+        let var = format!("DIFFUI_TEST_TOKEN_{}", std::process::id());
+        let sources = |stored: bool| Sources {
+            env: vec![var.clone()],
+            stored: stored.then(|| (store.clone(), "forge@forge.test".to_string())),
+            git: false,
+        };
+        let cmd = ["echo", "from-cmd"].map(String::from);
+        let ask = |sources: &Sources, cmd: Option<&[String]>| {
+            token("forge.test", sources, cmd, Path::new("/"), &cancel)
+        };
+        assert_eq!(ask(&sources(true), Some(&cmd)).unwrap(), "stored");
+        assert_eq!(ask(&sources(false), Some(&cmd)).unwrap(), "from-cmd");
+        let error = ask(&sources(false), None).unwrap_err();
+        assert_eq!(error.name, "NotFoundError");
+        assert_eq!(
+            error.message,
+            "No token for forge.test: none is stored for it"
+        );
+        // SAFETY: the variable is this test's own.
+        unsafe { std::env::set_var(&var, "from-env") };
+        assert_eq!(ask(&sources(true), Some(&cmd)).unwrap(), "from-env");
+        unsafe { std::env::remove_var(&var) };
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

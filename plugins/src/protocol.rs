@@ -238,6 +238,39 @@ pub enum ForgeCall {
     /// The whole pull request's diff. Streams [`DiffPart`]s through the
     /// call's parts, then replies `null`.
     Diff { pr: PrRef },
+    /// Who the user is on `host` and how the forge reaches it, or, with
+    /// `token`, who that token belongs to. Reply: [`Account`].
+    Account {
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<Secret>,
+    },
+}
+
+/// A token on its way to the script: never printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// How a forge reaches a host, and as whom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// `cli`, `token`, or `None` when nothing signs in to the host.
+    pub method: Option<AccountMethod>,
+    pub login: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountMethod {
+    Cli,
+    Token,
 }
 
 impl ForgeCall {
@@ -253,6 +286,7 @@ impl ForgeCall {
             ForgeCall::Commits { .. } => "commits",
             ForgeCall::CommitDiff { .. } => "commitDiff",
             ForgeCall::Diff { .. } => "diff",
+            ForgeCall::Account { .. } => "account",
         }
     }
 
@@ -265,7 +299,7 @@ impl ForgeCall {
 
 /// The provider methods a script can register, in the order the host lists
 /// them.
-pub const FORGE_METHODS: [&str; 9] = [
+pub const FORGE_METHODS: [&str; 10] = [
     "pullRequests",
     "checks",
     "createPullRequest",
@@ -275,6 +309,7 @@ pub const FORGE_METHODS: [&str; 9] = [
     "commits",
     "commitDiff",
     "diff",
+    "account",
 ];
 
 /// The methods a pull request's tab needs, all of them.

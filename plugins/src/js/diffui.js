@@ -752,8 +752,16 @@ export class ForgeError extends Error {
 }
 
 export const auth = freezeDeep({
-  token(host) {
-    return call("auth.token", { host: String(host) });
+  token(host, options = {}) {
+    return call("auth.token", { host: String(host), git: options.git !== false });
+  },
+  async secret(key, options = {}) {
+    const args = { key: String(key) };
+    if (options.host != null) args.host = String(options.host);
+    return (await call("auth.secret", args)) ?? null;
+  },
+  hosts() {
+    return call("auth.hosts", {});
   },
 });
 
@@ -868,6 +876,10 @@ async function askForge(id, repo, request, signal) {
       return forgeProvider.updatePullRequest(repo, request.number, request.patch);
     case "hosts":
       return forgeProvider.hosts();
+    case "account": {
+      const options = request.token == null ? {} : { token: request.token };
+      return forgeProvider.account(request.host, Object.freeze(options));
+    }
     case "view":
       return forgeProvider.view(freezePr(request.pr));
     case "commits":
