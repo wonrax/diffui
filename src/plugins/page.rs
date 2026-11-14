@@ -42,6 +42,8 @@ pub(crate) struct PluginPage {
     /// Tokens being checked, by host, and why one was refused.
     validating: HashSet<String>,
     rejected: HashMap<String, String>,
+    /// The host whose removal waits on a yes, because it deletes a token.
+    removing: Option<String>,
 }
 
 impl PluginPage {
@@ -50,6 +52,12 @@ impl PluginPage {
     #[cfg(test)]
     pub(crate) fn settled(&self) -> bool {
         self.validating.is_empty() && !self.accounts.values().any(|check| *check == Check::Asking)
+    }
+
+    /// The host whose removal is waiting on a yes.
+    #[cfg(test)]
+    pub(crate) fn removing(&self) -> Option<&str> {
+        self.removing.as_deref()
     }
 
     /// Who `host`'s check said the user is.
@@ -95,6 +103,11 @@ pub(crate) enum PageAction {
     TokenPage { host: String },
     /// Add the typed host to the forge's `hosts` setting.
     AddHost,
+    /// Remove a host: from `hosts`, its per-host settings and its secrets.
+    /// Unconfirmed, a host with a stored secret asks first.
+    RemoveHost { host: String, confirmed: bool },
+    /// Keep the host whose removal was asked about.
+    KeepHost,
 }
 
 /// A field's id: the input widget's ids are static, so each distinct name
@@ -117,18 +130,32 @@ pub(super) fn draft_id(key: &str, host: Option<&str>) -> &'static str {
     }
 }
 
-const NEW_HOST: &str = "plugin-page-new-host";
+pub(super) const NEW_HOST: &str = "plugin-page-new-host";
+
+/// `host`'s table under `per_host` in a `[plugins.<id>]` table.
+fn lookup_host<'a>(table: &'a toml::Table, host: &str) -> Option<&'a toml::Table> {
+    table
+        .get(PER_HOST)?
+        .as_table()?
+        .get(&host.to_ascii_lowercase())?
+        .as_table()
+}
+
+/// The store's accounts for `host`'s per-host secrets of `id`.
+fn host_secrets(manifest: &Manifest, id: &str, host: &str) -> Vec<String> {
+    manifest
+        .config
+        .iter()
+        .filter(|field| field.kind == ConfigKind::Secret && field.per_host)
+        .map(|field| secrets::account(id, &field.key, Some(host)))
+        .collect()
+}
 
 /// Where a setting's value lives in a `[plugins.<id>]` table.
 fn lookup<'a>(table: &'a toml::Table, key: &str, host: Option<&str>) -> Option<&'a toml::Value> {
     match host {
         None => table.get(key),
-        Some(host) => table
-            .get(PER_HOST)?
-            .as_table()?
-            .get(&host.to_ascii_lowercase())?
-            .as_table()?
-            .get(key),
+        Some(host) => lookup_host(table, host)?.get(key),
     }
 }
 
@@ -225,7 +252,7 @@ impl Diffui {
     /// The hosts `id`'s page has a row for: the forge's default host, the
     /// concrete hosts it claims beyond its patterns, the ones with a token
     /// or per-host settings, and any the page was opened for.
-    fn page_hosts(&self, id: &str) -> Vec<String> {
+    pub(super) fn page_hosts(&self, id: &str) -> Vec<String> {
         let Some(found) = self.plugins.get(id) else {
             return Vec::new();
         };
@@ -271,6 +298,7 @@ impl Diffui {
                     stored: stored.into_iter().collect(),
                     validating: HashSet::new(),
                     rejected: HashMap::new(),
+                    removing: None,
                 });
                 self.check_page_accounts(&id);
             }
@@ -388,7 +416,151 @@ impl Diffui {
                 }
                 self.set_plugin_setting(diffui_plugins::HOSTS, None, Some(hosts.into()));
             }
+            PageAction::RemoveHost { host, confirmed } => {
+                let Some((page, manifest)) = self.page_manifest() else {
+                    return;
+                };
+                let id = page.id.clone();
+                let stored = host_secrets(&manifest, &id, &host)
+                    .into_iter()
+                    .any(|account| page.stored.contains(&account));
+                if stored && !confirmed {
+                    if let Some(page) = self.plugins.page.as_mut() {
+                        page.removing = Some(host);
+                    }
+                    return;
+                }
+                self.remove_page_host(&id, &manifest, &host);
+            }
+            PageAction::KeepHost => {
+                if let Some(page) = self.plugins.page.as_mut() {
+                    page.removing = None;
+                }
+            }
         }
+    }
+
+    /// Take `host` off `id`'s page: out of settings.toml's `hosts` and
+    /// `per_host`, its secrets out of the store. What config.toml or the
+    /// forge's own CLI lists stays, and a toast says why.
+    fn remove_page_host(&mut self, id: &str, manifest: &Manifest, host: &str) {
+        let lower = host.to_ascii_lowercase();
+        let mut record = self
+            .config_files
+            .plugins
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let mut changed = false;
+        if let Some(hosts) = record
+            .config
+            .get_mut(diffui_plugins::HOSTS)
+            .and_then(toml::Value::as_array_mut)
+        {
+            let before = hosts.len();
+            hosts.retain(|known| {
+                !known
+                    .as_str()
+                    .is_some_and(|known| known.eq_ignore_ascii_case(host))
+            });
+            changed |= hosts.len() != before;
+            if hosts.is_empty() {
+                record.config.remove(diffui_plugins::HOSTS);
+            }
+        }
+        if let Some(per_host) = record
+            .config
+            .get_mut(PER_HOST)
+            .and_then(toml::Value::as_table_mut)
+        {
+            changed |= per_host.remove(&lower).is_some();
+            if per_host.is_empty() {
+                record.config.remove(PER_HOST);
+            }
+        }
+        if changed && let Err(error) = self.config_files.write_plugin(id, record) {
+            self.push_error_toast("Couldn't save settings", &error);
+            return;
+        }
+        for account in host_secrets(manifest, id, host) {
+            if let Err(error) = self.plugins.secrets.delete(&account) {
+                self.push_error_toast("Couldn't remove the token", &error);
+            }
+        }
+        if let Some(page) = self.plugins.page.as_mut() {
+            page.extra.retain(|known| !known.eq_ignore_ascii_case(host));
+            page.accounts.remove(host);
+            page.rejected.remove(host);
+            page.removing = None;
+        }
+        self.secrets_changed(id);
+        if let Some(why) = self.host_kept_by(id, manifest, host) {
+            self.push_info_toast(Prose::new().path(host).text(" stays"), &why);
+        }
+    }
+
+    /// Why `host` is on `id`'s page beyond anything Settings can remove:
+    /// config.toml lists it, it is the forge's own, or its CLI signs in there.
+    pub(super) fn host_kept_by(&self, id: &str, manifest: &Manifest, host: &str) -> Option<String> {
+        let forge = manifest.forge.as_ref()?;
+        if forge
+            .default_host
+            .as_deref()
+            .is_some_and(|default| default.eq_ignore_ascii_case(host))
+        {
+            return Some("The plugin's own host".to_owned());
+        }
+        if let Some(user) = self.user_config.plugins.get(id) {
+            let listed = super::forge::user_hosts(Some(user))
+                .iter()
+                .any(|known| known.to_string().eq_ignore_ascii_case(host));
+            let per_host = lookup_host(user, host).is_some();
+            if listed || per_host {
+                return Some("Set in config.toml".to_owned());
+            }
+        }
+        let stored = secrets::token_hosts(&*self.plugins.secrets, id)
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(host));
+        let answered = self.plugins.get(id).is_some_and(|found| {
+            found
+                .extra_hosts
+                .iter()
+                .any(|known| known.to_string().eq_ignore_ascii_case(host))
+        });
+        (answered && !stored).then(|| match &forge.cli {
+            Some(cli) => format!("{cli} signs in to it"),
+            None => "The plugin lists it".to_owned(),
+        })
+    }
+
+    /// Whether removing `host` would take anything away: a `hosts` entry or
+    /// per-host settings in settings.toml, a stored secret, or the page
+    /// having been opened for it.
+    pub(super) fn host_removable(
+        &self,
+        page: &PluginPage,
+        manifest: &Manifest,
+        host: &str,
+    ) -> bool {
+        let saved = self
+            .config_files
+            .plugins
+            .get(&page.id)
+            .is_some_and(|record| {
+                super::forge::user_hosts(Some(&record.config))
+                    .iter()
+                    .any(|known| known.to_string().eq_ignore_ascii_case(host))
+                    || lookup_host(&record.config, host).is_some()
+            });
+        saved
+            || page
+                .extra
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(host))
+            || host_secrets(manifest, &page.id, host)
+                .iter()
+                .any(|account| page.stored.contains(account))
     }
 
     fn page_manifest(&self) -> Option<(&PluginPage, std::sync::Arc<Manifest>)> {
@@ -992,6 +1164,30 @@ fn account_row(
                 cx,
             )
         });
+    let own = manifest
+        .forge
+        .as_ref()
+        .and_then(|forge| forge.default_host.as_deref())
+        .is_some_and(|default| default.eq_ignore_ascii_case(host));
+    let remove = (!own).then(|| {
+        let removable = ui.host_removable(page, manifest, host);
+        let button = look
+            .close_button(
+                gpui_kit::SharedString::from(format!("plugin-page-remove-{host}")),
+                theme.muted_text,
+            )
+            .disabled(!removable);
+        match ui.host_kept_by(&page.id, manifest, host) {
+            Some(why) if !removable => button.tip(why),
+            _ => button.tip("Remove").on_click(send(
+                PageAction::RemoveHost {
+                    host: host.to_owned(),
+                    confirmed: false,
+                },
+                cx,
+            )),
+        }
+    });
     let top = div()
         .flex()
         .flex_row()
@@ -999,11 +1195,46 @@ fn account_row(
         .w_full()
         .gap(px(theme::space::XL))
         .child(name)
-        .children(methods.map(|methods| div().flex_none().child(methods)));
+        .children(methods.map(|methods| div().flex_none().child(methods)))
+        .children(remove);
 
     let account = secrets::account(&page.id, &token.key, Some(host));
     let secret = token.secret.as_ref();
-    let bottom = if page.stored.contains(&account) {
+    let bottom = if page.removing.as_deref() == Some(host) {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(theme::space::MD))
+            .child(div().flex_1().min_w_0().child(caption(
+                look,
+                "Remove this host and its saved token?",
+                theme.text,
+            )))
+            .child(
+                look.cancel_button(gpui_kit::SharedString::from(format!(
+                    "plugin-page-keep-{host}"
+                )))
+                .compact()
+                .on_click(send(PageAction::KeepHost, cx)),
+            )
+            .child(
+                look.button(
+                    gpui_kit::SharedString::from(format!("plugin-page-remove-yes-{host}")),
+                    "Remove",
+                )
+                .destructive()
+                .compact()
+                .on_click(send(
+                    PageAction::RemoveHost {
+                        host: host.to_owned(),
+                        confirmed: true,
+                    },
+                    cx,
+                )),
+            )
+    } else if page.stored.contains(&account) {
         div()
             .flex()
             .flex_row()

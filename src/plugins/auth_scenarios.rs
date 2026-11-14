@@ -759,3 +759,199 @@ fn a_token_pasted_in_settings_gets_badges() {
         );
     });
 }
+
+/// The page's state of `host`: listed, removable, and why it stays.
+fn host_on_page(ui: &crate::Diffui, host: &str) -> (bool, bool, Option<String>) {
+    let page = ui.plugins.page.as_ref().expect("the page");
+    let manifest = ui
+        .plugins
+        .get("github")
+        .and_then(|found| found.manifest.clone())
+        .expect("github's manifest");
+    (
+        ui.page_hosts("github").iter().any(|known| known == host),
+        ui.host_removable(page, &manifest, host),
+        ui.host_kept_by("github", &manifest, host),
+    )
+}
+
+fn config_files() -> (String, String) {
+    let dir = crate::harness::scratch_home().join(".config/diffui");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    (read("config.toml"), read("settings.toml"))
+}
+
+/// GitHub's page, open, on the fixture with gh not there.
+fn github_page(config: &str, settings: &str) -> crate::harness::Harness {
+    use super::PluginAction;
+    use super::page::PageAction;
+    use super::scenarios::{launch_on, wait_running};
+
+    let repo = crate::harness::fixture_repo();
+    let config = format!("[plugins.github]\nprogram = \"/nonexistent/diffui-test/gh\"\n{config}");
+    let mut h = launch_on(&repo, &[], &config, settings);
+    wait_running(&mut h, "github");
+    h.perform(crate::Action::Plugin(PluginAction::Page(
+        PageAction::Open {
+            id: "github".into(),
+            host: None,
+        },
+    )));
+    h
+}
+
+fn page(action: super::page::PageAction) -> crate::Action {
+    crate::Action::Plugin(super::PluginAction::Page(action))
+}
+
+/// A host added on the page, then given a sign-in method of its own, goes
+/// with both when it is removed: settings.toml is back to nothing.
+#[test]
+fn a_host_added_on_the_page_is_removed_with_its_settings() {
+    use super::page::{NEW_HOST, PageAction};
+
+    let host = "git.acme.test";
+    let mut h = github_page("", "");
+    h.perform(page(PageAction::Draft {
+        field: NEW_HOST,
+        text: format!("https://{host}/"),
+    }));
+    h.perform(page(PageAction::AddHost));
+    h.perform(page(PageAction::Set {
+        key: "auth".into(),
+        host: Some(host.into()),
+        value: Some("cli".into()),
+    }));
+    let (config, settings) = config_files();
+    assert!(
+        settings.contains(&format!("hosts = [\"{host}\"]")),
+        "{settings}"
+    );
+    assert!(
+        settings.contains(&format!("[plugins.github.config.per_host.\"{host}\"]")),
+        "{settings}"
+    );
+    h.read(|ui| assert_eq!(host_on_page(ui, host), (true, true, None)));
+
+    h.perform(page(PageAction::RemoveHost {
+        host: host.into(),
+        confirmed: false,
+    }));
+    let (after, settings) = config_files();
+    assert_eq!(after, config, "config.toml isn't written");
+    assert!(!settings.contains(host), "{settings}");
+    h.read(|ui| {
+        assert_eq!(ui.plugins.page.as_ref().unwrap().removing(), None);
+        assert!(!host_on_page(ui, host).0);
+    });
+}
+
+/// A host with a saved token asks first; Cancel keeps it, Remove takes the
+/// token out of the store and the host out of settings.toml.
+#[test]
+fn removing_a_host_with_a_token_asks_then_deletes_the_token() {
+    use super::page::PageAction;
+
+    let host = "git.acme.test";
+    let account = format!("github@{host}");
+    let mut h = github_page(
+        "",
+        &format!(
+            "[plugins.github.config]\nhosts = [\"{host}\"]\n\n[plugins.github.config.per_host.\"{host}\"]\nauth = \"cli\"\n"
+        ),
+    );
+    h.read(|ui| ui.plugins.secrets.set(&account, TOKEN).unwrap());
+    // The page reads the store when it opens.
+    h.perform(page(PageAction::Open {
+        id: "github".into(),
+        host: None,
+    }));
+    let ask = || {
+        page(PageAction::RemoveHost {
+            host: host.into(),
+            confirmed: false,
+        })
+    };
+
+    h.perform(ask());
+    h.read(|ui| {
+        assert_eq!(ui.plugins.page.as_ref().unwrap().removing(), Some(host));
+        assert_eq!(
+            ui.plugins.secrets.get(&account).unwrap().as_deref(),
+            Some(TOKEN)
+        );
+    });
+    h.perform(page(PageAction::KeepHost));
+    h.read(|ui| {
+        assert_eq!(ui.plugins.page.as_ref().unwrap().removing(), None);
+        assert_eq!(host_on_page(ui, host), (true, true, None));
+    });
+    assert!(config_files().1.contains(host));
+
+    h.perform(ask());
+    h.perform(page(PageAction::RemoveHost {
+        host: host.into(),
+        confirmed: true,
+    }));
+    h.read(|ui| {
+        assert_eq!(ui.plugins.secrets.get(&account).unwrap(), None);
+        assert!(
+            !ui.plugins
+                .secrets
+                .accounts()
+                .unwrap()
+                .iter()
+                .any(|known| known.contains(host))
+        );
+        assert_eq!(ui.plugins.page.as_ref().unwrap().removing(), None);
+        assert!(!host_on_page(ui, host).0);
+    });
+    let (config, settings) = config_files();
+    assert!(!settings.contains(host), "{settings}");
+    assert!(!config.contains(host), "{config}");
+    let secrets =
+        std::fs::read_to_string(crate::harness::scratch_home().join(".diffui-secrets.json"))
+            .unwrap_or_default();
+    assert!(!secrets.contains(host), "{secrets}");
+}
+
+/// A host config.toml lists can't be removed from the page: what Settings
+/// saved for it goes, config.toml is left alone, the host stays and the page
+/// and a toast say why.
+#[test]
+fn a_host_config_toml_lists_stays_and_says_why() {
+    use super::page::PageAction;
+
+    let host = "git.corp.test";
+    let mut h = github_page(
+        &format!("hosts = [\"{host}\"]\n"),
+        &format!("[plugins.github.config.per_host.\"{host}\"]\nauth = \"cli\"\n"),
+    );
+    let (config, _) = config_files();
+    h.read(|ui| {
+        assert_eq!(
+            host_on_page(ui, host),
+            (true, true, Some("Set in config.toml".to_owned()))
+        )
+    });
+
+    h.perform(page(PageAction::RemoveHost {
+        host: host.into(),
+        confirmed: false,
+    }));
+    let (after, settings) = config_files();
+    assert_eq!(after, config);
+    assert!(!settings.contains(host), "{settings}");
+    h.read(|ui| {
+        assert_eq!(
+            host_on_page(ui, host),
+            (true, false, Some("Set in config.toml".to_owned()))
+        );
+        assert!(
+            ui.toasts
+                .iter()
+                .any(|toast| format!("{:?}", toast.detail).contains("Set in config.toml")),
+            "a toast says why it stays"
+        );
+    });
+}

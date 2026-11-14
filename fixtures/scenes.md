@@ -1487,6 +1487,12 @@ section of `assets/agent/SKILL.md`). New in the port.
 - State: GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.
 - Steps: Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.
 
+### `plugins-remove-host`
+
+- Window: 1440x900, light
+- State: GitHub's page in Settings: github.acme.com with a saved token, its x pressed, the row asking whether to remove the host and its token with Cancel and Remove.
+- Steps: Launch with github.acme.com added and a token saved for it; open GitHub's page and press the host's x.
+
 ### `plugins-permission`
 
 - Window: 1440x900, light

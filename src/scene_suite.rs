@@ -2805,6 +2805,42 @@ fn all() -> Vec<Scene> {
     );
     t.add(
         s(
+            "plugins-remove-host",
+            "GitHub's page in Settings: github.acme.com with a saved token, its x pressed, the row asking whether to remove the host and its token with Cancel and Remove.",
+            "Launch with github.acme.com added and a token saved for it; open GitHub's page and press the host's x.",
+            |c| {
+                crate::harness::answer_forge(&[("api user --jq .login", "octo\n")]);
+                c.key("cmd+,");
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "github".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::RemoveHost {
+                        host: "github.acme.com".to_owned(),
+                        confirmed: false,
+                    },
+                )));
+                c.settle();
+            },
+        )
+        .settings(
+            "[plugins.github.config]\nhosts = [\"github.acme.com\"]\n\n[plugins.github.config.per_host.\"github.acme.com\"]\nauth = \"cli\"\n",
+        )
+        .home(|home| {
+            use diffui_plugins::secrets::{FileStore, SecretStore};
+            FileStore::new(home.join(".diffui-secrets.json"))
+                .set("github@github.acme.com", "tok")
+                .expect("save the token");
+        }),
+    );
+    t.add(
+        s(
             "plugins-permission",
             "The dialog that asks whether a plugin may run: its id, version and folder, each thing it could do, Don't allow and Allow.",
             "Launch with a plugin nobody has answered for.",
