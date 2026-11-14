@@ -650,16 +650,26 @@ mod tests {
     #[test]
     fn the_skill_names_the_whole_plugin_surface() {
         use diffui_plugins::protocol::{EVENT_NAMES, FORGE_METHODS};
-        for verb in ["init", "check", "list"] {
+        for verb in ["init", "check", "list", "eject"] {
             assert!(SKILL.contains(&format!("`diffui plugin {verb}")), "{verb}");
         }
         for import in [
-            "commands", "forge", "events", "http", "exec", "auth", "kv", "config", "ui",
+            "commands",
+            "forge",
+            "events",
+            "http",
+            "exec",
+            "auth",
+            "kv",
+            "config",
+            "ui",
+            "ForgeError",
         ] {
             assert!(SKILL.contains(&format!("| `{import}` |")), "{import}");
             assert!(
                 diffui_plugins::TYPES.contains(&format!("export const {import}:"))
-                    || diffui_plugins::TYPES.contains(&format!("export function {import}(")),
+                    || diffui_plugins::TYPES.contains(&format!("export function {import}("))
+                    || diffui_plugins::TYPES.contains(&format!("export class {import} ")),
                 "{import} isn't in diffui.d.ts"
             );
         }

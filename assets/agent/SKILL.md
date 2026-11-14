@@ -268,7 +268,16 @@ dialogs for a host diffui doesn't know).
    `not-allowed`, `off`, `failed` with the error and its `file:line:col`),
    what it registered and the end of its log (`--json` for all of it).
    `diffui ctl run <id>` runs one of its commands. `diffui plugin list`
-   lists the folder without the app.
+   lists the plugins without the app: the bundled ones and the folder's.
+
+diffui ships some plugins built in (its GitHub and GitLab forges). They run
+without asking, with the permissions they declare; `[plugins.<id>] enabled
+= false` in settings.toml (or the Off toggle in Settings) turns one off. A
+plugin in the plugins folder with a bundled plugin's id replaces it, and is
+asked about like any other. To change a bundled plugin,
+`diffui plugin eject <id>` copies it into the plugins folder with
+`diffui.d.ts`; edit the copy, and delete the folder to go back to the
+built-in one.
 
 ### `plugin.toml`
 
@@ -304,7 +313,28 @@ Unlike a `[[commands]]` row in config.toml, a plugin's row has no `exec`,
 that in code. `term` is `"pull request"` (the default) or `"merge request"`,
 whichever the forge says. The user sets a plugin's config under
 `[plugins.<id>]` in config.toml; `token_cmd` there is an argv that prints
-the token `auth.token` returns.
+the token `auth.token` returns, and `hosts` adds hosts to a forge's claim.
+
+A forge can say more about itself, so diffui names it, opens its links and
+explains its errors without running the script (all optional):
+
+```toml
+[provides.forge]
+hosts = ["github.com", "github.*", "*.github.*"]   # here "*" is any label or more
+term = "pull request"
+sigil = "#"                     # references read owner/name#12 ("!" for a merge request)
+short = "PR"                    # "MR" for a merge request
+default_host = "github.com"     # the host a reference without one means
+host_env = "GH_HOST"            # a variable that names that host instead, when set
+cli = "gh"                      # the program errors tell the user to install and sign in with
+pull_request_path = "{owner}/{name}/pull/{number}"   # a pull request's page after the host
+subgroups = false               # true when an owner can be several segments (GitLab)
+```
+
+A remote goes to the first forge that claims its host: a folder plugin
+that replaces a bundled one, then the bundled ones, then the rest, so a
+plugin from the folder can't take a bundled forge's host unless that forge
+is off or replaced.
 
 ### Permissions
 
@@ -314,7 +344,8 @@ for, and the user sees the list before it runs:
 | Manifest | Lets the script |
 |---|---|
 | `http = ["host", "*.example.com", "localhost:3000"]` | `http.fetch` those hosts, and ask `auth.token` for their git credentials |
-| `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes |
+| `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes; a word `"{config.program}"` is the string setting `program` (declare it in `[config.schema]`), so the user can point the plugin at a program |
+| `env = ["GH_HOST"]` | set these variables for the programs `exec` runs |
 | `jj = "read"` | read the repository: `repo.bookmarks`, `remotes`, `selection`, `rows`, `diff`, `readFile`, `repo.jj.query` |
 | `jj = "write"` | all of that, and `repo.jj.run` |
 
@@ -348,10 +379,11 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 | Import | For |
 |---|---|
 | `commands` | `commands.register(id, handler)`: the handler gets `{ repo, changeId, commitId, bookmark, path, line }` |
-| `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`; only `pullRequests` is required, and diffui hides what a missing method would serve |
+| `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`, `hosts` (more hosts to claim, asked once after loading), and for a pull request in a tab of its own `view`, `commits`, `commitDiff` and `diff`; only `pullRequests` is required, and diffui hides what a missing method would serve |
+| `ForgeError` | `throw new ForgeError(kind, message, { host, what })` from a provider, `kind` one of `missing-cli`, `auth`, `not-found`, `rate-limited`, `unreachable`, `timeout`, `failed`: diffui then says what to do (`gh auth login --hostname …`) |
 | `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
-| `exec` | `exec(argv, options)`: no shell, an allowed argv prefix |
+| `exec` | `exec(argv, options)`: no shell, an allowed argv prefix, `env` for allowed variables; `exec.stream(argv, options)` for output read a piece at a time with `for await`, then `await out.ended` for the exit |
 | `auth` | `auth.token(host)`: the user's `token_cmd`, else `git credential fill`; never prompts |
 | `kv` | a small JSON store that survives restarts |
 | `config` | the plugin's settings |
@@ -370,6 +402,28 @@ resolves with its stdout. The argv starts with one of `log`, `show`,
 `config get`, `git remote list`, `workspace list`, and can't carry `-R`,
 `--at-op`, `--ignore-working-copy`, `--tool` or `--config`.
 `repo.jj.run(argv)` runs any jj command the way `diffui ctl jj` does.
+
+A pull request tab needs all four of `view(pr)`, `commits(pr)`,
+`commitDiff(pr, oid, { signal })` and `diff(pr, { signal })`; `pr` is
+`{ host, owner, name, number, webUrl }`. A diff is unified `git diff` text
+or files (`{ path, oldPath, status, patch, additions, deletions }`), handed
+over as it arrives: return a string, an array, or an (async) iterable of
+parts, and never collect a big diff first. `diff` as an async generator
+over `exec.stream` (or `http.fetch(url, { stream: true })`'s `body`) keeps
+memory flat whatever the size; diffui shows each file once it is whole, and
+`signal` aborts (killing the program) when the user closes the tab.
+
+```js
+async *diff(pr, { signal }) {
+  const out = await exec.stream([config.program, "pr", "diff", String(pr.number)], {
+    env: { GH_HOST: pr.host },
+    signal,
+  });
+  yield* out;
+  const { ok, stderr } = await out.ended;
+  if (!ok) throw new ForgeError("failed", stderr);
+}
+```
 
 ### TypeScript
 
@@ -539,6 +593,9 @@ commands.register("forgejo.open-in-browser", async ({ repo, bookmark }) => {
 - `ui.status.set` is one item per plugin for the whole window, not one per
   repository: it doesn't change when the user switches tabs.
 - Plugins never draw. What they can show is in `ui`.
+- `exec` and `http.fetch` hold their whole output (up to 8 MB). For
+  anything bigger, a diff above all, use `exec.stream` or `stream: true`
+  and hand pieces on as they come.
 - `repo.jj.run` resolves when diffui has accepted the command, not when it
   has finished, and the handle is stale once the repository changed: one
   command per handler, or carry on from the next event.
