@@ -328,7 +328,7 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 |---|---|
 | `commands` | `commands.register(id, handler)`: the handler gets `{ repo, changeId, commitId, bookmark, path, line }` |
 | `forge` | `forge.register(provider)`, a provider being `pullRequests`, `checks`, `createPullRequest` and `updatePullRequest`; only `pullRequests` is required, and diffui hides what a missing method would serve |
-| `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
+| `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
 | `exec` | `exec(argv, options)`: no shell, an allowed argv prefix |
 | `auth` | `auth.token(host)`: the user's `token_cmd`, else `git credential fill`; never prompts |

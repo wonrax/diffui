@@ -1,5 +1,6 @@
 //! Telling plugins what happened: a repository opened, its bookmarks moved,
-//! the selection changed, a fetch or a push finished, a command ran.
+//! it reached another operation, the selection changed, a fetch or a push
+//! finished, a command ran.
 //!
 //! Nothing here waits on a plugin. An event is handed to the scripts that
 //! subscribed to it (their registration says which) and forgotten; what a
@@ -27,6 +28,8 @@ pub(crate) struct TabPlugins {
     opened: bool,
     /// Where every bookmark pointed then, local and remote, as a hash.
     refs: u64,
+    /// The jj operation that load was at; empty in a git repository.
+    op: String,
     selection: Option<(RevisionSelection, Vec<String>, usize)>,
     /// Fetches and pushes that finished. They are told once the repository
     /// has settled, so the handle they carry is at the operation that shows
@@ -82,11 +85,29 @@ impl Diffui {
                 let refs = refs_hash(&state.session.bookmarks);
                 if !seen.opened {
                     seen.opened = true;
+                    seen.op = state
+                        .session
+                        .graph_operation()
+                        .unwrap_or_default()
+                        .to_owned();
                     events.push((tab.id, "repoOpened", |repo| Event::RepoOpened { repo }));
                 } else if refs != seen.refs {
                     events.push((tab.id, "refsChanged", |repo| Event::RefsChanged { repo }));
                 }
                 seen.refs = refs;
+            }
+            // Looked at on every pass, not only when a graph lands: a load
+            // can land at the operation the last one did (another revset),
+            // and the operation moves without a load when a working-copy
+            // edit is snapshotted and its row patched in place.
+            let op = state.session.graph_operation().unwrap_or_default();
+            if seen.opened && op != seen.op {
+                seen.op = op.to_owned();
+                events.push(
+                    (tab.id, "operationChanged", |repo| Event::OperationChanged {
+                        repo,
+                    }),
+                );
             }
             if !seen.due.is_empty() && !state.session.busy() {
                 for due in seen.due.drain(..) {

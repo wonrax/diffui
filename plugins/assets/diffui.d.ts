@@ -164,6 +164,14 @@ declare module "diffui" {
     repoOpened: { readonly repo: Repo };
     /** Bookmarks or remote refs moved. */
     refsChanged: { readonly repo: Repo };
+    /**
+     * The repository changed: a commit, a rebase, an undo, a fetch that brought something, an edit to the
+     * working copy once it has been snapshotted. Sent when the log on screen is at a jj operation other
+     * than the last one, so `repo` reads the new state. One event however many operations went by; never
+     * for a git repository. The event to recompute a status item or a cache on. When bookmarks moved too,
+     * `refsChanged` is sent as well.
+     */
+    operationChanged: { readonly repo: Repo };
     /** The selected revisions or the selected file changed, and stayed put for a moment. Read them with `repo.selection()`. */
     selectionChanged: { readonly repo: Repo };
     /** A fetch finished, and the log shows what it brought. */

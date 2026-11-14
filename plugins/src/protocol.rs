@@ -279,6 +279,11 @@ pub enum Event {
     RefsChanged {
         repo: RepoHandle,
     },
+    /// The repository is at another operation than the one the plugin last
+    /// saw it at.
+    OperationChanged {
+        repo: RepoHandle,
+    },
     SelectionChanged {
         repo: RepoHandle,
     },
@@ -302,6 +307,7 @@ impl Event {
         match self {
             Event::RepoOpened { .. } => "repoOpened",
             Event::RefsChanged { .. } => "refsChanged",
+            Event::OperationChanged { .. } => "operationChanged",
             Event::SelectionChanged { .. } => "selectionChanged",
             Event::Fetched { .. } => "fetched",
             Event::Pushed { .. } => "pushed",
@@ -311,9 +317,10 @@ impl Event {
 }
 
 /// Every event name, for `events.on`'s check and the type definitions.
-pub const EVENT_NAMES: [&str; 6] = [
+pub const EVENT_NAMES: [&str; 7] = [
     "repoOpened",
     "refsChanged",
+    "operationChanged",
     "selectionChanged",
     "fetched",
     "pushed",

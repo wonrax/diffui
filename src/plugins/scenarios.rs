@@ -471,7 +471,7 @@ commands.register("probe.ask", () => tell(async () => {
   const which = await ui.prompt.choose({ label: "Which", choices: ["a", { label: "Bee", value: "b" }] });
   return JSON.stringify([name, sure, which]);
 }));
-for (const name of ["repoOpened", "refsChanged", "selectionChanged", "fetched", "commandInvoked"]) {
+for (const name of ["repoOpened", "refsChanged", "operationChanged", "selectionChanged", "fetched", "commandInvoked"]) {
   events.on(name, (event) => console.log(`event ${name}${event.id ? ` ${event.id}` : ""}`));
 }
 "#;
@@ -759,17 +759,57 @@ fn a_plugin_hears_the_events_it_subscribed_to() {
     h.act(|ui, cx| ui.run_command("repo.fetch", CommandArg::None, cx));
     heard(&mut h, "event fetched");
 
-    h.act(|ui, cx| {
-        let tab = ui.active_tab_id().expect("a tab");
-        ui.run_jj_line(tab, "bookmark create heard -r @", None, cx)
-            .expect("the line runs");
-    });
-    heard(&mut h, "event refsChanged");
-    h.read(|ui| {
+    let count = |h: &mut Harness, event: &str| {
+        h.read(|ui| {
+            logged(ui, "probe")
+                .iter()
+                .filter(|line| *line == event)
+                .count()
+        })
+    };
+    let run = |h: &mut Harness, line: &'static str| {
+        h.act(|ui, cx| {
+            let tab = ui.active_tab_id().expect("a tab");
+            ui.run_jj_line(tab, line, None, cx).expect("the line runs");
+        });
+    };
+    // A new commit moves no bookmark: the repository changed, the refs
+    // didn't.
+    let (operations, refs) = (
+        count(&mut h, "event operationChanged"),
+        count(&mut h, "event refsChanged"),
+    );
+    run(&mut h, "new");
+    h.wait_until("event operationChanged", |ui| {
         let lines = logged(ui, "probe");
-        let count = |event: &str| lines.iter().filter(|line| *line == event).count();
-        assert_eq!(count("event repoOpened"), 1, "{lines:?}");
+        lines
+            .iter()
+            .filter(|line| *line == "event operationChanged")
+            .count()
+            > operations
     });
+    assert_eq!(count(&mut h, "event refsChanged"), refs);
+
+    // Another graph at the same operation is no change.
+    let graph = h.read(|ui| ui.active().session.graph_version());
+    h.perform(Action::SetRevset("all()".to_owned()));
+    h.wait_until("the other revset's graph", |ui| {
+        ui.active().session.graph_version() != graph && !ui.active().session.busy()
+    });
+
+    // A bookmark is both, and each is told once.
+    run(&mut h, "bookmark create heard -r @");
+    heard(&mut h, "event refsChanged");
+    h.wait_until("the second operationChanged", |ui| {
+        logged(ui, "probe")
+            .iter()
+            .filter(|line| *line == "event operationChanged")
+            .count()
+            > operations + 1
+    });
+    assert_eq!(count(&mut h, "event operationChanged"), operations + 2);
+    assert_eq!(count(&mut h, "event refsChanged"), refs + 1);
+    assert_eq!(count(&mut h, "event repoOpened"), 1);
 }
 
 fn commit_of(repo: &Path, name: &str) -> String {
