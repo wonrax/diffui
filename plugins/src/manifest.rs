@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use toml::Spanned;
@@ -48,8 +49,12 @@ impl fmt::Display for Diagnostic {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
-    /// The plugin's directory. Relative imports resolve inside it.
+    /// The plugin's directory. Relative imports resolve inside it. A bundled
+    /// plugin's names it for messages only: its files are [`Self::files`].
     pub dir: PathBuf,
+    /// The files of a plugin built into diffui, by path relative to its
+    /// directory. `None`: they are on disk under `dir`.
+    pub files: Option<Arc<BTreeMap<String, String>>>,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -443,6 +448,35 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// The manifest of a plugin whose files are in memory (one built into
+    /// diffui): `files` holds `plugin.toml` and every module, by path
+    /// relative to the plugin's directory. `dir` names it in messages.
+    pub fn bundled(
+        dir: &Path,
+        files: BTreeMap<String, String>,
+    ) -> Result<Manifest, Vec<Diagnostic>> {
+        let whole_file = |message: String| {
+            vec![Diagnostic {
+                path: dir.join(MANIFEST_FILE),
+                line: 1,
+                col: 1,
+                message,
+            }]
+        };
+        let text = files
+            .get(MANIFEST_FILE)
+            .ok_or_else(|| whole_file("no manifest".into()))?;
+        let mut manifest = Manifest::parse(dir, text)?;
+        if !files.contains_key(&manifest.main) {
+            return Err(whole_file(format!(
+                "main = \"{}\": no such file beside {MANIFEST_FILE}",
+                manifest.main
+            )));
+        }
+        manifest.files = Some(Arc::new(files));
+        Ok(manifest)
+    }
+
     /// Check a manifest's text. Touches no files; `dir` only names the plugin
     /// directory in the result and in diagnostics.
     pub fn parse(dir: &Path, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
@@ -773,6 +807,7 @@ impl Manifest {
         }
         Ok(Manifest {
             dir: dir.to_path_buf(),
+            files: None,
             id,
             name: raw.name.into_inner(),
             version: raw.version.into_inner(),
@@ -799,7 +834,7 @@ impl Manifest {
     /// directory, or the home directory for a plugin with none on disk
     /// (a bundled one).
     pub fn cwd(&self) -> &Path {
-        if self.dir.is_dir() {
+        if self.files.is_none() && self.dir.is_dir() {
             &self.dir
         } else {
             home_dir()

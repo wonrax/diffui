@@ -237,10 +237,10 @@ impl Js {
         })));
         runtime.set_loader(
             PluginResolver {
-                dir: manifest.dir.clone(),
+                files: Source::of(manifest),
             },
             PluginLoader {
-                dir: manifest.dir.clone(),
+                files: Source::of(manifest),
             },
         );
         let context = Context::full(&runtime).map_err(engine)?;
@@ -261,7 +261,7 @@ impl Js {
                 Module::evaluate(ctx.clone(), HOST_MODULE, HOST_SOURCE)?.finish::<()>()?;
                 let dispatch: Function = boot.get("dispatch")?;
                 let finish_load: Function = boot.get("finishLoad")?;
-                let (_, main) = declare(&ctx, &manifest.dir, &manifest.main)?.eval()?;
+                let (_, main) = declare(&ctx, &Source::of(manifest), &manifest.main)?.eval()?;
                 Ok((
                     Persistent::save(&ctx, dispatch),
                     Persistent::save(&ctx, finish_load),
@@ -492,8 +492,70 @@ fn describe<'js>(ctx: &Ctx<'js>, thrown: Value<'js>) -> JsError {
     }
 }
 
+/// Where a plugin's modules are read from: its directory, or memory for a
+/// bundled plugin.
+#[derive(Clone)]
+enum Source {
+    Dir(PathBuf),
+    Files(std::sync::Arc<std::collections::BTreeMap<String, String>>),
+}
+
+impl Source {
+    fn of(manifest: &Manifest) -> Self {
+        match &manifest.files {
+            Some(files) => Source::Files(files.clone()),
+            None => Source::Dir(manifest.dir.clone()),
+        }
+    }
+
+    fn has(&self, name: &str) -> bool {
+        match self {
+            Source::Dir(dir) => dir.join(name).is_file(),
+            Source::Files(files) => files.contains_key(name),
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<String, String> {
+        match self {
+            Source::Dir(dir) => std::fs::read_to_string(dir.join(name)).map_err(|e| e.to_string()),
+            Source::Files(files) => files
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "no such file".into()),
+        }
+    }
+
+    /// The modules at the top of the plugin, for the message about one that
+    /// isn't there.
+    fn modules(&self) -> Vec<String> {
+        let names: Vec<String> = match self {
+            Source::Dir(dir) => std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect(),
+            Source::Files(files) => files
+                .keys()
+                .filter(|name| !name.contains('/'))
+                .cloned()
+                .collect(),
+        };
+        let mut names: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                [".js", ".mjs", ".ts", ".mts"]
+                    .iter()
+                    .any(|ext| name.ends_with(ext))
+            })
+            .collect();
+        names.sort();
+        names
+    }
+}
+
 struct PluginResolver {
-    dir: PathBuf,
+    files: Source,
 }
 
 impl Resolver for PluginResolver {
@@ -536,18 +598,18 @@ impl Resolver for PluginResolver {
         }
         let mut resolved = parts.join("/");
         // TypeScript's habit of importing "./util.js" for a util.ts.
-        if !self.dir.join(&resolved).is_file()
+        if !self.files.has(&resolved)
             && let Some(stem) = resolved.strip_suffix(".js")
-            && self.dir.join(format!("{stem}.ts")).is_file()
+            && self.files.has(&format!("{stem}.ts"))
         {
             resolved = format!("{stem}.ts");
         }
-        if !self.dir.join(&resolved).is_file() {
+        if !self.files.has(&resolved) {
             return Err(Exception::throw_reference(
                 ctx,
                 &format!(
                     "Cannot import \"{name}\" (from {base}): there is no {resolved} in the plugin's directory. It has: {}.",
-                    modules_in(&self.dir).join(", ")
+                    self.files.modules().join(", ")
                 ),
             ));
         }
@@ -556,7 +618,7 @@ impl Resolver for PluginResolver {
 }
 
 struct PluginLoader {
-    dir: PathBuf,
+    files: Source,
 }
 
 impl Loader for PluginLoader {
@@ -566,13 +628,17 @@ impl Loader for PluginLoader {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, Declared>> {
-        declare(ctx, &self.dir, name)
+        declare(ctx, &self.files, name)
     }
 }
 
 /// Read and compile the module at `name`, a path relative to the plugin
 /// directory. A TypeScript module has its types erased first.
-fn declare<'js>(ctx: &Ctx<'js>, dir: &Path, name: &str) -> rquickjs::Result<Module<'js, Declared>> {
+fn declare<'js>(
+    ctx: &Ctx<'js>,
+    files: &Source,
+    name: &str,
+) -> rquickjs::Result<Module<'js, Declared>> {
     let inside = Path::new(name)
         .components()
         .all(|part| matches!(part, Component::Normal(_)));
@@ -580,7 +646,7 @@ fn declare<'js>(ctx: &Ctx<'js>, dir: &Path, name: &str) -> rquickjs::Result<Modu
         let why = format!("\"{name}\" is outside the plugin's directory");
         return Err(Exception::throw_reference(ctx, &why));
     }
-    let mut source = std::fs::read_to_string(dir.join(name)).map_err(|error| {
+    let mut source = files.read(name).map_err(|error| {
         Exception::throw_reference(ctx, &format!("Cannot read {name}: {error}"))
     })?;
     if typescript::is_typescript(name) {
@@ -597,24 +663,6 @@ fn declare<'js>(ctx: &Ctx<'js>, dir: &Path, name: &str) -> rquickjs::Result<Modu
         })?;
     }
     Module::declare(ctx.clone(), name, source)
-}
-
-/// The modules at the top of a plugin's directory, for the message about one
-/// that isn't there.
-fn modules_in(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| {
-            [".js", ".mjs", ".ts", ".mts"]
-                .iter()
-                .any(|ext| name.ends_with(ext))
-        })
-        .collect();
-    names.sort();
-    names
 }
 
 #[cfg(test)]

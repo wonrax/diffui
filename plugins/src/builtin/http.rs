@@ -203,7 +203,7 @@ fn send(
                 agent.run(limited!(agent.configure_request(request)).build())
             }
         };
-        let mut response = sent.map_err(|error| transport(&uri, error))?;
+        let response = sent.map_err(|error| transport(&uri, error))?;
         let status = response.status();
 
         let location = response

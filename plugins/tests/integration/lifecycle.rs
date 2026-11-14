@@ -645,3 +645,30 @@ fn a_panic_on_the_plugins_thread_fails_that_plugin_only() {
     plugin.loaded();
     assert_eq!(plugin.case("ok").unwrap(), json!("fine"));
 }
+
+#[test]
+fn a_bundled_plugin_runs_from_memory() {
+    let plugin = Setup::new(
+        "[permissions]\nexec = [[\"pwd\"]]\n",
+        r#"import { commands, exec, forge } from "diffui";
+import { answer } from "./lib/answer.js";
+commands.register("t.run", async () => {});
+forge.register({
+  async pullRequests() { return []; },
+  async checks() { return { answer: answer(), cwd: (await exec(["pwd"])).stdout.trim() }; },
+});
+"#,
+    )
+    .file("lib/answer.ts", "export const answer = (): number => 42;\n")
+    .spawn_bundled();
+    plugin.loaded();
+    assert!(!plugin.dir.exists(), "nothing was written");
+    let seen = plugin.case("any").unwrap();
+    assert_eq!(seen["answer"], 42);
+    // With no directory of its own, a program runs in the home directory.
+    let home = std::env::var("HOME").unwrap();
+    assert_eq!(
+        std::fs::canonicalize(seen["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(home).unwrap()
+    );
+}

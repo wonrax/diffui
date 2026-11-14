@@ -187,16 +187,36 @@ impl<'a> Setup<'a> {
     }
 
     pub fn spawn(self) -> TestPlugin {
+        self.spawn_from(false)
+    }
+
+    /// Spawn it from memory, the way diffui runs a bundled plugin: nothing
+    /// is written to disk.
+    pub fn spawn_bundled(self) -> TestPlugin {
+        self.spawn_from(true)
+    }
+
+    fn spawn_from(self, bundled: bool) -> TestPlugin {
         let root = scratch("plugin");
         let dir = root.join("plugin");
-        for (name, text) in
-            std::iter::once(("plugin.toml", self.manifest.clone())).chain(self.files)
-        {
-            let path = dir.join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
+        let files: std::collections::BTreeMap<String, String> =
+            std::iter::once(("plugin.toml", self.manifest.clone()))
+                .chain(self.files)
+                .map(|(name, text)| (name.to_string(), text))
+                .collect();
+        if !bundled {
+            for (name, text) in &files {
+                let path = dir.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
         }
-        let manifest = Manifest::load(&dir).unwrap_or_else(|problems| {
+        let loaded = if bundled {
+            Manifest::bundled(&dir, files)
+        } else {
+            Manifest::load(&dir)
+        };
+        let manifest = loaded.unwrap_or_else(|problems| {
             panic!(
                 "the test manifest is wrong:\n{}",
                 problems
