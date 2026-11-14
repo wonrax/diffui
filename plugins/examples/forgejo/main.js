@@ -1,5 +1,5 @@
 // @ts-check
-/// <reference path="../../assets/diffui.d.ts" />
+/// <reference path="./diffui.d.ts" />
 import { auth, commands, forge, http, ui } from "diffui";
 
 /**

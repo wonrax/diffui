@@ -356,8 +356,9 @@ The reference plugin: Forgejo and Gitea pull requests. `plugin.toml`:
 
 ```toml
 # Forgejo and Gitea pull requests for diffui: badges on bookmarks, checks,
-# create and update. The reference plugin; copy it to
-# ~/.config/diffui/plugins/forgejo to use it.
+# create and update. The reference plugin: to use it, run
+# `diffui plugin init forgejo` and replace the plugin.toml and main.js it
+# writes with these two. The diffui.d.ts it writes is the one main.js names.
 #
 # For a self-hosted instance, add its host to both lists below. The token
 # comes from `git credential fill`, or from `token_cmd` under
@@ -385,7 +386,7 @@ menu = ["bookmark", "palette"]
 
 ```js
 // @ts-check
-/// <reference path="../../assets/diffui.d.ts" />
+/// <reference path="./diffui.d.ts" />
 import { auth, commands, forge, http, ui } from "diffui";
 
 /**
