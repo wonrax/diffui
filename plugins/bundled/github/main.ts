@@ -5,7 +5,7 @@
 // a piece at a time as it arrives, and diffui shows each file once its last
 // hunk is in, so a huge PR paints progressively while the download is still
 // running. Lists and writes go through `gh pr list --json` and `gh api`.
-import { ForgeError, config, exec, forge } from "diffui";
+import { ForgeError, config, exec, files, forge } from "diffui";
 import type { Checks, FilePatch, ForgeRemote, PrCommit, PrInfo, PrRef, PullRequest, Repo } from "diffui";
 
 /**
@@ -287,17 +287,19 @@ function isDiffTooLarge(text: string): boolean {
   return text.includes("HTTP 406") || text.includes("too_large") || text.includes("exceeded the maximum");
 }
 
+/** gh's own list of the hosts it is signed in to, found where gh looks. */
+const HOSTS_FILE = "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml";
+
 /**
- * The host keys of `gh auth status`: each host gh is signed in to starts a
- * line, its account indented under it. What lets this forge claim a company
- * host whose name doesn't say it is GitHub. Host names only; nothing else is
- * kept.
+ * The host keys of gh's `hosts.yml`, each at the top level with its account
+ * indented under it. What lets this forge claim a company host whose name
+ * doesn't say it is GitHub. Host names only; nothing else is kept.
  */
-function statusHosts(text: string): string[] {
+function yamlHosts(text: string): string[] {
   return text
     .split("\n")
     .filter((line) => !/^[ \t#]/.test(line))
-    .map((line) => line.trim().replace(/:$/, "").toLowerCase())
+    .map((line) => line.trim().replace(/:$/, "").replace(/^["']+|["']+$/g, "").toLowerCase())
     .filter((key) => key.includes(".") && !key.startsWith(".") && !/[~ ]/.test(key));
 }
 
@@ -381,15 +383,10 @@ forge.register({
   },
 
   async hosts() {
-    let out;
-    try {
-      out = await exec([program, "auth", "status"], { timeoutMs: NETWORK_TIMEOUT_MS });
-    } catch {
-      // No gh: no hosts beyond the manifest's.
-      return [];
-    }
-    // Older gh prints the status on stderr.
-    return statusHosts(`${out.stdout}\n${out.stderr}`);
+    // Read offline, as gh keeps it: `gh auth status` would ask every host.
+    // No file (gh never signed in): no hosts beyond the manifest's.
+    const text = await files.read(HOSTS_FILE).catch(() => "");
+    return yamlHosts(text);
   },
 
   async view(pr): Promise<PrInfo> {

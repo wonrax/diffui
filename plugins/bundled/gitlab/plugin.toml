@@ -8,13 +8,11 @@ api = 0
 main = "main.ts"
 
 [permissions]
-exec = [
-  ["{config.program}", "api"],
-  # The hosts glab is configured for, from its config file, found the way
-  # glab finds it.
-  ["sh", "-c", 'cat "${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}/config.yml"'],
-]
+exec = [["{config.program}", "api"]]
 env = ["GITLAB_HOST"]
+# The hosts glab is configured for, from its config file, found the way glab
+# finds it.
+read = ["${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/glab-cli}/config.yml"]
 
 # gitlab.com, and any host named like a GitLab (`gitlab.acme.org`).
 [provides.forge]

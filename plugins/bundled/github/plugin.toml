@@ -10,10 +10,12 @@ main = "main.ts"
 [permissions]
 exec = [["{config.program}"]]
 env = ["GH_HOST"]
+# The hosts gh is signed in to, from its own list, found the way gh finds it.
+read = ["${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml"]
 
 [provides.forge]
 # github.com, and any host with a `github` label (github.acme.com). The hosts
-# gh is signed in to come from `hosts()`.
+# gh is signed in to come from `hosts()`, which reads gh's hosts.yml.
 hosts = ["github.com", "github.*", "*.github.*"]
 cli = "gh"
 default_host = "github.com"

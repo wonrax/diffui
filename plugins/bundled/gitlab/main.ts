@@ -4,7 +4,7 @@
 // subgroup works like any other.
 
 import {
-  exec,
+  files,
   forge,
   type Checks,
   type FilePatch,
@@ -141,12 +141,11 @@ async function* diffs(pr: PrRef, path: string, signal: AbortSignal): AsyncGenera
 
 /** The hosts glab has been signed in to, from its config file's `hosts`. */
 async function configuredHosts(): Promise<string[]> {
-  const out = await exec([
-    "sh",
-    "-c",
-    'cat "${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}/config.yml"',
-  ]);
-  return out.ok ? yamlHosts(out.stdout) : [];
+  // No file (glab never configured): no hosts beyond the manifest's.
+  const text = await files.read("${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/glab-cli}/config.yml").catch(
+    () => "",
+  );
+  return yamlHosts(text);
 }
 
 /**

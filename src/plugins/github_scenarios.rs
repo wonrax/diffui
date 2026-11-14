@@ -420,21 +420,21 @@ fn a_diff_too_large_for_gh_comes_from_the_files_api() {
 }
 
 /// In the app: GitHub runs without asking, claims its hosts and the ones
-/// `gh auth status` lists, and opens its links.
+/// gh's `hosts.yml` lists (read without running gh), and opens its links.
 #[test]
 fn the_bundled_github_claims_its_hosts() {
-    let fake = FakeCli::new(
-        "gh-app",
-        &[(
-            "auth status",
-            "github.com\n  \u{2713} Logged in to github.com account ada (keyring)\ngit.corp.example\n  \u{2713} Logged in to git.corp.example account ada (keyring)\n",
-        )],
-    );
+    let fake = FakeCli::new("gh-app", &[]);
     let config = format!(
         "[plugins.github]\nprogram = \"{}\"\n",
         fake.program().display()
     );
-    let mut h = Harness::open_fresh(None, (1280.0, 800.0), &config, "");
+    let hosts =
+        "github.com:\n    user: ada\n    git_protocol: ssh\n\"git.corp.example\":\n    user: ada\n";
+    let mut h = Harness::open_prepared(None, (1280.0, 800.0), &config, "", |home| {
+        let dir = home.join(".config/gh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hosts.yml"), hosts).unwrap();
+    });
     h.wait_until("gh's hosts", |ui| {
         ui.forge
             .forges
@@ -466,7 +466,7 @@ fn the_bundled_github_claims_its_hosts() {
         let pr = ui.forge.forges.parse_pr("team/app#4").expect("a reference");
         assert_eq!(pr.kind.id(), "github");
     });
-    assert!(has(&fake.calls()[0], &["auth", "status"]));
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 
     // `diffui plugin eject github`: the TypeScript and what checks it.
     let folder = h
@@ -476,6 +476,9 @@ fn the_bundled_github_claims_its_hosts() {
     for file in ["plugin.toml", "main.ts", "diffui.d.ts", "tsconfig.json"] {
         assert!(folder.join("github").join(file).is_file(), "{file}");
     }
+    drop(h);
+    // Other tests share the home.
+    let _ = std::fs::remove_dir_all(crate::harness::scratch_home().join(".config/gh"));
 }
 
 /// `repo` with `count` local bookmarks, `origin` on a GitHub project.
