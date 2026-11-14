@@ -2765,7 +2765,44 @@ fn all() -> Vec<Scene> {
         },
     ));
 
+    t.add(
+        s(
+            "forge-auth-error",
+            "A pull request tab GitHub has no token for: the card says to add one or sign gh in, with Add a token.",
+            "Launch with GitHub set to sign in with a token and none kept; open acme/app#5.",
+            |c| {
+                c.act(Action::OpenRepo("acme/app#5".to_owned()));
+                c.wait_for_load();
+            },
+        )
+        .config("[plugins.github]\nauth = \"token\"\n"),
+    );
+
     t.group("Plugins");
+    t.add(
+        s(
+            "plugins-account",
+            "GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.",
+            "Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.",
+            |c| {
+                crate::harness::answer_forge(&[("api user --jq .login", "octo\n")]);
+                c.key("cmd+,");
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "github".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                c.settle();
+            },
+        )
+        .settings(
+            "[plugins.github.config]\nhosts = [\"github.acme.com\"]\n\n[plugins.github.config.per_host.\"github.acme.com\"]\nauth = \"token\"\n",
+        ),
+    );
     t.add(
         s(
             "plugins-permission",

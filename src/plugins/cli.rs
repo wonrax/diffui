@@ -66,6 +66,25 @@ enum Verb {
         /// The bundled plugin's id
         id: String,
     },
+    /// How a forge signs in to a host, and its token: say who it signs in
+    /// as (the default), keep a token read from stdin once the forge
+    /// accepts it, or remove the one kept
+    Auth {
+        /// The forge plugin's id (github, gitlab, or one in the plugins folder)
+        id: String,
+        /// The host (the forge's default host when left out)
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Read a token from stdin, check it with the forge and keep it
+        #[arg(long, conflicts_with_all = ["sign_out", "status"])]
+        token_stdin: bool,
+        /// Remove the token kept for the host
+        #[arg(long, conflicts_with = "status")]
+        sign_out: bool,
+        /// Say how the forge signs in to the host, and as whom
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 fn plugin_main() -> i32 {
@@ -99,6 +118,26 @@ fn plugin_main() -> i32 {
             Some(folder) => super::bundled::eject(&id, &folder),
             None => Err("no home directory to put the plugins folder in".to_owned()),
         },
+        Verb::Auth {
+            id,
+            host,
+            token_stdin,
+            sign_out,
+            status: _,
+        } => {
+            let ask = if sign_out {
+                AuthAsk::SignOut
+            } else if token_stdin {
+                let mut token = String::new();
+                match std::io::Read::read_to_string(&mut std::io::stdin(), &mut token) {
+                    Ok(_) => AuthAsk::Token(token.trim().to_owned()),
+                    Err(error) => return fail(&format!("couldn't read the token: {error}")),
+                }
+            } else {
+                AuthAsk::Status
+            };
+            auth(&id, host.as_deref(), ask, &super::secret_store())
+        }
     };
     match done {
         Ok(text) => {
@@ -462,6 +501,147 @@ fn placed_all(problems: &[diffui_plugins::Diagnostic]) -> String {
         .collect()
 }
 
+/// What `diffui plugin auth` was asked to do.
+enum AuthAsk {
+    Status,
+    Token(String),
+    SignOut,
+}
+
+/// The manifest of the plugin `id`: the plugins folder's, else a bundled one.
+fn manifest_by_id(id: &str) -> Result<Manifest, String> {
+    if let Some(dir) = plugins_dir().map(|folder| folder.join(id))
+        && dir.join(MANIFEST_FILE).is_file()
+    {
+        return Manifest::load(&dir).map_err(|problems| placed_all(&problems));
+    }
+    let plugin = super::bundled::bundled()
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| format!("no plugin {id:?}: `diffui plugin list` names them"))?;
+    Manifest::bundled(&super::bundled::place(id), plugin.files)
+        .map_err(|problems| placed_all(&problems))
+}
+
+/// `diffui plugin auth`: the forge's own `account` says who a token (or
+/// what it uses now) signs in as; a token is kept only once it has.
+fn auth(
+    id: &str,
+    host: Option<&str>,
+    ask: AuthAsk,
+    store: &Arc<dyn diffui_plugins::secrets::SecretStore>,
+) -> Result<String, String> {
+    use diffui_plugins::protocol::{Account, AccountMethod, ForgeCall, PluginCall, Secret};
+    let manifest = manifest_by_id(id)?;
+    let Some(forge) = &manifest.forge else {
+        return Err(format!("{id} isn't a forge"));
+    };
+    if manifest.secret("token").is_none_or(|field| !field.per_host) {
+        return Err(format!("{id} doesn't sign in with a token"));
+    }
+    let host = match host.or(forge.default_host.as_deref()) {
+        Some(host) => host.trim().to_ascii_lowercase(),
+        None => return Err(format!("{id} has no default host: pass --host")),
+    };
+    let account = diffui_plugins::secrets::account(id, "token", Some(&host));
+    let token = match ask {
+        AuthAsk::SignOut => {
+            store.delete(&account)?;
+            return Ok(format!("Removed the {} token for {host}\n", manifest.name));
+        }
+        AuthAsk::Token(token) if token.is_empty() => {
+            return Err("no token on stdin".to_owned());
+        }
+        AuthAsk::Token(token) => Some(token),
+        AuthAsk::Status => None,
+    };
+
+    let mut config = crate::config::plugin_records()
+        .remove(id)
+        .map(|record| record.config)
+        .unwrap_or_default();
+    if let Ok(user) = crate::config::UserConfig::reload()
+        && let Some(table) = user.plugins.get(id)
+    {
+        super::page::overlay(&mut config, table);
+    }
+    let (events, loaded) = std::sync::mpsc::channel();
+    let data_dir = std::env::temp_dir().join(format!("diffui-plugin-auth-{}", std::process::id()));
+    let limits = Limits::default();
+    let plugin = Plugin::spawn(
+        manifest.clone(),
+        Options {
+            config: config.clone(),
+            data_dir: data_dir.clone(),
+            limits,
+            secrets: Some(store.clone()),
+        },
+        Arc::new(NoApp(std::sync::Mutex::new(events))),
+    );
+    let mut reach = super::forge::user_hosts(Some(&config));
+    reach.extend(diffui_plugins::HostPattern::parse_claim(&host));
+    plugin.set_forge_hosts(reach);
+    let loaded = loaded.recv_timeout(limits.load + Duration::from_secs(5));
+    let answer = match loaded {
+        Ok(PluginEvent::Loaded(registration))
+            if registration
+                .forge
+                .as_ref()
+                .is_some_and(|methods| methods.iter().any(|method| method == "account")) =>
+        {
+            let (tell, told) = std::sync::mpsc::channel();
+            plugin.call::<Account>(
+                PluginCall::Forge {
+                    repo: super::forge::no_repository(None),
+                    call: ForgeCall::Account {
+                        host: host.clone(),
+                        token: token.clone().map(Secret),
+                    },
+                },
+                move |result| {
+                    let _ = tell.send(result);
+                },
+            );
+            told.recv_timeout(limits.forge_call + Duration::from_secs(5))
+                .map_err(|_| "the forge didn't answer".to_owned())
+                .and_then(|result| {
+                    result.map_err(|error| match error {
+                        diffui_plugins::PluginError::Threw(thrown) => thrown.message,
+                        other => other.to_string(),
+                    })
+                })
+        }
+        Ok(PluginEvent::Loaded(_)) => Err(format!("{id} has no account method to ask")),
+        Ok(PluginEvent::Failed(why)) => Err(format!("{id} didn't load: {why}")),
+        Err(_) => Err(format!("{id} didn't finish loading")),
+    };
+    drop(plugin);
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let account_said = answer?;
+    let name = &manifest.name;
+    match token {
+        Some(token) => {
+            store.set(&account, &token)?;
+            let who = account_said.login.unwrap_or_else(|| "its owner".to_owned());
+            Ok(format!(
+                "Kept a {name} token for {host}, signed in as {who}. A running diffui uses it once the plugin reloads (`diffui ctl reload`).\n"
+            ))
+        }
+        None => {
+            let through = match account_said.method {
+                Some(AccountMethod::Cli) => forge.cli.clone().unwrap_or_else(|| "its CLI".into()),
+                Some(AccountMethod::Token) => "a token".to_owned(),
+                None => return Ok(format!("{host}: not signed in\n")),
+            };
+            let who = account_said
+                .login
+                .map(|login| format!(" as {login}"))
+                .unwrap_or_default();
+            Ok(format!("{host}: signed in{who} with {through}\n"))
+        }
+    }
+}
+
 /// [`check`] of `manifest`, read from `dir`.
 fn check_manifest(manifest: Manifest, dir: &Path) -> Result<String, String> {
     let shown = display_path(dir);
@@ -488,6 +668,7 @@ fn check_manifest(manifest: Manifest, dir: &Path) -> Result<String, String> {
             config: toml::Table::new(),
             data_dir: data_dir.clone(),
             limits,
+            secrets: None,
         },
         Arc::new(NoApp(std::sync::Mutex::new(events))),
     );
@@ -548,8 +729,11 @@ fn check_manifest(manifest: Manifest, dir: &Path) -> Result<String, String> {
 fn permissions_line(manifest: &Manifest) -> String {
     let permissions = &manifest.permissions;
     let mut parts = Vec::new();
-    if !permissions.http.is_empty() {
-        let hosts: Vec<String> = permissions.http.iter().map(ToString::to_string).collect();
+    if !permissions.http.is_empty() || permissions.forge_hosts {
+        let mut hosts: Vec<String> = permissions.http.iter().map(ToString::to_string).collect();
+        if permissions.forge_hosts {
+            hosts.push(diffui_plugins::FORGE_HOSTS.to_owned());
+        }
         parts.push(format!("http {}", hosts.join(", ")));
     }
     for argv in &permissions.exec {
@@ -795,13 +979,13 @@ mod tests {
             .expect("GitHub is bundled")
             .expect("it loads");
         assert!(
-            said.starts_with("github 1.0.0 (api 0) in (bundled)/github\n"),
+            said.starts_with("github 1.1.0 (api 0) in (bundled)/github\n"),
             "{said}"
         );
         assert!(
             said.contains(
                 "forge github.com, github.*, *.github.*: pullRequests, checks, createPullRequest, \
-                 updatePullRequest, hosts, view, commits, commitDiff, diff\n"
+                 updatePullRequest, hosts, view, commits, commitDiff, diff, account\n"
             ),
             "{said}"
         );
@@ -810,7 +994,7 @@ mod tests {
             .expect("GitLab is bundled")
             .expect("it loads");
         assert!(
-            said.starts_with("gitlab 1.0.0 (api 0) in (bundled)/gitlab\n"),
+            said.starts_with("gitlab 1.1.0 (api 0) in (bundled)/gitlab\n"),
             "{said}"
         );
         assert!(said.ends_with("ok\n"), "{said}");

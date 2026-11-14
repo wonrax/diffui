@@ -21,6 +21,10 @@ pub(crate) struct Record {
     /// The permissions that answer was about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) permissions: Option<Permissions>,
+    /// Its settings as Settings changed them: `[plugins.<id>.config]`, under
+    /// config.toml's `[plugins.<id>]`.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub(crate) config: toml::Table,
 }
 
 fn enabled() -> bool {
@@ -37,6 +41,7 @@ impl Default for Record {
             enabled: true,
             allowed: None,
             permissions: None,
+            config: toml::Table::new(),
         }
     }
 }
@@ -68,6 +73,7 @@ pub(crate) fn verdict(record: Option<&Record>, asked: &Permissions) -> Verdict {
 /// Whether everything `asked` names was already in `granted`.
 fn covers(granted: &Permissions, asked: &Permissions) -> bool {
     asked.jj <= granted.jj
+        && (!asked.forge_hosts || granted.forge_hosts)
         && asked.http.iter().all(|host| granted.http.contains(host))
         && asked.exec.iter().all(|argv| exec_covered(granted, argv))
         && asked.env.iter().all(|var| granted.env.contains(var))
@@ -119,6 +125,17 @@ pub(crate) fn lines(manifest: &Manifest, before: Option<&Permissions>) -> Vec<Li
             )
         });
     }
+    if asked.forge_hosts {
+        lines.push(Line {
+            tail: ", using the tokens you give it",
+            ..line(
+                icons::EXTERNAL_LINK,
+                "Send requests to every host it shows pull requests for",
+                None,
+                before.is_some_and(|before| !before.forge_hosts),
+            )
+        });
+    }
     for argv in &asked.exec {
         lines.push(line(
             icons::TERMINAL,
@@ -133,6 +150,26 @@ pub(crate) fn lines(manifest: &Manifest, before: Option<&Permissions>) -> Vec<Li
             "Set for those programs",
             Some(asked.env.join(" ")),
             before.is_some_and(|before| asked.env.iter().any(|var| !before.env.contains(var))),
+        ));
+    }
+    let token_vars: Vec<&str> = manifest
+        .config
+        .iter()
+        .filter_map(|field| field.secret.as_ref())
+        .flat_map(|secret| secret.env.iter().flat_map(|(_, vars)| vars))
+        .map(String::as_str)
+        .fold(Vec::new(), |mut seen, var| {
+            if !seen.contains(&var) {
+                seen.push(var);
+            }
+            seen
+        });
+    if !token_vars.is_empty() {
+        lines.push(line(
+            crate::overlay_kit::glyph::LOCK,
+            "Read a token from",
+            Some(token_vars.join(" ")),
+            false,
         ));
     }
     for file in &asked.read {
@@ -196,6 +233,7 @@ mod tests {
                 .iter()
                 .map(|argv| argv.iter().map(|word| (*word).to_owned()).collect())
                 .collect(),
+            forge_hosts: false,
             env: Vec::new(),
             read: Vec::new(),
             jj,
@@ -207,6 +245,7 @@ mod tests {
             enabled: true,
             allowed: Some(allowed),
             permissions: Some(permissions.clone()),
+            ..Record::default()
         }
     }
 

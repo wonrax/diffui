@@ -65,7 +65,12 @@ pub(crate) fn allowed(id: &str, permissions: &str) -> String {
 
 /// The app on `repo` with `plugins` installed, `settings` as its
 /// settings.toml and `config` as its config.toml, its graph loaded.
-fn launch_on(repo: &Path, plugins: &[PluginDir], config: &str, settings: &str) -> Harness {
+pub(crate) fn launch_on(
+    repo: &Path,
+    plugins: &[PluginDir],
+    config: &str,
+    settings: &str,
+) -> Harness {
     let mut h = Harness::open_prepared(Some(repo), SIZE, config, settings, |home| {
         for plugin in plugins {
             plugin.write(home);
@@ -822,7 +827,7 @@ fn a_plugin_hears_the_events_it_subscribed_to() {
     assert_eq!(count(&mut h, "event repoOpened"), 1);
 }
 
-fn commit_of(repo: &Path, name: &str) -> String {
+pub(crate) fn commit_of(repo: &Path, name: &str) -> String {
     let manifest =
         std::fs::read_to_string(repo.join(".jj/fixture-manifest")).expect("the manifest");
     manifest
@@ -843,25 +848,77 @@ fn commit_of(repo: &Path, name: &str) -> String {
 /// `authorization` header.
 type Asked = (String, String, Option<String>);
 
+/// One request a [`Server`] took: its method, path, headers (names
+/// lowercase) and body.
+#[derive(Debug, Clone)]
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+}
+
+impl Request {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// What a [`Server`] answers: a status, headers beyond the length, a body.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+}
+
+impl Answer {
+    pub(crate) fn json(status: u16, body: impl ToString) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: body.to_string(),
+        }
+    }
+
+    pub(crate) fn header(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.headers.push((name.to_owned(), value.into()));
+        self
+    }
+}
+
 /// A loopback HTTP server that answers each request with what `respond`
-/// makes of its method and path, and keeps what it was asked.
-struct Server {
+/// makes of it, and keeps what it was asked.
+pub(crate) struct Server {
     /// `127.0.0.1:<port>`.
-    host: String,
+    pub(crate) host: String,
     seen: Arc<Mutex<Vec<Asked>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl Server {
     fn start(respond: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> Self {
+        Self::start_with(move |request| {
+            let (status, body) = respond(&request.method, &request.path);
+            Answer::json(status, body)
+        })
+    }
+
+    /// [`Self::start`], answering from the whole request.
+    pub(crate) fn start_with(respond: impl Fn(&Request) -> Answer + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let host = listener.local_addr().expect("an address").to_string();
         let seen: Arc<Mutex<Vec<Asked>>> = Arc::new(Mutex::new(Vec::new()));
+        let requests: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
         let respond = Arc::new(respond);
         std::thread::spawn({
-            let seen = seen.clone();
+            let (seen, requests) = (seen.clone(), requests.clone());
             move || {
                 for stream in listener.incoming().flatten() {
-                    let (seen, respond) = (seen.clone(), respond.clone());
+                    let (seen, requests, respond) =
+                        (seen.clone(), requests.clone(), respond.clone());
                     std::thread::spawn(move || {
                         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                         let mut line = String::new();
@@ -872,44 +929,81 @@ impl Server {
                         let (Some(method), Some(path)) = (words.next(), words.next()) else {
                             return;
                         };
-                        let (mut length, mut authorization) = (0usize, None);
+                        let mut headers = Vec::new();
                         loop {
                             let mut header = String::new();
                             if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
                                 break;
                             }
                             if let Some((name, value)) = header.split_once(':') {
-                                match name.to_ascii_lowercase().as_str() {
-                                    "content-length" => length = value.trim().parse().unwrap_or(0),
-                                    "authorization" => {
-                                        authorization = Some(value.trim().to_owned())
-                                    }
-                                    _ => {}
-                                }
+                                headers.push((
+                                    name.trim().to_ascii_lowercase(),
+                                    value.trim().to_owned(),
+                                ));
                             }
                         }
+                        let length = headers
+                            .iter()
+                            .find(|(name, _)| name == "content-length")
+                            .and_then(|(_, value)| value.parse().ok())
+                            .unwrap_or(0);
                         let mut body = vec![0; length];
                         let _ = reader.read_exact(&mut body);
+                        let request = Request {
+                            method: method.to_owned(),
+                            path: path.to_owned(),
+                            headers,
+                            body: String::from_utf8_lossy(&body).into_owned(),
+                        };
                         seen.lock().unwrap().push((
-                            method.to_owned(),
-                            path.to_owned(),
-                            authorization,
+                            request.method.clone(),
+                            request.path.clone(),
+                            request.header("authorization").map(str::to_owned),
                         ));
-                        let (status, body) = respond(method, path);
-                        let mut stream = stream;
-                        let _ = stream.write_all(
-                            format!(
-                                "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                body.len()
-                            )
-                            .as_bytes(),
+                        requests.lock().unwrap().push(request.clone());
+                        let answer = respond(&request);
+                        let mut head = format!(
+                            "HTTP/1.1 {} Status\r\ncontent-length: {}\r\nconnection: close\r\n",
+                            answer.status,
+                            answer.body.len()
                         );
+                        for (name, value) in &answer.headers {
+                            head.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                        let mut stream = stream;
+                        let _ = stream.write_all(format!("{head}\r\n{}", answer.body).as_bytes());
                     });
                 }
             }
         });
-        Self { host, seen }
+        Self {
+            host,
+            seen,
+            requests,
+        }
     }
+
+    /// Every request so far, in the order they came.
+    pub(crate) fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// Make the fixture's remote `url`.
+pub(crate) fn point_origin_at(repo: &Path, url: &str) {
+    let git_config = repo.join(".git/config");
+    let text = std::fs::read_to_string(&git_config).expect("the git config");
+    let pointed: String = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("url = ") {
+                format!("\turl = {url}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&git_config, pointed).expect("point origin at the server");
 }
 
 /// The reference Forgejo plugin, as shipped, is the forge of a repository
@@ -954,19 +1048,7 @@ fn the_forgejo_plugin_badges_bookmarks_like_a_built_in_forge() {
     let host = server.host.clone();
 
     // The repository's remote is on the server's host.
-    let git_config = repo.join(".git/config");
-    let text = std::fs::read_to_string(&git_config).expect("the git config");
-    let pointed: String = text
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("url = ") {
-                format!("\turl = http://{host}/team/app.git\n")
-            } else {
-                format!("{line}\n")
-            }
-        })
-        .collect();
-    std::fs::write(&git_config, pointed).expect("point origin at the server");
+    point_origin_at(&repo, &format!("http://{host}/team/app.git"));
 
     // The example's own files, with the server's host for codeberg.org.
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/examples/forgejo");

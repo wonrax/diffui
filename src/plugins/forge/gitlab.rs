@@ -26,6 +26,7 @@ impl Fake {
     /// `name` is unique per test: the tests run concurrently.
     fn new(name: &str, rules: &[(&str, &str, i32)]) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
+        crate::harness::without_forge_tokens();
         let dir = std::env::temp_dir().join(format!("diffui-gitlab-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -104,6 +105,7 @@ fn gitlab(program: &Path) -> ScriptForge {
             config,
             data_dir: std::env::temp_dir().join("diffui-gitlab-data"),
             limits: Default::default(),
+            secrets: None,
         },
         Arc::new(Quiet),
     );

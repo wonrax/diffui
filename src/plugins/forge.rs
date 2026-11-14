@@ -48,6 +48,13 @@ pub(super) struct ScriptForge {
 }
 
 /// What the app says about `manifest`'s forge.
+#[cfg(test)]
+impl ScriptForge {
+    pub(crate) fn plugin(&self) -> &Arc<Plugin> {
+        &self.plugin
+    }
+}
+
 pub(super) fn spec_of(manifest: &Manifest) -> Option<ForgeSpec> {
     let claim = manifest.forge.as_ref()?;
     Some(ForgeSpec {
@@ -61,6 +68,7 @@ pub(super) fn spec_of(manifest: &Manifest) -> Option<ForgeSpec> {
         host_env: claim.host_env.clone(),
         pull_request_path: claim.pull_request_path.clone(),
         subgroups: claim.subgroups,
+        tokens: manifest.secret("token").is_some_and(|field| field.per_host),
     })
 }
 
@@ -78,7 +86,7 @@ pub(crate) fn bundled_kind(id: &str) -> ForgeKind {
 
 /// The handle a call about no repository carries: one every repository call
 /// refuses, with `forgeRemote` set when there is a project to name.
-fn no_repository(forge_remote: Option<protocol::ForgeRemote>) -> RepoHandle {
+pub(super) fn no_repository(forge_remote: Option<protocol::ForgeRemote>) -> RepoHandle {
     RepoHandle {
         id: String::new(),
         op: String::new(),
@@ -660,9 +668,12 @@ impl Diffui {
                 let manifest = found.manifest.as_ref()?;
                 let mut hosts = manifest.forge.as_ref()?.hosts.clone();
                 hosts.extend(found.extra_hosts.iter().cloned());
-                hosts.extend(user_hosts(self.user_config.plugins.get(&found.id)));
+                hosts.extend(user_hosts(Some(&self.plugin_config(&found.id))));
+                let plugin = found.running.as_ref()?.plugin.clone();
+                // What `{forge.hosts}` lets it reach.
+                plugin.set_forge_hosts(hosts.clone());
                 let provider = ScriptForge {
-                    plugin: found.running.as_ref()?.plugin.clone(),
+                    plugin,
                     kind: ForgeKind::new(spec_of(manifest)?),
                     hosts,
                     methods,
@@ -878,6 +889,7 @@ pub(super) mod tests {
     /// A directory of the system's temp dir for one test, empty. Not under
     /// the harness's home, which launches clear.
     pub(crate) fn scratch_dir(name: &str) -> std::path::PathBuf {
+        crate::harness::without_forge_tokens();
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "diffui-testforge-{}-{}-{name}",
@@ -903,6 +915,7 @@ pub(super) mod tests {
                 config,
                 data_dir: dir.join("data"),
                 limits: Default::default(),
+                secrets: None,
             },
             Arc::new(Quiet),
         );
@@ -910,6 +923,48 @@ pub(super) mod tests {
             plugin: Arc::new(plugin),
             kind: ForgeKind::new(spec_of(&manifest).expect("a forge")),
             hosts: manifest.forge.as_ref().unwrap().hosts.clone(),
+            methods: None,
+            handles: Handles::default(),
+        }
+    }
+
+    /// The bundled plugin `id` with `config` as its `[plugins.<id>]`, its
+    /// secrets in `secrets`, and `hosts` claimed (and reachable) beyond its
+    /// manifest's: the token path against a local server.
+    pub(crate) fn bundled_with(
+        id: &str,
+        config: toml::Table,
+        secrets: Arc<dyn diffui_plugins::secrets::SecretStore>,
+        hosts: &[&str],
+        dir: &std::path::Path,
+    ) -> ScriptForge {
+        let plugin = super::super::bundled::built_in()
+            .into_iter()
+            .find(|plugin| plugin.id == id)
+            .expect("bundled");
+        let manifest = Manifest::bundled(&super::super::bundled::place(id), plugin.files)
+            .expect("its manifest");
+        let extra: Vec<HostPattern> = hosts
+            .iter()
+            .map(|host| HostPattern::parse_claim(host).expect("a host"))
+            .collect();
+        let plugin = Plugin::spawn(
+            manifest.clone(),
+            diffui_plugins::Options {
+                config,
+                data_dir: dir.join("data"),
+                limits: Default::default(),
+                secrets: Some(secrets),
+            },
+            Arc::new(Quiet),
+        );
+        plugin.set_forge_hosts(extra.clone());
+        let mut claimed = manifest.forge.as_ref().unwrap().hosts.clone();
+        claimed.extend(extra);
+        ScriptForge {
+            plugin: Arc::new(plugin),
+            kind: ForgeKind::new(spec_of(&manifest).expect("a forge")),
+            hosts: claimed,
             methods: None,
             handles: Handles::default(),
         }
@@ -1123,6 +1178,7 @@ pub(super) mod tests {
                     config,
                     data_dir: forge.dir.join("data"),
                     limits: Default::default(),
+                    secrets: None,
                 },
                 Arc::new(Quiet),
             )),
@@ -1210,6 +1266,7 @@ pub(super) mod tests {
                     config: toml::Table::new(),
                     data_dir: std::env::temp_dir(),
                     limits: Default::default(),
+                    secrets: None,
                 },
                 Arc::new(Loaded(Mutex::new(tell))),
             );

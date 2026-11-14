@@ -1470,10 +1470,22 @@ scenes are new in the port; there is no iced capture for them.
 - State: A GitLab merge request open as a tab: the tab reads render-toolkit!7, the header says Merge request.
 - Steps: Open acme/render-toolkit!7.
 
+### `forge-auth-error`
+
+- Window: 1440x900, light
+- State: A pull request tab GitHub has no token for: the card says to add one or sign gh in, with Add a token.
+- Steps: Launch with GitHub set to sign in with a token and none kept; open acme/app#5.
+
 ## Plugins
 
 Script plugins from `~/.config/diffui/plugins` (see the "Writing a plugin"
 section of `assets/agent/SKILL.md`). New in the port.
+
+### `plugins-account`
+
+- Window: 1440x900, light
+- State: GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.
+- Steps: Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.
 
 ### `plugins-permission`
 

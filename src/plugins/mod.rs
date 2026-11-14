@@ -22,6 +22,8 @@
 //! and a handle that no longer matches what is on screen is refused.
 
 mod api;
+#[cfg(test)]
+mod auth_scenarios;
 mod bundled;
 mod cli;
 mod events;
@@ -30,6 +32,7 @@ mod forge;
 mod forge_scenarios;
 #[cfg(test)]
 mod github_scenarios;
+mod page;
 mod query;
 #[cfg(test)]
 mod scenarios;
@@ -54,6 +57,7 @@ pub(crate) use cli::client_main;
 pub(crate) use events::TabPlugins;
 #[cfg(test)]
 pub(crate) use forge::bundled_kind;
+pub(crate) use page::{PageAction, PluginPage, page_overlay};
 #[cfg(test)]
 pub(crate) use query::READ_ONLY;
 #[cfg(test)]
@@ -108,6 +112,14 @@ pub(crate) enum FromPlugin {
         plugin: String,
         instance: u64,
         hosts: Vec<String>,
+    },
+    /// A forge's `account(host)` answered, for its settings page.
+    Account {
+        plugin: String,
+        host: String,
+        /// It was about a token the user pasted, not what is in use.
+        checked: bool,
+        result: Result<diffui_plugins::protocol::Account, String>,
     },
 }
 
@@ -324,6 +336,24 @@ pub(crate) struct Plugins {
     asking: Option<api::Asking>,
     selection_changed: crate::spawn::Debounce,
     watcher: Option<watch::Watcher>,
+    /// Where `secret` settings are kept.
+    pub(crate) secrets: Arc<dyn diffui_plugins::secrets::SecretStore>,
+    /// The plugin page Settings shows, if one is open.
+    pub(crate) page: Option<PluginPage>,
+}
+
+/// The secret store: the Keychain in a real run. The app's tests never get
+/// it, whatever `HOME` is: a file under their scratch home.
+fn secret_store() -> Arc<dyn diffui_plugins::secrets::SecretStore> {
+    #[cfg(test)]
+    {
+        let home = std::env::var_os("HOME").map_or_else(std::env::temp_dir, PathBuf::from);
+        Arc::new(diffui_plugins::secrets::FileStore::new(
+            home.join(".diffui-secrets.json"),
+        ))
+    }
+    #[cfg(not(test))]
+    diffui_plugins::secrets::store()
 }
 
 impl Default for Plugins {
@@ -344,6 +374,8 @@ impl Default for Plugins {
             asking: None,
             selection_changed: Default::default(),
             watcher: None,
+            secrets: secret_store(),
+            page: None,
         }
     }
 }
@@ -706,15 +738,11 @@ impl Diffui {
 
     /// Start `id`'s script afresh. Only for a plugin the user allowed.
     fn spawn_plugin(&mut self, id: &str) {
-        let config = self
-            .user_config
-            .plugins
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
+        let config = self.plugin_config(id);
         self.plugins.instances += 1;
         let instance = self.plugins.instances;
         let to = self.plugins.to_app.clone();
+        let secrets = self.plugins.secrets.clone();
         let Some(found) = self.plugins.get_mut(id) else {
             return;
         };
@@ -730,6 +758,7 @@ impl Diffui {
             config,
             data_dir: data_dir(),
             limits: Limits::default(),
+            secrets: Some(secrets),
         };
         found.state = State::Loading;
         found.extra_hosts.clear();
@@ -972,6 +1001,12 @@ impl Diffui {
                     .collect();
                 self.refresh_script_forges();
             }
+            FromPlugin::Account {
+                plugin,
+                host,
+                checked,
+                result,
+            } => self.plugin_account_answered(&plugin, host, checked, result),
         }
     }
 
@@ -1035,6 +1070,7 @@ impl Diffui {
                 }
                 self.tell_open_repositories(id);
                 self.ask_forge_hosts(id);
+                self.check_page_accounts(id);
             }
             PluginEvent::Failed(why) => {
                 // A load error leads with where it is (`main.js:3:7: …`).
@@ -1128,6 +1164,7 @@ impl Diffui {
                 }
             }
             PluginAction::ShowLog(id) => self.show_plugin_log(&id, cx),
+            PluginAction::Page(action) => self.update_plugin_page(action, cx),
         }
     }
 
@@ -1140,6 +1177,12 @@ impl Diffui {
             enabled: true,
             allowed: Some(allowed),
             permissions: Some(manifest.permissions.clone()),
+            ..self
+                .config_files
+                .plugins
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
         };
         if let Err(error) = self.config_files.write_plugin(id, record) {
             self.push_error_toast("Couldn't save settings", &error);
@@ -1254,4 +1297,6 @@ pub(crate) enum PluginAction {
     /// Show this plugin's directory, or the plugins folder.
     Reveal(Option<String>),
     ShowLog(String),
+    /// On a plugin's settings page.
+    Page(page::PageAction),
 }

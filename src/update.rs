@@ -1062,6 +1062,7 @@ impl Diffui {
             Action::OpenSettings => self.open_settings(),
             Action::CloseSettings => {
                 self.pop_mode(ModeKind::Settings);
+                self.plugins.page = None;
             }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {

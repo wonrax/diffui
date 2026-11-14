@@ -89,11 +89,32 @@ const BEAT: Duration = Duration::from_millis(10);
 /// How long nothing may change for a settle to call it done.
 const QUIET: Duration = Duration::from_millis(250);
 
+/// Unset the variables a forge plugin reads a token from (`GH_TOKEN`, …):
+/// one in the environment the tests run in would turn a CLI path into a
+/// token path, and send it.
+pub(crate) fn without_forge_tokens() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        for var in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GITLAB_TOKEN",
+            "GITLAB_ACCESS_TOKEN",
+        ] {
+            // SAFETY: done once, before any plugin a test starts reads them.
+            unsafe { std::env::remove_var(var) };
+        }
+    });
+}
+
 /// The process-wide scratch `HOME`: window state, recents and config all derive
 /// from it, and the owner's real session must survive a test run.
 pub(crate) fn scratch_home() -> &'static Path {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     HOME.get_or_init(|| {
+        without_forge_tokens();
         let home = std::env::temp_dir().join(format!("diffui-harness-{}", std::process::id()));
         std::fs::create_dir_all(&home).expect("create the scratch home");
         // SAFETY: tests that touch the environment go through here first, and the

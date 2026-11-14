@@ -196,6 +196,9 @@ pub(crate) fn build_overlay(
     if ui.mode(ModeKind::Settings).is_none() {
         return div().into_any_element();
     }
+    if let Some(page) = crate::plugins::page_overlay(ui, look, _window, cx) {
+        return page;
+    }
     let Look { theme, .. } = look;
     let config = ui.config;
     let locked = |key: Key| config.locked.contains(key);

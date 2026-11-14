@@ -1,0 +1,761 @@
+//! The bundled GitHub and GitLab plugins signed in with a token: each call
+//! a CLI path makes, made against a local server standing in for the API,
+//! and how `auto` picks between the CLI and a token. Nothing here reaches a
+//! real forge or the real Keychain (the secrets are a file).
+
+use std::sync::Arc;
+
+use diffui_core::forge::{
+    CheckState, CreatePr, ForgeError, ForgePr, ForgeProvider, ForgeRemote, PrState, ReviewDecision,
+    UpdatePr,
+};
+use diffui_core::repo::CancelFlag;
+use diffui_plugins::protocol::{Account, AccountMethod, ForgeCall, PluginCall, Secret};
+use diffui_plugins::secrets::{FileStore, SecretStore};
+use serde_json::json;
+
+use super::forge::ScriptForge;
+use super::forge::tests::{block_on, bundled_with, scratch_dir};
+use super::scenarios::{Answer, Request, Server};
+use crate::forge_dialog::tests::FakeCli;
+
+const TOKEN: &str = "tok-123";
+
+/// A secret store in a scratch file holding `tokens`, by account.
+fn store(name: &str, tokens: &[(&str, &str)]) -> Arc<dyn SecretStore> {
+    let store = FileStore::new(scratch_dir(name).join("secrets.json"));
+    for (account, token) in tokens {
+        store.set(account, token).unwrap();
+    }
+    Arc::new(store)
+}
+
+/// `[plugins.<id>]` for a forge on `server`: its API there over http, `auth`
+/// as given (none: auto), and `program` a CLI that isn't there unless one is
+/// given.
+fn config(server: &Server, api: &str, auth: Option<&str>, program: Option<&str>) -> toml::Table {
+    let host = &server.host;
+    let mut text = format!(
+        "program = {:?}\n",
+        program.unwrap_or("/nonexistent/diffui-test/cli")
+    );
+    if let Some(auth) = auth {
+        text.push_str(&format!("auth = \"{auth}\"\n"));
+    }
+    text.push_str(&format!(
+        "[per_host.\"{host}\"]\napi_url = \"http://{host}{api}\"\n"
+    ));
+    toml::from_str(&text).unwrap()
+}
+
+fn remote(forge: &ScriptForge, server: &Server) -> ForgeRemote {
+    forge
+        .claims(&format!("http://{}/team/app.git", server.host))
+        .expect("claimed")
+}
+
+fn pr(forge: &ScriptForge, server: &Server, project: &str, number: u64) -> ForgePr {
+    forge
+        .claims(&format!("http://{}/team/{project}.git", server.host))
+        .expect("claimed")
+        .pull_request(number)
+}
+
+/// The forge's `account(host)`, or with `token`, whose that token is.
+fn account(forge: &ScriptForge, host: &str, token: Option<&str>) -> Result<Account, String> {
+    let (tell, told) = std::sync::mpsc::channel();
+    forge.plugin().call::<Account>(
+        PluginCall::Forge {
+            repo: super::forge::no_repository(None),
+            call: ForgeCall::Account {
+                host: host.to_owned(),
+                token: token.map(|token| Secret(token.to_owned())),
+            },
+        },
+        move |result| {
+            let _ = tell.send(result.map_err(|error| error.to_string()));
+        },
+    );
+    told.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("an answer")
+}
+
+fn authorized(request: &Request, how: &str) -> bool {
+    request.header("authorization") == Some(&format!("Bearer {TOKEN}"))
+        || request.header("private-token") == Some(TOKEN) && how == "gitlab"
+}
+
+/// `<url>; rel="next"` for the server that got `request`.
+fn link(request: &Request, path: &str) -> String {
+    format!(
+        "<http://{}{path}>; rel=\"next\"",
+        request.header("host").unwrap_or_default()
+    )
+}
+
+const DIFF: &str =
+    "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
+
+fn rest_pull(number: u64, state: &str, draft: bool) -> serde_json::Value {
+    json!({
+        "number": number, "html_url": format!("https://example.test/team/app/pull/{number}"),
+        "title": "Add the thing", "state": state, "draft": draft, "merged_at": null,
+        "user": { "login": "ada" }, "additions": 3, "deletions": 1, "changed_files": 2,
+        "head": { "ref": "thing", "sha": "abc" }, "base": { "ref": "main", "sha": "def" },
+    })
+}
+
+fn listed(number: u64, head: &str, state: &str, fork: bool) -> serde_json::Value {
+    json!({
+        "number": number, "url": format!("https://example.test/team/app/pull/{number}"),
+        "title": format!("PR {number}"), "headRefName": head, "baseRefName": "main",
+        "headRefOid": format!("sha{number}"), "state": state, "isDraft": false,
+        "reviewDecision": "APPROVED", "isCrossRepository": fork,
+    })
+}
+
+/// GitHub's REST and GraphQL APIs as GitHub Enterprise serves them under
+/// `/api/v3` and `/api/graphql`.
+fn github_server() -> Server {
+    Server::start_with(|request| {
+        if !authorized(request, "github") {
+            return Answer::json(401, json!({ "message": "Bad credentials" }));
+        }
+        let path = request.path.as_str();
+        let wants_diff = request.header("accept") == Some("application/vnd.github.diff");
+        match (request.method.as_str(), path) {
+            ("POST", "/api/graphql") if request.body.contains("pullRequests") => {
+                let second = request.body.contains("\"after\":\"c1\"");
+                let (nodes, more) = if second {
+                    (vec![listed(2, "feature-b", "MERGED", false)], false)
+                } else {
+                    (
+                        vec![
+                            listed(3, "feature-a", "OPEN", false),
+                            listed(4, "feature-a", "OPEN", true),
+                        ],
+                        true,
+                    )
+                };
+                Answer::json(
+                    200,
+                    json!({ "data": { "repository": { "pullRequests": {
+                        "nodes": nodes, "pageInfo": { "hasNextPage": more, "endCursor": "c1" } } } } }),
+                )
+            }
+            ("POST", "/api/graphql") if request.body.contains("statusCheckRollup") => {
+                let state = if request.body.contains("\"sha\":\"good\"") {
+                    json!({ "state": "SUCCESS" })
+                } else {
+                    json!(null)
+                };
+                Answer::json(
+                    200,
+                    json!({ "data": { "repository": { "object": { "statusCheckRollup": state } } } }),
+                )
+            }
+            ("POST", "/api/v3/repos/team/app/pulls") => Answer::json(201, rest_pull(7, "open", true)),
+            ("PATCH", "/api/v3/repos/team/app/pulls/7") => Answer::json(200, rest_pull(7, "open", false)),
+            ("GET", "/api/v3/repos/team/app/pulls/5") if wants_diff => Answer {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: DIFF.to_owned(),
+            },
+            ("GET", "/api/v3/repos/team/app/pulls/5") => Answer::json(200, rest_pull(5, "open", false)),
+            ("GET", "/api/v3/repos/team/app/pulls/6") if wants_diff => {
+                Answer::json(406, json!({ "message": "Sorry, the diff exceeded the maximum number of files (300)." }))
+            }
+            ("GET", "/api/v3/repos/team/app/pulls/6/files?per_page=100&page=1") => Answer::json(
+                200,
+                json!([{ "filename": "big.rs", "status": "added", "additions": 1, "deletions": 0,
+                         "patch": "@@ -0,0 +1 @@\n+x" }]),
+            ),
+            ("GET", "/api/v3/repos/team/app/pulls/5/commits?per_page=100") => Answer::json(
+                200,
+                json!([{ "sha": "aaa1", "author": { "login": "ada" },
+                         "commit": { "message": "First\n\nbody", "author": { "date": "2026-11-14T09:30:00Z" } } }]),
+            )
+            .header(
+                "link",
+                link(request, "/api/v3/repos/team/app/pulls/5/commits?per_page=100&page=2"),
+            ),
+            ("GET", "/api/v3/repos/team/app/pulls/5/commits?per_page=100&page=2") => Answer::json(
+                200,
+                json!([{ "sha": "bbb2", "author": null, "commit": { "message": "Second" } }]),
+            ),
+            ("GET", "/api/v3/user") => Answer::json(200, json!({ "login": "octo" })),
+            ("GET", "/api/v3/repos/team/busy/pulls/1") => {
+                Answer::json(403, json!({ "message": "API rate limit exceeded" }))
+                    .header("x-ratelimit-remaining", "0")
+            }
+            ("GET", "/api/v3/repos/team/sso/pulls/1") => {
+                Answer::json(403, json!({ "message": "Resource protected by organization SAML enforcement" }))
+            }
+            _ => Answer::json(404, json!({ "message": "Not Found" })),
+        }
+    })
+}
+
+fn github(server: &Server, store: Arc<dyn SecretStore>, auth: Option<&str>) -> ScriptForge {
+    bundled_with(
+        "github",
+        config(server, "/api/v3", auth, None),
+        store,
+        &[&server.host],
+        &scratch_dir("github-token"),
+    )
+}
+
+fn github_token(server: &Server) -> ScriptForge {
+    let account = format!("github@{}", server.host);
+    github(
+        server,
+        store("gh-token", &[(&account, TOKEN)]),
+        Some("token"),
+    )
+}
+
+#[test]
+fn github_badges_and_checks_with_a_token() {
+    let server = github_server();
+    let github = github_token(&server);
+    let prs = block_on(github.pull_requests(
+        remote(&github, &server),
+        vec!["feature-a".into(), "feature-b".into()],
+    ))
+    .expect("listed");
+    let summary: Vec<(u64, PrState)> = prs.iter().map(|pr| (pr.number, pr.state)).collect();
+    assert_eq!(
+        summary,
+        [(3, PrState::Open), (2, PrState::Merged)],
+        "both GraphQL pages, without the fork's"
+    );
+    assert_eq!(prs[0].review, Some(ReviewDecision::Approved));
+    let checks = |sha: &str| {
+        block_on(github.checks(remote(&github, &server), sha.to_owned())).expect("checks")
+    };
+    assert_eq!(checks("good").state, CheckState::Success);
+    assert_eq!(checks("other").state, CheckState::None);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| authorized(request, "github")));
+}
+
+#[test]
+fn github_creates_and_updates_with_a_token() {
+    let server = github_server();
+    let github = github_token(&server);
+    let created = block_on(github.create_pull_request(
+        remote(&github, &server),
+        CreatePr {
+            head: "thing".into(),
+            base: "main".into(),
+            title: "Add the thing".into(),
+            body: "Line one\nline two".into(),
+            draft: true,
+        },
+    ))
+    .expect("created");
+    assert_eq!((created.number, created.state), (7, PrState::Draft));
+    block_on(github.update_pull_request(
+        remote(&github, &server),
+        7,
+        UpdatePr {
+            base: Some("feature-a".into()),
+            ..UpdatePr::default()
+        },
+    ))
+    .expect("updated");
+    let requests = server.requests();
+    let sent: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        sent,
+        json!({ "head": "thing", "base": "main", "title": "Add the thing", "body": "Line one\nline two", "draft": true })
+    );
+    let patched: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert_eq!(
+        patched,
+        json!({ "base": "feature-a" }),
+        "an update sends only what changes"
+    );
+}
+
+#[test]
+fn github_pull_request_tab_with_a_token() {
+    let server = github_server();
+    let github = github_token(&server);
+    let tab = pr(&github, &server, "app", 5);
+    let info = block_on(github.view(tab.clone())).expect("viewed");
+    assert_eq!(
+        (
+            info.title.as_str(),
+            info.author.as_str(),
+            info.state.as_str()
+        ),
+        ("Add the thing", "ada", "open")
+    );
+    assert_eq!((info.totals, info.changed_files), (Some((3, 1)), 2));
+    let commits = block_on(github.commits(tab.clone())).expect("commits");
+    let read: Vec<(&str, &str, &str)> = commits
+        .iter()
+        .map(|commit| {
+            (
+                commit.oid.as_str(),
+                commit.author.as_str(),
+                commit.headline.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [("aaa1", "ada", "First"), ("bbb2", "", "Second")],
+        "both pages, by Link"
+    );
+
+    let mut files = Vec::new();
+    block_on(github.stream_diff(
+        tab,
+        CancelFlag::default(),
+        Box::new(|file| files.push(file.path)),
+    ))
+    .expect("streamed");
+    assert_eq!(files, ["src/a.rs"]);
+    // Too large for the diff media type: the files API, paged.
+    let mut files = Vec::new();
+    block_on(github.stream_diff(
+        pr(&github, &server, "app", 6),
+        CancelFlag::default(),
+        Box::new(|file| files.push(file.path)),
+    ))
+    .expect("streamed");
+    assert_eq!(files, ["big.rs"]);
+    let asked_diff = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.header("accept") == Some("application/vnd.github.diff"))
+        .count();
+    assert_eq!(asked_diff, 2);
+}
+
+#[test]
+fn github_token_failures_are_typed() {
+    let server = github_server();
+    let forge = github_token(&server);
+    let kind = forge.kind();
+    let host = server.host.clone();
+    let view = |project: &str| block_on(forge.view(pr(&forge, &server, project, 1))).unwrap_err();
+    assert_eq!(
+        view("busy"),
+        ForgeError::RateLimited {
+            kind,
+            host: host.clone()
+        }
+    );
+    assert_eq!(
+        view("sso"),
+        ForgeError::NotAuthenticated {
+            kind,
+            host: host.clone()
+        }
+    );
+    assert!(matches!(view("gone"), ForgeError::NotFound { .. }));
+
+    // A token the server refuses, and none at all.
+    let refused = github(
+        &server,
+        store("gh-refused", &[(&format!("github@{host}"), "wrong")]),
+        Some("token"),
+    );
+    let error = block_on(refused.view(pr(&refused, &server, "app", 5))).unwrap_err();
+    assert_eq!(
+        error,
+        ForgeError::NotAuthenticated {
+            kind,
+            host: host.clone()
+        }
+    );
+    assert!(
+        error.to_string().contains("Add a token in Settings"),
+        "{error}"
+    );
+    let none = github(&server, store("gh-none", &[]), Some("token"));
+    let error = block_on(none.view(pr(&none, &server, "app", 5))).unwrap_err();
+    assert_eq!(error, ForgeError::NotAuthenticated { kind, host });
+}
+
+/// `auto`: a stored token when gh isn't signed in to the host, gh when no
+/// token is stored.
+#[test]
+fn github_auto_takes_a_token_only_when_there_is_one() {
+    let server = github_server();
+    let host = server.host.clone();
+    let with_token = github(
+        &server,
+        store("gh-auto", &[(&format!("github@{host}"), TOKEN)]),
+        None,
+    );
+    block_on(with_token.view(pr(&with_token, &server, "app", 5))).expect("viewed with the token");
+    assert_eq!(server.requests().len(), 1);
+
+    let fake = FakeCli::new("gh-auto-cli", &[]);
+    fake.answer_or_fail(&[(
+        "pr view 5 *",
+        "5\u{1f}Title\u{1f}me\u{1f}OPEN\u{1f}main\u{1f}topic\u{1f}1\u{1f}1\u{1f}1\u{1f}https://x/5\n",
+        0,
+    )]);
+    let program = fake.program().display().to_string();
+    let cli = bundled_with(
+        "github",
+        config(&server, "/api/v3", None, Some(&program)),
+        store("gh-auto-none", &[]),
+        &[&host],
+        &scratch_dir("github-auto"),
+    );
+    let info = block_on(cli.view(pr(&cli, &server, "app", 5))).expect("viewed with gh");
+    assert_eq!(info.title, "Title");
+    assert_eq!(fake.calls().len(), 1);
+    assert_eq!(server.requests().len(), 1, "the API wasn't asked");
+}
+
+#[test]
+fn github_account_says_whose_token_it_is() {
+    let server = github_server();
+    let host = server.host.clone();
+    let github = github(&server, store("gh-account", &[]), None);
+    assert_eq!(
+        account(&github, &host, Some(TOKEN)).expect("valid"),
+        Account {
+            method: Some(AccountMethod::Token),
+            login: Some("octo".into())
+        }
+    );
+    let refused = account(&github, &host, Some("wrong")).unwrap_err();
+    assert!(refused.contains("Bad credentials"), "{refused}");
+    // No gh there, no token: not signed in, rather than an error.
+    assert_eq!(
+        account(&github, &host, None).expect("asked"),
+        Account {
+            method: None,
+            login: None
+        }
+    );
+    let signed_in = github_token(&server);
+    assert_eq!(
+        account(&signed_in, &host, None).expect("asked"),
+        Account {
+            method: Some(AccountMethod::Token),
+            login: Some("octo".into())
+        }
+    );
+}
+
+/// GitLab's REST API under `/api/v4`.
+fn gitlab_server() -> Server {
+    Server::start_with(|request| {
+        if !authorized(request, "gitlab") {
+            return Answer::json(401, json!({ "message": "401 Unauthorized" }));
+        }
+        let mr = |iid: u64, branch: &str, state: &str| {
+            json!({ "iid": iid, "web_url": format!("https://example.test/team/app/-/merge_requests/{iid}"),
+                    "title": format!("MR {iid}"), "source_branch": branch, "target_branch": "main",
+                    "sha": format!("sha{iid}"), "state": state, "draft": false,
+                    "source_project_id": 1, "target_project_id": 1,
+                    "author": { "username": "ada" }, "changes_count": "2" })
+        };
+        let diff = |path: &str| json!({ "old_path": path, "new_path": path, "diff": "@@ -1 +1 @@\n-a\n+b\n" });
+        match (request.method.as_str(), request.path.as_str()) {
+            (
+                "GET",
+                "/api/v4/projects/team%2Fapp/merge_requests?state=all&order_by=updated_at&per_page=100",
+            ) => Answer::json(
+                200,
+                json!([mr(4, "feature-a", "opened"), mr(2, "feature-b", "merged")]),
+            ),
+            ("GET", "/api/v4/projects/team%2Fapp/repository/commits/sha4") => Answer::json(
+                200,
+                json!({ "id": "sha4", "last_pipeline": { "status": "running", "web_url": "https://ci/1" } }),
+            ),
+            ("POST", "/api/v4/projects/team%2Fapp/merge_requests") => {
+                Answer::json(201, mr(9, "thing", "opened"))
+            }
+            ("GET", "/api/v4/projects/team%2Fapp/merge_requests/9") => {
+                Answer::json(200, mr(9, "thing", "opened"))
+            }
+            ("GET", "/api/v4/projects/team%2Fapp/merge_requests/9/commits?per_page=100&page=1") => {
+                Answer::json(
+                    200,
+                    json!([{ "id": "c2", "title": "Second", "author_name": "Ada" },
+                       { "id": "c1", "title": "First", "author_name": "Ada" }]),
+                )
+            }
+            ("GET", "/api/v4/projects/team%2Fapp/merge_requests/9/diffs?per_page=100&page=1") => {
+                Answer::json(
+                    200,
+                    json!(
+                        (0..100)
+                            .map(|n| diff(&format!("f{n}.rs")))
+                            .collect::<Vec<_>>()
+                    ),
+                )
+            }
+            ("GET", "/api/v4/projects/team%2Fapp/merge_requests/9/diffs?per_page=100&page=2") => {
+                Answer::json(200, json!([diff("last.rs")]))
+            }
+            ("GET", "/api/v4/user") => Answer::json(200, json!({ "username": "ada" })),
+            ("GET", "/api/v4/projects/team%2Fbusy/merge_requests/1") => {
+                Answer::json(429, json!({ "message": "Retry later" }))
+                    .header("ratelimit-remaining", "0")
+            }
+            _ => Answer::json(404, json!({ "message": "404 Project Not Found" })),
+        }
+    })
+}
+
+fn gitlab(server: &Server, store: Arc<dyn SecretStore>, auth: Option<&str>) -> ScriptForge {
+    bundled_with(
+        "gitlab",
+        config(server, "/api/v4", auth, None),
+        store,
+        &[&server.host],
+        &scratch_dir("gitlab-token"),
+    )
+}
+
+#[test]
+fn gitlab_does_everything_with_a_token() {
+    let server = gitlab_server();
+    let host = server.host.clone();
+    // auto, with a token and no glab config: the token.
+    let gitlab = gitlab(
+        &server,
+        store("gl-token", &[(&format!("gitlab@{host}"), TOKEN)]),
+        None,
+    );
+    let prs = block_on(gitlab.pull_requests(
+        remote(&gitlab, &server),
+        vec!["feature-a".into(), "feature-b".into()],
+    ))
+    .expect("listed");
+    assert_eq!(prs.iter().map(|pr| pr.number).collect::<Vec<_>>(), [4, 2]);
+    let checks = block_on(gitlab.checks(remote(&gitlab, &server), "sha4".into())).expect("checks");
+    assert_eq!(checks.state, CheckState::Pending);
+    let created = block_on(gitlab.create_pull_request(
+        remote(&gitlab, &server),
+        CreatePr {
+            head: "thing".into(),
+            base: "main".into(),
+            title: "Thing".into(),
+            body: "Body".into(),
+            draft: true,
+        },
+    ))
+    .expect("created");
+    assert_eq!(created.number, 9);
+    let tab = pr(&gitlab, &server, "app", 9);
+    let info = block_on(gitlab.view(tab.clone())).expect("viewed");
+    assert_eq!((info.title.as_str(), info.changed_files), ("MR 9", 2));
+    let commits = block_on(gitlab.commits(tab.clone())).expect("commits");
+    assert_eq!(
+        commits
+            .iter()
+            .map(|c| c.headline.as_str())
+            .collect::<Vec<_>>(),
+        ["First", "Second"]
+    );
+    let mut files = Vec::new();
+    block_on(gitlab.stream_diff(
+        tab,
+        CancelFlag::default(),
+        Box::new(|file| files.push(file.path)),
+    ))
+    .expect("streamed");
+    assert_eq!(files.len(), 101, "both pages");
+    assert_eq!(files.last().map(String::as_str), Some("last.rs"));
+
+    let requests = server.requests();
+    assert!(requests.iter().all(|request| authorized(request, "gitlab")));
+    let sent: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    assert_eq!(
+        sent,
+        json!({ "source_branch": "thing", "target_branch": "main", "title": "Draft: Thing", "description": "Body" })
+    );
+    assert_eq!(
+        account(&gitlab, &host, None).expect("asked"),
+        Account {
+            method: Some(AccountMethod::Token),
+            login: Some("ada".into())
+        }
+    );
+}
+
+#[test]
+fn gitlab_token_failures_are_typed() {
+    let server = gitlab_server();
+    let host = server.host.clone();
+    let forge = gitlab(
+        &server,
+        store("gl-fail", &[(&format!("gitlab@{host}"), TOKEN)]),
+        Some("token"),
+    );
+    let kind = forge.kind();
+    let view = |project: &str| block_on(forge.view(pr(&forge, &server, project, 1))).unwrap_err();
+    assert_eq!(
+        view("busy"),
+        ForgeError::RateLimited {
+            kind,
+            host: host.clone()
+        }
+    );
+    assert!(matches!(view("gone"), ForgeError::NotFound { .. }));
+    let refused = account(&forge, &host, Some("wrong")).unwrap_err();
+    assert!(refused.contains("401"), "{refused}");
+    let wrong = gitlab(
+        &server,
+        store("gl-wrong", &[(&format!("gitlab@{host}"), "wrong")]),
+        Some("token"),
+    );
+    let error = block_on(wrong.view(pr(&wrong, &server, "app", 9))).unwrap_err();
+    assert_eq!(error, ForgeError::NotAuthenticated { kind, host });
+}
+
+/// The whole way in the app: a repository on a company GitHub, gh not
+/// there, so no badges; the token pasted on GitHub's page in Settings is
+/// checked against the server, kept in the store (not in settings.toml),
+/// and the bookmark gets its badge. Sign out removes it.
+#[test]
+fn a_token_pasted_in_settings_gets_badges() {
+    use super::PluginAction;
+    use super::page::{PageAction, draft_id};
+    use super::scenarios::{launch_on, point_origin_at, wait_running};
+    use crate::Action;
+
+    let repo = crate::harness::fixture_repo();
+    let head = super::scenarios::commit_of(&repo, "fix/parser-crash");
+    let server = Server::start_with(move |request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            _ if !authorized(request, "github") => {
+                Answer::json(401, json!({ "message": "Bad credentials" }))
+            }
+            ("GET", "/api/v3/user") => Answer::json(200, json!({ "login": "octo" })),
+            ("POST", "/api/graphql") if request.body.contains("pullRequests") => {
+                let mut pull = listed(7, "fix/parser-crash", "OPEN", false);
+                pull["headRefOid"] = json!(head);
+                Answer::json(
+                    200,
+                    json!({ "data": { "repository": { "pullRequests": {
+                    "nodes": [pull], "pageInfo": { "hasNextPage": false, "endCursor": null } } } } }),
+                )
+            }
+            ("POST", "/api/graphql") => Answer::json(
+                200,
+                json!({ "data": { "repository": { "object": { "statusCheckRollup": { "state": "SUCCESS" } } } } }),
+            ),
+            _ => Answer::json(404, json!({ "message": "Not Found" })),
+        }
+    });
+    let host = server.host.clone();
+    point_origin_at(&repo, &format!("http://{host}/team/app.git"));
+    let config = format!(
+        "[plugins.github]\nhosts = [\"{host}\"]\nprogram = \"/nonexistent/diffui-test/gh\"\n\n[plugins.github.per_host.\"{host}\"]\napi_url = \"http://{host}/api/v3\"\n"
+    );
+    let mut h = launch_on(&repo, &[], &config, "");
+    wait_running(&mut h, "github");
+    let page = |action| Action::Plugin(PluginAction::Page(action));
+    h.perform(page(PageAction::Open {
+        id: "github".into(),
+        host: None,
+    }));
+    h.wait_until("the account check", |ui| {
+        ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+    });
+    h.read(|ui| {
+        assert!(
+            ui.active().forge.of("fix/parser-crash").is_none(),
+            "no badge without a token"
+        )
+    });
+
+    // A wrong one is refused and not kept.
+    h.perform(page(PageAction::Draft {
+        field: draft_id("token", Some(&host)),
+        text: "wrong".into(),
+    }));
+    h.perform(page(PageAction::SaveSecret {
+        key: "token".into(),
+        host: Some(host.clone()),
+    }));
+    h.wait_until("the refusal", |ui| {
+        ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+    });
+    h.read(|ui| {
+        assert!(
+            ui.plugins
+                .secrets
+                .get(&format!("github@{host}"))
+                .unwrap()
+                .is_none()
+        );
+    });
+
+    h.perform(page(PageAction::Draft {
+        field: draft_id("token", Some(&host)),
+        text: format!(" {TOKEN}\n"),
+    }));
+    h.perform(page(PageAction::SaveSecret {
+        key: "token".into(),
+        host: Some(host.clone()),
+    }));
+    h.wait_until("the badge", |ui| {
+        ui.active()
+            .forge
+            .of("fix/parser-crash")
+            .is_some_and(|decoration| decoration.checks.is_some())
+    });
+    h.read(|ui| {
+        assert_eq!(
+            ui.plugins
+                .secrets
+                .get(&format!("github@{host}"))
+                .unwrap()
+                .as_deref(),
+            Some(TOKEN)
+        );
+        let decoration = ui.active().forge.of("fix/parser-crash").unwrap();
+        assert_eq!(decoration.pr.number, 7);
+        assert_eq!(
+            decoration.checks.as_ref().unwrap().state,
+            CheckState::Success
+        );
+        assert!(
+            ui.toasts
+                .iter()
+                .all(|toast| !format!("{:?}", toast.detail).contains(TOKEN)),
+            "a token is never in a toast"
+        );
+    });
+    let settings = std::fs::read_to_string(
+        crate::harness::scratch_home().join(".config/diffui/settings.toml"),
+    )
+    .unwrap_or_default();
+    assert!(!settings.contains(TOKEN), "{settings}");
+    h.wait_until("the account says the token", |ui| {
+        ui.plugins
+            .page
+            .as_ref()
+            .is_some_and(|page| page.settled() && page.signed_in(&host).as_deref() == Some("octo"))
+    });
+
+    h.perform(page(PageAction::ClearSecret {
+        key: "token".into(),
+        host: Some(host.clone()),
+    }));
+    h.read(|ui| {
+        assert!(
+            ui.plugins
+                .secrets
+                .get(&format!("github@{host}"))
+                .unwrap()
+                .is_none()
+        );
+    });
+}

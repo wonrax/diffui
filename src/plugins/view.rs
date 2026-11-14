@@ -276,6 +276,10 @@ fn plugin_row(ui: &Diffui, look: Look, index: usize, found: &Found, cx: &mut Cx)
     let id = &found.id;
     let bundled = found.origin == Origin::Bundled;
     let has_manifest = found.manifest.is_some() && !bundled;
+    let has_settings = found
+        .manifest
+        .as_ref()
+        .is_some_and(|manifest| !manifest.config.is_empty());
     let has_tab = !ui.tabs.is_empty();
     let button = |name: &'static str, glyph: &'static str, tip: &'static str| {
         look.icon_button((name, index), glyph, theme.muted_text)
@@ -323,6 +327,27 @@ fn plugin_row(ui: &Diffui, look: Look, index: usize, found: &Found, cx: &mut Cx)
             .disabled(!has_manifest)
             .when(has_manifest, |button| {
                 button.on_click(send(PluginAction::Review(id.clone()), cx))
+            }),
+        )
+        .child(
+            button(
+                "settings-plugin-settings",
+                icons::PENCIL,
+                if has_settings {
+                    "Settings"
+                } else {
+                    "No settings"
+                },
+            )
+            .disabled(!has_settings)
+            .when(has_settings, |button| {
+                button.on_click(send(
+                    PluginAction::Page(super::page::PageAction::Open {
+                        id: id.clone(),
+                        host: None,
+                    }),
+                    cx,
+                ))
             }),
         );
     let on = found.state != State::Disabled;

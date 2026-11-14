@@ -112,6 +112,37 @@ pub(crate) fn reset_button(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<AnyEl
     )
 }
 
+/// "Add a token", when a pull request tab failed because its forge isn't
+/// signed in to the host (or its CLI is missing) and the forge takes a
+/// token: it opens the forge's page in Settings at that host.
+fn sign_in_button(ui: &Diffui, look: Look, error: &str, cx: &mut Cx) -> Option<AnyElement> {
+    use diffui_core::forge::ForgeError;
+    let crate::TabSource::ForgePr(pr) = &ui.tabs.get(ui.active)?.source else {
+        return None;
+    };
+    let kind = pr.kind;
+    let host = pr.remote().host;
+    let signed_out = ForgeError::NotAuthenticated {
+        kind,
+        host: host.clone(),
+    }
+    .to_string();
+    let missing = ForgeError::MissingCli { kind }.to_string();
+    if !kind.tokens || !(error.contains(&signed_out) || error.contains(&missing)) {
+        return None;
+    }
+    let open = crate::plugins::PluginAction::Page(crate::plugins::PageAction::Open {
+        id: kind.id().to_owned(),
+        host: Some(host),
+    });
+    Some(
+        look.button("load-error-add-token", "Add a token")
+            .compact()
+            .on_click(Diffui::on_action(Action::Plugin(open), cx))
+            .into_any_element(),
+    )
+}
+
 /// The alert card above the list when the graph load failed. A revset error
 /// gets its own wording, the parser's message in mono (it points a caret at
 /// the offending column), and a way back to the default.
@@ -148,7 +179,7 @@ pub(crate) fn load_error(ui: &Diffui, look: Look, error: &str, cx: &mut Cx) -> A
             if revset {
                 reset_button(ui, look, cx)
             } else {
-                None
+                sign_in_button(ui, look, error, cx)
             }
             .map(
                 // A column stretches its children; the button keeps its own width.
