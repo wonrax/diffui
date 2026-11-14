@@ -48,7 +48,7 @@ pub(crate) struct ForgeUi {
 impl Default for ForgeUi {
     fn default() -> Self {
         Self {
-            forges: Forges::builtin(),
+            forges: Forges::default(),
             was_focused: true,
         }
     }
@@ -787,7 +787,12 @@ mod tests {
     }
 
     fn remote() -> ForgeRemote {
-        ForgeRemote::new(ForgeKind::GitHub, "github.com", "team", "app")
+        ForgeRemote::new(
+            crate::plugins::bundled_kind("github"),
+            "github.com",
+            "team",
+            "app",
+        )
     }
 
     fn answer(prs: Vec<PullRequest>) -> Refreshed {
@@ -1006,7 +1011,12 @@ mod tests {
         assert_eq!(label(&ui, "forge.create"), "Create pull request");
         ui.tab_mut(tab).unwrap().forge.home = Some((
             "origin".to_owned(),
-            ForgeRemote::new(ForgeKind::GitLab, "gitlab.com", "team", "app"),
+            ForgeRemote::new(
+                crate::plugins::bundled_kind("gitlab"),
+                "gitlab.com",
+                "team",
+                "app",
+            ),
         ));
         assert_eq!(label(&ui, "forge.create"), "Create merge request");
         assert_eq!(label(&ui, "forge.refresh"), "Refresh merge requests");

@@ -19,18 +19,6 @@ pub struct ForgePr {
 }
 
 impl ForgePr {
-    /// Parse the forms people paste, for GitHub and GitLab:
-    /// - GitHub: a PR URL (`https://github.com/o/r/pull/123`, trailing
-    ///   `/files`-style segments and queries tolerated), `o/r#123`,
-    ///   `host/o/r#123` and `o/r/pull/123`;
-    /// - GitLab: an MR URL (`https://host/group/sub/name/-/merge_requests/7`),
-    ///   `group/name!7` and `host/group/name!7`.
-    ///
-    /// See [`Self::parse_with`].
-    pub fn parse(input: &str) -> Option<Self> {
-        Self::parse_with(input, &[ForgeKind::GitHub, ForgeKind::GitLab])
-    }
-
     /// Parse a pull request link or reference for one of `kinds`, asked in
     /// order, each by its [`ForgeSpec`](super::ForgeSpec): a URL whose path
     /// reads like its `pull_request_path` (with or without the scheme, or
@@ -69,7 +57,7 @@ impl ForgePr {
         // first forge whose sigil is there decides.
         if let Some(kind) = kinds
             .iter()
-            .find(|kind| kind.spec().pull_request_path.is_some() && input.contains(kind.sigil()))
+            .find(|kind| kind.pull_request_path.is_some() && input.contains(kind.sigil()))
         {
             let (slug, number) = input.split_once(kind.sigil())?;
             let number = number.parse().ok()?;
@@ -78,8 +66,8 @@ impl ForgePr {
                 return None;
             }
             let hosted = parts.len() >= 3 && looks_like_host(parts[0]);
-            let (host, path) = match (kind.spec().subgroups, parts.len()) {
-                (_, _) if hosted && (kind.spec().subgroups || parts.len() == 3) => {
+            let (host, path) = match (kind.subgroups, parts.len()) {
+                (_, _) if hosted && (kind.subgroups || parts.len() == 3) => {
                     (Some(parts[0]), &parts[1..])
                 }
                 (false, 2) | (true, 2..) => (None, &parts[..]),
@@ -117,11 +105,11 @@ impl ForgePr {
     /// `kind`'s pull request path (`owner/name/pull/number[...]`), segments
     /// after it tolerated, a query or fragment after the number too.
     fn parse_path(kind: ForgeKind, path: &str) -> Option<Self> {
-        let pattern = kind.spec().pull_request_path.as_deref()?;
+        let pattern = kind.pull_request_path.as_deref()?;
         let pattern: Vec<&str> = pattern.split('/').collect();
         let segments: Vec<&str> = path.split('/').collect();
         let mut found = Found::default();
-        if !match_path(&pattern, &segments, kind.spec().subgroups, &mut found) {
+        if !match_path(&pattern, &segments, kind.subgroups, &mut found) {
             return None;
         }
         Some(Self {
@@ -344,10 +332,16 @@ fn remotes_in_config(config: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::fixtures;
+
+    /// GitHub's and GitLab's links and references.
+    fn parse(input: &str) -> Option<ForgePr> {
+        ForgePr::parse_with(input, &[fixtures::github(), fixtures::gitlab()])
+    }
 
     fn github(host: Option<&str>, owner: &str, name: &str, number: u64) -> Option<ForgePr> {
         Some(ForgePr {
-            kind: ForgeKind::GitHub,
+            kind: fixtures::github(),
             host: host.map(str::to_owned),
             owner: owner.to_owned(),
             name: name.to_owned(),
@@ -357,7 +351,7 @@ mod tests {
 
     fn gitlab(host: Option<&str>, owner: &str, name: &str, number: u64) -> Option<ForgePr> {
         Some(ForgePr {
-            kind: ForgeKind::GitLab,
+            kind: fixtures::gitlab(),
             ..github(host, owner, name, number)?
         })
     }
@@ -372,7 +366,7 @@ mod tests {
             "anthropics/claude-code/pull/123",
             "anthropics/claude-code#123",
         ] {
-            assert_eq!(ForgePr::parse(input), expected, "{input}");
+            assert_eq!(parse(input), expected, "{input}");
         }
     }
 
@@ -380,48 +374,45 @@ mod tests {
     fn parses_enterprise_hosts() {
         let expected = github(Some("github.acme.com"), "team", "app", 42);
         assert_eq!(
-            ForgePr::parse("https://github.acme.com/team/app/pull/42/files"),
+            parse("https://github.acme.com/team/app/pull/42/files"),
             expected
         );
-        assert_eq!(ForgePr::parse("github.acme.com/team/app/pull/42"), expected);
-        assert_eq!(ForgePr::parse("github.acme.com/team/app#42"), expected);
-        assert_eq!(ForgePr::parse("GitHub.Acme.com/team/app#42"), expected);
+        assert_eq!(parse("github.acme.com/team/app/pull/42"), expected);
+        assert_eq!(parse("github.acme.com/team/app#42"), expected);
+        assert_eq!(parse("GitHub.Acme.com/team/app#42"), expected);
         // github.com spelled out is the same PR as the shorthand.
         assert_eq!(
-            ForgePr::parse("https://www.github.com/team/app/pull/42"),
-            ForgePr::parse("team/app#42")
+            parse("https://www.github.com/team/app/pull/42"),
+            parse("team/app#42")
         );
         // A relative path with three segments isn't a host reference.
-        assert_eq!(ForgePr::parse("code/team/app#42"), None);
+        assert_eq!(parse("code/team/app#42"), None);
     }
 
     #[test]
     fn parses_merge_requests() {
         assert_eq!(
-            ForgePr::parse("https://gitlab.com/group/sub/app/-/merge_requests/7/diffs"),
+            parse("https://gitlab.com/group/sub/app/-/merge_requests/7/diffs"),
             gitlab(None, "group/sub", "app", 7)
         );
         assert_eq!(
-            ForgePr::parse("https://git.acme.org/infra/tools/-/merge_requests/12"),
+            parse("https://git.acme.org/infra/tools/-/merge_requests/12"),
             gitlab(Some("git.acme.org"), "infra", "tools", 12)
         );
+        assert_eq!(parse("group/app!7"), gitlab(None, "group", "app", 7));
         assert_eq!(
-            ForgePr::parse("group/app!7"),
-            gitlab(None, "group", "app", 7)
-        );
-        assert_eq!(
-            ForgePr::parse("group/sub/app!7"),
+            parse("group/sub/app!7"),
             gitlab(None, "group/sub", "app", 7)
         );
         assert_eq!(
-            ForgePr::parse("git.acme.org/infra/tools!3"),
+            parse("git.acme.org/infra/tools!3"),
             gitlab(Some("git.acme.org"), "infra", "tools", 3)
         );
         assert_eq!(
-            ForgePr::parse("gitlab.com/group/app!7"),
+            parse("gitlab.com/group/app!7"),
             gitlab(None, "group", "app", 7)
         );
-        assert_eq!(ForgePr::parse("app!7"), None);
+        assert_eq!(parse("app!7"), None);
         let mr = gitlab(None, "group/sub", "app", 7).expect("an MR");
         assert_eq!(mr.label(), "app!7");
         assert_eq!(mr.reference(), "group/sub/app!7");
@@ -429,15 +420,15 @@ mod tests {
 
     #[test]
     fn a_plugins_forge_reads_its_own_links() {
-        let forgejo = ForgeKind::Script(crate::forge::ScriptForge::new(crate::forge::ForgeSpec {
+        let forgejo = ForgeKind::new(crate::forge::ForgeSpec {
             id: "forgejo".into(),
             name: "Forgejo".into(),
             sigil: '#',
             short: "PR".into(),
             pull_request_path: Some("{owner}/{name}/pulls/{number}".into()),
             ..Default::default()
-        }));
-        let kinds = [ForgeKind::GitHub, forgejo];
+        });
+        let kinds = [fixtures::github(), forgejo];
         let pr = ForgePr::parse_with("https://codeberg.org/team/app/pulls/12/files", &kinds)
             .expect("a pull request");
         assert_eq!(pr.kind, forgejo);
@@ -450,7 +441,7 @@ mod tests {
         // A host-less reference needs a forge with a default host: GitHub's.
         assert_eq!(
             ForgePr::parse_with("team/app#3", &kinds).unwrap().kind,
-            ForgeKind::GitHub
+            fixtures::github()
         );
         let alone = [forgejo];
         assert_eq!(ForgePr::parse_with("team/app#3", &alone), None);
@@ -473,7 +464,7 @@ mod tests {
             "https://github.com/anthropics/claude-code/issues/123",
             "",
         ] {
-            assert_eq!(ForgePr::parse(input), None, "{input}");
+            assert_eq!(parse(input), None, "{input}");
         }
     }
 
@@ -543,11 +534,11 @@ mod tests {
             ]
         );
         let urls = || remotes.iter().map(|(_, url)| url.as_str());
-        let pr = ForgePr::parse("team/app#42")
+        let pr = parse("team/app#42")
             .expect("a reference")
             .with_host_from_remotes(urls());
         assert_eq!(Some(pr), github(Some("github.acme.com"), "team", "app", 42));
-        let pr = ForgePr::parse("me/app#1")
+        let pr = parse("me/app#1")
             .expect("a reference")
             .with_host_from_remotes(urls());
         assert_eq!(pr.host, None, "github.com stays the default");

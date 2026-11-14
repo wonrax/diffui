@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use diffui_core::RevisionSelection;
-use diffui_core::forge::{ForgeKind, ForgePr};
+use diffui_core::forge::ForgePr;
 
 use super::forge::tests::{fixture_dir, install_cli};
 use super::{Origin, State};
@@ -146,7 +146,7 @@ fn a_bundled_plugin_forges_pull_request_opens_in_a_tab() {
     });
 
     let pr = open_pr(&mut h, "https://testforge.invalid/team/app/pull/1/files");
-    assert!(matches!(pr.kind, ForgeKind::Script(script) if script.id == "testforge"));
+    assert_eq!(pr.kind.id(), "testforge");
     assert_eq!(pr.label(), "app#1");
     // A reference without a host means the forge's default host when no
     // other forge writes them that way first; with the host it is this one.

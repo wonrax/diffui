@@ -53,6 +53,8 @@ use futures::channel::mpsc;
 pub(crate) use cli::client_main;
 pub(crate) use events::TabPlugins;
 #[cfg(test)]
+pub(crate) use forge::bundled_kind;
+#[cfg(test)]
 pub(crate) use query::READ_ONLY;
 #[cfg(test)]
 pub(crate) use scenarios::PluginDir;
@@ -446,8 +448,7 @@ impl Plugins {
             .filter(|found| !matches!(found.state, State::Disabled | State::Failed(_)))
             .filter_map(|found| {
                 let spec = forge::spec_of(found.manifest.as_ref()?)?;
-                let kind = diffui_core::forge::ScriptForge::new(spec);
-                Some((found.origin, diffui_core::forge::ForgeKind::Script(kind)))
+                Some((found.origin, diffui_core::forge::ForgeKind::new(spec)))
             })
             .collect();
         kinds.sort_by_key(|(origin, _)| origin.rank());

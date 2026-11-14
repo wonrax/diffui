@@ -109,9 +109,7 @@ fn gitlab(program: &Path) -> ScriptForge {
     );
     ScriptForge {
         plugin: Arc::new(plugin),
-        kind: ForgeKind::Script(diffui_core::forge::ScriptForge::new(
-            spec_of(&manifest).expect("a forge"),
-        )),
+        kind: ForgeKind::new(spec_of(&manifest).expect("a forge")),
         hosts: manifest.forge.as_ref().unwrap().hosts.clone(),
         methods: None,
         handles: Handles::default(),
@@ -564,13 +562,8 @@ fn hosts_glab_is_configured_for_are_gitlabs() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.yml"), config).unwrap();
     });
-    let claimed = |ui: &crate::Diffui, url: &str| {
-        ui.forge
-            .forges
-            .claim(url)
-            .filter(|remote| matches!(remote.kind, ForgeKind::Script(_)))
-            .map(|remote| remote.kind.id())
-    };
+    let claimed =
+        |ui: &crate::Diffui, url: &str| ui.forge.forges.claim(url).map(|remote| remote.kind.id());
     h.wait_until("hosts() to answer", |ui| {
         claimed(ui, "git@code.corp.invalid:infra/tools.git") == Some("gitlab")
     });

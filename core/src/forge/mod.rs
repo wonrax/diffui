@@ -10,10 +10,10 @@
 //! Everything a provider takes and returns is owned data, and every call is a
 //! boxed future, so a provider written in another language (the script
 //! runtime's adapter) implements the same trait without reaching into app
-//! state. The built-in providers shell out to each forge's own CLI (`gh`,
-//! `glab`), which keeps tokens out of diffui.
+//! state. Every forge is a plugin's: GitHub and GitLab are bundled ones
+//! (`plugins/bundled`) that shell out to `gh` and `glab`, which keeps tokens
+//! out of diffui.
 
-mod cli;
 mod remote;
 
 use std::fmt;
@@ -33,22 +33,18 @@ use crate::model::{
 };
 use crate::repo::CancelFlag;
 
-/// Which forge a remote or a pull request lives on.
+/// Which forge a remote or a pull request lives on: the spec of the plugin
+/// that provides it. `Copy`, so the spec is interned for the life of the
+/// process (one small allocation per distinct spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ForgeKind {
-    GitHub,
-    GitLab,
-    /// A forge a plugin provides.
-    Script(ScriptForge),
-}
+pub struct ForgeKind(&'static ForgeSpec);
 
 /// What a forge is called and how its references read: everything the app
-/// says about a forge without asking it. A plugin's comes from its
-/// manifest; the built-in forges have theirs here.
+/// says about a forge without asking it, from its plugin's manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ForgeSpec {
-    /// What a when-clause's `repo.forge` reads: `github`, `gitlab`, or a
-    /// plugin's id.
+    /// What a when-clause's `repo.forge` reads: the plugin's id (`github`,
+    /// `gitlab`).
     pub id: String,
     /// The forge's name, for messages.
     pub name: String,
@@ -72,50 +68,7 @@ pub struct ForgeSpec {
     pub subgroups: bool,
 }
 
-impl ForgeSpec {
-    fn github() -> Self {
-        Self {
-            id: "github".into(),
-            name: "GitHub".into(),
-            merge_requests: false,
-            sigil: '#',
-            short: "PR".into(),
-            cli: "gh".into(),
-            default_host: "github.com".into(),
-            host_env: Some("GH_HOST".into()),
-            pull_request_path: Some("{owner}/{name}/pull/{number}".into()),
-            subgroups: false,
-        }
-    }
-
-    fn gitlab() -> Self {
-        Self {
-            id: "gitlab".into(),
-            name: "GitLab".into(),
-            merge_requests: true,
-            sigil: '!',
-            short: "MR".into(),
-            cli: "glab".into(),
-            default_host: "gitlab.com".into(),
-            host_env: Some("GITLAB_HOST".into()),
-            pull_request_path: Some("{owner}/{name}/-/merge_requests/{number}".into()),
-            subgroups: true,
-        }
-    }
-}
-
-/// A plugin's forge. `Copy` like the built-in kinds, so its spec is interned
-/// for the life of the process (one small allocation per distinct spec).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScriptForge(&'static ForgeSpec);
-
-impl ScriptForge {
-    pub fn new(spec: ForgeSpec) -> Self {
-        Self(intern(spec))
-    }
-}
-
-impl std::ops::Deref for ScriptForge {
+impl std::ops::Deref for ForgeKind {
     type Target = ForgeSpec;
     fn deref(&self) -> &ForgeSpec {
         self.0
@@ -137,31 +90,23 @@ fn intern(spec: ForgeSpec) -> &'static ForgeSpec {
 }
 
 impl ForgeKind {
-    /// What the app says about this forge.
-    pub fn spec(self) -> &'static ForgeSpec {
-        static GITHUB: std::sync::LazyLock<ForgeSpec> = std::sync::LazyLock::new(ForgeSpec::github);
-        static GITLAB: std::sync::LazyLock<ForgeSpec> = std::sync::LazyLock::new(ForgeSpec::gitlab);
-        match self {
-            Self::GitHub => &GITHUB,
-            Self::GitLab => &GITLAB,
-            Self::Script(script) => script.0,
-        }
+    pub fn new(spec: ForgeSpec) -> Self {
+        Self(intern(spec))
     }
 
     /// The forge's name, for messages.
     pub fn name(self) -> &'static str {
-        &self.spec().name
+        &self.0.name
     }
 
-    /// What a when-clause's `repo.forge` reads: `github`, `gitlab`, or a
-    /// plugin's id.
+    /// What a when-clause's `repo.forge` reads: the plugin's id.
     pub fn id(self) -> &'static str {
-        &self.spec().id
+        &self.0.id
     }
 
     /// Whether the forge says "merge request" for a pull request.
     pub fn merge_requests(self) -> bool {
-        self.spec().merge_requests
+        self.0.merge_requests
     }
 
     /// What the forge calls a pull request, lowercase.
@@ -184,27 +129,27 @@ impl ForgeKind {
 
     /// The abbreviation: `PR`, `MR`.
     pub fn short(self) -> &'static str {
-        &self.spec().short
+        &self.0.short
     }
 
     /// What prefixes a number in the forge's own references: `#12`, `!12`.
     pub fn sigil(self) -> char {
-        self.spec().sigil
+        self.0.sigil
     }
 
     /// The program the forge's errors name; empty when it has none.
     pub fn cli(self) -> &'static str {
-        &self.spec().cli
+        &self.0.cli
     }
 
     /// The host a reference without one means; empty when it has none.
     pub fn default_host(self) -> &'static str {
-        &self.spec().default_host
+        &self.0.default_host
     }
 
     /// The environment variable that points the CLI at a host.
     fn host_env(self) -> Option<&'static str> {
-        self.spec().host_env.as_deref()
+        self.0.host_env.as_deref()
     }
 
     /// The host a reference without one resolves to: the CLI's environment
@@ -494,8 +439,8 @@ pub type ForgeFuture<'a, T> = Pin<Box<dyn Future<Output = ForgeResult<T>> + Send
 /// Called once per file as a pull request's diff streams in.
 pub type OnFile<'a> = Box<dyn FnMut(DiffFile) + Send + 'a>;
 
-/// Something a provider may not be able to do. The built-in forges do all of
-/// it; a plugin's forge does what its script implements.
+/// Something a provider may not be able to do: a plugin's forge does what its
+/// script implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeAbility {
     /// [`ForgeProvider::create_pull_request`].
@@ -575,8 +520,9 @@ pub trait ForgeProvider: Send + Sync {
     }
 }
 
-/// The providers diffui knows, in the order they're asked to claim a remote.
-#[derive(Clone)]
+/// The forges the plugins provide, in the order they're asked to claim a
+/// remote.
+#[derive(Clone, Default)]
 pub struct Forges {
     providers: Vec<Arc<dyn ForgeProvider>>,
 }
@@ -589,18 +535,7 @@ impl fmt::Debug for Forges {
     }
 }
 
-impl Default for Forges {
-    fn default() -> Self {
-        Self::builtin()
-    }
-}
-
 impl Forges {
-    /// None: GitHub and GitLab are bundled plugins (`plugins/bundled`).
-    pub fn builtin() -> Self {
-        Self::new(Vec::new())
-    }
-
     pub fn new(providers: Vec<Arc<dyn ForgeProvider>>) -> Self {
         Self { providers }
     }
@@ -610,20 +545,6 @@ impl Forges {
             .iter()
             .find(|provider| provider.kind() == kind)
             .cloned()
-    }
-
-    /// These forges with `scripts` as the plugins' forges, after the built-in
-    /// ones: a plugin's forge answers for hosts no built-in claims, and never
-    /// takes one over.
-    pub fn with_scripts(&self, scripts: Vec<Arc<dyn ForgeProvider>>) -> Self {
-        let mut providers: Vec<Arc<dyn ForgeProvider>> = self
-            .providers
-            .iter()
-            .filter(|provider| !matches!(provider.kind(), ForgeKind::Script(_)))
-            .cloned()
-            .collect();
-        providers.extend(scripts);
-        Self { providers }
     }
 
     /// The forges, in the order they're asked to claim a remote.
@@ -929,6 +850,43 @@ pub fn pr_revision_details(kind: ForgeKind, info: &PrInfo) -> RevisionDetails {
     }
 }
 
+/// GitHub's and GitLab's kinds as their bundled manifests
+/// (`plugins/bundled/*/plugin.toml`) give them, for the core's tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{ForgeKind, ForgeSpec};
+
+    pub(crate) fn github() -> ForgeKind {
+        ForgeKind::new(ForgeSpec {
+            id: "github".into(),
+            name: "GitHub".into(),
+            merge_requests: false,
+            sigil: '#',
+            short: "PR".into(),
+            cli: "gh".into(),
+            default_host: "github.com".into(),
+            host_env: Some("GH_HOST".into()),
+            pull_request_path: Some("{owner}/{name}/pull/{number}".into()),
+            subgroups: false,
+        })
+    }
+
+    pub(crate) fn gitlab() -> ForgeKind {
+        ForgeKind::new(ForgeSpec {
+            id: "gitlab".into(),
+            name: "GitLab".into(),
+            merge_requests: true,
+            sigil: '!',
+            short: "MR".into(),
+            cli: "glab".into(),
+            default_host: "gitlab.com".into(),
+            host_env: Some("GITLAB_HOST".into()),
+            pull_request_path: Some("{owner}/{name}/-/merge_requests/{number}".into()),
+            subgroups: true,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,10 +896,10 @@ mod tests {
 
     impl ForgeProvider for Claims {
         fn kind(&self) -> ForgeKind {
-            ForgeKind::Script(ScriptForge::new(ForgeSpec {
+            ForgeKind::new(ForgeSpec {
                 id: "test".into(),
                 ..ForgeSpec::default()
-            }))
+            })
         }
 
         fn claims(&self, remote_url: &str) -> Option<ForgeRemote> {
@@ -1059,13 +1017,13 @@ mod tests {
     #[test]
     fn errors_say_what_to_do() {
         let missing = ForgeError::MissingCli {
-            kind: ForgeKind::GitLab,
+            kind: fixtures::gitlab(),
         }
         .to_string();
         assert!(missing.contains("glab auth login"), "{missing}");
         assert!(missing.contains("PATH"), "{missing}");
         let auth = ForgeError::NotAuthenticated {
-            kind: ForgeKind::GitHub,
+            kind: fixtures::github(),
             host: "github.acme.com".to_owned(),
         }
         .to_string();

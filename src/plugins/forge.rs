@@ -1,5 +1,5 @@
-//! A plugin's forge behind [`ForgeProvider`], so the badges, the dialog and
-//! stack submission treat it like the built-in ones.
+//! A plugin's forge behind [`ForgeProvider`], for the badges, the dialog,
+//! stack submission and the pull request tab.
 //!
 //! The provider exists from the moment the plugin starts loading, so remotes
 //! are claimed from the manifest without waiting for the script (calls made
@@ -7,19 +7,17 @@
 //! answers [`ForgeError::Unsupported`], and [`ForgeProvider::can`] says so
 //! up front.
 //!
-//! Script forges go after the built-in providers (see
-//! [`Forges::with_scripts`]), and among themselves a plugin that replaces a
-//! bundled one goes first, then the bundled ones, then the rest: a remote
-//! goes to the first that claims it, so a plugin from the plugins folder
-//! never takes a host a bundled forge claims.
+//! A plugin that replaces a bundled one goes first, then the bundled ones,
+//! then the rest: a remote goes to the first that claims it, so a plugin
+//! from the plugins folder never takes a host a bundled forge claims.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use diffui_core::forge::{
     CheckState, Checks, CreatePr, DiffParts, ForgeAbility, ForgeError, ForgeFuture, ForgeKind,
-    ForgePr, ForgeProvider, ForgeRemote, ForgeSpec, OnFile, PrCommit, PrInfo, PrState, PullRequest,
-    ReviewDecision, UpdatePr, latest_per_branch, parse_remote_url,
+    ForgePr, ForgeProvider, ForgeRemote, ForgeSpec, Forges, OnFile, PrCommit, PrInfo, PrState,
+    PullRequest, ReviewDecision, UpdatePr, latest_per_branch, parse_remote_url,
 };
 use diffui_core::model::{DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo};
 use diffui_core::repo::CancelFlag;
@@ -64,6 +62,18 @@ pub(super) fn spec_of(manifest: &Manifest) -> Option<ForgeSpec> {
         pull_request_path: claim.pull_request_path.clone(),
         subgroups: claim.subgroups,
     })
+}
+
+/// The forge the bundled plugin `id` provides, from the build's own copy.
+#[cfg(test)]
+pub(crate) fn bundled_kind(id: &str) -> ForgeKind {
+    let plugin = super::bundled::built_in()
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .expect("a bundled plugin");
+    let manifest =
+        Manifest::bundled(&super::bundled::place(id), plugin.files).expect("its manifest reads");
+    ForgeKind::new(spec_of(&manifest).expect("a forge"))
 }
 
 /// The handle a call about no repository carries: one every repository call
@@ -567,8 +577,7 @@ fn to_script_remote(remote: &ForgeRemote) -> protocol::ForgeRemote {
 /// `remote` as the plugin `id` sees it, when it is that plugin's forge that
 /// claimed it.
 pub(super) fn remote_of(remote: &ForgeRemote, id: &str) -> Option<protocol::ForgeRemote> {
-    matches!(remote.kind, ForgeKind::Script(script) if script.id == id)
-        .then(|| to_script_remote(remote))
+    (remote.kind.id() == id).then(|| to_script_remote(remote))
 }
 
 /// The hosts the user added to a forge's claim: `[plugins.<id>] hosts = [...]`
@@ -591,7 +600,7 @@ pub(super) fn user_hosts(config: Option<&toml::Table>) -> Vec<HostPattern> {
 /// https on the default port.
 fn claim(url: &str, kind: ForgeKind, hosts: &[HostPattern]) -> Option<ForgeRemote> {
     let (host, owner, name) = parse_remote_url(url)?;
-    if owner.contains('/') && !kind.spec().subgroups {
+    if owner.contains('/') && !kind.subgroups {
         return None;
     }
     let (scheme, port) = ["https", "http"]
@@ -626,9 +635,8 @@ fn claim(url: &str, kind: ForgeKind, hosts: &[HostPattern]) -> Option<ForgeRemot
 }
 
 impl Diffui {
-    /// Put the forges of the plugins that are running or loading behind the
-    /// built-in ones, in claiming order, and have every tab look at its
-    /// remotes again.
+    /// Make the forges of the plugins that are running or loading the app's,
+    /// in claiming order, and have every tab look at its remotes again.
     pub(super) fn refresh_script_forges(&mut self) {
         let handles = self.plugins.forge_handles.clone();
         let mut ranked: Vec<(u8, Arc<dyn ForgeProvider>)> = self
@@ -647,9 +655,7 @@ impl Diffui {
                 hosts.extend(user_hosts(self.user_config.plugins.get(&found.id)));
                 let provider = ScriptForge {
                     plugin: found.running.as_ref()?.plugin.clone(),
-                    kind: ForgeKind::Script(diffui_core::forge::ScriptForge::new(spec_of(
-                        manifest,
-                    )?)),
+                    kind: ForgeKind::new(spec_of(manifest)?),
                     hosts,
                     methods,
                     handles: handles.clone(),
@@ -662,7 +668,7 @@ impl Diffui {
             .collect();
         ranked.sort_by_key(|(rank, _)| *rank);
         let scripts = ranked.into_iter().map(|(_, provider)| provider).collect();
-        self.forge.forges = self.forge.forges.with_scripts(scripts);
+        self.forge.forges = Forges::new(scripts);
         for tab in &mut self.tabs {
             tab.state.forge.wanted = true;
         }
@@ -675,10 +681,7 @@ impl Diffui {
             let Some(remote) = self.forge.forges.claim(url) else {
                 continue;
             };
-            let ForgeKind::Script(script) = remote.kind else {
-                continue;
-            };
-            if let Some(handle) = self.repo_handle(tab, &script.id) {
+            if let Some(handle) = self.repo_handle(tab, remote.kind.id()) {
                 lock(&self.plugins.forge_handles).insert(remote.web_url, handle);
             }
         }
@@ -697,14 +700,14 @@ pub(super) mod tests {
     }
 
     fn kind_with_cli(cli: &str) -> ForgeKind {
-        ForgeKind::Script(diffui_core::forge::ScriptForge::new(ForgeSpec {
+        ForgeKind::new(ForgeSpec {
             id: "forgejo".into(),
             name: "Forgejo".into(),
             sigil: '#',
             short: "PR".into(),
             cli: cli.into(),
             ..ForgeSpec::default()
-        }))
+        })
     }
 
     fn thrown(message: &str, forge: Option<(&str, Option<&str>)>) -> PluginError {
@@ -897,9 +900,7 @@ pub(super) mod tests {
         );
         ScriptForge {
             plugin: Arc::new(plugin),
-            kind: ForgeKind::Script(diffui_core::forge::ScriptForge::new(
-                spec_of(&manifest).expect("a forge"),
-            )),
+            kind: ForgeKind::new(spec_of(&manifest).expect("a forge")),
             hosts: manifest.forge.as_ref().unwrap().hosts.clone(),
             methods: None,
             handles: Handles::default(),

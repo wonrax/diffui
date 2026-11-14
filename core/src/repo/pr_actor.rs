@@ -299,7 +299,7 @@ mod tests {
 
     impl ForgeProvider for Streams {
         fn kind(&self) -> ForgeKind {
-            ForgeKind::GitHub
+            crate::forge::fixtures::github()
         }
 
         fn claims(&self, _remote_url: &str) -> Option<ForgeRemote> {
@@ -417,7 +417,7 @@ mod tests {
             totals: (123_000, 45),
         };
         let spec = ForgePr {
-            kind: ForgeKind::GitHub,
+            kind: crate::forge::fixtures::github(),
             host: None,
             owner: "o".to_owned(),
             name: "r".to_owned(),

@@ -516,8 +516,9 @@ fn all_revs(c: &mut Ctx) {
 /// Pull requests on the fixture's bookmarks, as a refresh against a GitHub
 /// origin would have left them: one of each state, with and without checks.
 fn forge_badges(c: &mut Ctx) {
-    use diffui_core::forge::{CheckState, Checks, ForgeKind, ForgeRemote, PrState, PullRequest};
-    let remote = ForgeRemote::new(ForgeKind::GitHub, "github.com", "acme", "render-toolkit");
+    use diffui_core::forge::{CheckState, Checks, ForgeRemote, PrState, PullRequest};
+    let github = crate::plugins::bundled_kind("github");
+    let remote = ForgeRemote::new(github, "github.com", "acme", "render-toolkit");
     let badges = [
         (
             "feature/render-pipeline",

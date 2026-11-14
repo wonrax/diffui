@@ -1419,7 +1419,12 @@ pub(crate) mod tests {
             forge.decorations.insert(
                 name.to_owned(),
                 Decoration {
-                    remote: ForgeRemote::new(ForgeKind::GitHub, "github.com", "o", "r"),
+                    remote: ForgeRemote::new(
+                        crate::plugins::bundled_kind("github"),
+                        "github.com",
+                        "o",
+                        "r",
+                    ),
                     pr: PullRequest {
                         number: 1,
                         url: String::new(),

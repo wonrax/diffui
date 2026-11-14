@@ -1,4 +1,4 @@
-//! Running subprocesses (`git`, `gh`, a user's declared command), bounded.
+//! Running subprocesses (`git`, a user's declared command), bounded.
 //!
 //! A child is spawned with `kill_on_drop`, so whatever stops waiting on it
 //! (a timeout, a cancel, the job's future being dropped) also ends it. Before
@@ -15,10 +15,6 @@ use tokio::process::Command;
 
 use crate::cli::passthrough::{CliLine, CliStream};
 use crate::repo::CancelFlag;
-
-/// How long one network request (`gh api`, `gh pr view`) may take, and how
-/// long a streaming one may go without sending anything.
-pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often a wait looks at its cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
@@ -186,7 +182,7 @@ mod tests {
         let status = stream(
             Command::new("sh").args(["-c", "tr a-z A-Z; echo done >&2; exit 3"]),
             Some(b"one\ntwo\n".to_vec()),
-            Some(NETWORK_TIMEOUT),
+            Some(Duration::from_secs(60)),
             None,
             |line| lines.push((line.stream, line.text)),
         )
@@ -236,7 +232,7 @@ mod tests {
     async fn output_comes_back_when_nothing_intervenes() {
         let output = run(
             Command::new("sh").args(["-c", "echo out; echo err >&2"]),
-            Some(NETWORK_TIMEOUT),
+            Some(Duration::from_secs(60)),
             Some(&CancelFlag::default()),
         )
         .await

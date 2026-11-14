@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diffui_core::RevisionSelection;
-use diffui_core::forge::{CheckState, ForgeAbility, ForgeKind, PrState};
+use diffui_core::forge::{CheckState, ForgeAbility, PrState};
 
 use super::{PluginAction, State};
 use crate::commands::{CommandArg, PaletteScope};
@@ -914,7 +914,7 @@ impl Server {
 
 /// The reference Forgejo plugin, as shipped, is the forge of a repository
 /// whose remote is on a host it claims: its pull requests and checks land
-/// in the same store the built-in forges fill, and the app offers what the
+/// in the same store the bundled forges fill, and the app offers what the
 /// plugin implements.
 #[test]
 fn the_forgejo_plugin_badges_bookmarks_like_a_built_in_forge() {
@@ -993,7 +993,7 @@ fn the_forgejo_plugin_badges_bookmarks_like_a_built_in_forge() {
     });
     h.read(|ui| {
         let forge = &ui.active().forge;
-        let Some(ForgeKind::Script(script)) = forge.kind() else {
+        let Some(script) = forge.kind() else {
             panic!("the forge is the plugin's: {:?}", forge.kind());
         };
         assert_eq!(

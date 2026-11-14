@@ -41,10 +41,6 @@ jj-lib = "0.47"
 # Commit search (`commit_search`), shared with the palette. Already in the
 # tree through the app.
 nucleo-matcher = "0.3"
-# Both already in the tree transitively via jj-lib; used by the GitHub
-# files-API fallback (per-file JSON entries with embedded patches).
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 tokio = { version = "1.44", features = ["fs", "io-util", "macros", "process", "time", "rt", "sync"] }
 # Structured logging for the repository actor: one span per command, so a
 # stuck or slow operation is attributable without an `eprintln!` trail.

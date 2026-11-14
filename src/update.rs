@@ -71,11 +71,7 @@ impl Diffui {
         }
         // A link can name a plugin's forge: its manifest says how its links
         // read, before any script runs.
-        let boot_forges: Vec<diffui_core::forge::ForgeKind> = diffui_core::forge::Forges::default()
-            .kinds()
-            .into_iter()
-            .chain(plugins.forge_kinds())
-            .collect();
+        let boot_forges = plugins.forge_kinds();
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
         let mut cwd_root = None;
