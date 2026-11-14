@@ -249,13 +249,16 @@ dialogs for a host diffui doesn't know).
    writes loads as it is.
 2. Edit `plugin.toml` and the module. `diffui.d.ts` beside them is the whole
    API with its types and what each function does; read it before you write.
-3. `diffui plugin check <dir>` loads the plugin without the app and prints
-   its permissions, the commands, forge methods and events it registered,
-   and what it logged. Every problem is one line with its `file:line:col`
+3. `diffui plugin check <dir>` (or `check <id>` for one in the plugins
+   folder) loads the plugin without the app and prints its permissions, the
+   commands, forge methods and events it registered, and what it logged. For
+   a forge it names each optional method the script left out and what diffui
+   does without it. Every problem is one line with its `file:line:col`
    (a manifest field, a when-clause, a syntax error, a handler the manifest
    declares and the script doesn't register), and the exit status is
    non-zero. Nothing answers repository or `ui` calls there, so handlers
-   aren't run: `check` proves the plugin loads, not that it works.
+   aren't run: `check` proves the plugin loads, not that it works. It
+   doesn't check types either (see TypeScript below).
 4. In the running app, `diffui ctl reload` reads the plugins folder again.
    The first time a plugin is seen, and whenever its manifest asks for more
    than before, diffui asks the user whether it may run: you can't answer
@@ -320,6 +323,24 @@ permission. Ask for the least that works: every addition makes diffui ask
 the user again. A plugin that isn't allowed doesn't run, and its commands
 are listed greyed with "Not allowed".
 
+A forge names hosts in two places, and they are separate lists.
+`[provides] forge.hosts` is what the plugin claims: a repository with a
+remote on one of those hosts gets this forge. `[permissions] http` is what
+the script may fetch, and `auth.token(host)` only answers for a host that
+is in `http`. A forge host doesn't have to be in `http`. When the API lives
+on another host (`api.bitbucket.org` for remotes on `bitbucket.org`), put
+the API's host in `http`; if the plugin also wants the token git keeps for
+the remote, which is stored under the remote's host, put that host in
+`http` as well and ask `auth.token(repo.forgeRemote.host)`:
+
+```toml
+[permissions]
+http = ["api.bitbucket.org", "bitbucket.org"]   # fetch the first, token for the second
+
+[provides]
+forge = { hosts = ["bitbucket.org"] }
+```
+
 ### The API
 
 Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
@@ -349,6 +370,21 @@ resolves with its stdout. The argv starts with one of `log`, `show`,
 `config get`, `git remote list`, `workspace list`, and can't carry `-R`,
 `--at-op`, `--ignore-working-copy`, `--tool` or `--config`.
 `repo.jj.run(argv)` runs any jj command the way `diffui ctl jj` does.
+
+### TypeScript
+
+diffui erases a `.ts` module's types and runs what is left. It doesn't
+check them, and neither does `diffui plugin check`: a plugin with type
+errors loads. Check them yourself in the plugin's folder with the config
+`init` wrote:
+
+```sh
+npx -p typescript tsc --noEmit                    # main.ts, with tsconfig.json
+npx -p typescript tsc --noEmit -p jsconfig.json   # main.js with // @ts-check
+```
+
+Both find the API's types in the `diffui.d.ts` beside the module, which is
+how `import … from "diffui"` resolves; keep that file there.
 
 ### The Forgejo plugin, in full
 
@@ -497,8 +533,11 @@ commands.register("forgejo.open-in-browser", async ({ repo, bookmark }) => {
   `[provides] forge` without `forge.register`, fails the load.
 - A handler that runs for more than half a second without awaiting, or a
   heap past 64 MB, stops the plugin until it is reloaded. Await your I/O.
-- TypeScript is erased, not compiled: no `enum`, `namespace` or constructor
-  parameter properties, and types are imported with `import type`.
+- TypeScript is erased, not compiled and not checked: no `enum`,
+  `namespace` or constructor parameter properties, types are imported with
+  `import type`, and a type error doesn't stop the plugin loading.
+- `ui.status.set` is one item per plugin for the whole window, not one per
+  repository: it doesn't change when the user switches tabs.
 - Plugins never draw. What they can show is in `ui`.
 - `repo.jj.run` resolves when diffui has accepted the command, not when it
   has finished, and the handle is stale once the repository changed: one

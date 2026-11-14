@@ -352,10 +352,20 @@ fn init(id: &str, ts: bool, forge: Option<&str>, dir: &Path) -> Result<String, S
     } else {
         shell_quote(&dir.display().to_string())
     };
-    let _ = write!(
+    let _ = writeln!(
         said,
-        "Next: edit {main}, then run `diffui plugin check {target}`.\n\
-         diffui asks before it runs a new plugin; `diffui ctl reload` makes a running diffui look.\n"
+        "Next: edit {main}, then run `diffui plugin check {target}`."
+    );
+    if ts {
+        let _ = writeln!(
+            said,
+            "Types are erased, not checked: a type error still loads. To check them, run \
+             `npx -p typescript tsc --noEmit -p {}` (tsconfig.json there reads diffui.d.ts beside it).",
+            shell_quote(&dir.display().to_string())
+        );
+    }
+    said.push_str(
+        "diffui asks before it runs a new plugin; `diffui ctl reload` makes a running diffui look.\n",
     );
     Ok(said)
 }
@@ -622,7 +632,9 @@ mod tests {
             // Outside the plugins folder, the next step names the whole path.
             let next = format!("run `diffui plugin check {}`", dir.display());
             assert!(said.contains(&next), "{said}");
-
+            // Only TypeScript is told its types aren't checked, and how to.
+            let tsc = format!("`npx -p typescript tsc --noEmit -p {}`", dir.display());
+            assert_eq!(said.contains(&tsc), ts, "{said}");
             let written =
                 std::fs::read_to_string(dir.join(if ts { "main.ts" } else { "main.js" })).unwrap();
             assert_eq!(

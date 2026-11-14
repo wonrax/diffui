@@ -34,6 +34,14 @@
  *     [config.schema]                  # defaults for `config`; the user overrides them under [plugins.<id>] in config.toml
  *     host = { type = "string", default = "codeberg.org", label = "Host" }
  *
+ * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
+ * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
+ * may reach: `http.fetch` goes only there, and `auth.token(host)` answers only for a host listed there. A forge
+ * host doesn't have to be in `http`, and a forge whose API lives on another host ("api.bitbucket.org" for
+ * remotes on "bitbucket.org") lists the API's host in `http`. If it also wants the token git stores for the
+ * remote, which is kept under the remote's host, it lists that host in `http` too and asks
+ * `auth.token(repo.forgeRemote.host)`.
+ *
  * The runtime is QuickJS (ES2023), not Node and not a browser:
  *
  * - Import from "diffui" and from relative files ("./util.js"). Nothing else resolves: no npm, no `require`,
@@ -45,6 +53,10 @@
  *   errors are the file's. That is TypeScript's `"erasableSyntaxOnly": true` with `"verbatimModuleSyntax": true`:
  *   no `enum`, `namespace` or constructor parameter properties, and types are imported with `import type` or
  *   `import { type Repo }`. Import your own files by their real name ("./util.ts").
+ * - Types are erased, not checked: a module with type errors loads and runs, and `diffui plugin check` doesn't
+ *   see them. Check them yourself with the tsconfig.json (or jsconfig.json) `diffui plugin init` writes, from
+ *   the plugin's folder: `npx -p typescript tsc --noEmit` (`-p jsconfig.json` for JavaScript). It finds the
+ *   API's types because this file sits beside the module; without it there, `"diffui"` doesn't resolve.
  * - Plugins never draw. They answer questions (a forge provider), run commands and fill the slots in `ui`.
  * - Call `commands.register`, `forge.register` and `events.on` while the main module loads (top-level `await`
  *   is fine). Loading fails if a declared command or forge has no handler, or if anything throws.
@@ -75,7 +87,12 @@ declare module "diffui" {
   /** Where a command was invoked. Fields that don't apply are `null`. */
   export interface CommandContext {
     readonly repo: Repo;
-    /** The revision in context (the row the menu was opened on, else the selection). */
+    /**
+     * The revision in context: the row a menu was opened on, the revision of the bookmark in context, or the
+     * one a palette result was picked for. Run from the palette's top level or by a key, it is the selected
+     * revision (one row: the marked rows are in `repo.selection()`). `null` when there is none, or when it
+     * isn't in the log on screen.
+     */
     readonly changeId: string | null;
     readonly commitId: string | null;
     /** The bookmark in context, for a command placed in the bookmark menu. */
@@ -104,9 +121,16 @@ declare module "diffui" {
    * failure: the error's message is shown to the user. Each call must settle within a minute.
    */
   export interface ForgeProvider {
-    /** The pull requests whose head branch is one of `branches`, in any state. Ignore ones from forks. */
+    /**
+     * The pull requests whose head branch is one of `branches`, in any state. Leave out the ones from forks,
+     * whose branch can have the same name: keep a pull request only when its source repository is the one
+     * `repo.forgeRemote` names (compare the owner and name, or the repository's id against the target's).
+     */
     pullRequests(repo: Repo, query: { branches: string[] }): Promise<PullRequest[]>;
-    /** The combined CI state of a commit. */
+    /**
+     * The combined CI state of a commit. `sha` is the `headSha` of a pull request `pullRequests` returned, so
+     * return full commit ids there. Asked for open and draft pull requests only.
+     */
     checks?(repo: Repo, sha: string): Promise<Checks>;
     /** Open a pull request and return it. The head branch is already pushed. */
     createPullRequest?(repo: Repo, request: CreatePullRequest): Promise<PullRequest>;
@@ -144,6 +168,7 @@ declare module "diffui" {
     draft: boolean;
   }
 
+  /** The fields to change. One that isn't changing is absent: a field is a string or missing, never `null`. */
   export interface UpdatePullRequest {
     title?: string;
     body?: string;
@@ -208,9 +233,18 @@ declare module "diffui" {
     remotes(): Promise<Remote[]>;
     /** What the user has selected. */
     selection(): Promise<Selection>;
-    /** The revisions a revset matches, newest first. `limit` defaults to 100. */
+    /**
+     * The revisions a revset matches, newest first (the order of `jj log`). `limit` defaults to 100; when
+     * the revset matches more, the newest are kept. Rejects with jj's message when the revset doesn't parse
+     * or names a revision that doesn't exist.
+     */
     rows(revset: string, options?: { limit?: number }): Promise<Row[]>;
-    /** The diff of the revisions a revset matches. `format` defaults to "git", `maxBytes` to 1 MB. */
+    /**
+     * The diff of the revisions a revset matches, as `jj diff -r` makes it. Several revisions give one
+     * combined diff, from before the oldest to the newest (`a::c` is the change from `a`'s parent to `c`),
+     * not a diff per revision; a set with a gap in it (`a | c`) rejects with jj's message, as a revset that
+     * doesn't resolve does. `format` defaults to "git", `maxBytes` to 1 MB.
+     */
     diff(revset: string, options?: { format?: DiffFormat; maxBytes?: number }): Promise<Diff>;
     /** A file's text at a revision; `null` when the revision has no such file. `path` is relative to `root`. */
     readFile(rev: string, path: string): Promise<string | null>;
@@ -292,7 +326,10 @@ declare module "diffui" {
   export interface Row {
     changeId: string;
     commitId: string;
-    /** The first line of the description; "" when there is none. */
+    /**
+     * The first line of the description; "" when there is none. For all of it:
+     * `repo.jj.query(["log", "--no-graph", "-r", commitId, "-T", "description"])`.
+     */
     description: string;
     author: string;
     /** Author time in milliseconds since the epoch. */
@@ -464,7 +501,12 @@ declare module "diffui" {
     input(options: { label: string; value?: string; placeholder?: string }): Promise<string | null>;
     /** Ask yes or no. `destructive` styles the confirm button as dangerous. */
     confirm(options: { title: string; body?: string; confirmLabel?: string; destructive?: boolean }): Promise<boolean>;
-    /** Pick one. Resolves with the choice's `value` (its label for a plain string), or `null` when dismissed. */
+    /**
+     * Pick one, in the palette. Resolves with the choice's `value` (its label for a plain string), or `null`
+     * when dismissed. Typing filters the choices by label (a fuzzy match; hints and values aren't searched),
+     * and at most 200 matches are listed at once, so a long list is reached by typing. Give each choice its
+     * own label: the pick is found again by it.
+     */
     choose(options: { label: string; choices: Array<string | Choice> }): Promise<string | null>;
   }
 
@@ -481,7 +523,11 @@ declare module "diffui" {
   }
 
   export interface Status {
-    /** Show `text` in the status bar; `null` removes the item. */
+    /**
+     * Show `text` in the status bar; `null` (or blank text) removes the item. A plugin has one item, and it
+     * belongs to the window, not to a repository: it stays as it is when the user switches tabs. Only its
+     * first line shows, cut with an ellipsis past 220 px.
+     */
     set(text: string | null): Promise<void>;
   }
 }
