@@ -699,6 +699,8 @@ fn tab_widget(
     dragging: bool,
     cx: &mut Cx,
 ) -> (gpui_kit::Stateful<gpui_kit::Div>, f32) {
+    use gpui_kit::base::TestSupportExt as _;
+
     let Look { theme, .. } = look;
     let id = tab.id;
     let element = id.0 as usize;
@@ -740,9 +742,15 @@ fn tab_widget(
             0.0,
         ));
     // The dot gives way to the `×` under the cursor, so it can't carry its own
-    // tooltip; the label says what the tab is and what the dot means.
+    // tooltip; the label says what the tab is and what the dot means. It is
+    // as tall as the tab, so the tooltip hangs under the tab's edge, the gap
+    // every chrome control keeps, and not under the text inside it.
     let label = div()
         .id(("tab-label", element))
+        .test_support()
+        .h_full()
+        .flex()
+        .items_center()
         .min_w_0()
         .flex_shrink(1.0)
         .child(label)

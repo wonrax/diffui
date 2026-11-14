@@ -1486,15 +1486,18 @@ pub trait Tip: StatefulInteractiveElement + ParentElement + Sized {
         let anchor: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
         let recorded = anchor.clone();
         let label = label.into();
-        // An absolute child sits on its parent's box (taffy positions it
-        // against its own parent), so this reads the control's bounds.
+        // An absolute child pinned to its parent's edges sits on its box
+        // (taffy positions it against its own parent), so this reads the
+        // control's bounds. Pinned, not just sized: left to its static
+        // position it lands after the content of a parent that isn't a flex
+        // row, a content's height too low.
         self.child(
             canvas(
                 move |bounds, _, _| recorded.set(Some(bounds)),
                 |_, _, _, _| {},
             )
             .absolute()
-            .size_full(),
+            .inset_0(),
         )
         .tooltip(move |_, cx| {
             let label = label.clone();
