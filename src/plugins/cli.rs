@@ -84,7 +84,8 @@ fn plugin_main() -> i32 {
         }
         Verb::Check { plugin } => {
             let plugin = plugin.unwrap_or_else(|| PathBuf::from("."));
-            match plugin_dir(&plugin, plugins_dir().as_deref()) {
+            let here = std::env::current_dir().unwrap_or_default();
+            match plugin_dir(&plugin, &here, plugins_dir().as_deref()) {
                 Ok(dir) => check(&dir),
                 // No folder by that name: a bundled plugin by its id.
                 Err(not_found) => plugin
@@ -387,11 +388,13 @@ fn init(id: &str, ts: bool, forge: Option<&str>, dir: &Path) -> Result<String, S
     Ok(said)
 }
 
-/// The plugin directory `given` names: that directory, or, for a bare name
-/// with no directory of that name here, the plugin of that id in `folder`
-/// (the plugins folder). `Err` names every place it looked.
-fn plugin_dir(given: &Path, folder: Option<&Path>) -> Result<PathBuf, String> {
-    let here = std::path::absolute(given).unwrap_or_else(|_| given.to_path_buf());
+/// The plugin directory `given` names: that directory (relative to `cwd`),
+/// or, for a bare name with no directory of that name there, the plugin of
+/// that id in `folder` (the plugins folder). `Err` names every place it
+/// looked.
+fn plugin_dir(given: &Path, cwd: &Path, folder: Option<&Path>) -> Result<PathBuf, String> {
+    let joined = cwd.join(given);
+    let here = std::path::absolute(&joined).unwrap_or(joined);
     if here.is_dir() {
         return Ok(here);
     }
@@ -752,15 +755,16 @@ mod tests {
         let folder = scratch("folder");
         let installed = folder.join("stack-tools");
         std::fs::create_dir_all(&installed).unwrap();
+        // Not the process's directory: tests elsewhere change it.
+        let here = scratch("here");
+        std::fs::create_dir_all(&here).unwrap();
         assert_eq!(
-            plugin_dir(Path::new("stack-tools"), Some(&folder)),
+            plugin_dir(Path::new("stack-tools"), &here, Some(&folder)),
             Ok(installed.clone())
         );
-        assert_eq!(plugin_dir(&installed, None), Ok(installed));
-
-        let here = std::env::current_dir().unwrap();
+        assert_eq!(plugin_dir(&installed, &here, None), Ok(installed));
         assert_eq!(
-            plugin_dir(Path::new("no-such"), Some(&folder)),
+            plugin_dir(Path::new("no-such"), &here, Some(&folder)),
             Err(format!(
                 "No plugin directory at {} or {}",
                 display_path(&here.join("no-such")),
@@ -769,17 +773,18 @@ mod tests {
         );
         // Anything but a bare name is a path, looked for where it says.
         assert_eq!(
-            plugin_dir(Path::new("./stack-tools"), Some(&folder)),
+            plugin_dir(Path::new("./stack-tools"), &here, Some(&folder)),
             Err(format!(
                 "No plugin directory at {}",
                 display_path(&here.join("stack-tools"))
             ))
         );
         let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_dir_all(&here);
     }
 
     /// `check github` loads the bundled GitHub plugin when no folder is
-    /// named that.
+    /// named that, and `check gitlab` GitLab's.
     #[test]
     fn check_finds_a_bundled_plugin_by_id() {
         let built_in = super::super::bundled::built_in;
@@ -795,6 +800,14 @@ mod tests {
                 "forge github.com, github.*, *.github.*: pullRequests, checks, createPullRequest, \
                  updatePullRequest, hosts, view, commits, commitDiff, diff\n"
             ),
+            "{said}"
+        );
+        assert!(said.ends_with("ok\n"), "{said}");
+        let said = check_bundled("gitlab", built_in())
+            .expect("GitLab is bundled")
+            .expect("it loads");
+        assert!(
+            said.starts_with("gitlab 1.0.0 (api 0) in (bundled)/gitlab\n"),
             "{said}"
         );
         assert!(said.ends_with("ok\n"), "{said}");
