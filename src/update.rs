@@ -69,6 +69,13 @@ impl Diffui {
             Repo(Repository),
             Pr(diffui_core::forge::ForgePr),
         }
+        // A link can name a plugin's forge: its manifest says how its links
+        // read, before any script runs.
+        let boot_forges: Vec<diffui_core::forge::ForgeKind> = diffui_core::forge::Forges::default()
+            .kinds()
+            .into_iter()
+            .chain(plugins.forge_kinds())
+            .collect();
         let mut targets: Vec<BootTarget> = Vec::new();
         let mut first_error = None;
         let mut cwd_root = None;
@@ -87,7 +94,9 @@ impl Diffui {
         }
         if cli.requested_paths().next().is_some() {
             for path in cli.requested_paths() {
-                if let Some(spec) = diffui_core::forge::ForgePr::parse(&path.to_string_lossy()) {
+                if let Some(spec) =
+                    diffui_core::forge::ForgePr::parse_with(&path.to_string_lossy(), &boot_forges)
+                {
                     if !targets
                         .iter()
                         .any(|target| matches!(target, BootTarget::Pr(open) if *open == spec))

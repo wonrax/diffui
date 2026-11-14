@@ -986,7 +986,10 @@ fn the_forgejo_plugin_badges_bookmarks_like_a_built_in_forge() {
         let Some(ForgeKind::Script(script)) = forge.kind() else {
             panic!("the forge is the plugin's: {:?}", forge.kind());
         };
-        assert_eq!((script.id, script.name), ("forgejo", "Forgejo"));
+        assert_eq!(
+            (script.id.as_str(), script.name.as_str()),
+            ("forgejo", "Forgejo")
+        );
         assert_eq!(forge.decorations.len(), 1, "{:?}", forge.decorations);
         let decoration = forge.of("fix/parser-crash").unwrap();
         assert_eq!(decoration.pr.number, 7);

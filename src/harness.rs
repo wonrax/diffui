@@ -75,6 +75,8 @@ impl Drop for Harness {
     /// plugin folder there would open on its permission dialog.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(scratch_home().join(".config/diffui/plugins"));
+        // Bundled stand-ins too (see `plugins::bundled`): every launch reads them.
+        let _ = std::fs::remove_dir_all(scratch_home().join(".bundled-test"));
     }
 }
 

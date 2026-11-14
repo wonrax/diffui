@@ -57,8 +57,15 @@ enum Verb {
         /// (the current directory when left out)
         plugin: Option<PathBuf>,
     },
-    /// The plugins in the plugins folder, and whether each is allowed
+    /// The plugins: the bundled ones and those in the plugins folder, and
+    /// whether each is allowed
     List,
+    /// Copy a bundled plugin into the plugins folder to edit; the copy
+    /// replaces it
+    Eject {
+        /// The bundled plugin's id
+        id: String,
+    },
 }
 
 fn plugin_main() -> i32 {
@@ -81,6 +88,10 @@ fn plugin_main() -> i32 {
         )
         .and_then(|dir| check(&dir)),
         Verb::List => Ok(list()),
+        Verb::Eject { id } => match plugins_dir() {
+            Some(folder) => super::bundled::eject(&id, &folder),
+            None => Err("no home directory to put the plugins folder in".to_owned()),
+        },
     };
     match done {
         Ok(text) => {
@@ -300,7 +311,7 @@ fn main_text(id: &str, ts: bool, forge: bool) -> String {
     text
 }
 
-fn editor_config(ts: bool) -> (&'static str, &'static str) {
+pub(super) fn editor_config(ts: bool) -> (&'static str, &'static str) {
     if ts {
         (
             "tsconfig.json",
@@ -565,14 +576,33 @@ fn registered(manifest: &Manifest, registration: &Registration) -> String {
     said
 }
 
-/// The plugins folder's plugins, a line each.
+/// The plugins, a line each: the bundled ones, then the plugins folder's.
 fn list() -> String {
-    let Some(dir) = plugins_dir() else {
-        return String::new();
-    };
     let records = crate::config::plugin_records();
+    let folder = plugins_dir();
+    let dirs = folder.as_deref().map(plugin_dirs).unwrap_or_default();
+    let in_folder: Vec<String> = dirs
+        .iter()
+        .filter_map(|dir| Some(Manifest::load(dir).ok()?.id))
+        .collect();
     let mut said = String::new();
-    for dir in plugin_dirs(&dir) {
+    for plugin in super::bundled::bundled() {
+        let off = records
+            .get(&plugin.id)
+            .is_some_and(|record| !record.enabled);
+        let state = if in_folder.contains(&plugin.id) {
+            "replaced"
+        } else if off {
+            "off"
+        } else {
+            "on"
+        };
+        let version = Manifest::bundled(&super::bundled::place(&plugin.id), plugin.files)
+            .map(|manifest| manifest.version)
+            .unwrap_or_default();
+        let _ = writeln!(said, "{}\t{version}\t{state}\tbundled", plugin.id);
+    }
+    for dir in dirs {
         match Manifest::load(&dir) {
             Ok(manifest) => {
                 let record = records.get(&manifest.id);
@@ -600,7 +630,8 @@ fn list() -> String {
         }
     }
     if said.is_empty() {
-        let _ = writeln!(said, "No plugins in {}", display_path(&dir));
+        let place = folder.as_deref().map(display_path).unwrap_or_default();
+        let _ = writeln!(said, "No plugins in {place}");
     }
     said
 }

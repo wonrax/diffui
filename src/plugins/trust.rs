@@ -70,6 +70,7 @@ fn covers(granted: &Permissions, asked: &Permissions) -> bool {
     asked.jj <= granted.jj
         && asked.http.iter().all(|host| granted.http.contains(host))
         && asked.exec.iter().all(|argv| exec_covered(granted, argv))
+        && asked.env.iter().all(|var| granted.env.contains(var))
 }
 
 fn exec_covered(granted: &Permissions, argv: &[String]) -> bool {
@@ -125,6 +126,14 @@ pub(crate) fn lines(manifest: &Manifest, before: Option<&Permissions>) -> Vec<Li
             before.is_some_and(|before| !exec_covered(before, argv)),
         ));
     }
+    if !asked.env.is_empty() {
+        lines.push(line(
+            icons::TERMINAL,
+            "Set for those programs",
+            Some(asked.env.join(" ")),
+            before.is_some_and(|before| asked.env.iter().any(|var| !before.env.contains(var))),
+        ));
+    }
     let more_jj = before.is_some_and(|before| asked.jj > before.jj);
     match asked.jj {
         JjAccess::None => {}
@@ -178,6 +187,7 @@ mod tests {
                 .iter()
                 .map(|argv| argv.iter().map(|word| (*word).to_owned()).collect())
                 .collect(),
+            env: Vec::new(),
             jj,
         }
     }

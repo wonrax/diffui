@@ -22,9 +22,12 @@
 //! and a handle that no longer matches what is on screen is refused.
 
 mod api;
+mod bundled;
 mod cli;
 mod events;
 mod forge;
+#[cfg(test)]
+mod forge_scenarios;
 mod query;
 #[cfg(test)]
 mod scenarios;
@@ -96,6 +99,12 @@ pub(crate) enum FromPlugin {
     },
     /// Files changed under these directories of the plugins folder.
     Changed(Vec<String>),
+    /// A forge's `hosts()` answered.
+    Hosts {
+        plugin: String,
+        instance: u64,
+        hosts: Vec<String>,
+    },
 }
 
 /// One running script's line to the app. Each start of a plugin gets its
@@ -140,7 +149,30 @@ pub(crate) enum State {
     Failed(String),
 }
 
-/// One directory of the plugins folder.
+/// Where a plugin comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The plugins folder.
+    Folder,
+    /// Built into diffui: trusted as declared, never asked about.
+    Bundled,
+    /// The plugins folder, under the id of a bundled plugin it replaces.
+    Replaces,
+}
+
+impl Origin {
+    /// Who answers first when plugins provide the same thing (claim the same
+    /// host): one replacing a bundled plugin, the bundled ones, the rest.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Origin::Replaces => 0,
+            Origin::Bundled => 1,
+            Origin::Folder => 2,
+        }
+    }
+}
+
+/// One plugin: a directory of the plugins folder, or a bundled one.
 pub(crate) struct Found {
     /// The manifest's id, or the directory's name when it didn't read.
     pub(crate) id: String,
@@ -157,6 +189,9 @@ pub(crate) struct Found {
     running: Option<Running>,
     /// Say so when it next loads: the user (or an edit) asked for a reload.
     announce: bool,
+    pub(crate) origin: Origin,
+    /// The hosts its forge's `hosts()` answered with, since it last loaded.
+    extra_hosts: Vec<diffui_plugins::HostPattern>,
 }
 
 struct Running {
@@ -178,7 +213,24 @@ impl Found {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match Manifest::load(dir) {
+        Self::from_manifest(Manifest::load(dir), dir, folder, Origin::Folder, records)
+    }
+
+    /// A plugin built into diffui.
+    fn bundled(plugin: &bundled::Bundled, records: &crate::config::PluginRecords) -> Self {
+        let dir = bundled::place(&plugin.id);
+        let manifest = Manifest::bundled(&dir, plugin.files.clone());
+        Self::from_manifest(manifest, &dir, plugin.id.clone(), Origin::Bundled, records)
+    }
+
+    fn from_manifest(
+        manifest: Result<Manifest, Vec<diffui_plugins::Diagnostic>>,
+        dir: &Path,
+        folder: String,
+        origin: Origin,
+        records: &crate::config::PluginRecords,
+    ) -> Self {
+        match manifest {
             Ok(manifest) => {
                 let (rows, problems) = commands_of(&manifest);
                 let off = records.get(&manifest.id).is_some_and(|r| !r.enabled);
@@ -197,6 +249,8 @@ impl Found {
                     problems,
                     running: None,
                     announce: false,
+                    origin,
+                    extra_hosts: Vec::new(),
                 }
             }
             Err(problems) => {
@@ -217,6 +271,8 @@ impl Found {
                     problems,
                     running: None,
                     announce: false,
+                    origin,
+                    extra_hosts: Vec::new(),
                 }
             }
         }
@@ -311,10 +367,22 @@ impl Plugins {
         self.found.clear();
         self.reviews.clear();
         self.status.clear();
+        let bundled = bundled::bundled();
         let dirs = self.dir.as_deref().map(plugin_dirs).unwrap_or_default();
+        for plugin in &bundled {
+            self.found.push(Found::bundled(plugin, records));
+        }
         for dir in dirs {
             let mut found = Found::read(&dir, records);
-            if let Some(first) = self.found.iter().find(|seen| seen.id == found.id) {
+            if let Some(at) = self
+                .found
+                .iter()
+                .position(|seen| seen.id == found.id && seen.origin == Origin::Bundled)
+            {
+                // A plugin of the same id in the folder replaces the bundled one.
+                self.found.remove(at);
+                found.origin = Origin::Replaces;
+            } else if let Some(first) = self.found.iter().find(|seen| seen.id == found.id) {
                 found.state = State::Failed(format!(
                     "{} already uses the id {:?}",
                     display_path(&first.dir),
@@ -364,6 +432,24 @@ impl Plugins {
             .iter()
             .flat_map(|found| found.problems.iter().cloned())
             .collect()
+    }
+
+    /// The forges the plugins provide, in claiming order (see
+    /// [`Diffui::refresh_script_forges`]): what a pull request link can name
+    /// before any script has run.
+    pub(crate) fn forge_kinds(&self) -> Vec<diffui_core::forge::ForgeKind> {
+        let mut kinds: Vec<(Origin, diffui_core::forge::ForgeKind)> = self
+            .found
+            .iter()
+            .filter(|found| !matches!(found.state, State::Disabled | State::Failed(_)))
+            .filter_map(|found| {
+                let spec = forge::spec_of(found.manifest.as_ref()?)?;
+                let kind = diffui_core::forge::ScriptForge::new(spec);
+                Some((found.origin, diffui_core::forge::ForgeKind::Script(kind)))
+            })
+            .collect();
+        kinds.sort_by_key(|(origin, _)| origin.rank());
+        kinds.into_iter().map(|(_, kind)| kind).collect()
     }
 
     /// The handle id for `tab` on `repo`.
@@ -571,6 +657,7 @@ impl Diffui {
         for id in ids {
             self.settle_plugin(&id);
         }
+        self.refresh_script_forges();
         self.watch_plugins();
     }
 
@@ -597,6 +684,10 @@ impl Diffui {
         let record = self.config_files.plugins.get(id);
         if record.is_some_and(|record| !record.enabled) {
             return self.stop_plugin(id, State::Disabled);
+        }
+        if found.origin == Origin::Bundled {
+            // diffui's own: its permissions are part of the build.
+            return self.spawn_plugin(id);
         }
         match trust::verdict(record, &manifest.permissions) {
             trust::Verdict::Allowed => self.spawn_plugin(id),
@@ -638,6 +729,7 @@ impl Diffui {
             limits: Limits::default(),
         };
         found.state = State::Loading;
+        found.extra_hosts.clear();
         found.running = Some(Running {
             plugin: Arc::new(Plugin::spawn(manifest, options, host)),
             instance,
@@ -650,8 +742,8 @@ impl Diffui {
         let Some(found) = self.plugins.get_mut(id) else {
             return;
         };
-        let was_forge =
-            matches!(&found.state, State::Running(registration) if registration.forge.is_some());
+        let was_forge = found.manifest.as_ref().is_some_and(|m| m.forge.is_some())
+            && matches!(&found.state, State::Running(_) | State::Loading);
         found.running = None;
         found.state = state;
         self.plugins.status.remove(id);
@@ -684,8 +776,28 @@ impl Diffui {
                 found.announce = found.running.is_some();
             }
         }
+        self.refresh_script_forges();
         self.watch_plugins();
         problems
+    }
+
+    /// Bring back the bundled plugin `id` after the folder's plugin that
+    /// replaced it went away.
+    fn restore_bundled(&mut self, id: &str) {
+        let Some(plugin) = bundled::bundled()
+            .into_iter()
+            .find(|plugin| plugin.id == id)
+        else {
+            return;
+        };
+        if self.plugins.get(id).is_some() {
+            return;
+        }
+        let found = Found::bundled(&plugin, &self.config_files.plugins);
+        self.plugins.found.insert(0, found);
+        self.rederive_commands(None);
+        self.settle_plugin(id);
+        self.refresh_script_forges();
     }
 
     /// The registry and keymap again, from the config as read and the
@@ -722,9 +834,13 @@ impl Diffui {
                 // The directory, or its manifest, went away.
                 if let Some(index) = known {
                     let id = self.plugins.found[index].id.clone();
+                    let replaced = self.plugins.found[index].origin == Origin::Replaces;
                     self.stop_plugin(&id, State::Disabled);
                     self.plugins.found.remove(index);
                     self.rederive_commands(None);
+                    if replaced {
+                        self.restore_bundled(&id);
+                    }
                 }
                 continue;
             }
@@ -748,13 +864,33 @@ impl Diffui {
             // A new plugin, or a manifest that changed: what it may do is
             // looked at again before anything runs.
             let id = fresh.id.clone();
+            let mut restore = None;
             if let Some(index) = known {
                 let old = self.plugins.found[index].id.clone();
+                if self.plugins.found[index].origin == Origin::Replaces && old != id {
+                    restore = Some(old.clone());
+                }
                 self.stop_plugin(&old, State::Disabled);
                 self.plugins.found.remove(index);
             }
-            let clash = self.plugins.get(&id).map(|other| other.dir.clone());
             let mut fresh = fresh;
+            if let Some(index) = self
+                .plugins
+                .found
+                .iter()
+                .position(|other| other.id == id && other.origin == Origin::Bundled)
+            {
+                // It replaces the bundled plugin of its id from now on.
+                self.stop_plugin(&id, State::Disabled);
+                self.plugins.found.remove(index);
+                fresh.origin = Origin::Replaces;
+            } else if bundled::bundled().iter().any(|plugin| plugin.id == id) {
+                fresh.origin = Origin::Replaces;
+            }
+            if let Some(old) = restore {
+                self.restore_bundled(&old);
+            }
+            let clash = self.plugins.get(&id).map(|other| other.dir.clone());
             if let Some(other) = clash {
                 fresh.state = State::Failed(format!(
                     "{} already uses the id {id:?}",
@@ -816,7 +952,65 @@ impl Diffui {
                 Err(error) => self.push_error_toast(format!("{label} failed"), &error.to_string()),
             },
             FromPlugin::Changed(names) => self.plugins_changed_on_disk(names),
+            FromPlugin::Hosts {
+                plugin,
+                instance,
+                hosts,
+            } => {
+                if !self.plugins.is_current(&plugin, instance) {
+                    return;
+                }
+                let Some(found) = self.plugins.get_mut(&plugin) else {
+                    return;
+                };
+                found.extra_hosts = hosts
+                    .iter()
+                    .filter_map(|host| diffui_plugins::HostPattern::parse_claim(host).ok())
+                    .collect();
+                self.refresh_script_forges();
+            }
         }
+    }
+
+    /// Ask a forge that has `hosts()` which hosts it claims beyond its
+    /// manifest's, once per load.
+    fn ask_forge_hosts(&mut self, id: &str) {
+        let Some(found) = self.plugins.get(id) else {
+            return;
+        };
+        let (Some(running), State::Running(registration)) = (&found.running, &found.state) else {
+            return;
+        };
+        if !registration
+            .forge
+            .as_ref()
+            .is_some_and(|methods| methods.iter().any(|method| method == "hosts"))
+        {
+            return;
+        }
+        let (to, plugin, instance) = (self.plugins.to_app.clone(), id.to_owned(), running.instance);
+        let repo = RepoHandle {
+            id: String::new(),
+            op: String::new(),
+            root: String::new(),
+            forge_remote: None,
+        };
+        running.plugin.call::<Vec<String>>(
+            PluginCall::Forge {
+                repo,
+                call: diffui_plugins::protocol::ForgeCall::Hosts,
+            },
+            move |result| match result {
+                Ok(hosts) => {
+                    let _ = to.unbounded_send(FromPlugin::Hosts {
+                        plugin,
+                        instance,
+                        hosts,
+                    });
+                }
+                Err(error) => tracing::warn!(plugin, "hosts() failed: {error}"),
+            },
+        );
     }
 
     fn on_plugin_event(&mut self, id: &str, event: PluginEvent) {
@@ -837,6 +1031,7 @@ impl Diffui {
                     self.push_info_toast(format!("Reloaded {name}"), "");
                 }
                 self.tell_open_repositories(id);
+                self.ask_forge_hosts(id);
             }
             PluginEvent::Failed(why) => {
                 // A load error leads with where it is (`main.js:3:7: …`).

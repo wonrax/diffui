@@ -5,7 +5,7 @@
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
-use super::{Found, PluginAction, State, trust};
+use super::{Found, Origin, PluginAction, State, trust};
 use crate::commands::Context;
 use crate::config::display_path;
 use crate::modes::{Mode, ModeKind};
@@ -236,8 +236,18 @@ fn plugin_row(ui: &Diffui, look: Look, index: usize, found: &Found, cx: &mut Cx)
         .child(typography::baseline_row(name, theme::space::MD))
         .child(
             typography::line(
-                display_path(&found.dir),
-                mono,
+                match found.origin {
+                    Origin::Bundled => "Built into diffui".to_owned(),
+                    Origin::Replaces => {
+                        format!("{} (replaces the built-in one)", display_path(&found.dir))
+                    }
+                    Origin::Folder => display_path(&found.dir),
+                },
+                if found.origin == Origin::Bundled {
+                    font
+                } else {
+                    mono
+                },
                 text_size::CAPTION,
                 theme.muted_text,
             )
@@ -264,7 +274,8 @@ fn plugin_row(ui: &Diffui, look: Look, index: usize, found: &Found, cx: &mut Cx)
     let face = theme::radius::inner(theme::radius::CARD, theme::space::XXS);
     let side = theme::control::COMPACT - 2.0 * theme::space::XXS;
     let id = &found.id;
-    let has_manifest = found.manifest.is_some();
+    let bundled = found.origin == Origin::Bundled;
+    let has_manifest = found.manifest.is_some() && !bundled;
     let has_tab = !ui.tabs.is_empty();
     let button = |name: &'static str, glyph: &'static str, tip: &'static str| {
         look.icon_button((name, index), glyph, theme.muted_text)
@@ -277,9 +288,16 @@ fn plugin_row(ui: &Diffui, look: Look, index: usize, found: &Found, cx: &mut Cx)
             button(
                 "settings-plugin-reveal",
                 icons::FOLDER_OPEN,
-                "Reveal folder",
+                if bundled {
+                    "Built into diffui, nothing to reveal"
+                } else {
+                    "Reveal folder"
+                },
             )
-            .on_click(send(PluginAction::Reveal(Some(id.clone())), cx)),
+            .disabled(bundled)
+            .when(!bundled, |button| {
+                button.on_click(send(PluginAction::Reveal(Some(id.clone())), cx))
+            }),
         )
         .child(
             button(
