@@ -1487,6 +1487,36 @@ section of `assets/agent/SKILL.md`). New in the port.
 - State: GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.
 - Steps: Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.
 
+### `settings-ai`
+
+- Window: 1440x900, light
+- State: Settings, AI: the provider pop-up set to Anthropic, then Claude Code and Codex not installed, Anthropic in use with its key saved and a passed Test, and OpenAI-compatible with no key. Each row has Test and a pencil.
+- Steps: Launch with Anthropic picked and its key saved; open Settings, Test Anthropic and scroll to AI.
+
+### `plugins-ai-models`
+
+- Window: 1440x900, light
+- State: Anthropic's page in Settings: Provider with its status and Test, then Model with Choose open and the models listed under it, API address, and API key saved with Remove.
+- Steps: Open Anthropic's page from Settings, AI, and press Choose next to Model.
+
+### `description-generating`
+
+- Window: 1440x900, light
+- State: The description editor while Anthropic writes into it: half a description, the field read-only, Stop in place of Generate, and Writing with Anthropic in the footer.
+- Steps: Select fix/parser-crash, press Generate; caught mid-stream.
+
+### `ai-explain-panel`
+
+- Window: 1440x900, light
+- State: Explain this change in the output panel, rendered: a heading, a list with inline code and a nested numbered list, a quote, a code block, a rule and a link; Rendered | Raw, Copy and Close.
+- Steps: Select fix/parser-crash and run Explain this change.
+
+### `pull-request-preview`
+
+- Window: 1440x900, light
+- State: The create pull request dialog with its description in Preview: the Markdown body rendered (a heading, a list, inline code, a link), Edit | Preview above it.
+- Steps: Create pull request on fix/changelog-note, write a Markdown description, press Preview.
+
 ### `plugins-remove-host`
 
 - Window: 1440x900, light

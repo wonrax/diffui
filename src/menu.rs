@@ -79,6 +79,9 @@ pub(crate) enum MenuEntry {
         emphasized: bool,
         command: CommandId,
         arg: CommandArg,
+        /// A glyph before the label: [`crate::icons::SPARKLES`] on a row
+        /// that runs an AI provider.
+        icon: Option<&'static str>,
     },
     /// A parent row whose children open in a flyout beside it.
     Submenu {
@@ -525,6 +528,7 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
                 label,
                 detail,
                 emphasized,
+                icon,
                 ..
             } => {
                 let label_font = if *emphasized {
@@ -533,6 +537,9 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
                     font
                 };
                 let mut w = measure::line_width(label, MENU_LABEL_SIZE, label_font);
+                if icon.is_some() {
+                    w += MENU_ICON_SIZE + MENU_ROW_GAP;
+                }
                 if let Some(detail) = detail {
                     w += MENU_ROW_GAP + measure::line_width(detail, MENU_DETAIL_SIZE, mono);
                 }
@@ -562,6 +569,8 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
 /// Footprint of the submenu chevron. The icon box is square, so this value is
 /// both the chevron's rendered size and the width the menu-width calc reserves.
 const CHEVRON_WIDTH: f32 = 13.0;
+/// The glyph before a row's label (an AI row's sparkles).
+const MENU_ICON_SIZE: f32 = 12.0;
 
 /// An element that records its own bounds as it lays out, and the cell it records
 /// them in: how a dropdown anchors to its whole trigger. Make it an absolute child
@@ -818,6 +827,7 @@ fn build_row(
             label,
             detail,
             emphasized,
+            icon,
             ..
         } => {
             let label_font = if *emphasized {
@@ -830,12 +840,20 @@ fn build_row(
                 label_font,
                 MENU_LABEL_SIZE,
             );
-            match detail {
-                Some(detail) => {
-                    typography::baseline_row([label, detail_line(detail, mono)], MENU_ROW_GAP)
-                }
-                None => typography::baseline_row([label], 0.0),
+            let mut parts: Vec<Aligned> = icon
+                .map(|glyph| {
+                    Aligned::glyph(
+                        icons::icon(glyph, MENU_ICON_SIZE, theme.muted_text),
+                        MENU_ICON_SIZE,
+                    )
+                })
+                .into_iter()
+                .collect();
+            parts.push(label);
+            if let Some(detail) = detail {
+                parts.push(detail_line(detail, mono));
             }
+            typography::baseline_row(parts, MENU_ROW_GAP)
         }
         MenuEntry::Submenu { label, .. } => typography::baseline_row(
             [

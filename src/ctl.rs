@@ -649,7 +649,7 @@ mod tests {
     /// command, and the reference plugin as it is shipped.
     #[test]
     fn the_skill_names_the_whole_plugin_surface() {
-        use diffui_plugins::protocol::{EVENT_NAMES, FORGE_METHODS};
+        use diffui_plugins::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS};
         for verb in ["init", "check", "list", "eject"] {
             assert!(SKILL.contains(&format!("`diffui plugin {verb}")), "{verb}");
         }
@@ -665,6 +665,8 @@ mod tests {
             "config",
             "ui",
             "ForgeError",
+            "ai",
+            "AiError",
         ] {
             assert!(SKILL.contains(&format!("| `{import}` |")), "{import}");
             assert!(
@@ -674,7 +676,7 @@ mod tests {
                 "{import} isn't in diffui.d.ts"
             );
         }
-        for name in EVENT_NAMES.iter().chain(&FORGE_METHODS) {
+        for name in EVENT_NAMES.iter().chain(&FORGE_METHODS).chain(&AI_METHODS) {
             assert!(SKILL.contains(&format!("`{name}`")), "{name}");
         }
         for command in crate::plugins::READ_ONLY {

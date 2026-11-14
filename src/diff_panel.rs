@@ -970,26 +970,20 @@ fn build_description_editor(
 
     // The agent CLI writes one, where the shipped command (or a user's
     // override of it) can run here.
-    let generate = ui.registry.get(GENERATE).map(|command| {
-        let target = CommandArg::Revision(editor.target.clone());
-        let (label, action) = if generating {
-            ("Stop", Some(Action::StopGenerating))
-        } else {
-            let runs = command.enabled(ui, &target).is_ok();
-            (
-                "Generate",
-                runs.then(|| command.build(ui, target)).flatten(),
-            )
-        };
-        let button = look
-            .button("description-generate", label)
-            .compact()
-            .disabled(saving || action.is_none());
-        match action {
-            Some(action) => button.on_click(Diffui::on_action(action, cx)),
-            None => button,
-        }
-    });
+    let generate = crate::ai::ai_button(
+        ui,
+        look,
+        crate::ai::AiButton {
+            element: "description-generate",
+            command: GENERATE,
+            arg: CommandArg::Revision(editor.target.clone()),
+            label: "Generate",
+            generating,
+            held: saving,
+            size: crate::ui::Size::Compact,
+        },
+        cx,
+    );
 
     // A commit may keep the description as it stands.
     let save_enabled = !saving && !generating && (editor.is_dirty() || editor.commit);
@@ -1026,7 +1020,13 @@ fn build_description_editor(
     .collect();
     // Speaks up when the editor is holding a revision switch back, or what a commit does
     // after.
-    let note = if editor.switch_blocked {
+    let writing = generating.then(|| match ui.ai_provider_shown() {
+        Ok(provider) => format!("Writing with {}\u{2026}", provider.name()),
+        Err(_) => "Writing\u{2026}".to_owned(),
+    });
+    let note = if let Some(writing) = &writing {
+        Some((writing.as_str(), theme.muted_text))
+    } else if editor.switch_blocked {
         Some(("Save or cancel before switching revisions", theme.note_text))
     } else if editor.commit {
         Some(("Then starts a new change on top", theme.subtle_text))
@@ -1041,7 +1041,6 @@ fn build_description_editor(
         crate::theme::radius::inner(crate::theme::radius::CONTROL, crate::theme::HAIRLINE),
         hints,
         generate
-            .map(IntoElement::into_any_element)
             .into_iter()
             .chain([cancel.into_any_element(), save.into_any_element()]),
         theme,

@@ -21,6 +21,7 @@
 //! names the tab it is about with a handle the app minted ([`RepoHandle`]),
 //! and a handle that no longer matches what is on screen is refused.
 
+mod ai;
 mod api;
 #[cfg(test)]
 mod auth_scenarios;
@@ -53,6 +54,7 @@ use diffui_plugins::{
 };
 use futures::channel::mpsc;
 
+pub(crate) use ai::{AiProvider, Ended, Streamed};
 pub(crate) use cli::client_main;
 pub(crate) use events::TabPlugins;
 #[cfg(test)]
@@ -120,6 +122,16 @@ pub(crate) enum FromPlugin {
         /// It was about a token the user pasted, not what is in use.
         checked: bool,
         result: Result<diffui_plugins::protocol::Account, String>,
+    },
+    /// An AI provider's `models()` answered, for its page's picker.
+    AiModels {
+        plugin: String,
+        result: Result<Vec<diffui_plugins::protocol::AiModel>, String>,
+    },
+    /// An AI provider's `account()` answered, for its page.
+    AiAccount {
+        plugin: String,
+        result: Result<String, String>,
     },
 }
 
@@ -446,7 +458,7 @@ impl Plugins {
             .is_some_and(|running| running.instance == instance)
     }
 
-    fn plugin(&self, id: &str) -> Option<Arc<Plugin>> {
+    pub(super) fn plugin(&self, id: &str) -> Option<Arc<Plugin>> {
         self.get(id)?
             .running
             .as_ref()
@@ -694,6 +706,7 @@ impl Diffui {
         }
         self.refresh_script_forges();
         self.watch_plugins();
+        self.refresh_ai_keys();
     }
 
     /// Watch the plugins folder, once there is one to watch.
@@ -805,7 +818,8 @@ impl Diffui {
         for id in ids {
             self.settle_plugin(&id);
             if let Some(found) = self.plugins.get_mut(&id) {
-                found.announce = found.running.is_some();
+                // Built into diffui: nothing of it changed to announce.
+                found.announce = found.running.is_some() && found.origin != Origin::Bundled;
             }
         }
         self.refresh_script_forges();
@@ -1007,6 +1021,10 @@ impl Diffui {
                 checked,
                 result,
             } => self.plugin_account_answered(&plugin, host, checked, result),
+            FromPlugin::AiModels { plugin, result } => self.page_models_answered(&plugin, result),
+            FromPlugin::AiAccount { plugin, result } => {
+                self.page_ai_account_answered(&plugin, result)
+            }
         }
     }
 

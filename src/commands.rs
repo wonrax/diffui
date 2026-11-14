@@ -30,7 +30,7 @@ use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
 mod registry;
-pub(crate) use registry::{CommandId, Disabled, Entry, GROUPS, Registry};
+pub(crate) use registry::{CommandId, Disabled, Entry, GROUPS, Handler, Registry};
 
 /// Declares [`Context`] once: each variant with the name it goes by in
 /// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
@@ -2976,6 +2976,22 @@ pub(crate) static REGISTRY: &[Command] = &[
             Some(Action::ChangeSetting(crate::config::Setting::MonoFont(
                 font_arg(arg, crate::theme::Font::MONOSPACE)?,
             )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.ai-provider",
+        label: "Set AI provider",
+        hint: "Where AI commands send the diff",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| require(!ui.ai_choice().1, "Set in config.toml"),
+        build: |_ui, arg| {
+            let CommandArg::Text(choice) = arg else {
+                return None;
+            };
+            Some(Action::Ai(crate::ai::AiAction::SetProvider(choice)))
         },
         palette: PaletteScope::Hidden,
     },

@@ -40,6 +40,7 @@ impl Diffui {
             emphasized: false,
             command: entry.id.clone(),
             arg,
+            icon: self.runs_ai(command).then_some(crate::icons::SPARKLES),
         }
     }
 
@@ -67,6 +68,7 @@ impl Diffui {
             emphasized: false,
             command: command.into(),
             arg,
+            icon: None,
         }
     }
 
@@ -82,7 +84,7 @@ impl Diffui {
             ui: self,
             arg: &arg,
         };
-        let rows: Vec<menu::MenuEntry> = self
+        let (ai, mut rows): (Vec<_>, Vec<_>) = self
             .registry
             .iter()
             .filter(|entry| {
@@ -90,8 +92,23 @@ impl Diffui {
                     wanted(&declared.places) && declared.when.is_none_or(|when| when.eval(&keys))
                 })
             })
+            .partition(|entry| self.runs_ai(&entry.id));
+        let mut rows: Vec<menu::MenuEntry> = rows
+            .drain(..)
             .map(|entry| self.menu_item(&entry.id, arg.clone()))
             .collect();
+        // The AI rows go under the provider they send the diff to.
+        if !ai.is_empty()
+            && let Ok(provider) = self.ai_provider_shown()
+        {
+            rows.push(menu::MenuEntry::Submenu {
+                label: provider.name().to_owned(),
+                items: ai
+                    .iter()
+                    .map(|entry| self.menu_item(&entry.id, arg.clone()))
+                    .collect(),
+            });
+        }
         if rows.is_empty() {
             return rows;
         }
@@ -350,12 +367,24 @@ impl Diffui {
                         remote: Some(remote),
                         to: Some(selection.clone()),
                     },
+                    icon: None,
                 })
             })
             .collect();
         top.push(MenuEntry::Separator);
         top.extend(self.revision_bookmark_rows(selection));
-        top.extend(self.pull_request_rows(selection, None));
+        // The forge's rows under its own name.
+        let forge_rows: Vec<MenuEntry> = self
+            .pull_request_rows(selection, None)
+            .into_iter()
+            .filter(|row| !matches!(row, MenuEntry::Separator))
+            .collect();
+        if let (false, Some(kind)) = (forge_rows.is_empty(), self.active().forge.kind()) {
+            top.push(MenuEntry::Submenu {
+                label: kind.name().to_owned(),
+                items: forge_rows,
+            });
+        }
         top.push(if move_items.is_empty() {
             MenuEntry::Disabled {
                 label: "Move bookmark here".to_owned(),
@@ -511,6 +540,7 @@ impl Diffui {
                 emphasized: true,
                 command: "repo.fetch".into(),
                 arg: CommandArg::Fetch(FetchTarget::Default),
+                icon: None,
             },
             MenuEntry::Item {
                 label: "Fetch all remotes".to_owned(),
@@ -518,6 +548,7 @@ impl Diffui {
                 emphasized: false,
                 command: "repo.fetch".into(),
                 arg: CommandArg::Fetch(FetchTarget::AllRemotes),
+                icon: None,
             },
         ];
         let branches = self.remote_branches_by_proximity();
@@ -547,6 +578,7 @@ impl Diffui {
                 emphasized: false,
                 command: "repo.set-revset".into(),
                 arg: CommandArg::Revset(expr),
+                icon: None,
             })
             .collect()
     }

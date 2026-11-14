@@ -68,8 +68,12 @@
 //! `[[commands]]` declares commands of your own (see [`crate::user_commands`]
 //! and the agent docs in `assets/agent/SKILL.md` for the schema). `[editor]
 //! command` is the argv "Open in editor" starts, the path and line added the
-//! way that editor takes them; `[ai] command` is the agent CLI "Generate
-//! description" and `agent = "…"` rows run, the prompt added last:
+//! way that editor takes them. `[ai] provider` is where "Generate
+//! description" and `agent = "…"` rows send their prompt: `"auto"` (the
+//! default), a provider plugin's id (`claude-code`, `codex`, `anthropic`,
+//! `openai`) or `"custom"`; Settings → AI writes it to `settings.toml` too.
+//! `[ai] command` (config.toml only) is a program of your own that takes the
+//! prompt last, the "Custom command" provider, which `auto` picks first:
 //!
 //! ```toml
 //! [editor]
@@ -77,6 +81,7 @@
 //!
 //! [ai]
 //! command = ["claude", "-p"]
+//! provider = "auto"
 //! ```
 //!
 //! Kerning and OpenType feature toggles (ligatures, stylistic sets) aren't
@@ -150,14 +155,14 @@ impl AppConfig {
                 )
             }
         };
-        let (stored, plugins, settings_error) = match read_settings_file(settings_path.as_deref()) {
+        let (stored, tables, settings_error) = match read_settings_file(settings_path.as_deref()) {
             Ok(read) => {
-                let (stored, plugins) = read.unwrap_or_default();
-                (stored, plugins.plugins, None)
+                let (stored, tables) = read.unwrap_or_default();
+                (stored, tables, None)
             }
             Err(error) => {
                 tracing::warn!("ignoring settings file: {error}");
-                (Scalars::default(), Default::default(), Some(error))
+                (Scalars::default(), StoredPlugins::default(), Some(error))
             }
         };
         let resolved = Self::resolve(&config, &stored);
@@ -170,7 +175,8 @@ impl AppConfig {
             config_path,
             settings_path,
             stored,
-            plugins,
+            plugins: tables.plugins,
+            ai_provider: tables.ai.provider,
             config_error,
             settings_error,
         };
@@ -368,6 +374,8 @@ pub struct ConfigFiles {
     stored: Scalars,
     /// What the user decided about each plugin, by id.
     pub(crate) plugins: PluginRecords,
+    /// `settings.toml`'s `[ai] provider`: the AI provider Settings picked.
+    pub(crate) ai_provider: Option<String>,
     /// Why `config.toml` was ignored, as `path:line:col: message`.
     pub config_error: Option<String>,
     /// Why `settings.toml` was ignored.
@@ -403,7 +411,7 @@ impl ConfigFiles {
         };
         let mut next = self.stored.clone();
         setting.store(&mut next);
-        save_settings(path, &next, &self.plugins)?;
+        save_settings(path, &next, &self.plugins, self.ai_provider.as_deref())?;
         self.stored = next;
         self.settings_error = None;
         Ok(())
@@ -419,10 +427,20 @@ impl ConfigFiles {
         let mut next = self.plugins.clone();
         next.insert(id.to_owned(), record);
         if let Some(path) = &self.settings_path {
-            save_settings(path, &self.stored, &next)?;
+            save_settings(path, &self.stored, &next, self.ai_provider.as_deref())?;
             self.settings_error = None;
         }
         self.plugins = next;
+        Ok(())
+    }
+
+    /// Save the AI provider Settings picked (`None`: automatic).
+    pub(crate) fn write_ai_provider(&mut self, provider: Option<String>) -> Result<(), String> {
+        if let Some(path) = &self.settings_path {
+            save_settings(path, &self.stored, &self.plugins, provider.as_deref())?;
+            self.settings_error = None;
+        }
+        self.ai_provider = provider;
         Ok(())
     }
 }
@@ -440,19 +458,46 @@ pub(crate) fn plugin_records() -> PluginRecords {
         .unwrap_or_default()
 }
 
-/// The `[plugins.<id>]` tables of `settings.toml`.
+/// The tables of `settings.toml`: `[ai]` and each `[plugins.<id>]`.
 #[derive(Default, Debug, Deserialize, Serialize)]
 struct StoredPlugins {
+    #[serde(default, skip_serializing_if = "AiTable::is_empty")]
+    ai: AiTable,
     #[serde(default, skip_serializing_if = "PluginRecords::is_empty")]
     plugins: PluginRecords,
 }
 
-/// Write `settings.toml` whole: the settings, then the plugin tables.
-fn save_settings(path: &Path, scalars: &Scalars, plugins: &PluginRecords) -> Result<(), String> {
+/// `[ai]`. Only config.toml's has a `command`.
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+struct AiTable {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+}
+
+impl AiTable {
+    fn is_empty(&self) -> bool {
+        self.command.is_none() && self.provider.is_none()
+    }
+}
+
+/// Write `settings.toml` whole: the settings, then the `[ai]` and plugin
+/// tables.
+fn save_settings(
+    path: &Path,
+    scalars: &Scalars,
+    plugins: &PluginRecords,
+    ai_provider: Option<&str>,
+) -> Result<(), String> {
     let body = toml::to_string(scalars).map_err(|error| error.to_string())?;
     let mut text = format!("{SETTINGS_HEADER}{body}");
-    if !plugins.is_empty() {
+    if !plugins.is_empty() || ai_provider.is_some() {
         let tables = toml::to_string(&StoredPlugins {
+            ai: AiTable {
+                command: None,
+                provider: ai_provider.map(str::to_owned),
+            },
             plugins: plugins.clone(),
         })
         .map_err(|error| error.to_string())?;
@@ -550,13 +595,13 @@ struct FileOnly {
     #[serde(default)]
     editor: Tool,
     #[serde(default)]
-    ai: Tool,
+    ai: AiTable,
     /// `[plugins.<id>]`: each plugin's own settings, as written.
     #[serde(default)]
     plugins: std::collections::BTreeMap<String, toml::Table>,
 }
 
-/// `[editor]` / `[ai]`: the program a shipped command starts.
+/// `[editor]`: the program a shipped command starts.
 #[derive(Default, Debug, Deserialize)]
 struct Tool {
     command: Option<Vec<String>>,
@@ -572,7 +617,10 @@ pub(crate) struct UserConfig {
     /// What was wrong with the rows that didn't, `path:line:col: message`.
     pub(crate) problems: Vec<String>,
     pub(crate) editor: Option<Vec<String>>,
+    /// `[ai] command`: the "Custom command" AI provider.
     pub(crate) ai: Option<Vec<String>>,
+    /// `[ai] provider`, which Settings can't change then.
+    pub(crate) ai_provider: Option<String>,
     /// Each plugin's `[plugins.<id>]` table.
     pub(crate) plugins: std::collections::BTreeMap<String, toml::Table>,
 }
@@ -588,7 +636,8 @@ impl UserConfig {
             commands: commands.into_iter().map(std::sync::Arc::new).collect(),
             problems,
             editor: file_only.editor.command,
-            ai: file_only.ai.command,
+            ai: file_only.ai.command.filter(|argv| !argv.is_empty()),
+            ai_provider: file_only.ai.provider,
             plugins: file_only.plugins,
         }
     }

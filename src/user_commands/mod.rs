@@ -62,8 +62,8 @@ pub(crate) enum Step {
     /// A jj command line, split into words before substitution, run the way
     /// the palette runs it.
     Run(Vec<Template>),
-    /// The user's agent CLI (`[ai] command`, else `claude -p`, else
-    /// `codex exec`) with this prompt as its last argument.
+    /// The AI provider (see [`crate::ai`]) with this prompt: a command-line
+    /// one gets it as its last argument.
     Agent(Template),
     /// The user's editor (`[editor] command`, else `$VISUAL` / `$EDITOR`
     /// when it's a GUI editor, else the system's opener) on this path, at
@@ -84,6 +84,13 @@ pub(crate) enum Output {
     Description,
     /// The browser, its first line once it exits.
     OpenUrl,
+    /// The pull request dialog's title (the first line) and body, as it
+    /// arrives.
+    PullRequest,
+    /// The bookmark name prompt, its first line made a name, once it exits.
+    Bookmark,
+    /// The output panel, opened as it starts: text to read.
+    Panel,
     None,
 }
 
@@ -95,6 +102,9 @@ impl Output {
             "clipboard" => Output::Clipboard,
             "description" => Output::Description,
             "open-url" => Output::OpenUrl,
+            "pr" => Output::PullRequest,
+            "bookmark" => Output::Bookmark,
+            "panel" => Output::Panel,
             "none" => Output::None,
             _ => return None,
         })
@@ -162,6 +172,13 @@ impl UserCommand {
         if let Some((text, when)) = &self.when
             && !when.eval(&AppKeys { ui, arg })
         {
+            // Without a provider, say what to do about it.
+            let names_ai = text
+                .split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_'))
+                .any(|word| word == "ai");
+            if names_ai && let Err(why) = ui.ai_provider_shown() {
+                return Err(Cow::Owned(why));
+            }
             return Err(Cow::Owned(format!("Only when {text}")));
         }
         for var in self.vars() {
@@ -228,6 +245,11 @@ pub(crate) fn value(
         }
         Var::Diff => {
             root()?;
+            context::revision_row(ui, arg).ok_or(NO_REVISION)?;
+            return Ok(None);
+        }
+        Var::StackDiff | Var::StackDescriptions => {
+            crate::commands::require(tab.session.capabilities.mutate, reason::NOT_JJ)?;
             context::revision_row(ui, arg).ok_or(NO_REVISION)?;
             return Ok(None);
         }

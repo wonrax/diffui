@@ -251,7 +251,7 @@ fn command(at: &Locator<'_>, raw: RawCommand) -> Result<(UserCommand, Vec<String
         Some(output) => Output::parse(output.get_ref()).ok_or_else(|| {
             say(
                 output.span(),
-                "output is activity, toast, clipboard, description, open-url or none",
+                "output is activity, toast, clipboard, description, pr, bookmark, panel, open-url or none",
             )
         })?,
         None => Output::Activity,
@@ -522,6 +522,16 @@ exec = ["true"]
         let (commands, problems) = parse_commands(Path::new("commands.toml"), SHIPPED);
         assert!(problems.is_empty(), "{problems:#?}");
         let ids: Vec<&str> = commands.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["file.open-in-editor", "ai.describe"]);
+        assert_eq!(
+            ids,
+            [
+                "file.open-in-editor",
+                "ai.describe",
+                "ai.pr-description",
+                "ai.bookmark-name",
+                "ai.explain",
+                "ai.review"
+            ]
+        );
     }
 }

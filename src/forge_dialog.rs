@@ -33,6 +33,9 @@ pub(crate) const TITLE_INPUT_ID: &str = "pull-request-title";
 pub(crate) const BODY_INPUT_ID: &str = "pull-request-body";
 pub(crate) const BASE_INPUT_ID: &str = "pull-request-base";
 
+/// The description field's height, and its preview's.
+const BODY_HEIGHT: f32 = 120.0;
+
 /// The most commits a stack or a base search looks through.
 const STACK_LIMIT: usize = 500;
 
@@ -72,12 +75,16 @@ pub(crate) struct PrDialog {
     pub(crate) remote_name: String,
     pub(crate) remote: ForgeRemote,
     pub(crate) head: Head,
+    /// The revision the head is on.
+    pub(crate) revision: RevisionSelection,
     /// The open pull request this updates.
     pub(crate) existing: Option<PullRequest>,
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) base: String,
     pub(crate) draft: bool,
+    /// An AI provider writing the title and body (`ai.pr-description`).
+    pub(crate) generating: Option<crate::user_commands::Generation>,
 }
 
 impl PrDialog {
@@ -396,7 +403,9 @@ impl Diffui {
                 .unwrap_or_default(),
             draft: false,
             head,
+            revision: revision.clone(),
             existing,
+            generating: None,
         };
         let creating = dialog.existing.is_none();
         self.push_mode(Mode::PullRequest(dialog));
@@ -445,7 +454,8 @@ impl Diffui {
             (ForgeQuery::DialogDetails, Payload::DetailsLoaded { details, .. }) => {
                 let (title, body) = title_and_body(&details.description);
                 self.edit_dialog(|dialog| {
-                    if dialog.tab != tab || dialog.existing.is_some() {
+                    if dialog.tab != tab || dialog.existing.is_some() || dialog.generating.is_some()
+                    {
                         return;
                     }
                     if !title.is_empty() {
@@ -1133,14 +1143,35 @@ pub(crate) fn build_dialog(
     let body_spec = input::FieldSpec::new(BODY_INPUT_ID, &dialog.body)
         .placeholder(body_placeholder)
         .on_input(field_input(cx, ForgeAction::Body));
-    let body = {
+    let body = if ui.ai.pr_preview {
+        let preview = if dialog.body.trim().is_empty() {
+            div().child(crate::typography::line(
+                "Nothing to preview",
+                look.font,
+                text_size::BODY,
+                theme.subtle_text,
+            ))
+        } else {
+            crate::ai::rendered_markdown("pull-request-preview", &dialog.body, look)
+        };
+        crate::field::field_well(false, theme)
+            .h(px(BODY_HEIGHT))
+            .child(crate::ui::scrollable(
+                "pull-request-preview",
+                div().p(px(theme::space::SM)).child(preview),
+            ))
+            .into_any_element()
+    } else {
         let (editor, focused) = input::multi_line_with_focus(body_spec, look.font, window, cx);
-        crate::field::field_well(focused, theme).h(px(120.0)).child(
-            editor
-                .appearance(false)
-                .text_size(px(text_size::BODY))
-                .h_full(),
-        )
+        crate::field::field_well(focused, theme)
+            .h(px(BODY_HEIGHT))
+            .child(
+                editor
+                    .appearance(false)
+                    .text_size(px(text_size::BODY))
+                    .h_full(),
+            )
+            .into_any_element()
     };
     let row = |label, field: AnyElement| {
         div()
@@ -1170,7 +1201,30 @@ pub(crate) fn build_dialog(
                 cx,
             ),
         ))
-        .child(row("Description", body.into_any_element()));
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_end()
+                        .justify_between()
+                        .child(field_label("Description"))
+                        .child(crate::ai::view_toggle(
+                            look,
+                            "pull-request-body-view",
+                            ["Edit", "Preview"],
+                            ui.ai.pr_preview,
+                            crate::ai::AiAction::PrPreview,
+                            cx,
+                        )),
+                )
+                .child(body),
+        );
     if dialog.existing.is_none() {
         let draft = dialog.draft;
         let segment = |id, label: &'static str, active: bool| {
@@ -1230,7 +1284,27 @@ pub(crate) fn build_dialog(
             &["forge.dialog-cancel"],
             "Cancel",
         )
-        .buttons([cancel.into_any_element(), accept.into_any_element()])
+        .buttons(
+            crate::ai::ai_button(
+                ui,
+                look,
+                crate::ai::AiButton {
+                    element: "pull-request-generate",
+                    command: "ai.pr-description",
+                    arg: CommandArg::Revision(dialog.revision.clone()),
+                    label: "Generate",
+                    generating: dialog
+                        .generating
+                        .as_ref()
+                        .is_some_and(|generation| generation.running),
+                    held: false,
+                    size: crate::ui::Size::Standard,
+                },
+                cx,
+            )
+            .into_iter()
+            .chain([cancel.into_any_element(), accept.into_any_element()]),
+        )
         .build();
     crate::ui::input_modal("pull-request-modal", card, crate::toolbar::modal_top())
         .into_any_element()

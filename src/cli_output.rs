@@ -59,6 +59,9 @@ pub(crate) struct CliRun {
     /// Text to read rather than a run: `program` is its title, and there is
     /// no exit status to show.
     transcript: bool,
+    /// The panel's title in place of the command line: an AI command's
+    /// label and provider.
+    pub(crate) heading: Option<String>,
 }
 
 impl CliRun {
@@ -82,6 +85,7 @@ impl CliRun {
             scope: None,
             cancel: Some(cancel),
             transcript: false,
+            heading: None,
         }
     }
 
@@ -204,6 +208,7 @@ impl Diffui {
                 scope: scope.map(Scope),
                 cancel: None,
                 transcript: false,
+                heading: None,
             },
         );
         handle.send(diffui_core::Command::RunCli { job, invocation });
@@ -236,6 +241,7 @@ impl Diffui {
                 scope: None,
                 cancel: None,
                 transcript: true,
+                heading: None,
             },
         );
         self.open_cli_output(tab, activity);
@@ -389,7 +395,50 @@ pub(crate) fn build_overlay(
     };
     let font = look.font;
 
-    let content = if run.lines.is_empty() && run.dropped == 0 {
+    // An AI reply reads rendered unless the panel was switched to Raw.
+    let rendered = run.heading.is_some() && !ui.ai.panel_raw;
+    let content = if rendered
+        && run
+            .lines
+            .iter()
+            .any(|line| line.stream == CliStream::Stdout)
+    {
+        let notes = run
+            .lines
+            .iter()
+            .filter(|line| line.stream == CliStream::Stderr)
+            .map(|line| {
+                typography::line(
+                    line.text.clone(),
+                    font,
+                    text_size::CAPTION,
+                    theme.muted_text,
+                )
+                .overflow_hidden()
+                .text_ellipsis()
+            });
+        let reply: Vec<&str> = run
+            .lines
+            .iter()
+            .filter(|line| line.stream == CliStream::Stdout)
+            .map(|line| line.text.as_str())
+            .collect();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::space::SM))
+            .p(px(OUTPUT_INSET * 2.0))
+            .children(notes)
+            .child(crate::ai::rendered_markdown(
+                "ai-panel",
+                &reply.join("\n"),
+                look,
+            ));
+        div()
+            .h(px(OUTPUT_MAX_HEIGHT))
+            .child(ui::scrollable("ai-panel-rendered", body))
+            .into_any_element()
+    } else if run.lines.is_empty() && run.dropped == 0 {
         div()
             .p(px(theme::space::SM))
             .child(typography::line(
@@ -426,12 +475,22 @@ pub(crate) fn build_overlay(
         font,
         text_size::CAPTION,
     );
-    let mut buttons: Vec<AnyElement> = vec![
-        look.button("cli-output-copy", "Copy")
-            .icon(icons::COPY, theme.muted_text)
-            .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
-            .into_any_element(),
-    ];
+    let mut buttons: Vec<AnyElement> = Vec::new();
+    if run.heading.is_some() {
+        buttons.push(crate::ai::view_toggle(
+            look,
+            "ai-panel-view",
+            ["Rendered", "Raw"],
+            ui.ai.panel_raw,
+            crate::ai::AiAction::PanelRaw,
+            cx,
+        ));
+    }
+    buttons.extend([look
+        .button("cli-output-copy", "Copy")
+        .icon(icons::COPY, theme.muted_text)
+        .on_click(send::<ClickEvent>(OutputAction::Copy, cx))
+        .into_any_element()]);
     if run.exit.is_none() {
         buttons.push(
             look.button("cli-output-stop", "Stop")
@@ -445,10 +504,10 @@ pub(crate) fn build_overlay(
                 .into_any_element(),
         );
     }
-    let title = if run.transcript {
-        Prose::from(run.program.clone())
-    } else {
-        Prose::new().code(run.command())
+    let title = match (&run.heading, run.transcript) {
+        (Some(heading), _) => Prose::from(heading.clone()),
+        (None, true) => Prose::from(run.program.clone()),
+        (None, false) => Prose::new().code(run.command()),
     };
     let mut card = crate::overlay_kit::Dialog::new(&title, look)
         .width(OUTPUT_WIDTH)

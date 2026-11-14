@@ -587,6 +587,7 @@ fn one_row_menu(h: &mut Harness, opened_by: Option<gpui_kit::MouseButton>) {
         emphasized: false,
         command: "view.toggle-wrap".into(),
         arg: CommandArg::None,
+        icon: None,
     }];
     h.act(|ui, _| {
         ui.push_mode(Mode::Menu(OverlayMenu::new(

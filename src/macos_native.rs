@@ -87,6 +87,8 @@ pub enum MenuItem {
         enabled: bool,
         /// A second, smaller line under the label: why a greyed row is.
         subtitle: Option<String>,
+        /// An SF Symbol before the label (`sparkles` on an AI row).
+        symbol: Option<&'static str>,
     },
     /// A nested submenu. Empty `items` renders as a single disabled row.
     Submenu { label: String, items: Vec<MenuItem> },
@@ -101,6 +103,7 @@ impl MenuItem {
             id,
             enabled: true,
             subtitle: None,
+            symbol: None,
         }
     }
 
@@ -184,9 +187,13 @@ fn build_menu(mtm: MainThreadMarker, target: &AnyObject, items: &[MenuItem]) -> 
                 id,
                 enabled,
                 subtitle,
+                symbol,
             } => {
                 let menu_item = NSMenuItem::new(mtm);
                 menu_item.setTitle(&NSString::from_str(label));
+                if let Some(symbol) = symbol {
+                    set_symbol(&menu_item, symbol);
+                }
                 if let Some(subtitle) = subtitle {
                     set_subtitle(&menu_item, subtitle);
                 }
@@ -217,6 +224,23 @@ fn build_menu(mtm: MainThreadMarker, target: &AnyObject, items: &[MenuItem]) -> 
         }
     }
     menu
+}
+
+/// The SF Symbol `name` as the item's image, when the system has it.
+fn set_symbol(item: &NSMenuItem, name: &str) {
+    let name = NSString::from_str(name);
+    // SAFETY: a class method of NSImage (macOS 11+) that returns nil for an
+    // unknown name; `setImage:` takes an NSImage or nil.
+    let image: Option<Retained<AnyObject>> = unsafe {
+        msg_send![
+            objc2::class!(NSImage),
+            imageWithSystemSymbolName: &*name,
+            accessibilityDescription: std::ptr::null::<NSString>()
+        ]
+    };
+    if let Some(image) = image {
+        let _: () = unsafe { msg_send![item, setImage: &*image] };
+    }
 }
 
 /// `subtitle` under the item's title (macOS 14.4+; older systems skip it, as

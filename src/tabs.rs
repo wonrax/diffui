@@ -448,6 +448,7 @@ pub(crate) mod tests {
             registry: Default::default(),
             user_config: Default::default(),
             user_runs: Default::default(),
+            ai: Default::default(),
             keymap: Keymap::build(&crate::commands::Registry::builtin(), &Default::default()).0,
             modes: Vec::new(),
             focus_before_modes: None,

@@ -191,20 +191,41 @@ pub(crate) fn footer_with_buttons(
     buttons: impl IntoIterator<Item = gpui_kit::AnyElement>,
     theme: ThemeSpec,
 ) -> Div {
+    // Each hint is a line of the buttons' height; one that doesn't fit wraps
+    // onto a line below, which is clipped: a hint shows whole or not at all,
+    // never cut under the buttons.
+    let line = match density {
+        Density::Dialog => crate::ui::Size::Standard,
+        Density::Strip | Density::Well => crate::ui::Size::Compact,
+    }
+    .height();
     footer(density, corner, theme)
         .gap(px(crate::ui::BUTTON_GAP))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
+                .h(px(line))
                 .flex()
                 .flex_row()
-                .items_center()
-                .gap(px(HINT_GAP))
+                .flex_wrap()
+                .content_start()
+                .gap_x(px(HINT_GAP))
                 .overflow_hidden()
-                .children(hints),
+                .children(hints.into_iter().map(|hint| {
+                    div()
+                        .flex_none()
+                        .h(px(line))
+                        .flex()
+                        .items_center()
+                        .child(hint)
+                })),
         )
-        .children(buttons)
+        .children(
+            buttons
+                .into_iter()
+                .map(|button| div().flex_none().child(button)),
+        )
 }
 
 /// Between two key hints in a footer.

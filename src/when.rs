@@ -98,6 +98,11 @@ pub(crate) static KEYS: &[KeyDef] = &[
         },
     },
     KeyDef {
+        // an AI provider is picked (or found) and set up: see Settings → AI
+        name: "ai",
+        read: |ui, _| ui.ai_provider_shown().is_ok().into(),
+    },
+    KeyDef {
         // a revision is in context and in the log
         name: "revision.selected",
         read: |ui, arg| context::revision_row(ui, arg).is_some().into(),

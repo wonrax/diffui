@@ -79,6 +79,8 @@ pub(crate) enum PromptKind {
 pub(crate) struct NamePrompt {
     pub(crate) kind: PromptKind,
     pub(crate) value: String,
+    /// An AI provider suggesting the name (`ai.bookmark-name`).
+    pub(crate) generating: Option<crate::user_commands::Generation>,
 }
 
 /// What submitting the prompt's current text would do.
@@ -231,6 +233,7 @@ impl Diffui {
         self.push_mode(Mode::NamePrompt(NamePrompt {
             kind,
             value: value.to_owned(),
+            generating: None,
         }));
         crate::input::focus_and_select_all(NAME_PROMPT_INPUT_ID, cx);
     }
@@ -260,7 +263,7 @@ impl Diffui {
         }
     }
 
-    fn name_prompt_mut(&mut self) -> Option<&mut NamePrompt> {
+    pub(crate) fn name_prompt_mut(&mut self) -> Option<&mut NamePrompt> {
         match self.mode_mut(ModeKind::NamePrompt) {
             Some(Mode::NamePrompt(prompt)) => Some(prompt),
             _ => None,
@@ -474,6 +477,7 @@ impl Diffui {
                 emphasized: false,
                 command: "revision.push-change".into(),
                 arg: push_change(remote),
+                icon: None,
             }),
             None if !info.remotes.is_empty() => rows.push(MenuEntry::Submenu {
                 label: "Push as new bookmark".to_owned(),
@@ -848,7 +852,27 @@ pub(crate) fn build_name_prompt(
             &["bookmark.prompt-cancel"],
             "Cancel",
         )
-        .buttons([cancel_button.into_any_element(), accept.into_any_element()])
+        .buttons(
+            match &prompt.kind {
+                PromptKind::Create { at } => crate::ai::ai_button(
+                    ui,
+                    look,
+                    crate::ai::AiButton {
+                        element: "name-prompt-suggest",
+                        command: "ai.bookmark-name",
+                        arg: crate::commands::CommandArg::Revision(at.clone()),
+                        label: "Suggest",
+                        generating: prompt.generating.is_some(),
+                        held: false,
+                        size: crate::ui::Size::Standard,
+                    },
+                    cx,
+                ),
+                _ => None,
+            }
+            .into_iter()
+            .chain([cancel_button.into_any_element(), accept.into_any_element()]),
+        )
         .build();
     ui::input_modal("name-prompt-modal", card, crate::toolbar::modal_top()).into_any_element()
 }

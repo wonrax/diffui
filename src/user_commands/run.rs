@@ -4,10 +4,12 @@
 //!
 //! A program runs through [`diffui_core::process::stream`] with the launch
 //! `PATH` (see [`crate::launch_env`]), its timeout, and a cancel the output
-//! panel's Stop (or the description editor's) raises. Its lines land in an
-//! activity row and the output panel the way a jj CLI run's do; what it
-//! prints goes where `output` says once it exits, or into the description
-//! editor as it arrives.
+//! panel's Stop (or the description editor's) raises. An `agent` row goes to
+//! the AI provider ([`crate::ai`]): the custom command runs as a program, a
+//! provider plugin streams its text back. Either way the text lands in an
+//! activity row and the output panel the way a jj CLI run's does, and goes
+//! where `output` says: once it ends, or as it arrives for the description
+//! editor and the pull request dialog.
 
 use std::sync::Arc;
 
@@ -18,8 +20,11 @@ use futures::StreamExt as _;
 use super::template::{ARG_DIFF_LIMIT, Template, Values, Var};
 use super::{Output, PromptKind, Step, UserCommand, context_values};
 use crate::activity::ActivityId;
+use crate::ai::Provider;
 use crate::cli_output::Exit;
 use crate::commands::CommandArg;
+use crate::modes::{Mode, ModeKind};
+use crate::plugins::{Ended, Streamed};
 use crate::prose::Prose;
 use crate::{Action, Cx, Diffui, TabId};
 
@@ -60,10 +65,17 @@ struct Waiting {
     answered: usize,
     confirmed: bool,
     fetching: bool,
+    /// A diff it reads was cut at [`DIFF_LIMIT`].
+    cut: bool,
 }
 
-/// A program writing into the description editor: what Stop raises, and the
-/// text to put back if it fails. Kept once it has exited, so what it wrote
+/// The most of a diff a command is given; past it the diff is cut, with a
+/// line that says so.
+const DIFF_LIMIT: usize = 200 * 1024;
+
+/// A run writing into the description editor (or the pull request dialog,
+/// or the bookmark name prompt): what Stop raises, and the text to put back
+/// if it fails. Kept once it has exited, so what it wrote
 /// stays on the field's undo stack until the editor closes.
 #[derive(Debug, Clone)]
 pub(crate) struct Generation {
@@ -74,13 +86,16 @@ pub(crate) struct Generation {
     pub(crate) running: bool,
 }
 
-/// What a running program reports.
+/// What a running program, or a provider plugin, reports.
 enum Event {
     Line(CliLine),
     Exit(std::io::Result<std::process::ExitStatus>),
+    /// A provider's text, cut anywhere.
+    Text(String),
+    Ended(Ended),
 }
 
-/// A program that has started: where what it reports goes.
+/// A run that has started: where what it reports goes.
 struct Running {
     tab: TabId,
     job: diffui_core::JobId,
@@ -88,9 +103,16 @@ struct Running {
     label: String,
     program: String,
     output: Output,
+    /// The provider plugin, for its errors' wording.
+    provider: Option<String>,
+    cut: bool,
+    /// Everything it wrote to stdout so far.
+    text: String,
+    /// A provider's last line, until its end comes.
+    partial: String,
 }
 
-/// A program to run: everything rendered, nothing left to ask.
+/// A run: everything rendered, nothing left to ask.
 struct Launch {
     tab: TabId,
     label: String,
@@ -98,8 +120,9 @@ struct Launch {
     stdin: Option<String>,
     output: Output,
     timeout: std::time::Duration,
-    /// The revision `output = "description"` writes into.
-    target: Option<diffui_core::RevisionSelection>,
+    /// What the command was started on: the revision its output belongs to.
+    arg: CommandArg,
+    cut: bool,
 }
 
 impl Diffui {
@@ -128,6 +151,7 @@ impl Diffui {
             answered: 0,
             confirmed: false,
             fetching: false,
+            cut: false,
         });
         self.advance_user_run(cx);
     }
@@ -260,32 +284,42 @@ impl Diffui {
         }
         let work = async move {
             let mut values = Values::new();
+            let mut cut = false;
+            let commit = commit.ok_or_else(|| "No revision here".to_owned());
             for var in vars {
                 let value = match var {
-                    Var::Diff => {
-                        let Some(commit) = &commit else {
-                            return Err("No revision here".to_owned());
-                        };
-                        read_diff(&repository, commit).await?
+                    Var::Diff => read_diff(&repository, &commit.clone()?).await?,
+                    Var::StackDiff => read_stack_diff(&repository, &commit.clone()?).await?,
+                    Var::StackDescriptions => {
+                        read_stack_descriptions(&repository, &commit.clone()?).await?
                     }
                     Var::RecentDescriptions => read_recent_descriptions(&repository).await?,
                     _ => continue,
                 };
+                let value = match var {
+                    Var::Diff | Var::StackDiff => {
+                        let (value, was_cut) = cut_diff(value);
+                        cut |= was_cut;
+                        value
+                    }
+                    _ => value,
+                };
                 values.insert(var, value);
             }
-            Ok(values)
+            Ok((values, cut))
         };
         Self::run_async(
             work,
             cx,
-            move |this, fetched: Result<Values, String>, cx| {
+            move |this, fetched: Result<(Values, bool), String>, cx| {
                 let Some(run) = this.user_runs.waiting.as_mut().filter(|run| run.id == id) else {
                     return;
                 };
                 run.fetching = false;
                 match fetched {
-                    Ok(values) => {
+                    Ok((values, cut)) => {
                         run.values.extend(values);
+                        run.cut |= cut;
                         this.advance_user_run(cx);
                     }
                     Err(error) => this.drop_user_run(id, &error),
@@ -300,6 +334,7 @@ impl Diffui {
             command,
             arg,
             values,
+            cut,
             ..
         } = run;
         let render = |template: &Template| {
@@ -307,12 +342,20 @@ impl Diffui {
                 .render(&values)
                 .map_err(|var| format!("{{{}}} has no value here", var.name()))
         };
+        let provider = match &command.step {
+            Step::Agent(_) => match self.ai_provider() {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    return self.push_error_toast(format!("{} didn't run", command.label), &error);
+                }
+            },
+            _ => None,
+        };
         let rendered: Result<Vec<String>, String> = match &command.step {
             Step::Exec(words) | Step::Run(words) => words.iter().map(render).collect(),
-            Step::Agent(prompt) => render(prompt).and_then(|prompt| {
-                let mut argv = agent_command(self.user_config.ai.as_deref())?;
-                argv.push(prompt);
-                Ok(argv)
+            Step::Agent(prompt) => render(prompt).map(|prompt| match &provider {
+                Some(Provider::Custom(argv)) => argv.iter().cloned().chain([prompt]).collect(),
+                _ => vec![prompt],
             }),
             Step::Edit(path) => render(path).and_then(|path| {
                 let root = values.get(&Var::Root).ok_or("No local repository here")?;
@@ -358,92 +401,173 @@ impl Diffui {
             }
             return;
         }
-        let target = matches!(command.output, Output::Description)
-            .then(|| crate::commands::target_revision(self, &arg))
-            .flatten();
         let output = match command.step {
             Step::Edit(_) => Output::None,
             _ => command.output,
         };
-        self.spawn_program(
-            Launch {
-                tab: id.tab,
-                label: command.label.clone(),
-                argv,
-                stdin,
-                output,
-                timeout: command.timeout,
-                target,
-            },
-            cx,
-        );
-    }
-
-    fn spawn_program(&mut self, launch: Launch, cx: &mut Cx) {
-        let Launch {
-            tab,
-            label,
+        let launch = Launch {
+            tab: id.tab,
+            label: command.label.clone(),
             argv,
             stdin,
             output,
-            timeout,
-            target,
-        } = launch;
+            timeout: command.timeout,
+            arg,
+            cut,
+        };
+        match provider {
+            Some(Provider::Plugin { id, name }) => self.spawn_ai(launch, id, name, cx),
+            _ => self.spawn_program(launch, cx),
+        }
+    }
+
+    /// Start what every run shows: its activity row, its output panel run,
+    /// and the field it writes into, opened if it isn't. `None` when the tab
+    /// has no repository.
+    fn begin_run(
+        &mut self,
+        launch: &Launch,
+        program: String,
+        args: Vec<String>,
+        shown: String,
+        provider: Option<(String, String)>,
+        cx: &mut Cx,
+    ) -> Option<(Running, CancelFlag, std::path::PathBuf)> {
+        let tab = launch.tab;
+        let label = launch.label.clone();
         let Some(root) = self
             .tab(tab)
             .and_then(|state| state.repository.as_ref())
             .map(|repository| repository.root.clone())
         else {
-            return self
-                .push_error_toast(format!("{label} didn't run"), "No local repository here");
-        };
-        let Some((program, args)) = argv.split_first() else {
-            return;
+            self.push_error_toast(format!("{label} didn't run"), "No local repository here");
+            return None;
         };
         let (activity, _) = self.begin_activity(tab, Prose::from(label.clone()), false);
         let cancel = CancelFlag::default();
-        if output == Output::Description
-            && let Some(target) = target
-        {
-            self.perform(
-                Action::EditDescription {
-                    target: Some(target),
-                },
-                cx,
-            );
-            if let Some(editor) = self
-                .tab_mut(tab)
-                .and_then(|state| state.description_editor_mut())
-            {
-                editor.generating = Some(Generation {
-                    activity,
-                    cancel: cancel.clone(),
-                    before: std::mem::take(&mut editor.content),
-                    running: true,
-                });
-            }
+        self.open_output_field(launch, activity, &cancel, cx);
+        let state = self.tab_mut(tab)?;
+        let job = state.session.next_job();
+        let mut run = crate::cli_output::CliRun::program(
+            activity,
+            job,
+            program.clone(),
+            args,
+            cancel.clone(),
+        );
+        if launch.output == Output::Panel {
+            run.heading = Some(match &provider {
+                Some((_, name)) => format!("{label} \u{b7} {name}"),
+                None => label.clone(),
+            });
         }
-        let Some(state) = self.tab_mut(tab) else {
+        crate::cli_output::keep_run(&mut state.cmdline.runs, run);
+        if let Some(log) = self.activity_log_for(tab) {
+            log.set_command(activity, Some(shown));
+        }
+        if launch.output == Output::Panel {
+            if launch.cut {
+                self.cli_output(tab, job, &[cut_note()]);
+            }
+            self.open_cli_output(tab, activity);
+        }
+        let running = Running {
+            tab,
+            job,
+            activity,
+            label,
+            program,
+            output: launch.output,
+            provider: provider.map(|(id, _)| id),
+            cut: launch.cut,
+            text: String::new(),
+            partial: String::new(),
+        };
+        Some((running, cancel, root))
+    }
+
+    /// Open the field `launch` writes into, if it isn't, and mark it as
+    /// being written.
+    fn open_output_field(
+        &mut self,
+        launch: &Launch,
+        activity: ActivityId,
+        cancel: &CancelFlag,
+        cx: &mut Cx,
+    ) {
+        let generation = |before: String| Generation {
+            activity,
+            cancel: cancel.clone(),
+            before,
+            running: true,
+        };
+        match launch.output {
+            Output::Description => {
+                let Some(target) = crate::commands::target_revision(self, &launch.arg) else {
+                    return;
+                };
+                self.perform(
+                    Action::EditDescription {
+                        target: Some(target),
+                    },
+                    cx,
+                );
+                if let Some(editor) = self
+                    .tab_mut(launch.tab)
+                    .and_then(|state| state.description_editor_mut())
+                {
+                    editor.generating = Some(generation(std::mem::take(&mut editor.content)));
+                }
+            }
+            Output::PullRequest => {
+                if self.pull_request_dialog().is_none() {
+                    self.perform(
+                        Action::Forge(crate::forge_dialog::ForgeAction::Open(launch.arg.clone())),
+                        cx,
+                    );
+                }
+                if let Some(Mode::PullRequest(dialog)) = self.mode_mut(ModeKind::PullRequest) {
+                    let before = format!("{}\n\n{}", dialog.title, dialog.body);
+                    dialog.generating = Some(generation(before));
+                }
+            }
+            Output::Bookmark => {
+                let creating = matches!(
+                    self.name_prompt(),
+                    Some(prompt) if matches!(prompt.kind, crate::bookmarks::PromptKind::Create { .. })
+                );
+                if !creating {
+                    let Some(at) = crate::commands::target_revision(self, &launch.arg) else {
+                        return;
+                    };
+                    self.perform(
+                        Action::Bookmark(crate::bookmarks::BookmarkAction::Create { at }),
+                        cx,
+                    );
+                }
+                if let Some(prompt) = self.name_prompt_mut() {
+                    prompt.generating = Some(generation(prompt.value.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn spawn_program(&mut self, launch: Launch, cx: &mut Cx) {
+        let Some((program, args)) = launch.argv.split_first() else {
             return;
         };
-        let job = state.session.next_job();
-        crate::cli_output::keep_run(
-            &mut state.cmdline.runs,
-            crate::cli_output::CliRun::program(
-                activity,
-                job,
-                program.clone(),
-                args.to_vec(),
-                cancel.clone(),
-            ),
-        );
-        if let Some(log) = self.activity_log_for(tab) {
-            log.set_command(activity, Some(display_argv(&argv)));
-        }
-
+        let (program, args) = (program.clone(), args.to_vec());
+        let shown = display_argv(&launch.argv);
+        let Some((running, cancel, root)) =
+            self.begin_run(&launch, program.clone(), args.clone(), shown, None, cx)
+        else {
+            return;
+        };
         let (sender, events) = futures::channel::mpsc::unbounded();
-        let mut process = tokio::process::Command::new(program);
-        process.args(args).current_dir(&root);
+        let mut process = tokio::process::Command::new(&program);
+        process.args(&args).current_dir(&root);
+        let (stdin, timeout) = (launch.stdin, launch.timeout);
         crate::spawn::runtime().spawn(async move {
             let lines = sender.clone();
             let status = diffui_core::process::stream(
@@ -458,21 +582,60 @@ impl Diffui {
             .await;
             let _ = sender.unbounded_send(Event::Exit(status));
         });
-        let running = Running {
-            tab,
-            job,
-            activity,
-            label,
-            program: program.clone(),
-            output,
+        self.follow_run(running, events, cx);
+    }
+
+    /// Send the prompt to the provider plugin `id`.
+    fn spawn_ai(&mut self, launch: Launch, id: String, name: String, cx: &mut Cx) {
+        let Some((mut running, cancel, root)) = self.begin_run(
+            &launch,
+            name.clone(),
+            Vec::new(),
+            name.clone(),
+            Some((id.clone(), name)),
+            cx,
+        ) else {
+            return;
         };
+        let request = diffui_plugins::protocol::AiRequest {
+            prompt: launch.argv.into_iter().next().unwrap_or_default(),
+            input: launch.stdin,
+            cwd: Some(root.display().to_string()),
+            ..Default::default()
+        };
+        match self.ai_complete(&id, request, cancel) {
+            Ok(stream) => {
+                let events = stream.map(|streamed| match streamed {
+                    Streamed::Text(text) => Event::Text(text),
+                    Streamed::Ended(ended) => Event::Ended(ended),
+                });
+                self.follow_run(running, events, cx);
+            }
+            Err(error) => {
+                let ended = Ended::Failed {
+                    kind: None,
+                    message: error,
+                };
+                self.on_program_event(&mut running, Event::Ended(ended), cx);
+            }
+        }
+    }
+
+    /// Take in what a run reports until it ends.
+    fn follow_run(
+        &mut self,
+        running: Running,
+        events: impl futures::Stream<Item = Event> + Unpin + 'static,
+        cx: &mut Cx,
+    ) {
+        let mut running = running;
         cx.spawn(async move |this, cx| {
             let mut events = events.ready_chunks(256);
             while let Some(batch) = events.next().await {
                 let updated = this.update(cx, |this, cx| {
                     this.act(cx, |this, cx| {
                         for event in batch {
-                            this.on_program_event(&running, event, cx);
+                            this.on_program_event(&mut running, event, cx);
                         }
                     })
                 });
@@ -484,44 +647,42 @@ impl Diffui {
         .detach();
     }
 
-    fn on_program_event(&mut self, running: &Running, event: Event, cx: &mut Cx) {
-        let Running {
-            tab,
-            job,
-            activity,
-            ref label,
-            ref program,
-            output,
-        } = *running;
+    fn on_program_event(&mut self, running: &mut Running, event: Event, cx: &mut Cx) {
         match event {
             Event::Line(line) => {
-                if output == Output::Description
-                    && line.stream == CliStream::Stdout
-                    && let Some(editor) = self.generating_editor(tab, activity)
-                {
-                    // Blank lines wait for text after them, so a trailing
-                    // one never lands.
-                    match line.text.trim_end() {
-                        "" if editor.content.is_empty() => {}
-                        "" => editor.content.push('\n'),
-                        text => {
-                            if !editor.content.is_empty() && !editor.content.ends_with("\n\n") {
-                                editor.content.push('\n');
-                            }
-                            editor.content.push_str(text);
-                        }
-                    }
+                if line.stream == CliStream::Stdout {
+                    self.take_text(running, &format!("{}\n", line.text));
                 }
-                self.cli_output(tab, job, std::slice::from_ref(&line));
+                self.cli_output(running.tab, running.job, std::slice::from_ref(&line));
+            }
+            Event::Text(text) => {
+                self.take_text(running, &text);
+                running.partial.push_str(&text);
+                let lines: Vec<CliLine> = match running.partial.rfind('\n') {
+                    Some(end) => {
+                        let complete: String = running.partial.drain(..=end).collect();
+                        complete
+                            .lines()
+                            .map(|line| CliLine {
+                                stream: CliStream::Stdout,
+                                text: line.to_owned(),
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                if !lines.is_empty() {
+                    self.cli_output(running.tab, running.job, &lines);
+                }
             }
             Event::Exit(status) => {
-                let stdout = self.program_stdout(tab, job);
                 let exit = match &status {
                     Ok(status) => Exit::Code(status.code()),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         Exit::Cancelled
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let program = &running.program;
                         Exit::Failed(if program.contains('/') {
                             format!("`{program}` doesn't exist")
                         } else {
@@ -530,48 +691,133 @@ impl Diffui {
                     }
                     Err(error) => Exit::Failed(error.to_string()),
                 };
-                self.finish_cli_run(tab, job, activity, exit.clone());
-                let ok = exit == Exit::Code(Some(0));
-                if let Some(editor) = self.generating_editor(tab, activity)
-                    && let Some(generation) = editor.generating.as_mut()
-                {
-                    generation.running = false;
-                    if ok {
-                        editor.content = editor.content.trim_end().to_owned();
-                    } else {
-                        editor.content = generation.before.clone();
-                    }
+                self.finish_run(running, exit, cx);
+            }
+            Event::Ended(ended) => {
+                if !running.partial.is_empty() {
+                    let line = CliLine {
+                        stream: CliStream::Stdout,
+                        text: std::mem::take(&mut running.partial),
+                    };
+                    self.cli_output(running.tab, running.job, &[line]);
                 }
-                if !ok {
-                    if exit != Exit::Cancelled {
-                        let why = match &exit {
-                            Exit::Failed(error) => error.clone(),
-                            _ => self
-                                .program_last_error(tab, job)
-                                .unwrap_or_else(|| "It exited with an error".to_owned()),
-                        };
-                        self.push_error_toast(format!("{label} failed"), &why);
-                    }
-                    return;
-                }
-                let text = stdout.trim_end().to_owned();
-                match output {
-                    Output::Toast if !text.is_empty() => {
-                        self.push_info_toast(label.to_owned(), &text)
-                    }
-                    Output::Clipboard => crate::write_clipboard(text, cx),
-                    Output::OpenUrl => match text.lines().next().map(str::trim) {
-                        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
-                            crate::open_url(url)
-                        }
-                        _ => self.push_error_toast(
-                            format!("{label} printed no link"),
-                            text.lines().next().unwrap_or(""),
-                        ),
-                    },
-                    Output::Activity | Output::Toast | Output::Description | Output::None => {}
+                let exit = match ended {
+                    Ended::Done => Exit::Code(Some(0)),
+                    Ended::Cancelled => Exit::Cancelled,
+                    Ended::Failed { kind, message } => Exit::Failed(match &running.provider {
+                        Some(id) => self.ai_failure(id, kind.as_deref(), &message),
+                        None => message,
+                    }),
+                };
+                self.finish_run(running, exit, cx);
+            }
+        }
+    }
+
+    /// Text a run wrote: kept, and shown in the field it writes into.
+    fn take_text(&mut self, running: &mut Running, text: &str) {
+        running.text.push_str(text);
+        // Blank lines at either end wait for text after them.
+        let shown = running.text.trim().to_owned();
+        let activity = running.activity;
+        match running.output {
+            Output::Description => {
+                if let Some(editor) = self.generating_editor(running.tab, activity) {
+                    editor.content = shown;
                 }
             }
+            Output::PullRequest => {
+                if let Some(dialog) = self.generating_dialog(activity) {
+                    let (title, body) = crate::forge_dialog::title_and_body(&shown);
+                    dialog.title = title;
+                    dialog.body = body;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_run(&mut self, running: &Running, exit: Exit, cx: &mut Cx) {
+        let Running {
+            tab,
+            job,
+            activity,
+            ref label,
+            output,
+            cut,
+            ..
+        } = *running;
+        self.finish_cli_run(tab, job, activity, exit.clone());
+        let ok = exit == Exit::Code(Some(0));
+        let text = running.text.trim().to_owned();
+        if let Some(editor) = self.generating_editor(tab, activity)
+            && let Some(generation) = editor.generating.as_mut()
+        {
+            generation.running = false;
+            editor.content = if ok {
+                text.clone()
+            } else {
+                generation.before.clone()
+            };
+        }
+        // Kept, stopped: the head's description, should it come after,
+        // doesn't overwrite what was written.
+        if let Some(dialog) = self.generating_dialog(activity)
+            && let Some(generation) = dialog.generating.as_mut()
+        {
+            generation.running = false;
+            let (title, body) =
+                crate::forge_dialog::title_and_body(if ok { &text } else { &generation.before });
+            dialog.title = title;
+            dialog.body = body;
+        }
+        if let Some(prompt) = self.name_prompt_mut()
+            && let Some(generation) = prompt
+                .generating
+                .take_if(|generation| generation.activity == activity)
+        {
+            prompt.value = match bookmark_name(&text) {
+                name if ok && !name.is_empty() => name,
+                _ => generation.before,
+            };
+        }
+        if !ok {
+            if exit != Exit::Cancelled {
+                let why = match &exit {
+                    Exit::Failed(error) => error.clone(),
+                    _ => self
+                        .program_last_error(tab, job)
+                        .unwrap_or_else(|| "It exited with an error".to_owned()),
+                };
+                self.push_error_toast(format!("{label} failed"), &why);
+            }
+            return;
+        }
+        if cut && output != Output::Panel {
+            self.push_info_toast(
+                format!("{label}: the diff was cut"),
+                &format!("It went with its first {} KB only.", DIFF_LIMIT / 1024),
+            );
+        }
+        match output {
+            Output::Toast if !text.is_empty() => self.push_info_toast(label.to_owned(), &text),
+            Output::Clipboard => crate::write_clipboard(text, cx),
+            Output::OpenUrl => match text.lines().next().map(str::trim) {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    crate::open_url(url)
+                }
+                _ => self.push_error_toast(
+                    format!("{label} printed no link"),
+                    text.lines().next().unwrap_or(""),
+                ),
+            },
+            Output::Activity
+            | Output::Toast
+            | Output::Description
+            | Output::PullRequest
+            | Output::Bookmark
+            | Output::Panel
+            | Output::None => {}
         }
     }
 
@@ -591,20 +837,22 @@ impl Diffui {
             })
     }
 
-    fn program_stdout(&self, tab: TabId, job: diffui_core::JobId) -> String {
-        let Some(run) = self.cli_run(tab, job) else {
-            return String::new();
-        };
-        let mut out = String::new();
-        for line in run
-            .lines
-            .iter()
-            .filter(|line| line.stream == CliStream::Stdout)
-        {
-            out.push_str(&line.text);
-            out.push('\n');
+    /// The pull request dialog `activity` is writing into.
+    fn generating_dialog(
+        &mut self,
+        activity: ActivityId,
+    ) -> Option<&mut crate::forge_dialog::PrDialog> {
+        match self.mode_mut(ModeKind::PullRequest) {
+            Some(Mode::PullRequest(dialog))
+                if dialog
+                    .generating
+                    .as_ref()
+                    .is_some_and(|generation| generation.activity == activity) =>
+            {
+                Some(dialog)
+            }
+            _ => None,
         }
-        out
     }
 
     fn program_last_error(&self, tab: TabId, job: diffui_core::JobId) -> Option<String> {
@@ -616,16 +864,47 @@ impl Diffui {
             .map(|line| line.text.trim().to_owned())
     }
 
-    /// Stop the program writing into the active tab's description editor.
+    /// Stop what writes into the active tab's description editor, the pull
+    /// request dialog or the bookmark name prompt.
     pub(crate) fn stop_generating(&mut self) {
-        if let Some(generation) = self
+        let editor = self
             .active()
             .description_editor()
-            .and_then(|editor| editor.generating.as_ref())
-            .filter(|generation| generation.running)
-        {
-            generation.cancel.cancel();
+            .and_then(|editor| editor.generating.as_ref());
+        let dialog = self
+            .pull_request_dialog()
+            .and_then(|dialog| dialog.generating.as_ref());
+        let prompt = self
+            .name_prompt()
+            .and_then(|prompt| prompt.generating.as_ref());
+        for generation in [editor, dialog, prompt].into_iter().flatten() {
+            if generation.running {
+                generation.cancel.cancel();
+            }
         }
+    }
+
+    /// Whether the command `id` is an `agent` row: it runs the AI provider.
+    pub(crate) fn runs_ai(&self, id: &str) -> bool {
+        matches!(
+            self.registry.get(id).map(|entry| &entry.handler),
+            Some(crate::commands::Handler::User(command)) if matches!(command.step, Step::Agent(_))
+        )
+    }
+
+    /// The AI provider an `agent` row would go to, for a tooltip or a
+    /// palette hint: "Sends the diff to Anthropic".
+    pub(crate) fn agent_destination(&self, id: &str) -> Option<String> {
+        let crate::commands::Handler::User(command) = &self.registry.get(id)?.handler else {
+            return None;
+        };
+        if !matches!(command.step, Step::Agent(_)) {
+            return None;
+        }
+        Some(match self.ai_provider_shown() {
+            Ok(provider) => format!("Sends the diff to {}", provider.name()),
+            Err(why) => why,
+        })
     }
 }
 
@@ -754,24 +1033,103 @@ async fn read_recent_descriptions(repository: &crate::Repository) -> Result<Stri
     output_of(command, "recent descriptions").await
 }
 
-/// Whether `program` is a file on `PATH`.
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+/// The revisions of `commit`'s stack: what it adds over trunk.
+fn stack_revset(commit: &str) -> String {
+    format!("trunk()..{commit}")
 }
 
-/// The agent CLI's argv, before the prompt: `[ai] command`, else `claude -p`,
-/// else `codex exec`.
-fn agent_command(configured: Option<&[String]>) -> Result<Vec<String>, String> {
-    if let Some(argv) = configured.filter(|argv| !argv.is_empty()) {
-        return Ok(argv.to_vec());
+/// The diff of `commit`'s stack, in git format.
+async fn read_stack_diff(repository: &crate::Repository, commit: &str) -> Result<String, String> {
+    let root = repository.root.display().to_string();
+    let mut command = jj();
+    command.args([
+        "--ignore-working-copy",
+        "--color=never",
+        "-R",
+        &root,
+        "diff",
+        "--git",
+        "-r",
+        &stack_revset(commit),
+    ]);
+    output_of(command, "the stack's diff").await
+}
+
+/// The descriptions of `commit`'s stack, oldest first, separated by lines
+/// of `---`.
+async fn read_stack_descriptions(
+    repository: &crate::Repository,
+    commit: &str,
+) -> Result<String, String> {
+    let root = repository.root.display().to_string();
+    let mut command = jj();
+    command.args([
+        "--ignore-working-copy",
+        "--color=never",
+        "-R",
+        &root,
+        "log",
+        "--no-graph",
+        "--reversed",
+        "-r",
+        &stack_revset(commit),
+        "-T",
+        "description ++ \"---\\n\"",
+    ]);
+    output_of(command, "the stack's descriptions").await
+}
+
+/// `diff` cut at [`DIFF_LIMIT`], on a line, with a line that says how much
+/// was left out; and whether it was.
+fn cut_diff(diff: String) -> (String, bool) {
+    if diff.len() <= DIFF_LIMIT {
+        return (diff, false);
     }
-    for argv in [["claude", "-p"], ["codex", "exec"]] {
-        if on_path(argv[0]) {
-            return Ok(argv.iter().map(|word| (*word).to_owned()).collect());
+    let mut end = DIFF_LIMIT;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = diff[..end].rfind('\n').map_or(end, |line| line + 1);
+    let left_out = diff.len() - end;
+    let mut cut = diff[..end].to_owned();
+    cut.push_str(&format!(
+        "[diffui: the diff is cut here; the other {left_out} bytes of the diff are left out here]\n"
+    ));
+    (cut, true)
+}
+
+/// The output panel's first line when the diff was cut.
+fn cut_note() -> CliLine {
+    CliLine {
+        stream: CliStream::Stderr,
+        text: format!(
+            "The diff was cut to its first {} KB: what follows is about that part.",
+            DIFF_LIMIT / 1024
+        ),
+    }
+}
+
+/// A provider's suggestion as a bookmark name: its first line, lowercase,
+/// words joined by dashes, at most 60 characters.
+fn bookmark_name(suggestion: &str) -> String {
+    let line = suggestion
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let mut name = String::new();
+    for c in line.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() || c == '/' || c == '.' {
+            name.push(c);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
         }
     }
-    Err("No agent CLI: install claude or codex, or set [ai] command in config.toml".to_owned())
+    let mut name: String = name.chars().take(60).collect();
+    while name.ends_with(['-', '.', '/']) {
+        name.pop();
+    }
+    name
 }
 
 /// Editors that open a window of their own, so they can run without a
@@ -889,9 +1247,26 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_agent_wins() {
-        let configured = vec!["llm".to_owned(), "-m".to_owned(), "x".to_owned()];
-        assert_eq!(agent_command(Some(&configured)), Ok(configured.clone()));
+    fn a_suggestion_becomes_a_bookmark_name() {
+        assert_eq!(bookmark_name("`Fix Parser crash`\n"), "fix-parser-crash");
+        assert_eq!(
+            bookmark_name("\nfeat/add_AI providers!!\nmore"),
+            "feat/add-ai-providers"
+        );
+        assert_eq!(bookmark_name("Name: \"x  y\""), "name-x-y");
+        assert!(bookmark_name(&"word ".repeat(40)).len() <= 60);
+    }
+
+    #[test]
+    fn a_big_diff_is_cut_on_a_line_and_says_so() {
+        let small = "diff --git a b\n+x\n".to_owned();
+        assert_eq!(cut_diff(small.clone()), (small, false));
+        let big = "+0123456789\n".repeat(DIFF_LIMIT / 10);
+        let (cut, was_cut) = cut_diff(big.clone());
+        assert!(was_cut);
+        assert!(cut.len() < DIFF_LIMIT + 200, "{}", cut.len());
+        assert!(cut.ends_with("bytes of the diff are left out here]\n"));
+        assert_eq!(cut.lines().rev().nth(1), Some("+0123456789"));
     }
 
     #[test]

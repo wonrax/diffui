@@ -235,6 +235,8 @@ pub(crate) enum Action {
     },
     /// The permission dialog's answer, and what Settings does to a plugin.
     Plugin(crate::plugins::PluginAction),
+    /// Settings → AI.
+    Ai(crate::ai::AiAction),
     /// Stop the program writing into the description editor.
     StopGenerating,
     /// Read `config.toml`'s keys and commands again.

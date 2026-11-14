@@ -6,6 +6,9 @@ use std::{
 
 mod action;
 mod activity;
+mod ai;
+#[cfg(test)]
+mod ai_scenarios;
 mod app_files;
 mod app_menu;
 mod bookmarks;
@@ -94,7 +97,8 @@ pub(crate) use diffui_core::{
 // were modules of this crate.
 pub(crate) use diffui_widgets::{
     chip, chrome, diff_view, ellipsis, geometry, graph_view, hunk_actions, icons, input, keys,
-    measure, prose, resize_handle, revision_list, scrollbar, squircle, theme, typography, ui,
+    markdown, measure, prose, resize_handle, revision_list, scrollbar, squircle, theme, typography,
+    ui,
 };
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -453,6 +457,8 @@ pub(crate) struct Diffui {
     pub(crate) forge: forge::ForgeUi,
     /// The plugins found in the plugins folder, and what runs of them.
     pub(crate) plugins: plugins::Plugins,
+    /// Settings → AI's tests and what it knows of the secret store.
+    pub(crate) ai: ai::AiState,
     /// How many times the root has rendered.
     #[cfg(test)]
     pub(crate) renders: usize,
@@ -1256,12 +1262,14 @@ fn lower_menu_to_native(
                 id: 0,
                 enabled: false,
                 subtitle: reason.clone(),
+                symbol: None,
             },
             MenuEntry::Item {
                 label,
                 detail,
                 command,
                 arg,
+                icon,
                 ..
             } => {
                 let id = picks.len() as u32;
@@ -1270,7 +1278,14 @@ fn lower_menu_to_native(
                     Some(detail) => format!("{label}  ·  {detail}"),
                     None => label.clone(),
                 };
-                MenuItem::entry(label, id)
+                let symbol = (*icon == Some(icons::SPARKLES)).then_some("sparkles");
+                MenuItem::Entry {
+                    label,
+                    id,
+                    enabled: true,
+                    subtitle: None,
+                    symbol,
+                }
             }
             MenuEntry::Submenu { label, items } => {
                 MenuItem::submenu(label.clone(), lower_menu_to_native(items, picks))

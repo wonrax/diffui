@@ -224,6 +224,7 @@ impl Diffui {
             keymap,
             user_config,
             user_runs: Default::default(),
+            ai: Default::default(),
             modes: Vec::new(),
             focus_before_modes: None,
             sidebar_file_reveal_token: 0,
@@ -837,6 +838,7 @@ impl Diffui {
                 self.run_plugin_command(command, tab, arg)
             }
             Action::Plugin(action) => self.update_plugins(action, cx),
+            Action::Ai(action) => self.update_ai(action, cx),
             Action::StopGenerating => self.stop_generating(),
             Action::ReloadCommands => {
                 if let Err(error) = self.reload_commands() {

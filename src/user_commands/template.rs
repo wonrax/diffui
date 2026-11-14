@@ -28,6 +28,10 @@ pub(crate) enum Var {
     /// The last ten descriptions on the working copy's line, for an agent to
     /// match their style.
     RecentDescriptions,
+    /// The diff of `trunk()..` the revision, its stack.
+    StackDiff,
+    /// The descriptions of the stack's revisions, oldest first.
+    StackDescriptions,
     /// What the prompt named `.0` was answered with.
     Prompt(String),
 }
@@ -44,6 +48,8 @@ pub(crate) const VARS: &[(&str, Var)] = &[
     ("description", Var::Description),
     ("diff", Var::Diff),
     ("recent_descriptions", Var::RecentDescriptions),
+    ("stack_diff", Var::StackDiff),
+    ("stack_descriptions", Var::StackDescriptions),
 ];
 
 impl Var {
@@ -60,7 +66,10 @@ impl Var {
     /// Read from the repository when the command runs, rather than from what
     /// is on screen.
     pub(crate) fn is_fetched(&self) -> bool {
-        matches!(self, Var::Diff | Var::RecentDescriptions)
+        matches!(
+            self,
+            Var::Diff | Var::RecentDescriptions | Var::StackDiff | Var::StackDescriptions
+        )
     }
 }
 

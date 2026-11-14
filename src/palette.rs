@@ -1896,7 +1896,8 @@ fn result_row_body(
                 } else {
                     highlighted(&command_label(ui, id), indices, primary, look)
                 },
-                None,
+                // An AI command says where the diff goes.
+                ui.agent_destination(id).and_then(hint),
                 // The shortcut, where there is one: what the palette teaches.
                 ui.keymap
                     .chord_for(commands::Context::Base, id)

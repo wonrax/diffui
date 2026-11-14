@@ -50,6 +50,7 @@ const MULTI_CLICK_MS: std::ops::RangeInclusive<f32> = 150.0..=1000.0;
 
 impl Diffui {
     pub(crate) fn open_settings(&mut self) {
+        self.refresh_ai_keys();
         // It replaces the transient overlays rather than stacking over them:
         // they share one keyboard.
         self.pop_mode(ModeKind::Palette);
@@ -111,6 +112,7 @@ impl Diffui {
             emphasized: current.family == family,
             command: command.into(),
             arg: CommandArg::Text(family.to_owned()),
+            icon: None,
         };
         let mut tree = vec![
             item(font_label(default), default.family),
@@ -364,14 +366,18 @@ pub(crate) fn build_overlay(
     let hinted_rows = 2.0;
     let (plugins, plugins_height) = crate::plugins::settings_group(ui, look, cx);
     let plugin_rows = plugins.len();
+    // Every AI row is a hinted row's height.
+    let ai = crate::ai::settings_group(ui, look, cx);
+    let ai_rows = ai.len();
     let groups = [
         ("Appearance", appearance),
         ("Code", code_rows),
         ("Behaviour", behaviour),
+        ("AI", ai),
         ("Plugins", plugins),
     ];
     let count = groups.len() as f32;
-    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>() - plugin_rows;
+    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>() - plugin_rows - ai_rows;
     for (index, (title, rows)) in groups.into_iter().enumerate() {
         body = body.child(group(look, title, index > 0, rows));
     }
@@ -386,6 +392,7 @@ pub(crate) fn build_overlay(
         + hinted_rows * (HINT_ROW_HEIGHT - ROW_HEIGHT)
         + plugins_height
         + plugin_rows as f32 * theme::HAIRLINE
+        + ai_rows as f32 * (HINT_ROW_HEIGHT + theme::HAIRLINE)
         + errors as f32 * BANNER_HEIGHT;
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
         .min(content)
@@ -454,7 +461,7 @@ fn row(look: Look, name: &'static str, locked: bool, control: impl IntoElement) 
 
 /// [`row`], with `hint` wrapped under the name when the name alone doesn't
 /// say what the setting does.
-fn hinted_row(
+pub(crate) fn hinted_row(
     look: Look,
     name: &'static str,
     hint: Option<&'static str>,

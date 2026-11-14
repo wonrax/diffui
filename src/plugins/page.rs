@@ -14,10 +14,11 @@ use std::sync::Mutex;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
-use diffui_plugins::protocol::{Account, AccountMethod, ForgeCall, PluginCall, Secret};
+use diffui_plugins::protocol::{Account, AccountMethod, AiModel, ForgeCall, PluginCall, Secret};
 use diffui_plugins::secrets;
 use diffui_plugins::{ConfigField, ConfigKind, Manifest, PER_HOST};
 
+use super::ai::program_found;
 use super::{FromPlugin, PluginAction, State};
 use crate::modes::ModeKind;
 use crate::overlay_kit::{self, DIALOG_PAD};
@@ -44,6 +45,12 @@ pub(crate) struct PluginPage {
     rejected: HashMap<String, String>,
     /// The host whose removal waits on a yes, because it deletes a token.
     removing: Option<String>,
+    /// An AI provider's `account()` answer; `None` while it is asked.
+    ai_account: Option<Result<String, String>>,
+    /// An AI provider's models, once asked for: `None` while they come.
+    models: Option<Option<Result<Vec<AiModel>, String>>>,
+    /// The model list is open under the model setting.
+    picking: bool,
 }
 
 impl PluginPage {
@@ -58,6 +65,23 @@ impl PluginPage {
     #[cfg(test)]
     pub(crate) fn removing(&self) -> Option<&str> {
         self.removing.as_deref()
+    }
+
+    /// The models the list offers, once they came.
+    #[cfg(test)]
+    pub(crate) fn models(&self) -> Option<Vec<String>> {
+        match self.models.as_ref()? {
+            Some(Ok(models)) => Some(models.iter().map(|model| model.id.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    /// Show `account` and the open model list with `models`, for a scene.
+    #[cfg(test)]
+    pub(crate) fn show_ai(&mut self, account: &str, models: Vec<AiModel>) {
+        self.ai_account = Some(Ok(account.to_owned()));
+        self.models = Some(Some(Ok(models)));
+        self.picking = true;
     }
 
     /// Who `host`'s check said the user is.
@@ -108,6 +132,11 @@ pub(crate) enum PageAction {
     RemoveHost { host: String, confirmed: bool },
     /// Keep the host whose removal was asked about.
     KeepHost,
+    /// Open or close an AI provider's model list, asking for it the first
+    /// time.
+    PickModels,
+    /// Set the model setting to this one and close the list.
+    UseModel(String),
 }
 
 /// A field's id: the input widget's ids are static, so each distinct name
@@ -180,26 +209,6 @@ pub(super) fn overlay(under: &mut toml::Table, over: &toml::Table) {
             }
         }
     }
-}
-
-/// Whether `program` names something there: a path that exists, or a name
-/// on the `PATH`.
-fn program_found(program: &str) -> bool {
-    if program.is_empty() {
-        return false;
-    }
-    let path = std::path::Path::new(program);
-    if program.contains('/') {
-        let expanded = match program.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(rest))
-                .unwrap_or_else(|| path.to_path_buf()),
-            None => path.to_path_buf(),
-        };
-        return expanded.exists();
-    }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// A setting's value as its field shows it.
@@ -299,6 +308,9 @@ impl Diffui {
                     validating: HashSet::new(),
                     rejected: HashMap::new(),
                     removing: None,
+                    ai_account: None,
+                    models: None,
+                    picking: false,
                 });
                 self.check_page_accounts(&id);
             }
@@ -437,6 +449,42 @@ impl Diffui {
                     page.removing = None;
                 }
             }
+            PageAction::PickModels => {
+                let Some(page) = self.plugins.page.as_mut() else {
+                    return;
+                };
+                page.picking = !page.picking;
+                let id = page.id.clone();
+                if page.picking && !matches!(page.models, Some(Some(Ok(_)))) {
+                    page.models = Some(None);
+                    self.ask_ai_models(&id);
+                }
+            }
+            PageAction::UseModel(model) => {
+                let Some((_, manifest)) = self.page_manifest() else {
+                    return;
+                };
+                let Some(key) = manifest.ai.as_ref().and_then(|ai| ai.model.clone()) else {
+                    return;
+                };
+                if let Some(page) = self.plugins.page.as_mut() {
+                    page.picking = false;
+                    page.drafts.remove(draft_id(&key, None));
+                }
+                self.set_plugin_setting(&key, None, Some(toml::Value::String(model)));
+            }
+        }
+    }
+
+    pub(super) fn page_models_answered(&mut self, id: &str, result: Result<Vec<AiModel>, String>) {
+        if let Some(page) = self.plugins.page.as_mut().filter(|page| page.id == id) {
+            page.models = Some(Some(result));
+        }
+    }
+
+    pub(super) fn page_ai_account_answered(&mut self, id: &str, result: Result<String, String>) {
+        if let Some(page) = self.plugins.page.as_mut().filter(|page| page.id == id) {
+            page.ai_account = Some(result);
         }
     }
 
@@ -637,10 +685,12 @@ impl Diffui {
         }
         if let Some(page) = self.plugins.page.as_mut().filter(|page| page.id == id) {
             page.accounts.clear();
+            page.ai_account = None;
         }
     }
 
     fn secrets_changed(&mut self, id: &str) {
+        self.refresh_ai_keys();
         let stored = self.plugins.secrets.accounts().unwrap_or_default();
         if let Some(page) = self.plugins.page.as_mut() {
             page.stored = stored.into_iter().collect();
@@ -732,6 +782,9 @@ impl Diffui {
     pub(super) fn check_page_accounts(&mut self, id: &str) {
         if self.plugins.page.as_ref().is_none_or(|page| page.id != id) {
             return;
+        }
+        if self.ai_answers(id, "account") {
+            self.ask_ai_account(id);
         }
         let Some(found) = self.plugins.get(id) else {
             return;
@@ -831,6 +884,17 @@ pub(crate) fn page_overlay(
         first = false;
     }
 
+    if manifest.ai.is_some() {
+        body = body.child(group(
+            look,
+            "Provider",
+            !first,
+            vec![provider_row(ui, look, page, cx)],
+        ));
+        height += HINT_ROW_HEIGHT + GROUP_HEAD;
+        first = false;
+    }
+
     let fields: Vec<&ConfigField> = manifest
         .config
         .iter()
@@ -838,15 +902,19 @@ pub(crate) fn page_overlay(
         .filter(|field| !field.per_host || field.default.is_some())
         .collect();
     if !fields.is_empty() {
-        let rows: Vec<AnyElement> = fields
-            .iter()
-            .map(|field| {
-                height += HINT_ROW_HEIGHT;
-                setting_row(
-                    ui, look, page, &manifest, field, &resolved, &user, window, cx,
-                )
-            })
-            .collect();
+        let model_key = manifest.ai.as_ref().and_then(|ai| ai.model.as_deref());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for field in &fields {
+            height += HINT_ROW_HEIGHT;
+            rows.push(setting_row(
+                ui, look, page, &manifest, field, &resolved, &user, window, cx,
+            ));
+            if page.picking && model_key == Some(field.key.as_str()) {
+                let (list, list_height) = model_list(look, page, &field.key, cx);
+                rows.push(list);
+                height += list_height;
+            }
+        }
         body = body.child(group(look, "Settings", !first, rows));
         height += GROUP_HEAD;
     }
@@ -1507,6 +1575,30 @@ fn setting_row(
                     .child(browse)
                     .into_any_element();
                 (under, control)
+            } else if manifest.ai.as_ref().and_then(|ai| ai.model.as_deref()) == Some(&field.key)
+                && ui.ai_answers(&page.id, "models")
+            {
+                let choose = look
+                    .button(
+                        "plugin-page-models",
+                        if page.picking {
+                            "Close"
+                        } else {
+                            "Choose\u{2026}"
+                        },
+                    )
+                    .compact()
+                    .disabled(locked)
+                    .on_click(send(PageAction::PickModels, cx));
+                let control = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::space::MD))
+                    .child(field_element)
+                    .child(choose)
+                    .into_any_element();
+                (plain_hint, control)
             } else {
                 (plain_hint, field_element)
             }
@@ -1518,6 +1610,131 @@ fn setting_row(
         label(look, field.title(), locked, under),
         control,
     )
+}
+
+/// An AI provider's state: what `account()` said, or a Test's result, and
+/// the Test button.
+fn provider_row(ui: &Diffui, look: Look, page: &PluginPage, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let under = match (ui.ai.tests.get(&page.id), &page.ai_account) {
+        (Some(test), _) => crate::ai::test_caption(look, test),
+        (None, Some(Ok(label))) => caption(look, label.clone(), theme.muted_text),
+        (None, Some(Err(why))) => caption(look, why.clone(), theme.removed_text),
+        (None, None) if ui.ai_answers(&page.id, "account") => {
+            caption(look, "Checking\u{2026}", theme.muted_text)
+        }
+        (None, None) => caption(look, "Test it to see that it answers", theme.subtle_text),
+    };
+    let testing = ui.ai.tests.get(&page.id) == Some(&crate::ai::Test::Running);
+    let test = look
+        .button("plugin-page-ai-test", "Test")
+        .compact()
+        .disabled(testing || ui.plugins.plugin(&page.id).is_none())
+        .tip("Send a short prompt and show the reply")
+        .on_click(Diffui::on_action(
+            Action::Ai(crate::ai::AiAction::Test(page.id.clone())),
+            cx,
+        ));
+    row_shell(
+        HINT_ROW_HEIGHT,
+        label(look, "Status", false, Some(under)),
+        test,
+    )
+}
+
+/// The most models the list shows; typing in the field narrows it.
+const MODELS_SHOWN: usize = 12;
+const MODEL_ROW: f32 = 28.0;
+
+/// The provider's models under its model setting, narrowed by what is
+/// typed there: each one sets it.
+fn model_list(look: Look, page: &PluginPage, key: &str, cx: &mut Cx) -> (AnyElement, f32) {
+    let Look {
+        theme, font, mono, ..
+    } = look;
+    let typed = page
+        .drafts
+        .get(draft_id(key, None))
+        .map(|text| text.trim().to_lowercase())
+        .unwrap_or_default();
+    let line = |text: String, ink| {
+        div()
+            .h(px(MODEL_ROW))
+            .flex()
+            .items_center()
+            .child(caption(look, text, ink))
+            .into_any_element()
+    };
+    let mut lines: Vec<AnyElement> = Vec::new();
+    match &page.models {
+        None | Some(None) => lines.push(line(
+            "Asking for the models\u{2026}".into(),
+            theme.muted_text,
+        )),
+        Some(Some(Err(why))) => lines.push(line(why.clone(), theme.removed_text)),
+        Some(Some(Ok(models))) => {
+            let matching: Vec<&AiModel> = models
+                .iter()
+                .filter(|model| {
+                    typed.is_empty()
+                        || model.id.to_lowercase().contains(&typed)
+                        || model
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| name.to_lowercase().contains(&typed))
+                })
+                .collect();
+            if matching.is_empty() {
+                lines.push(line("No model matches".into(), theme.muted_text));
+            }
+            for (index, model) in matching.iter().take(MODELS_SHOWN).enumerate() {
+                let mut row = div()
+                    .id(("plugin-page-model", index))
+                    .h(px(MODEL_ROW))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .min_w_0()
+                    .gap(px(theme::space::MD))
+                    .px(px(theme::space::SM))
+                    .rounded(px(theme::radius::CONTROL))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme::hover_wash(theme)))
+                    .on_click(send(PageAction::UseModel(model.id.clone()), cx))
+                    .child(
+                        typography::line(model.id.clone(), mono, text_size::CAPTION, theme.text)
+                            .flex_none(),
+                    );
+                if let Some(name) = &model.name {
+                    row = row.child(
+                        typography::line(name.clone(), font, text_size::CAPTION, theme.muted_text)
+                            .overflow_hidden()
+                            .text_ellipsis(),
+                    );
+                }
+                lines.push(row.into_any_element());
+            }
+            if matching.len() > MODELS_SHOWN {
+                lines.push(line(
+                    format!(
+                        "{} more: type in the field to narrow",
+                        matching.len() - MODELS_SHOWN
+                    ),
+                    theme.subtle_text,
+                ));
+            }
+        }
+    }
+    let height = lines.len() as f32 * MODEL_ROW + 2.0 * theme::space::SM;
+    let list = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .py(px(theme::space::SM))
+        .px(px(ROW_INSET))
+        .children(lines)
+        .into_any_element();
+    (list, height)
 }
 
 fn json_to_toml(value: &serde_json::Value) -> toml::Value {

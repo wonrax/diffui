@@ -515,6 +515,17 @@ fn all_revs(c: &mut Ctx) {
 
 /// Pull requests on the fixture's bookmarks, as a refresh against a GitHub
 /// origin would have left them: one of each state, with and without checks.
+/// The AI providers with their programs nowhere, so no scene finds a real
+/// one, and Anthropic's address a closed local port, so none reaches it.
+const AI_CONFIG: &str = "[plugins.claude-code]\nprogram = \"/nonexistent/claude\"\n\n[plugins.codex]\nprogram = \"/nonexistent/codex\"\n\n[plugins.anthropic]\nbase_url = \"http://127.0.0.1:9\"\n";
+
+fn save_anthropic_key(home: &Path) {
+    use diffui_plugins::secrets::{FileStore, SecretStore};
+    FileStore::new(home.join(".diffui-secrets.json"))
+        .set("anthropic.api_key", "sk-scene")
+        .expect("save the key");
+}
+
 fn forge_badges(c: &mut Ctx) {
     use diffui_core::forge::{CheckState, Checks, ForgeRemote, PrState, PullRequest};
     let github = crate::plugins::bundled_kind("github");
@@ -2803,6 +2814,174 @@ fn all() -> Vec<Scene> {
             "[plugins.github.config]\nhosts = [\"github.acme.com\"]\n\n[plugins.github.config.per_host.\"github.acme.com\"]\nauth = \"token\"\n",
         ),
     );
+    t.add(
+        s(
+            "settings-ai",
+            "Settings, AI: the provider pop-up set to Anthropic, then Claude Code and Codex not installed, Anthropic in use with its key saved and a passed Test, and OpenAI-compatible with no key. Each row has Test and a pencil.",
+            "Launch with Anthropic picked and its key saved; open Settings, Test Anthropic and scroll to AI.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.key("cmd+,");
+                c.h.act(|ui, _| {
+                    ui.ai
+                        .tests
+                        .insert("anthropic".to_owned(), crate::ai::Test::Replied("OK".to_owned()));
+                });
+                // Down to the AI group.
+                c.scroll(720.0, 450.0, -560.0);
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(
+        s(
+            "plugins-ai-models",
+            "Anthropic's page in Settings: Provider with its status and Test, then Model with Choose open and the models listed under it, API address, and API key saved with Remove.",
+            "Open Anthropic's page from Settings, AI, and press Choose next to Model.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.key("cmd+,");
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "anthropic".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.act(|ui, _| {
+                    let model = |id: &str, name: &str| diffui_plugins::protocol::AiModel {
+                        id: id.to_owned(),
+                        name: Some(name.to_owned()),
+                    };
+                    if let Some(page) = ui.plugins.page.as_mut() {
+                        page.show_ai(
+                            "The API key works",
+                            vec![
+                                model("claude-opus-5-5", "Claude Opus 5.5"),
+                                model("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                                model("claude-haiku-5-5", "Claude Haiku 5.5"),
+                                model("claude-fable-5-2", "Claude Fable 5.2"),
+                            ],
+                        );
+                    }
+                });
+                c.settle();
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(
+        s(
+            "description-generating",
+            "The description editor while Anthropic writes into it: half a description, the field read-only, Stop in place of Generate, and Writing with Anthropic in the footer.",
+            "Select fix/parser-crash, press Generate; caught mid-stream.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.select("fix/parser-crash");
+                c.key("d");
+                c.h.act(|ui, _| {
+                    let activity = ui.allocate_activity_id();
+                    if let Some(editor) = ui.active_mut().description_editor_mut() {
+                        editor.content =
+                            "Fix the parser crash on empty input\n\nThe tokenizer now returns".to_owned();
+                        editor.generating = Some(crate::user_commands::Generation {
+                            activity,
+                            cancel: Default::default(),
+                            before: String::new(),
+                            running: true,
+                        });
+                    }
+                });
+                c.settle();
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(s(
+        "ai-explain-panel",
+        "Explain this change in the output panel, rendered: a heading, a list with inline code and a nested numbered list, a quote, a code block, a rule and a link; Rendered | Raw, Copy and Close.",
+        "Select fix/parser-crash and run Explain this change.",
+        |c| {
+            c.select("fix/parser-crash");
+            c.h.act(|ui, _| {
+                let Some(tab) = ui.active_tab_id() else {
+                    return;
+                };
+                let activity = ui.allocate_activity_id();
+                let Some(state) = ui.tab_mut(tab) else {
+                    return;
+                };
+                let job = state.session.next_job();
+                let mut run = crate::cli_output::CliRun::program(
+                    activity,
+                    job,
+                    "Anthropic".to_owned(),
+                    Vec::new(),
+                    Default::default(),
+                );
+                run.heading = Some("Explain this change \u{b7} Anthropic".to_owned());
+                run.exit = Some(crate::cli_output::Exit::Code(Some(0)));
+                run.lines = [
+                    "This change stops the parser from **panicking** when it is given an empty file.",
+                    "",
+                    "## What changes",
+                    "",
+                    "- `src/parser.rs`: the tokenizer used to index the first byte of the input without checking that there was one. It now returns an empty token list for empty input.",
+                    "- `tests/parser.rs`: a new test parses an empty file and expects no tokens.",
+                    "  1. it builds an empty buffer",
+                    "  2. it asserts *nothing* comes back",
+                    "",
+                    "> The parser treats an empty token list as an empty document.",
+                    "",
+                    "```rust",
+                    "if input.is_empty() {",
+                    "    return Vec::new();",
+                    "}",
+                    "```",
+                    "",
+                    "---",
+                    "",
+                    "See [the issue](https://example.com/issues/12) for the crash report.",
+                ]
+                .into_iter()
+                .map(|text| diffui_core::cli::CliLine {
+                    stream: diffui_core::cli::CliStream::Stdout,
+                    text: text.to_owned(),
+                })
+                .collect();
+                crate::cli_output::keep_run(&mut state.cmdline.runs, run);
+                ui.open_cli_output(tab, activity);
+            });
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "pull-request-preview",
+        "The create pull request dialog with its description in Preview: the Markdown body rendered (a heading, a list, inline code, a link), Edit | Preview above it.",
+        "Create pull request on fix/changelog-note, write a Markdown description, press Preview.",
+        |c| {
+            forge_badges(c);
+            c.h.act(|ui, _| {
+                ui.active_mut().forge.decorations.remove("fix/changelog-note");
+            });
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Open(
+                CommandArg::Bookmark {
+                    name: "fix/changelog-note".to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            )));
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Body(
+                "## Why\n\nThe release needs a **changelog** note.\n\n- adds `CHANGELOG.md`\n- links [the release](https://example.com/r/1)\n".to_owned(),
+            )));
+            c.act(Action::Ai(crate::ai::AiAction::PrPreview(true)));
+        },
+    ));
     t.add(
         s(
             "plugins-remove-host",

@@ -102,6 +102,8 @@ pub(crate) fn without_forge_tokens() {
             "GITHUB_ENTERPRISE_TOKEN",
             "GITLAB_TOKEN",
             "GITLAB_ACCESS_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
         ] {
             // SAFETY: done once, before any plugin a test starts reads them.
             unsafe { std::env::remove_var(var) };
