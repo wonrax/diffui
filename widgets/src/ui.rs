@@ -1388,7 +1388,8 @@ const TOOLTIP_PAD_X: f32 = 8.0;
 const TOOLTIP_PAD_Y: f32 = 3.0;
 
 /// The hover label every tooltip in the app shows: an 11px caption on a small
-/// card, like a macOS help tag. One line, never wrapped.
+/// card, like a macOS help tag. Never wrapped: it has the lines its label
+/// has, one unless the label breaks them itself.
 pub fn tooltip_card(label: impl Into<SharedString>, look: Look) -> Div {
     let Look { theme, font, .. } = look;
     let label = label.into();
@@ -1407,11 +1408,18 @@ pub fn tooltip_card(label: impl Into<SharedString>, look: Look) -> Div {
         .child(label)
 }
 
-/// The outer size of [`tooltip_card`] holding `label`, its 1px edge included.
+/// The outer size of [`tooltip_card`] holding `label`, its 1px edge included:
+/// as wide as the label's widest line, as tall as its lines.
 fn tooltip_size(label: &str, font: Font) -> (f32, f32) {
     let edge = 2.0;
-    let width = crate::measure::line_width(label, TOOLTIP_TEXT_SIZE, font) + 2.0 * TOOLTIP_PAD_X;
-    let height = TOOLTIP_TEXT_SIZE * typography::DEFAULT_LINE_HEIGHT + 2.0 * TOOLTIP_PAD_Y;
+    let (lines, widest) = label
+        .split('\n')
+        .fold((0.0, 0.0_f32), |(lines, widest), line| {
+            let width = crate::measure::line_width(line, TOOLTIP_TEXT_SIZE, font);
+            (lines + 1.0, widest.max(width))
+        });
+    let width = widest + 2.0 * TOOLTIP_PAD_X;
+    let height = lines * TOOLTIP_TEXT_SIZE * typography::DEFAULT_LINE_HEIGHT + 2.0 * TOOLTIP_PAD_Y;
     (width.ceil() + edge, height.ceil() + edge)
 }
 
@@ -1526,6 +1534,31 @@ mod tests {
             width,
             height,
         }
+    }
+
+    /// A label that breaks its own lines gets a card as wide as the widest
+    /// and a line taller for each; a one-line label's card is what it was.
+    #[test]
+    fn a_tooltip_card_fits_every_line_of_its_label() {
+        let font = Font::DEFAULT;
+        let line = TOOLTIP_TEXT_SIZE * typography::DEFAULT_LINE_HEIGHT;
+        let width = |text: &str| {
+            (crate::measure::line_width(text, TOOLTIP_TEXT_SIZE, font) + 2.0 * TOOLTIP_PAD_X).ceil()
+                + 2.0
+        };
+        let (short, long) = ("~/.dotfiles", "Working copy (@) has changes");
+
+        let one = tooltip_size(long, font);
+        assert_eq!(
+            one,
+            (width(long), (line + 2.0 * TOOLTIP_PAD_Y).ceil() + 2.0)
+        );
+
+        let two = tooltip_size(&format!("{short}\n{long}"), font);
+        assert_eq!(two.0, one.0, "the widest line sets the width");
+        assert!(width(short) < two.0);
+        assert_eq!(two.1, (2.0 * line + 2.0 * TOOLTIP_PAD_Y).ceil() + 2.0);
+        assert_eq!(tooltip_size(&format!("{long}\n{short}"), font), two);
     }
 
     #[test]
