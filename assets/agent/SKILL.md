@@ -346,6 +346,7 @@ for, and the user sees the list before it runs:
 | `http = ["host", "*.example.com", "localhost:3000"]` | `http.fetch` those hosts, and ask `auth.token` for their git credentials |
 | `exec = [["git", "config"]]` | `exec` an argv that starts with one of these prefixes; a word `"{config.program}"` is the string setting `program` (declare it in `[config.schema]`), so the user can point the plugin at a program |
 | `env = ["GH_HOST"]` | set these variables for the programs `exec` runs |
+| `read = ["${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml"]` | `files.read` these files, named as written or by the path they expand to; `~/`, `$NAME` and `${NAME:-default}` expand when read. Read-only, and nothing else on disk |
 | `jj = "read"` | read the repository: `repo.bookmarks`, `remotes`, `selection`, `rows`, `diff`, `readFile`, `repo.jj.query` |
 | `jj = "write"` | all of that, and `repo.jj.run` |
 
@@ -384,6 +385,7 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 | `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
 | `exec` | `exec(argv, options)`: no shell, an allowed argv prefix, `env` for allowed variables; `exec.stream(argv, options)` for output read a piece at a time with `for await`, then `await out.ended` for the exit |
+| `files` | `files.read(path)`: the text of a file `[permissions] read` lists, such as a CLI's own config |
 | `auth` | `auth.token(host)`: the user's `token_cmd`, else `git credential fill`; never prompts |
 | `kv` | a small JSON store that survives restarts |
 | `config` | the plugin's settings |
@@ -577,7 +579,8 @@ commands.register("forgejo.open-in-browser", async ({ repo, bookmark }) => {
 ### Pitfalls
 
 - There is no Node here: no `require`, `fs`, `process`, `Buffer` or npm
-  packages, and no global `fetch`. Import from `"diffui"` and from your own
+  packages, and no global `fetch`. `files.read` reads only the files
+  `[permissions] read` lists. Import from `"diffui"` and from your own
   files by relative path (`"./util.js"`); anything else fails the load with
   a message that lists what exists.
 - `http.fetch` reaches only the hosts under `[permissions] http`, redirects

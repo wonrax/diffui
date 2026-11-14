@@ -19,6 +19,7 @@
  *     http = ["codeberg.org"]          # hosts http.fetch and auth.token may use; "*.example.com" and "localhost:3000" work
  *     exec = [["git", "credential"]]   # argv prefixes exec may run; a word "{config.<key>}" is that string setting
  *     env = ["GH_HOST"]                # variables exec may set for the programs it runs
+ *     read = ["${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml"]   # files files.read may read; ~/, $NAME and ${NAME:-default} expand
  *     jj = "read"                      # "read": repo reads and repo.jj.query. "write": also repo.jj.run
  *
  *     [provides]
@@ -71,7 +72,8 @@
  * The runtime is QuickJS (ES2023), not Node and not a browser:
  *
  * - Import from "diffui" and from relative files ("./util.js"). Nothing else resolves: no npm, no `require`,
- *   no `fs`, no `process`. There is no global `fetch`; use `http.fetch`.
+ *   no `fs` (`files.read` reads the files the manifest lists), no `process`. There is no global `fetch`; use
+ *   `http.fetch`.
  * - The only globals beyond the language are the ones declared at the bottom of this file. Type-check with
  *   `"lib": ["ES2023"]` (no "DOM") so that nothing else looks available. In JavaScript, put `// @ts-check` at
  *   the top of each file and set `"checkJs": true`.
@@ -609,6 +611,24 @@ declare module "diffui" {
     readonly code: number | null;
     readonly stdout: string;
     readonly stderr: string;
+  }
+
+  /** Files on the user's machine, the ones `[permissions] read` lists. */
+  export const files: Files;
+
+  export interface Files {
+    /**
+     * The text of a file listed under `[permissions] read`, named as written there (`"~/.config/gh/hosts.yml"`)
+     * or by the path that expands to. An entry expands when it is read: `~/` is the home directory, `$NAME` a
+     * variable, `${NAME:-default}` the variable or, when it is unset or empty, `default` (itself expanded).
+     * That is how a forge finds its CLI's own config where the CLI would:
+     * `"${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml"`. Rejects with "NotFoundError" when there
+     * is no such file or a variable it needs is unset, and with an `Error` for a file over 8 MB. There is no
+     * way to write a file.
+     *
+     *     const text = await files.read("${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml").catch(() => "");
+     */
+    read(path: string, options?: { signal?: AbortSignal }): Promise<string>;
   }
 
   /** Credentials. diffui stores none. */

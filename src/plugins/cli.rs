@@ -555,6 +555,9 @@ fn permissions_line(manifest: &Manifest) -> String {
     for argv in &permissions.exec {
         parts.push(format!("exec {}", argv.join(" ")));
     }
+    for file in &permissions.read {
+        parts.push(format!("read {file}"));
+    }
     match permissions.jj {
         JjAccess::None => {}
         JjAccess::Read => parts.push("jj read".to_owned()),

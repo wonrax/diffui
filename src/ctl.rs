@@ -659,6 +659,7 @@ mod tests {
             "events",
             "http",
             "exec",
+            "files",
             "auth",
             "kv",
             "config",

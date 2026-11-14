@@ -33,13 +33,14 @@ const HOST_SOURCE: &str = include_str!("js/diffui.js");
 
 /// What `import { … } from "diffui"` offers. A test holds this, the module
 /// and `assets/diffui.d.ts` to the same list.
-pub(crate) const EXPORTS: [&str; 10] = [
+pub(crate) const EXPORTS: [&str; 11] = [
     "ForgeError",
     "auth",
     "commands",
     "config",
     "events",
     "exec",
+    "files",
     "forge",
     "http",
     "kv",

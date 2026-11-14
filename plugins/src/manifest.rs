@@ -87,6 +87,10 @@ pub struct Permissions {
     /// Environment variables `exec` may set for the programs it runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
+    /// Files `files.read` may read, as written: `~/`, `$NAME` and
+    /// `${NAME:-default}` expand when it reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
     #[serde(default)]
     pub jj: JjAccess,
 }
@@ -345,6 +349,8 @@ struct RawPermissions {
     exec: Vec<Spanned<Vec<String>>>,
     #[serde(default)]
     env: Vec<Spanned<String>>,
+    #[serde(default)]
+    read: Vec<Spanned<String>>,
     jj: Option<Spanned<String>>,
 }
 
@@ -673,6 +679,13 @@ impl Manifest {
                 env.push(name.clone());
             }
         }
+        let mut read = Vec::new();
+        for entry in &raw.permissions.read {
+            match crate::builtin::file::check_entry(entry.get_ref()) {
+                Ok(()) => read.push(entry.get_ref().clone()),
+                Err(why) => report.at(entry.span(), format!("read \"{}\" {why}", entry.get_ref())),
+            }
+        }
         let jj = match &raw.permissions.jj {
             None => JjAccess::None,
             Some(jj) => match jj.get_ref().as_str() {
@@ -834,6 +847,7 @@ impl Manifest {
                     .map(Spanned::into_inner)
                     .collect(),
                 env,
+                read,
                 jj,
             },
             forge,

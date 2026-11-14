@@ -131,7 +131,7 @@ fn a_bare_import_says_what_can_be_imported() {
     let plugin = Setup::new("", "import fs from \"node:fs\";\n").spawn();
     assert_eq!(
         plugin.failed(),
-        "main.js did not load: ReferenceError: Cannot import \"node:fs\" (from main.js). A plugin can import \"diffui\" (ForgeError, auth, commands, config, events, exec, forge, http, kv, ui) and its own files by relative path (\"./util.js\"). There is no Node, npm or require here."
+        "main.js did not load: ReferenceError: Cannot import \"node:fs\" (from main.js). A plugin can import \"diffui\" (ForgeError, auth, commands, config, events, exec, files, forge, http, kv, ui) and its own files by relative path (\"./util.js\"). There is no Node, npm or require here."
     );
 }
 

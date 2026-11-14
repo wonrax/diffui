@@ -22,7 +22,7 @@ use crate::builtin::exec::{ExecRequest, Run};
 use crate::builtin::http::FetchRequest;
 use crate::builtin::kv::Kv;
 use crate::builtin::stream::Pull;
-use crate::builtin::{auth, exec, http};
+use crate::builtin::{auth, exec, file, http};
 use crate::host::{
     Host, HostError, LogLevel, LogLine, PluginError, PluginEvent, PluginState, Registration, Reply,
 };
@@ -730,6 +730,10 @@ impl Actor {
             host: String,
         }
         #[derive(Deserialize)]
+        struct FilePath {
+            path: String,
+        }
+        #[derive(Deserialize)]
         struct StreamId {
             stream: u64,
         }
@@ -877,6 +881,14 @@ impl Actor {
                         })?;
                         Ok(json!({ "code": output.code, "stdout": output.stdout, "stderr": output.stderr }))
                     }),
+                );
+            }
+            "file.read" => {
+                let FilePath { path } = read(op, args)?;
+                let path = file::resolve(&path, &manifest.permissions.read)?;
+                self.spawn(
+                    id,
+                    Box::new(move || file::read(&path, limits.max_response).map(Value::String)),
                 );
             }
             "auth.token" => {

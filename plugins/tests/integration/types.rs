@@ -111,7 +111,7 @@ fn the_type_definitions_declare_exactly_what_the_runtime_installs() {
         &format!("[permissions]\nhttp = [\"{}\"]\nexec = [[\"true\"]]\n", server.host),
         &format!(
             r#"import * as diffui from "diffui";
-const {{ auth, commands, config, events, exec, forge, http, kv, ui }} = diffui;
+const {{ auth, commands, config, events, exec, files, forge, http, kv, ui }} = diffui;
 const own = (object) => Object.keys(object);
 const inherited = (object) => Object.getOwnPropertyNames(Object.getPrototypeOf(object)).filter((name) => name !== "constructor");
 const all = (object) => [...own(object), ...inherited(object)];
@@ -124,7 +124,7 @@ forge.register({{
     const controller = new AbortController();
     return {{
       module: own(diffui),
-      commands: own(commands), forge: own(forge), events: own(events), http: own(http), auth: own(auth), kv: own(kv),
+      commands: own(commands), forge: own(forge), events: own(events), http: own(http), auth: own(auth), kv: own(kv), files: own(files),
       ui: own(ui), prompt: own(ui.prompt), clipboard: own(ui.clipboard), status: own(ui.status),
       activity: own(await ui.activity("x")),
       context, repo: all(repo), jj: own(repo.jj), forgeRemote: own(repo.forgeRemote),
@@ -160,6 +160,7 @@ forge.register({{
         ("http", "Http"),
         ("auth", "Auth"),
         ("kv", "Kv"),
+        ("files", "Files"),
         ("ui", "Ui"),
         ("prompt", "Prompt"),
         ("clipboard", "Clipboard"),

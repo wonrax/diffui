@@ -9,7 +9,7 @@ use diffui_plugins::protocol::{
 use diffui_plugins::{PluginError, PluginState};
 use serde_json::{Value, json};
 
-use crate::support::{CURRENT_OP, PATIENCE, Response, Server, case, probe, repo, threw};
+use crate::support::{CURRENT_OP, PATIENCE, Response, Server, case, probe, repo, scratch, threw};
 
 #[test]
 fn every_permission_is_refused_without_its_grant() {
@@ -476,6 +476,38 @@ fn a_token_comes_from_token_cmd_and_is_asked_for_once() {
     assert_eq!(
         std::fs::read_to_string(plugin.dir.join("asked.log")).unwrap(),
         "asked\n"
+    );
+}
+
+#[test]
+fn read_file_reads_only_what_the_manifest_lists() {
+    let dir = scratch("read");
+    std::fs::write(dir.join("hosts.yml"), "github.com:\n    user: ada\n").unwrap();
+    let listed = dir.join("hosts.yml").display().to_string();
+    let missing = dir.join("gone.yml").display().to_string();
+    let plugin = probe(
+        &format!("[permissions]\nread = [{listed:?}, {missing:?}]\n"),
+        &format!(
+            r#"
+  listed: () => diffui.files.read({listed:?}),
+  missing: () => diffui.files.read({missing:?}),
+  other: () => diffui.files.read("/etc/hosts"),
+"#
+        ),
+    )
+    .spawn();
+    plugin.loaded();
+    assert_eq!(
+        plugin.case("listed").unwrap(),
+        json!("github.com:\n    user: ada\n")
+    );
+    assert_eq!(threw(plugin.case("missing")).name, "NotFoundError");
+    let other = threw(plugin.case("other"));
+    assert_eq!(other.name, "PermissionError");
+    assert!(
+        other.message.contains("[permissions] read"),
+        "{}",
+        other.message
     );
 }
 

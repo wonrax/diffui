@@ -730,6 +730,12 @@ exec.stream = async (argv, options = {}) => {
 };
 Object.freeze(exec);
 
+export const files = freezeDeep({
+  read(path, options = {}) {
+    return call("file.read", { path: String(path) }, { signal: options.signal });
+  },
+});
+
 const FORGE_ERROR_KINDS = ["missing-cli", "auth", "not-found", "rate-limited", "unreachable", "timeout", "failed"];
 
 export class ForgeError extends Error {

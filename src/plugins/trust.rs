@@ -71,6 +71,7 @@ fn covers(granted: &Permissions, asked: &Permissions) -> bool {
         && asked.http.iter().all(|host| granted.http.contains(host))
         && asked.exec.iter().all(|argv| exec_covered(granted, argv))
         && asked.env.iter().all(|var| granted.env.contains(var))
+        && asked.read.iter().all(|file| granted.read.contains(file))
 }
 
 fn exec_covered(granted: &Permissions, argv: &[String]) -> bool {
@@ -134,6 +135,14 @@ pub(crate) fn lines(manifest: &Manifest, before: Option<&Permissions>) -> Vec<Li
             before.is_some_and(|before| asked.env.iter().any(|var| !before.env.contains(var))),
         ));
     }
+    for file in &asked.read {
+        lines.push(line(
+            icons::FILE,
+            "Read the file",
+            Some(file.clone()),
+            before.is_some_and(|before| !before.read.contains(file)),
+        ));
+    }
     let more_jj = before.is_some_and(|before| asked.jj > before.jj);
     match asked.jj {
         JjAccess::None => {}
@@ -188,6 +197,7 @@ mod tests {
                 .map(|argv| argv.iter().map(|word| (*word).to_owned()).collect())
                 .collect(),
             env: Vec::new(),
+            read: Vec::new(),
             jj,
         }
     }
@@ -243,6 +253,10 @@ mod tests {
                 &[&["git", "credential"]],
                 JjAccess::Write,
             ),
+            Permissions {
+                read: vec!["~/.config/gh/hosts.yml".to_owned()],
+                ..granted.clone()
+            },
         ] {
             assert_eq!(
                 verdict(Some(&allowed), &more),

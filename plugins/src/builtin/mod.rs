@@ -3,6 +3,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod exec;
+pub(crate) mod file;
 pub(crate) mod http;
 pub(crate) mod kv;
 pub(crate) mod stream;
