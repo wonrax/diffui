@@ -54,9 +54,10 @@
  * `owner/name#12` references; with `default_host` a reference may leave the host out. A forge whose provider has
  * `view`, `commits`, `commitDiff` and `diff` opens pull requests in a tab of their own.
  *
- * Bundled plugins (the GitHub and GitLab forges diffui ships) are trusted with their permissions as declared. A
- * plugin in the plugins folder with the same id replaces a bundled one, and `[plugins.<id>] enabled = false` in
- * settings turns one off. `diffui plugin eject <id>` copies a bundled plugin into the plugins folder to edit.
+ * Bundled plugins (the GitHub and GitLab forges diffui ships; it has no other support for either) are trusted
+ * with their permissions as declared. A plugin in the plugins folder with the same id replaces a bundled one,
+ * and `[plugins.<id>] enabled = false` in settings turns one off. `diffui plugin eject <id>` copies a bundled
+ * plugin into the plugins folder to edit.
  * A remote goes to the forge that claims its host, asking in this order: a plugin that replaces a bundled one,
  * the bundled ones, the rest. A plugin can't claim a host a bundled forge claims unless that forge is turned off
  * or replaced.
@@ -168,8 +169,9 @@ declare module "diffui" {
     updatePullRequest?(repo: Repo, number: number, patch: UpdatePullRequest): Promise<PullRequest>;
     /**
      * Hosts this forge claims beyond `[provides] forge.hosts`, written the same way: say, the company hosts its
-     * command-line tool is signed in to. Asked once, after the plugin loads; diffui keeps the answer until the
-     * plugin reloads. A host a bundled forge claims stays that forge's.
+     * command-line tool is signed in to (read its config with `files.read` rather than running it: this is
+     * asked at every start). Asked once, after the plugin loads; diffui keeps the answer until the plugin
+     * reloads. A host a bundled forge claims stays that forge's.
      */
     hosts?(): Promise<string[]>;
     /** A pull request tab: its header. The tab needs `view`, `commits`, `commitDiff` and `diff`, all four. */

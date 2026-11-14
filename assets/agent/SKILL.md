@@ -54,6 +54,12 @@ revision (select one first with `diffui ctl select`):
 The dialog waits for the user; `forge.submit-stack` doesn't. Watch `state`'s
 activity for the outcome.
 
+GitHub and GitLab are bundled plugins (`github`, `gitlab`; see Plugins),
+not built into the app: turning one off leaves that forge without badges or
+pull request tabs, `diffui plugin eject <id>` copies one out to change, and
+a folder plugin with the same id replaces it. `[plugins.github] program =
+"/path/to/gh"` in config.toml points one at another CLI.
+
 ## Declaring commands
 
 `config.toml` lives at `$XDG_CONFIG_HOME/diffui/config.toml`, else
@@ -270,11 +276,11 @@ dialogs for a host diffui doesn't know).
    `diffui ctl run <id>` runs one of its commands. `diffui plugin list`
    lists the plugins without the app: the bundled ones and the folder's.
 
-diffui ships some plugins built in (its GitHub and GitLab forges). They run
-without asking, with the permissions they declare; `[plugins.<id>] enabled
-= false` in settings.toml (or the Off toggle in Settings) turns one off. A
-plugin in the plugins folder with a bundled plugin's id replaces it, and is
-asked about like any other. To change a bundled plugin,
+diffui ships some plugins built in (its GitHub and GitLab forges, its only
+support for either). They run without asking, with the permissions they
+declare; `[plugins.<id>] enabled = false` in settings.toml (or the Off
+toggle in Settings) turns one off. A plugin in the plugins folder with a
+bundled plugin's id replaces it, and is asked about like any other. To change a bundled plugin,
 `diffui plugin eject <id>` copies it into the plugins folder with
 `diffui.d.ts`; edit the copy, and delete the folder to go back to the
 built-in one.
