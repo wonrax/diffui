@@ -387,6 +387,13 @@ impl Harness {
         self.cx.run_until_parked();
     }
 
+    /// Moves the dispatcher's clock on by `by` and runs what came due: its
+    /// timers (a tooltip's delay) don't follow the wall clock.
+    pub(crate) fn advance(&mut self, by: Duration) {
+        self.cx.advance_clock(by);
+        self.pump();
+    }
+
     /// Pumps until the app has stopped changing: nothing queued, and no frame
     /// requested, for a quiet stretch of real time. For after a click or an action
     /// whose results come from another thread.
@@ -578,6 +585,15 @@ impl Harness {
     /// listeners, which is free outside tests. kit redraws everything around this one.
     pub(crate) fn click(&mut self, id: &'static str) {
         self.with_window(|window, cx| window.click(id, cx));
+    }
+
+    /// Where the element `id` was in the last frame. [`Self::click`] says
+    /// which elements can be found.
+    pub(crate) fn bounds(
+        &mut self,
+        id: impl Into<gpui_kit::ElementId>,
+    ) -> gpui_kit::Bounds<Pixels> {
+        self.with_window(|window, _| window.find(id).bounds())
     }
 
     /// Clicks a window position (logical pixels, top-left origin).

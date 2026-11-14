@@ -227,6 +227,13 @@ impl Ctx {
         self.settle();
     }
 
+    /// Rests the pointer on the middle of the element `id`.
+    fn hover_element(&mut self, id: impl Into<gpui_kit::ElementId>) {
+        let centre = self.h.bounds(id).center();
+        self.h.hover_point(centre);
+        self.settle();
+    }
+
     fn right_click(&mut self, x: f32, y: f32) {
         // macOS pops the native menu, so the overlay is raised the way the baseline's
         // capture build did: the row under the point, its menu at the point.
@@ -696,6 +703,16 @@ fn all() -> Vec<Scene> {
     t.add(s("tabs-two-repos", "Two repository tabs, second active; first tab shows owner/name dimmed and the uncommitted-changes dot.", "Open a second repository (cmd+O, pick it).", |c| { second_repo(c, "second-repo"); }));
     t.add(s("tabs-many-long", "Many tabs with long directory names squeezing the strip: ellipsis in tab labels, + and the palette control stay pinned.", "Open six repositories with long directory names.", |c| {
         for name in ["a-rather-long-repository-name-one", "a-rather-long-repository-name-two", "a-rather-long-repository-name-three", "a-rather-long-repository-name-four", "a-rather-long-repository-name-five", "a-rather-long-repository-name-six"] { second_repo(c, name); }
+    }));
+    t.add(s("tabs-tooltip", "Pointer resting on the name of a tab whose working copy has changes: a two-line tooltip just under the tab, the repository's path over what the dot means.", "Rest the pointer on the tab's name until the tooltip shows.", |c| {
+        let tab = c.h.read(|ui| ui.active_tab_id().unwrap());
+        c.hover_element(("tab-label", tab.0 as usize));
+        // A tooltip waits half a second for the pointer to rest.
+        c.h.advance(std::time::Duration::from_millis(600));
+        c.h.frames();
+    }).raw());
+    t.add(s("segmented-active-hover", "Pointer on the view switcher's active segment: its raised face a shade deeper, still raised and ringed.", "Hover the Diff segment.", |c| {
+        c.hover_element("segment-Diff");
     }));
     t.add(s("toolbar-running-activity", "Toolbar while work runs: spinner with the task's label, +N chip for a second running task, progress line along the toolbar's bottom edge.", "Start two long operations (a slow fetch and a refresh). The harness starts two activity rows directly, since real ones finish too fast to catch.", |c| {
         c.h.act(|ui, _| {
@@ -2007,6 +2024,34 @@ fn all() -> Vec<Scene> {
             std::fs::write(&git, lines).unwrap();
             c.key("f");
             c.settle();
+            c.act(Action::ToggleActivityPopover);
+        },
+    ));
+    t.add(s(
+        "activity-popover-two-failed",
+        "Two failed rows, one above the other: a sliver of the card between their tints.",
+        "Fail two operations, open the popover. The harness finishes two activity rows as failed directly.",
+        |c| {
+            c.h.act(|ui, _| {
+                let tab = ui.active_tab_id().unwrap();
+                for (label, why) in [
+                    (
+                        "Fetch from origin",
+                        "Could not reach origin: the remote hung up",
+                    ),
+                    (
+                        "Load pull request",
+                        "The GitLab CLI (`glab`) wasn't found. Install it and sign in.",
+                    ),
+                ] {
+                    let (id, _) = ui.begin_activity(tab, label, false);
+                    ui.tab_mut(tab).unwrap().activities.finish(
+                        id,
+                        crate::activity::ActivityStatus::Error,
+                        Some(why.to_owned()),
+                    );
+                }
+            });
             c.act(Action::ToggleActivityPopover);
         },
     ));

@@ -113,6 +113,18 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - State: Many tabs with long directory names squeezing the strip: ellipsis in tab labels, + and the palette control stay pinned.
 - Steps: Open six repositories with long directory names.
 
+### `tabs-tooltip`
+
+- Window: 1440x900, light
+- State: Pointer resting on the name of a tab whose working copy has changes: a two-line tooltip just under the tab, the repository's path over what the dot means.
+- Steps: Rest the pointer on the tab's name until the tooltip shows.
+
+### `segmented-active-hover`
+
+- Window: 1440x900, light
+- State: Pointer on the view switcher's active segment: its raised face a shade deeper, still raised and ringed.
+- Steps: Hover the Diff segment.
+
 ### `toolbar-running-activity`
 
 - Window: 1440x900, light
@@ -1012,6 +1024,12 @@ have no scene; see src/toolbar.rs and core/src/github.rs for what differs.
 - Window: 1440x900, light
 - State: A failed row: its error text.
 - Steps: Fail a fetch, open the popover.
+
+### `activity-popover-two-failed`
+
+- Window: 1440x900, light
+- State: Two failed rows, one above the other: a sliver of the card between their tints.
+- Steps: Fail two operations, open the popover. The harness finishes two activity rows as failed directly.
 
 ### `activity-popover-dark`
 
