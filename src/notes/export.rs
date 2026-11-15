@@ -36,7 +36,13 @@ pub(crate) fn markdown(notes: &[(&Thread, &Located)]) -> String {
         } else {
             title
         };
-        out.push_str(&format!("\n## Change `{change}`: {title}\n"));
+        match first.subject {
+            super::store::Subject::Change { .. } => {
+                out.push_str(&format!("\n## Change `{change}`: {title}\n"));
+            }
+            // An opened diff's key means nothing outside its tab.
+            super::store::Subject::Opened { .. } => out.push_str(&format!("\n## {title}\n")),
+        }
         if located.archived() {
             out.push_str("\nThis change was abandoned.\n");
         }

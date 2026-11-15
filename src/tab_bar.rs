@@ -156,6 +156,14 @@ fn tab_tooltip(tab: &crate::Tab) -> String {
     let place = match &tab.source {
         crate::TabSource::Repo { root, .. } => crate::contract_user_path(&root.to_string_lossy()),
         crate::TabSource::ForgePr(spec) => spec.reference(),
+        crate::TabSource::Diff(diffui_core::patch::DiffInput::Patch(origin)) => {
+            crate::contract_user_path(&origin.name())
+        }
+        crate::TabSource::Diff(diffui_core::patch::DiffInput::Compare { left, right }) => format!(
+            "{}\n{}",
+            crate::contract_user_path(&left.to_string_lossy()),
+            crate::contract_user_path(&right.to_string_lossy())
+        ),
     };
     if tab_is_dirty(tab) {
         format!("{place}\nWorking copy (@) has changes")
@@ -849,7 +857,7 @@ fn tab_natural_width(ui: &Diffui, tab: &crate::Tab) -> f32 {
         + CLOSE_SIDE
 }
 
-/// A tab's `jj` / `git` / `pr` badge: says what the tab holds. Neutral, and
+/// A tab's `jj` / `git` / `pr` / `diff` badge: says what the tab holds. Neutral, and
 /// in the accent on the active tab, so colour never competes with the state
 /// the panes below show.
 fn tab_badge(source: &crate::TabSource, active: bool, look: Look) -> Div {
@@ -859,6 +867,7 @@ fn tab_badge(source: &crate::TabSource, active: bool, look: Look) -> Div {
         crate::TabSource::Repo { vcs: Vcs::Git, .. } => "git",
         crate::TabSource::ForgePr(spec) if spec.kind.merge_requests() => "mr",
         crate::TabSource::ForgePr(_) => "pr",
+        crate::TabSource::Diff(_) => "diff",
     };
     let ink = if active {
         theme.accent

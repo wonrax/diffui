@@ -363,6 +363,22 @@ impl Diffui {
         self.push_tab(owner, name, source, state, cx)
     }
 
+    /// A new tab of `source`, with no repository behind it, made active:
+    /// its id.
+    pub(crate) fn open_source_tab(
+        &mut self,
+        owner: String,
+        name: String,
+        source: TabSource,
+        cx: &mut Cx,
+    ) -> TabId {
+        self.pop_mode(ModeKind::OpenRepo);
+        self.mark_geometry_dirty();
+        let id = TabId(self.next_tab_id);
+        self.push_tab(owner, name, source, TabState::unloaded_pr(), cx);
+        id
+    }
+
     /// Append a new tab and make it active, kicking its load. Shared tail of
     /// the repo and PR open paths.
     fn push_tab(

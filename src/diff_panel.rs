@@ -588,7 +588,9 @@ fn build_diff_panel_body(ui: &Diffui, look: Look, window: &mut Window, cx: &mut 
     let session = &tab.session;
     let range = crate::range::shown_range(ui);
     let compare = crate::compare::build_compare_banner(ui, look, window, cx);
-    let mut panel = panel_column(theme).children(compare);
+    let mut panel = panel_column(theme)
+        .children(compare)
+        .children(crate::opened::banners(ui, look, cx));
 
     if let Some(error) = crate::range::refused_span(ui) {
         // The marked rows aren't one diff; say so rather than show the browsed

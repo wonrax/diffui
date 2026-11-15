@@ -2107,6 +2107,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "repo.open-clipboard-patch",
+        label: "Open the clipboard as a patch",
+        hint: "Show the diff on the clipboard in a new tab",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::OpenClipboardPatch),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "repo.close-dialog",
         label: "Close dialog",
         hint: "Dismiss the open-repository dialog",
@@ -2788,7 +2799,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &[],
         mac_chords: &[],
         enabled: |ui, _arg| {
-            require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+            require(crate::notes::app::view_available(ui), reason::NOT_JJ)?;
             require(
                 ui.active().main_view != MainView::Notes,
                 "Already showing the notes",
@@ -2898,7 +2909,7 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &[],
         mac_chords: &[],
         enabled: |ui, arg| {
-            require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+            require(crate::notes::app::view_available(ui), reason::NOT_JJ)?;
             require(matches!(arg, CommandArg::Text(_)), "Needs a filter")
         },
         build: |_ui, arg| match arg {

@@ -53,6 +53,7 @@ mod meta_line;
 mod mode_hints;
 mod modes;
 mod notes;
+mod opened;
 mod overlay_kit;
 #[cfg(test)]
 mod overlay_scenes;
@@ -228,9 +229,17 @@ fn main() {
     if let Some(code) = plugins::client_main() {
         std::process::exit(code);
     }
+    // `diffui diff LEFT RIGHT`: compare, through the running app.
+    if let Some(code) = opened::client_main() {
+        std::process::exit(code);
+    }
     // First, while the process is still single-threaded: it may `set_var`.
     let path_repair = launch_env::repair_path();
     let cli = Cli::parse();
+    // Patches only, and an app is running: they open there.
+    if let Some(code) = opened::hand_off(&cli.requested_paths().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     logging::init();
     if let Some(repair) = path_repair {
         tracing::info!("{repair}");
@@ -265,16 +274,21 @@ fn screen_visible_size() -> Option<(f32, f32)> {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(version, about = "Native GUI diff viewer for jj and git")]
+#[command(
+    version,
+    about = "Native GUI diff viewer for jj and git",
+    after_help = opened::AFTER_HELP
+)]
 struct Cli {
-    /// Repository path (or GitHub PR reference) to open as a tab; repeat to
-    /// open several. Same as passing it positionally.
+    /// Repository path (or GitHub PR reference, or patch) to open as a tab;
+    /// repeat to open several. Same as passing it positionally.
     #[arg(short = 'p', long = "path", value_name = "REPO")]
     paths: Vec<PathBuf>,
 
-    /// Repositories (or GitHub PR references) to open, e.g. `diffui .`. With
-    /// none, diffui restores your last session and, when started inside a
-    /// repository, opens and focuses that one too.
+    /// Repositories (or GitHub PR references, or patches; `-` for stdin)
+    /// to open, e.g. `diffui .`. With none, diffui restores your last
+    /// session and, when started inside a repository, opens and focuses
+    /// that one too.
     #[arg(value_name = "REPO")]
     repos: Vec<PathBuf>,
 }
@@ -862,6 +876,8 @@ pub(crate) struct TabState {
     /// The description the header shows whole, by its hash, after "Show
     /// all"; any other shows its first lines.
     pub(crate) description_whole: Option<u64>,
+    /// The `diffui diff` commands waiting for this tab to close.
+    pub(crate) waiting: opened::Waiting,
 }
 
 impl TabState {
@@ -915,13 +931,14 @@ impl TabState {
             plugins: Default::default(),
             notes: Default::default(),
             description_whole: None,
+            waiting: Default::default(),
         }
     }
 
     /// A never-loaded GitHub-PR tab: a `Session` whose source is the PR. No
     /// local repository, so the watcher/snapshot/mutation machinery stays off
     /// and `ensure_active_loaded` routes to the streaming PR load.
-    fn unloaded_pr() -> Self {
+    pub(crate) fn unloaded_pr() -> Self {
         Self::unloaded(None, Some(String::new()))
     }
 
@@ -1022,6 +1039,8 @@ pub(crate) enum TabSource {
         root: PathBuf,
     },
     ForgePr(diffui_core::forge::ForgePr),
+    /// A patch, or two files or folders compared: no repository behind it.
+    Diff(diffui_core::patch::DiffInput),
 }
 
 /// One open tab: its identity + display metadata, plus the per-tab state it
@@ -1045,7 +1064,7 @@ impl Tab {
     pub(crate) fn root(&self) -> Option<&Path> {
         match &self.source {
             TabSource::Repo { root, .. } => Some(root),
-            TabSource::ForgePr(_) => None,
+            TabSource::ForgePr(_) | TabSource::Diff(_) => None,
         }
     }
 
@@ -1063,6 +1082,7 @@ impl Tab {
                     .unwrap_or_default(),
             },
             TabSource::ForgePr(spec) => diffui_core::OpenSpec::ForgePr(spec.clone()),
+            TabSource::Diff(input) => diffui_core::OpenSpec::Diff(input.clone()),
         }
     }
 

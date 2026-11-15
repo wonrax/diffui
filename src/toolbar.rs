@@ -299,7 +299,7 @@ fn view_switcher(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> A
     if crate::history_panel::available(ui) {
         segments.push(segment(icons::HISTORY, "History", MainView::History));
     }
-    if crate::notes::app::available(ui) {
+    if crate::notes::app::view_available(ui) {
         segments.push(segment(icons::MESSAGES, "Notes", MainView::Notes));
     }
     segmented(segments, look, window, cx)

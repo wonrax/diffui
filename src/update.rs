@@ -68,6 +68,7 @@ impl Diffui {
         enum BootTarget {
             Repo(Repository),
             Pr(diffui_core::forge::ForgePr),
+            Diff(diffui_core::patch::DiffInput),
         }
         // A link can name a plugin's forge: its manifest says how its links
         // read, before any script runs.
@@ -82,7 +83,7 @@ impl Diffui {
         fn push_repo(targets: &mut Vec<BootTarget>, repository: Repository) {
             let duplicate = targets.iter().any(|target| match target {
                 BootTarget::Repo(open) => open.root == repository.root,
-                BootTarget::Pr(_) => false,
+                BootTarget::Pr(_) | BootTarget::Diff(_) => false,
             });
             if !duplicate {
                 targets.push(BootTarget::Repo(repository));
@@ -99,6 +100,13 @@ impl Diffui {
                     {
                         targets.push(BootTarget::Pr(spec));
                     }
+                    continue;
+                }
+                // `-`, or a patch file (see `opened::patch_origin`).
+                if let Some(origin) = crate::opened::patch_origin(path) {
+                    targets.push(BootTarget::Diff(diffui_core::patch::DiffInput::Patch(
+                        origin,
+                    )));
                     continue;
                 }
                 match prepare_repository(path) {
@@ -135,7 +143,7 @@ impl Diffui {
             .and_then(|active| {
                 targets.iter().position(|target| match target {
                     BootTarget::Repo(repository) => repository.root.to_string_lossy() == active,
-                    BootTarget::Pr(_) => false,
+                    BootTarget::Pr(_) | BootTarget::Diff(_) => false,
                 })
             })
             .unwrap_or(0);
@@ -161,6 +169,15 @@ impl Diffui {
                     TabSource::ForgePr(spec.clone()),
                     TabState::unloaded(None, Some(String::new())),
                 ),
+                BootTarget::Diff(input) => {
+                    let (owner, name) = crate::opened::tab_label(input);
+                    (
+                        owner,
+                        name,
+                        TabSource::Diff(input.clone()),
+                        TabState::unloaded_pr(),
+                    )
+                }
             };
             let id = TabId(next_tab_id);
             next_tab_id += 1;
@@ -1211,6 +1228,7 @@ impl Diffui {
                 }
             }
             Action::CloseTab(id) => self.close_tab(id, cx),
+            Action::OpenClipboardPatch => self.open_clipboard_patch(cx),
             Action::CloseActiveTab => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     let id = tab.id;
@@ -4022,7 +4040,14 @@ impl Diffui {
             .repository
             .as_ref()
             .map(|repository| format!("Load {}", repo_label(&repository.root).1))
-            .unwrap_or_else(|| "Load pull request".to_owned());
+            .unwrap_or_else(|| match self.tabs.iter().find(|open| open.id == tab) {
+                Some(Tab {
+                    source: TabSource::Diff(_),
+                    name,
+                    ..
+                }) => format!("Load {name}"),
+                _ => "Load pull request".to_owned(),
+            });
         let (activity_id, progress) = self.begin_activity(tab, label, true);
         let Some(target) = self.tab_mut(tab) else {
             return;

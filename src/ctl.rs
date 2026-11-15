@@ -65,12 +65,29 @@ pub(crate) enum Request {
     /// Every plugin found, with its state, what it registered and the end
     /// of its log.
     Plugins,
+    /// Open a patch as a tab: a file by its path, or text piped into
+    /// another `diffui`.
+    Patch {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Compare two files or two folders in a tab, answered once that tab
+    /// closes: `diffui diff` waits on it.
+    Compare {
+        left: String,
+        right: String,
+        /// What's waiting: "jj", "git".
+        #[serde(default)]
+        by: Option<String>,
+    },
 }
 
 /// Where an answer goes.
 pub(crate) type Reply = oneshot::Sender<Value>;
 
-type Incoming = (Request, Reply);
+pub(crate) type Incoming = (Request, Reply);
 
 static INCOMING: Mutex<Option<mpsc::UnboundedReceiver<Incoming>>> = Mutex::new(None);
 
@@ -79,7 +96,7 @@ fn socket_file() -> Option<PathBuf> {
     app_file(AppDir::State, "ctl-socket")
 }
 
-fn failure(error: impl std::fmt::Display) -> Value {
+pub(crate) fn failure(error: impl std::fmt::Display) -> Value {
     json!({ "ok": false, "error": error.to_string() })
 }
 
@@ -118,7 +135,7 @@ fn nonce() -> u64 {
 /// Bind `socket` (0600) and hand each request to `sender`, answering with
 /// what comes back.
 #[cfg(unix)]
-fn serve(socket: &Path, sender: mpsc::UnboundedSender<Incoming>) -> std::io::Result<()> {
+pub(crate) fn serve(socket: &Path, sender: mpsc::UnboundedSender<Incoming>) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
     let listener = UnixListener::bind(socket)?;
@@ -215,6 +232,10 @@ impl Diffui {
                 return self.ctl_line(repo.as_deref(), vec!["show".to_owned(), revset], reply, cx);
             }
             Request::Jj { args, repo } => return self.ctl_line(repo.as_deref(), args, reply, cx),
+            Request::Patch { path, text } => self.ctl_patch(path, text, cx),
+            Request::Compare { left, right, by } => {
+                return self.ctl_compare(left, right, by, reply, cx);
+            }
         };
         let _ = reply.send(match answer {
             Ok(Value::Object(mut fields)) => {
@@ -252,7 +273,7 @@ impl Diffui {
         Ok(tab)
     }
 
-    fn ctl_state(&self) -> Value {
+    pub(crate) fn ctl_state(&self) -> Value {
         let repos: Vec<Value> = self
             .tabs
             .iter()
@@ -261,11 +282,16 @@ impl Diffui {
                 json!({
                     "tab": tab.id.0,
                     "root": state.repository.as_ref().map(|repository| repository.root.display().to_string()),
-                    "kind": match &state.repository {
-                        Some(repository) if repository.vcs == crate::Vcs::Jj => "jj",
-                        Some(_) => "git",
-                        None => "pr",
+                    "kind": match &tab.source {
+                        crate::TabSource::Repo { vcs: crate::Vcs::Jj, .. } => "jj",
+                        crate::TabSource::Repo { .. } => "git",
+                        crate::TabSource::ForgePr(_) => "pr",
+                        crate::TabSource::Diff(diffui_core::patch::DiffInput::Patch(_)) => "patch",
+                        crate::TabSource::Diff(diffui_core::patch::DiffInput::Compare { .. }) => {
+                            "compare"
+                        }
                     },
+                    "name": tab.name,
                     "active": self.is_active(tab.id),
                 })
             })
@@ -514,6 +540,17 @@ fn ctl_main() -> i32 {
     }
 }
 
+/// The running app's socket, when one answers there.
+pub(crate) fn running_socket() -> Option<PathBuf> {
+    let socket = std::fs::read(socket_file()?).ok()?;
+    let socket = PathBuf::from(String::from_utf8_lossy(&socket).into_owned());
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Some(socket);
+    }
+    None
+}
+
 /// Send one request to the app at `socket` and read its answer.
 #[cfg(unix)]
 fn call(socket: &Path, request: &Request) -> Result<Value, String> {
@@ -598,7 +635,10 @@ fn print_human(request: &Request, response: &Value) {
                 }
             }
         }
-        Request::Run { .. } | Request::Toast { .. } => {}
+        Request::Run { .. }
+        | Request::Toast { .. }
+        | Request::Patch { .. }
+        | Request::Compare { .. } => {}
     }
 }
 

@@ -68,6 +68,7 @@ pub(crate) fn shown_pull_request(ui: &Diffui) -> Option<ForgePr> {
                 .find_map(|name| state.forge.of(name))
                 .map(|decoration| decoration.remote.pull_request(decoration.pr.number))
         }
+        TabSource::Diff(_) => None,
     }
 }
 
@@ -78,7 +79,9 @@ fn epoch(ui: &Diffui) -> u64 {
         return 0;
     };
     match tab.source {
-        TabSource::ForgePr(_) => tab.state.session.graph_version().map_or(0, |job| job.0),
+        TabSource::ForgePr(_) | TabSource::Diff(_) => {
+            tab.state.session.graph_version().map_or(0, |job| job.0)
+        }
         TabSource::Repo { .. } => tab.state.forge.generation(),
     }
 }

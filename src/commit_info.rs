@@ -114,12 +114,47 @@ pub(crate) const FOLD_LINES: usize = 10;
 pub(crate) fn header(ui: &Diffui, look: Look) -> Option<Header> {
     let tab = ui.active();
     if let (Some(outline), Some(Scope::All)) = (&tab.session.outline, tab.scope()) {
-        let Subject::PullRequest(info) = &outline.subject;
-        let kind = match &ui.tabs.get(ui.active)?.source {
-            crate::TabSource::ForgePr(spec) => spec.kind,
-            crate::TabSource::Repo { .. } => return None,
+        return match &outline.subject {
+            Subject::PullRequest(info) => {
+                let crate::TabSource::ForgePr(spec) = &ui.tabs.get(ui.active)?.source else {
+                    return None;
+                };
+                Some(pull_request_header(spec.kind, info, look))
+            }
+            Subject::Patch { origin, mail } => Some(patch_header(
+                Some(origin),
+                mail.as_ref(),
+                // A series' cover letter is prose; one patch's message is a
+                // commit message.
+                if outline.steps.is_empty() {
+                    TextKind::Message
+                } else {
+                    TextKind::Markdown
+                },
+                look,
+            )),
+            Subject::Compare { left, right } => Some(compare_header(left, right, look)),
         };
-        return Some(pull_request_header(kind, info, look));
+    }
+    if let (Some(outline), Some(Scope::Step(index))) = (&tab.session.outline, tab.scope())
+        && let Subject::Patch { .. } = &outline.subject
+    {
+        let step = outline.steps.get(index)?;
+        let (title, message) = step
+            .message
+            .split_once("\n\n")
+            .unwrap_or((step.message.as_str(), ""));
+        let mail = diffui_core::patch::Mail {
+            subject: title.to_owned(),
+            author: step.author.clone(),
+            date: step
+                .authored_millis
+                .and_then(diffui_core::history::timestamp_from_millis),
+            millis: step.authored_millis,
+            message: message.to_owned(),
+            commit: (step.id.len() == 40).then(|| step.id.clone()),
+        };
+        return Some(patch_header(None, Some(&mail), TextKind::Message, look));
     }
     if let Some(details) = &tab.session.revision_details {
         return Some(revision_header(ui, details, look));
@@ -208,6 +243,102 @@ pub(crate) fn pull_request_header(kind: ForgeKind, info: &PrInfo, look: Look) ->
     }
 }
 
+/// A patch's header: its email's subject, who wrote it and when, the commit
+/// it was made from, where it was read from, then its message. A patch
+/// with no email is titled by where it came from.
+fn patch_header(
+    origin: Option<&str>,
+    mail: Option<&diffui_core::patch::Mail>,
+    kind: TextKind,
+    look: Look,
+) -> Header {
+    let Look { theme, .. } = look;
+    let mut facts = Vec::new();
+    if let Some(mail) = mail {
+        if !mail.author.is_empty() {
+            let (name, email) = match mail.author.rsplit_once(" <") {
+                Some((name, email)) => (name, email.trim_end_matches('>')),
+                None => (mail.author.as_str(), ""),
+            };
+            let signature = SignatureInfo {
+                name: name.trim_matches('"').to_owned(),
+                email: email.to_owned(),
+                timestamp: None,
+            };
+            facts.push(rich(signature_field("Author", &signature, theme)));
+        }
+        if let Some(date) = mail.date.as_deref() {
+            facts.push(rich(date_field(date, theme)));
+        }
+        if let Some(commit) = &mail.commit {
+            let mut field = HeaderField::new("Commit", commit.clone());
+            field.runs = vec![(0, theme.muted_text), (COMMIT_ID_CHARS, theme.subtle_text)];
+            field.buttons = vec![(icons::COPY, HeaderAction::Copy(commit.clone()))];
+            facts.push(rich(field));
+        }
+    }
+    if let Some(origin) = origin {
+        facts.push(rich(path_field("Patch", origin, theme)));
+    }
+    let title = mail
+        .map(|mail| mail.subject.clone())
+        .filter(|subject| !subject.trim().is_empty())
+        .or_else(|| {
+            origin.map(|origin| {
+                std::path::Path::new(origin).file_name().map_or_else(
+                    || origin.to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            })
+        });
+    Header {
+        title,
+        facts,
+        description: mail.map(|mail| mail.message.clone()).unwrap_or_default(),
+        kind,
+    }
+}
+
+/// Two files or folders compared: what each side is.
+fn compare_header(left: &std::path::Path, right: &std::path::Path, look: Look) -> Header {
+    let Look { theme, .. } = look;
+    let title = crate::opened::compare_title(left, right);
+    let (left, right) = (left.display().to_string(), right.display().to_string());
+    Header {
+        title: Some(title),
+        facts: vec![
+            rich(path_field("Left", &left, theme)),
+            rich(path_field("Right", &right, theme)),
+        ],
+        description: String::new(),
+        kind: TextKind::Message,
+    }
+}
+
+/// A path as a field: its folder quieter than its name, with a copy
+/// button; under the home folder, `~` for it.
+fn path_field(label: &str, path: &str, theme: ThemeSpec) -> HeaderField {
+    let shown = crate::contract_user_path(path);
+    let name_at = shown
+        .rfind('/')
+        .map_or(0, |slash| shown[..=slash].chars().count());
+    let mut field = HeaderField::new(label, shown);
+    field.runs = vec![(0, theme.subtle_text), (name_at, theme.text)];
+    field.buttons = vec![(icons::COPY, HeaderAction::Copy(path.to_owned()))];
+    field
+}
+
+/// A date field: the exact time, then how long ago, quieter.
+fn date_field(timestamp: &str, theme: ThemeSpec) -> HeaderField {
+    let exact = human_timestamp(timestamp).unwrap_or_else(|| timestamp.to_owned());
+    let mut date = HeaderField::new("Date", exact.clone());
+    if let Some(millis) = parse_timestamp_millis(timestamp) {
+        date.value = format!("{exact}  {}", meta_line::age_phrase(millis, now_millis()));
+        date.runs = vec![(0, theme.text), (exact.chars().count(), theme.subtle_text)];
+    }
+    date
+}
+
 /// A revision's header: its title, then author, date, ids, parents, refs
 /// and pull requests as fields, then the rest of its message.
 pub(crate) fn revision_header(ui: &Diffui, details: &RevisionDetails, look: Look) -> Header {
@@ -227,18 +358,13 @@ pub(crate) fn revision_header(ui: &Diffui, details: &RevisionDetails, look: Look
         .to_owned();
     let mut lines = Vec::new();
     lines.push(rich(signature_field("Author", &details.author, theme)));
-    if let Some(timestamp) = details
+    if let Some(date) = details
         .author
         .timestamp
         .as_deref()
         .filter(|timestamp| !timestamp.is_empty())
+        .map(|timestamp| date_field(timestamp, theme))
     {
-        let exact = human_timestamp(timestamp).unwrap_or_else(|| timestamp.to_owned());
-        let mut date = HeaderField::new("Date", exact.clone());
-        if let Some(millis) = parse_timestamp_millis(timestamp) {
-            date.value = format!("{exact}  {}", meta_line::age_phrase(millis, now_millis()));
-            date.runs = vec![(0, theme.text), (exact.chars().count(), theme.subtle_text)];
-        }
         lines.push(rich(date));
     }
     // Only when someone else committed it: the same person again, a few

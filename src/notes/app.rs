@@ -338,20 +338,136 @@ impl TabNotes {
     }
 }
 
-/// Whether the active tab can have notes: a jj repository.
+/// Whether the active tab can have notes in its diff: a jj repository, or
+/// a diff opened without one.
 pub(crate) fn available(ui: &Diffui) -> bool {
+    view_available(ui) || in_memory(ui)
+}
+
+/// Whether the active tab has the Notes view: a jj repository's store.
+pub(crate) fn view_available(ui: &Diffui) -> bool {
     ui.active()
         .repository
         .as_ref()
         .is_some_and(|repository| repository.vcs == Vcs::Jj)
 }
 
-/// The change the diff on screen shows, when it shows one change.
+/// Whether the active tab's notes live in memory: a patch or a compare.
+pub(crate) fn in_memory(ui: &Diffui) -> bool {
+    ui.tabs
+        .get(ui.active)
+        .is_some_and(|tab| matches!(tab.source, crate::TabSource::Diff(_)))
+}
+
+/// What an opened diff's tab keys the notes on its whole by; a step's are
+/// keyed by its id.
+const WHOLE: &str = "all";
+
+/// The change the diff on screen shows, when it shows one change. An
+/// opened diff's whole, or one patch of its series, counts as one.
 pub(crate) fn shown_change(tab: &TabState) -> Option<&str> {
     if tab.session.document_base != diffui_core::DiffBase::Parents {
         return None;
     }
+    if let Some(outline) = &tab.session.outline
+        && !matches!(outline.subject, diffui_core::Subject::PullRequest(_))
+    {
+        return Some(match &tab.session.selected_revision {
+            diffui_core::RevisionSelection::Commit(id) => id,
+            diffui_core::RevisionSelection::WorkingCopy => WHOLE,
+        });
+    }
     tab.session.revision_details.as_ref()?.change_id.as_deref()
+}
+
+/// The change on screen as a new note's subject, with its title.
+fn shown_change_now(tab: &TabState) -> Option<diffui_core::notes::ChangeNow> {
+    let change_id = shown_change(tab)?.to_owned();
+    if let Some(details) = tab.session.revision_details.as_ref() {
+        return Some(diffui_core::notes::ChangeNow {
+            change_id,
+            commit_id: details.commit_id.clone(),
+            title: details.description.lines().next().unwrap_or("").to_owned(),
+        });
+    }
+    let outline = tab.session.outline.as_ref()?;
+    let title = match (&outline.subject, tab.scope()) {
+        (_, Some(crate::review::Scope::Step(index))) => outline.steps.get(index)?.title.clone(),
+        (diffui_core::Subject::Patch { origin, mail }, _) => mail
+            .as_ref()
+            .map(|mail| mail.subject.clone())
+            .filter(|subject| !subject.is_empty())
+            .unwrap_or_else(|| origin.clone()),
+        (diffui_core::Subject::Compare { left, right }, _) => {
+            crate::opened::compare_title(left, right)
+        }
+        (diffui_core::Subject::PullRequest(info), _) => info.title.clone(),
+    };
+    Some(diffui_core::notes::ChangeNow {
+        commit_id: change_id.clone(),
+        change_id,
+        title,
+    })
+}
+
+/// Where `thread` of an opened diff's tab sits: on the diff on screen,
+/// found again by its lines' text (a refreshed compare moves them); on
+/// another patch of the series, where it was written.
+fn locate_in_document(tab: &TabState, thread: &Thread) -> Located {
+    let now = Some(diffui_core::notes::ChangeNow {
+        change_id: thread.change_id().to_owned(),
+        commit_id: thread.change_id().to_owned(),
+        title: thread.title().to_owned(),
+    });
+    let shown = shown_change(tab) == Some(thread.change_id());
+    let place = match &thread.anchor {
+        None => Place::Change,
+        Some(anchor) => match &anchor.lines {
+            None => Place::File { outdated: false },
+            Some(lines) if !shown => Place::Lines {
+                start: lines.start,
+                end: lines.end(),
+            },
+            Some(lines) => {
+                let found = document_text(tab, &anchor.path, lines.side)
+                    .and_then(|text| diffui_core::notes::reattach(&lines.text, lines.start, &text));
+                match found {
+                    Some(start) => Place::Lines {
+                        start,
+                        end: start + lines.text.len() - 1,
+                    },
+                    None => Place::File { outdated: true },
+                }
+            }
+        },
+    };
+    Located { now, place }
+}
+
+/// The lines of `path` on `side` the diff on screen holds, each at its
+/// number; the lines it doesn't hold are blank.
+fn document_text(tab: &TabState, path: &str, side: Side) -> Option<String> {
+    let file = tab
+        .session
+        .document
+        .files
+        .iter()
+        .find(|file| file.path == path || file.old_path.as_deref() == Some(path))?;
+    let mut lines: Vec<&str> = Vec::new();
+    for row in file.hunks.iter().flat_map(|hunk| &hunk.lines) {
+        let number = match side {
+            Side::New if row.kind != DiffLineKind::Deletion => row.new_line,
+            Side::Old if row.kind != DiffLineKind::Addition => row.old_line,
+            _ => None,
+        };
+        if let Some(number) = number.filter(|number| *number > 0) {
+            if lines.len() < number {
+                lines.resize(number, "");
+            }
+            lines[number - 1] = &row.content;
+        }
+    }
+    Some(lines.join("\n"))
 }
 
 /// Where `note` goes in the diff on screen, or `None` when it isn't on its
@@ -637,6 +753,20 @@ pub(crate) fn file_badges(
     badges
 }
 
+/// Put `notes` on `state`, each message's Markdown parsed once.
+fn set_notes(state: &mut TabState, notes: Vec<Note>) {
+    state.notes.parsed.clear();
+    for note in &notes {
+        for (index, message) in note.thread.messages.iter().enumerate() {
+            state.notes.parsed.insert(
+                (note.thread.id.clone(), index),
+                Rc::new(crate::markdown::parse(&message.body)),
+            );
+        }
+    }
+    state.notes.notes = Rc::new(notes);
+}
+
 /// A change written to the store, off the UI thread.
 enum Write {
     Reply { id: String, body: String },
@@ -649,8 +779,16 @@ enum Write {
 impl Diffui {
     /// Starts each jj tab's watch, and loads what changed. From reconcile.
     pub(crate) fn sync_notes(&mut self, cx: &mut Cx) {
-        let ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
-        for tab in ids {
+        let ids: Vec<(TabId, bool)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.id, matches!(tab.source, crate::TabSource::Diff(_))))
+            .collect();
+        for (tab, opened) in ids {
+            if opened {
+                self.sync_memory_notes(tab);
+                continue;
+            }
             let Some(state) = self.tab_mut(tab) else {
                 continue;
             };
@@ -682,6 +820,37 @@ impl Diffui {
             }
             self.settle_pending_open(tab);
         }
+    }
+
+    /// An opened diff's notes: in memory from the start, located again on
+    /// each document once it has all landed.
+    fn sync_memory_notes(&mut self, tab: TabId) {
+        let Some(state) = self.tab_mut(tab) else {
+            return;
+        };
+        let source = state
+            .notes
+            .source
+            .get_or_insert_with(|| std::sync::Arc::new(super::memory::Memory::default()))
+            .clone();
+        if state.session.diff_in_flight() {
+            return;
+        }
+        let at = Some(format!("document {}", state.session.document_id));
+        if !state.notes.stale && at == state.notes.located_at {
+            return;
+        }
+        let notes: Vec<Note> = source
+            .load()
+            .into_iter()
+            .map(|thread| Note {
+                located: locate_in_document(state, &thread),
+                thread,
+            })
+            .collect();
+        state.notes.stale = false;
+        state.notes.located_at = at;
+        set_notes(state, notes);
     }
 
     fn load_notes(&mut self, tab: TabId, root: PathBuf, operation: Option<String>, cx: &mut Cx) {
@@ -722,16 +891,7 @@ impl Diffui {
                             .zip(located)
                             .map(|(thread, located)| Note { thread, located })
                             .collect();
-                        state.notes.parsed.clear();
-                        for note in &notes {
-                            for (index, message) in note.thread.messages.iter().enumerate() {
-                                state.notes.parsed.insert(
-                                    (note.thread.id.clone(), index),
-                                    Rc::new(crate::markdown::parse(&message.body)),
-                                );
-                            }
-                        }
-                        state.notes.notes = Rc::new(notes);
+                        set_notes(state, notes);
                         restack = state.notes.view.shown.is_some();
                         state.notes.located_at = operation;
                     }
@@ -871,16 +1031,30 @@ impl Diffui {
                 self.active_mut().pop_mode(ModeKind::NoteReply);
                 let write = match reply.to {
                     ReplyTo::Thread(id) => Write::Reply { id, body },
-                    ReplyTo::New(note) => Write::Create(Thread::on_change(
-                        &note.change,
-                        note.anchor,
-                        store::Message {
-                            author: "you".to_owned(),
-                            role: Role::User,
-                            at: store::now(),
-                            body,
-                        },
-                    )),
+                    ReplyTo::New(note) => {
+                        let mut thread = Thread::on_change(
+                            &note.change,
+                            note.anchor,
+                            store::Message {
+                                author: "you".to_owned(),
+                                role: Role::User,
+                                at: store::now(),
+                                body,
+                            },
+                        );
+                        if let Some(source) = &self.active().notes.source {
+                            thread.subject = source.subject(&note.change);
+                        }
+                        // Said once, as the first one goes in; the strip
+                        // atop the diff keeps saying it.
+                        if in_memory(self) && self.active().notes.notes.is_empty() {
+                            self.push_info_toast(
+                                "Notes on this tab aren't saved",
+                                "They go when the tab closes or diffui quits. Copy keeps them.",
+                            );
+                        }
+                        Write::Create(thread)
+                    }
                 };
                 self.write_notes(write, cx);
             }
@@ -1251,16 +1425,8 @@ impl Diffui {
     /// on screen.
     fn start_note(&mut self, target: NoteTarget, cx: &mut Cx) {
         let tab = self.active();
-        let Some(details) = tab.session.revision_details.as_ref() else {
+        let Some(change) = shown_change_now(tab) else {
             return;
-        };
-        let Some(change_id) = shown_change(tab) else {
-            return;
-        };
-        let change = diffui_core::notes::ChangeNow {
-            change_id: change_id.to_owned(),
-            commit_id: details.commit_id.clone(),
-            title: details.description.lines().next().unwrap_or("").to_owned(),
         };
         let files = &tab.session.document.files;
         let earlier = tab.note_reply().and_then(|reply| match &reply.to {

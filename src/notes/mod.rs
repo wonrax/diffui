@@ -12,6 +12,7 @@ pub(crate) mod export;
 pub(crate) mod forge;
 pub(crate) mod inline;
 pub(crate) mod locate;
+pub(crate) mod memory;
 pub(crate) mod review;
 pub(crate) mod store;
 pub(crate) mod view;

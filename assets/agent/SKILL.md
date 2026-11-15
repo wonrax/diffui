@@ -89,7 +89,7 @@ bring it forward; otherwise the active tab).
 
 | Verb | Does |
 |---|---|
-| `diffui ctl state` | Open repositories (tab, root, kind `jj`/`git`/`pr`, which is active), the selected revision (change id, commit id, first line, bookmarks, whether it's `@`), the log's revset, and the active tab's ten latest activity rows (label, status, result, equivalent command). |
+| `diffui ctl state` | Open tabs (tab, root, name, kind `jj`/`git`/`pr`/`patch`/`compare`, which is active), the selected revision (change id, commit id, first line, bookmarks, whether it's `@`), the log's revset, and the active tab's ten latest activity rows (label, status, result, equivalent command). |
 | `diffui ctl open <path>` | Open a repository, or a pull request (`https://github.com/o/r/pull/12`, `o/r#12`, a GitLab `https://host/group/name/-/merge_requests/7` or `group/name!7`), as a tab. Answers with `state`. |
 | `diffui ctl select <revset>` | Show the revision `<revset>` names, as `jj show` would. |
 | `diffui ctl commands` | Every command id, its label, whether it was declared in config (`declared`), and whether it can run now (`available`, with `reason` when not). |
@@ -101,6 +101,42 @@ bring it forward; otherwise the active tab).
 
 Prefer `diffui ctl jj …` over running `jj` yourself when the user is
 watching the app: the change shows in its activity and can be undone there.
+
+## Patches and comparisons
+
+diffui also shows a diff that has no repository behind it. With the app
+running, each of these opens as a tab there; without it, the app starts.
+
+- `diffui -` reads a diff from stdin: `git diff | diffui -`.
+- `diffui fix.patch` opens a patch file: any unified diff (`git diff`,
+  `diff -u`, `diff -ruN`, svn, hg), or `git format-patch` emails, one tab
+  per file with each email of a series as a step. A path is a patch when it
+  ends in `.patch`, `.diff`, `.mbox` or `.eml`, or when it's a file no
+  repository holds and it reads as a diff; any other path opens its
+  repository, as before.
+- `diffui diff <left> <right>` compares two files or two folders, and waits
+  until its tab closes. That makes it a diff tool for jj and git, which
+  delete the folders they compare once the tool exits.
+
+jj (`~/.config/jj/config.toml`), then `jj diff --tool diffui`:
+
+```toml
+[merge-tools.diffui]
+program = "diffui"
+diff-args = ["diff", "$left", "$right"]
+diff-invocation-mode = "dir"
+```
+
+git (`~/.gitconfig`), then `git difftool --dir-diff --tool diffui`:
+
+```ini
+[difftool "diffui"]
+  cmd = diffui diff "$LOCAL" "$REMOTE"
+```
+
+The user can leave notes on these tabs too, but they live in the tab
+only: `diffui notes` doesn't see them, and they're gone when the tab
+closes. Ask the user to paste them (Copy) if you need them.
 
 ## Pull requests
 

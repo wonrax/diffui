@@ -88,6 +88,8 @@ pub(crate) enum Action {
     FindPrevious,
     OpenRepoDialog,
     CloseRepoDialog,
+    /// Open the clipboard's text as a patch, in a tab of its own.
+    OpenClipboardPatch,
     /// Pick a local working-copy directory with the native folder chooser.
     ChooseRepoFolder,
     /// Resolve the dialog's path and open it as a tab — or, with a folder

@@ -5,9 +5,10 @@
 //! it is.
 //!
 //! A repository's steps are its revision graph. A source without a graph
-//! (a pull request) loads an [`Outline`] instead: its header, and its steps
-//! as a plain list, oldest first, under one scope item for the whole. That
-//! item is the default selection; a step scopes the diff to itself.
+//! (a pull request, a patch series) loads an [`Outline`] instead: its
+//! header, and its steps as a plain list, oldest first, under one scope
+//! item for the whole. That item is the default selection; a step scopes
+//! the diff to itself. A single patch and a compare have no steps.
 
 use diffui_core::history::{now_millis, relative_age};
 use diffui_core::{Outline, RevisionSelection, Step, Subject};
@@ -59,6 +60,16 @@ impl Tab {
                     step: "Commit",
                     steps: "commits",
                 }),
+            },
+            // A series' patches are its steps; a single patch and a compare
+            // have none.
+            TabSource::Diff(_) => match &self.state.session.outline {
+                Some(outline) if !outline.steps.is_empty() => Steps::List(StepsNames {
+                    whole: "All patches",
+                    step: "Patch",
+                    steps: "patches",
+                }),
+                _ => Steps::None,
             },
         }
     }
@@ -341,7 +352,20 @@ fn whole_row(
     cx: &mut Cx,
 ) -> AnyElement {
     let Look { theme, font, .. } = look;
-    let Subject::PullRequest(info) = &outline.subject;
+    // A pull request counts its own; a series adds up its patches'.
+    let (changed_files, totals) = match &outline.subject {
+        Subject::PullRequest(info) => (info.changed_files, info.totals),
+        _ => (
+            0,
+            outline
+                .steps
+                .iter()
+                .try_fold((0, 0), |(added, removed), step| {
+                    let (a, r) = step.counts?;
+                    Some((added + a, removed + r))
+                }),
+        ),
+    };
     let title_font = emphasis_font(font, Weight::MEDIUM);
     let title = typography::baseline_row(
         [
@@ -364,7 +388,7 @@ fn whole_row(
         Some(Scope::All) if !ui.active().session.document.files.is_empty() => {
             ui.active().session.document.files.len()
         }
-        _ => info.changed_files,
+        _ => changed_files,
     };
     let mut meta = vec![fill_on_line(
         caption_fill(
@@ -383,7 +407,7 @@ fn whole_row(
         font,
         text_size::CAPTION,
     )];
-    if let Some((additions, deletions)) = info.totals {
+    if let Some((additions, deletions)) = totals {
         meta.push(counts(additions, deletions, ui, look));
     }
     list_row(

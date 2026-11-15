@@ -93,6 +93,10 @@ pub(crate) enum Subject {
         #[serde(default)]
         title: String,
     },
+    /// A diff opened without a repository (a patch, a compare): the whole,
+    /// or one patch of a series, by `key`. Kept in memory by its tab, never
+    /// written to a store.
+    Opened { key: String, title: String },
 }
 
 /// The store format's version, written into every thread.
@@ -139,17 +143,19 @@ impl Thread {
         }
     }
 
-    /// The change it's on.
+    /// The change it's on: a change id, or what an opened diff's tab keys
+    /// its notes by.
     pub(crate) fn change_id(&self) -> &str {
         match &self.subject {
             Subject::Change { change_id, .. } => change_id,
+            Subject::Opened { key, .. } => key,
         }
     }
 
     /// The change's title when the note was written.
     pub(crate) fn title(&self) -> &str {
         match &self.subject {
-            Subject::Change { title, .. } => title,
+            Subject::Change { title, .. } | Subject::Opened { title, .. } => title,
         }
     }
 
@@ -388,6 +394,14 @@ pub(crate) trait Source: Send + Sync + std::fmt::Debug {
     /// A folder whose changes mean the threads changed, when something
     /// outside the app can change them.
     fn watched(&self) -> Option<PathBuf>;
+    /// What a new thread on `change` is on.
+    fn subject(&self, change: &diffui_core::notes::ChangeNow) -> Subject {
+        Subject::Change {
+            change_id: change.change_id.clone(),
+            commit_id: change.commit_id.clone(),
+            title: change.title.clone(),
+        }
+    }
 }
 
 impl Source for Store {
