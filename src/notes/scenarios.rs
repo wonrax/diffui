@@ -521,7 +521,7 @@ fn next_and_previous_step_through_notes_and_conflicts_across_files() {
             && !tab.session.document.files.is_empty()
             && super::app::diff_notes(tab).len() == 2
     });
-    let spots = h.read(|ui| super::app::spots(ui.active()));
+    let spots = h.read(super::app::spots);
     let notes = spots
         .iter()
         .filter(|(_, kind)| matches!(kind, super::app::SpotKind::Note { .. }))

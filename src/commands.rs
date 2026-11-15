@@ -2687,7 +2687,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "notes.next",
         label: "Next note or conflict",
-        hint: "Scroll to the next open review note or conflict in the diff",
+        hint: "Scroll to the next open review note, pull request comment or conflict in the diff",
         contexts: &[Context::Base],
         chords: &["]"],
         mac_chords: &[],
@@ -2697,7 +2697,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 "Only in the diff view",
             )?;
             require(
-                !crate::notes::app::spots(ui.active()).is_empty(),
+                !crate::notes::app::spots(ui).is_empty(),
                 "No open note or conflict in this diff",
             )
         },
@@ -2707,7 +2707,7 @@ pub(crate) static REGISTRY: &[Command] = &[
     Command {
         id: "notes.previous",
         label: "Previous note or conflict",
-        hint: "Scroll to the previous open review note or conflict in the diff",
+        hint: "Scroll to the previous open review note, pull request comment or conflict in the diff",
         contexts: &[Context::Base],
         chords: &["["],
         mac_chords: &[],
@@ -2717,7 +2717,7 @@ pub(crate) static REGISTRY: &[Command] = &[
                 "Only in the diff view",
             )?;
             require(
-                !crate::notes::app::spots(ui.active()).is_empty(),
+                !crate::notes::app::spots(ui).is_empty(),
                 "No open note or conflict in this diff",
             )
         },

@@ -203,7 +203,7 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
         }
     }
     let Look { theme, .. } = look;
-    let spots = spots(tab);
+    let spots = spots(ui);
     if !spots.is_empty() {
         let targets: Vec<DocSpot> = spots.iter().map(|(spot, _)| *spot).collect();
         let marks = spots
@@ -212,6 +212,13 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
                 SpotKind::Note { label, .. } => Mark {
                     at,
                     color: theme.accent,
+                    label: crate::ellipsis::cut_end(&label, 480.0, text_size::CAPTION, look.font)
+                        .into_owned(),
+                },
+                // Purple: apart from the notes' accent and the conflicts' red.
+                SpotKind::Review { label } => Mark {
+                    at,
+                    color: theme.renamed,
                     label: crate::ellipsis::cut_end(&label, 480.0, text_size::CAPTION, look.font)
                         .into_owned(),
                 },

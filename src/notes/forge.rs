@@ -457,6 +457,36 @@ pub(crate) mod tests {
                 (DocSpot::File(file), Place::File { outdated: true }, 1),
             ]
         );
+        // On the overview strip and stepped through in document order, the
+        // outdated one at its file's header first; never in the counts.
+        let line = DocSpot::Line(LineAt {
+            file,
+            hunk: 0,
+            line: 0,
+        });
+        let reviews = h.read(|ui| {
+            super::super::app::spots(ui)
+                .into_iter()
+                .map(|(spot, kind)| {
+                    assert!(matches!(kind, super::super::app::SpotKind::Review { .. }));
+                    spot
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(reviews, [DocSpot::File(file), line]);
+        let step = |h: &mut crate::harness::Harness, by| {
+            h.perform(crate::Action::Notes(super::super::NotesMsg::Step(by)));
+            h.read(|ui| ui.active().notes.reveal.map(|(spot, _)| spot))
+        };
+        assert_eq!(step(&mut h, 1), Some(DocSpot::File(file)));
+        assert_eq!(step(&mut h, 1), Some(line));
+        assert_eq!(step(&mut h, -1), Some(DocSpot::File(file)));
+        h.read(|ui| {
+            assert_eq!(super::super::app::file_note_count(ui, file), 0);
+            let change = ui.active().session.revision_details.as_ref().unwrap();
+            let change = change.change_id.as_deref().unwrap();
+            assert_eq!(ui.active().notes.open_on_change(change), 0);
+        });
         // Opened, the card says where it's from and offers the forge, not a
         // reply.
         let id = "https://github.invalid/team/app/pull/1#discussion_r1";

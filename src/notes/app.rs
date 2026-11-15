@@ -497,35 +497,59 @@ pub(crate) fn highlights(tab: &TabState) -> Vec<crate::diff_view::Highlight> {
 /// What a spot of the diff is, for next/previous and the overview strip.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SpotKind {
-    Note { id: String, label: String },
-    Conflict { label: String },
+    Note {
+        id: String,
+        label: String,
+    },
+    /// A pull request's review thread, read from its forge.
+    Review {
+        label: String,
+    },
+    Conflict {
+        label: String,
+    },
 }
 
-/// The diff's important spots in document order: open notes and conflicts.
-pub(crate) fn spots(tab: &TabState) -> Vec<(DocSpot, SpotKind)> {
+/// `author: first line` of a thread, for a mark's tooltip.
+fn spot_label(thread: &Thread) -> String {
+    let first = thread
+        .messages
+        .first()
+        .map_or("", |message| message.body.lines().next().unwrap_or(""));
+    let author = thread.messages.first().map_or("", |m| m.author.as_str());
+    format!("{author}: {first}")
+}
+
+/// The diff's important spots in document order: open notes, open review
+/// threads of the pull request on screen, and conflicts.
+pub(crate) fn spots(ui: &Diffui) -> Vec<(DocSpot, SpotKind)> {
+    let tab = ui.active();
     let mut spots: Vec<(DocSpot, SpotKind)> = diff_notes(tab)
         .into_iter()
         .filter(|(_, note)| note.thread.resolved.is_none())
         .map(|(spot, note)| {
-            let first = note
-                .thread
-                .messages
-                .first()
-                .map_or("", |message| message.body.lines().next().unwrap_or(""));
-            let author = note
-                .thread
-                .messages
-                .first()
-                .map_or("", |m| m.author.as_str());
             (
                 spot,
                 SpotKind::Note {
                     id: note.thread.id.clone(),
-                    label: format!("{author}: {first}"),
+                    label: spot_label(&note.thread),
                 },
             )
         })
         .collect();
+    spots.extend(
+        super::forge::placed(ui)
+            .into_iter()
+            .filter(|(_, note, _)| note.thread.resolved.is_none())
+            .map(|(spot, note, _)| {
+                (
+                    spot,
+                    SpotKind::Review {
+                        label: spot_label(&note.thread),
+                    },
+                )
+            }),
+    );
     for (file, diff) in tab.session.document.files.iter().enumerate() {
         let mut any = false;
         for (hunk, view) in diff.hunks.iter().enumerate() {
@@ -1302,8 +1326,8 @@ impl Diffui {
     }
 
     fn step_spot(&mut self, by: isize) {
+        let spots = spots(self);
         let tab = self.active();
-        let spots = spots(tab);
         if spots.is_empty() {
             return;
         }
