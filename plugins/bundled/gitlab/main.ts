@@ -42,6 +42,7 @@ interface Mr {
   target_project_id?: number | null;
   author?: { username: string } | null;
   changes_count?: string | null;
+  description?: string | null;
 }
 
 /** A commit, from the commits endpoints. */
@@ -355,6 +356,7 @@ forge.register({
       changedFiles: Number.isNaN(changed) ? 0 : changed,
       url: mr.web_url,
       title: mr.title,
+      body: mr.description ?? "",
     };
   },
 
@@ -368,6 +370,7 @@ forge.register({
           oid: commit.id,
           author: commit.author_name ?? "",
           headline: commit.title ?? "",
+          message: commit.message ?? commit.title ?? "",
           authoredAt: commit.authored_date ?? null,
         });
       }

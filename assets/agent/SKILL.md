@@ -591,7 +591,10 @@ resolves with its stdout. The argv starts with one of `log`, `show`,
 
 A pull request tab needs all four of `view(pr)`, `commits(pr)`,
 `commitDiff(pr, oid, { signal })` and `diff(pr, { signal })`; `pr` is
-`{ host, owner, name, number, webUrl }`. A diff is unified `git diff` text
+`{ host, owner, name, number, webUrl }`. `view` gives the header over the
+diff: fill its `body` with the description (Markdown) so the tab can show
+it. `commits` lists the commits oldest first, each with its whole `message`
+and, when the forge counts them, its `additions` and `deletions`. A diff is unified `git diff` text
 or files (`{ path, oldPath, status, patch, additions, deletions }`), handed
 over as it arrives: return a string, an array, or an (async) iterable of
 parts, and never collect a big diff first. `diff` as an async generator

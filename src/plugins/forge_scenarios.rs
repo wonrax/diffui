@@ -155,8 +155,8 @@ fn a_bundled_plugin_forges_pull_request_opens_in_a_tab() {
 
     h.wait_until("the pull request's diff", |ui| {
         let session = &ui.active().session;
-        // The commits (the graph) and the diff load side by side.
-        !session.diff_in_flight() && session.document.files.len() == 3 && session.commits.len() == 3
+        // The outline and the diff load side by side.
+        !session.diff_in_flight() && session.document.files.len() == 3 && session.outline.is_some()
     });
     h.read(|ui| {
         let session = &ui.active().session;
@@ -175,12 +175,16 @@ fn a_bundled_plugin_forges_pull_request_opens_in_a_tab() {
             ),
             (3, 1)
         );
-        let rows: Vec<&str> = session
-            .commits
+        // No graph: the commits are steps, oldest first, under the whole.
+        assert_eq!(session.commits.len(), 0);
+        let steps: Vec<&str> = ui
+            .active()
+            .outline_steps()
             .iter()
-            .map(|row| row.description())
+            .map(|step| step.title.as_str())
             .collect();
-        assert_eq!(rows, ["All changes", "Second", "First"]);
+        assert_eq!(steps, ["First", "Second"]);
+        assert_eq!(ui.active().scope(), Some(crate::review::Scope::All));
     });
 
     h.act(|ui, _| {

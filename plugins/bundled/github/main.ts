@@ -399,6 +399,37 @@ const THREADS_QUERY =
   "comments(first:100){nodes{author{login} body createdAt url diffHunk}}}" +
   "pageInfo{hasNextPage endCursor}}}}}";
 
+/** A pull request's commits, a page of 100 at a time, with their messages and line counts. */
+const COMMITS_QUERY =
+  "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){" +
+  "pullRequest(number:$number){commits(first:100,after:$after){" +
+  "nodes{commit{oid message messageHeadline additions deletions authoredDate author{name user{login}}}}" +
+  "pageInfo{hasNextPage endCursor}}}}}";
+
+/** GitHub lists at most 250 commits of a pull request. */
+const COMMIT_PAGES = 3;
+
+type CommitsPage = {
+  repository: {
+    pullRequest: {
+      commits: {
+        nodes: {
+          commit: {
+            oid: string;
+            message: string;
+            messageHeadline: string;
+            additions: number;
+            deletions: number;
+            authoredDate: string | null;
+            author: { name: string | null; user: { login: string } | null } | null;
+          };
+        }[];
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      };
+    } | null;
+  } | null;
+};
+
 /** How many pages of threads a pull request is read to. */
 const THREAD_PAGES = 5;
 
@@ -489,13 +520,6 @@ async function listWithToken(remote: ForgeRemote, via: rest.Api): Promise<Listed
 /** The state the tab shows, from a REST pull request. */
 function restState(pr: { state: string; draft?: boolean; merged_at?: string | null }): PrInfo["state"] {
   return pr.merged_at != null ? "merged" : pr.state === "closed" ? "closed" : pr.draft ? "draft" : "open";
-}
-
-/** A commit of `GET /pulls/{n}/commits`. */
-interface ApiPrCommit {
-  sha: string;
-  author?: { login?: string } | null;
-  commit: { message: string; author?: { date?: string } | null };
 }
 
 /** Who `host` knows the user as, and through what. */
@@ -629,6 +653,7 @@ forge.register({
         additions?: number;
         deletions?: number;
         changed_files?: number;
+        body?: string | null;
       };
       const pull = await rest.get<Pull>(via, `repos/${slugOf(pr)}/pulls/${pr.number}`);
       const totals = typeof pull.additions === "number" && typeof pull.deletions === "number";
@@ -643,14 +668,16 @@ forge.register({
         deletions: totals ? pull.deletions : null,
         changedFiles: pull.changed_files ?? 0,
         url: pull.html_url,
+        body: pull.body ?? "",
       };
     }
     // `\u001f` (the unit separator) frames the fields, so titles with tabs
-    // or quotes can't break them; titles can't hold newlines.
+    // or quotes can't break them; titles can't hold newlines. The body,
+    // which can, comes last and takes the rest.
     const jq =
       '[(.number|tostring), .title, .author.login, (if .isDraft and .state == "OPEN" then "DRAFT" else .state end), ' +
-      ".baseRefName, .headRefName, (.additions|tostring), (.deletions|tostring), (.changedFiles|tostring), .url] " +
-      '| join("\\u001f")';
+      ".baseRefName, .headRefName, (.additions|tostring), (.deletions|tostring), (.changedFiles|tostring), .url, " +
+      '(.body // "")] | join("\\u001f")';
     const stdout = await run(pr.host, [
       "pr",
       "view",
@@ -658,7 +685,7 @@ forge.register({
       "--repo",
       repoArg(pr.host, slugOf(pr)),
       "--json",
-      "number,title,author,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,url",
+      "number,title,author,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,url,body",
       "--jq",
       jq,
     ]);
@@ -680,45 +707,46 @@ forge.register({
       deletions: totals ? deletions : null,
       changedFiles: count(next()) ?? 0,
       url: next(),
+      body: parts.join("\u001f"),
     };
   },
 
+  /**
+   * The commits through GraphQL on either path: only it counts each
+   * commit's lines. A page of 100 at a time, to GitHub's 250.
+   */
   async commits(pr): Promise<PrCommit[]> {
     const via = await tokenApi(pr.host, pr.webUrl);
-    if (via !== null) {
-      const commits: PrCommit[] = [];
-      for await (const page of rest.pages<ApiPrCommit>(via, `repos/${slugOf(pr)}/pulls/${pr.number}/commits?per_page=${PAGE_SIZE}`)) {
-        for (const commit of page) {
-          commits.push({
-            oid: commit.sha,
-            author: commit.author?.login ?? "",
-            headline: commit.commit.message.split("\n")[0] ?? "",
-            authoredAt: commit.commit.author?.date || null,
-          });
-        }
+    const commits: PrCommit[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < COMMIT_PAGES; page++) {
+      const variables = { owner: pr.owner, name: pr.name, number: pr.number, after };
+      let answer: CommitsPage;
+      if (via !== null) {
+        answer = await rest.graphql<CommitsPage>(via, COMMITS_QUERY, variables);
+      } else {
+        const args = ["api", "graphql", "-f", `query=${COMMITS_QUERY}`, "-f", `owner=${pr.owner}`];
+        args.push("-f", `name=${pr.name}`, "-F", `number=${pr.number}`);
+        if (after !== null) args.push("-f", `after=${after}`);
+        answer = (await json<{ data: CommitsPage }>(pr.host, args)).data;
       }
-      return commits;
+      const listed = answer.repository?.pullRequest?.commits;
+      if (!listed) throw new ForgeError("not-found", `${slugOf(pr)}#${pr.number} wasn't found`, { host: pr.host });
+      for (const { commit } of listed.nodes) {
+        commits.push({
+          oid: commit.oid,
+          author: commit.author?.user?.login ?? commit.author?.name ?? "",
+          headline: commit.messageHeadline,
+          message: commit.message,
+          authoredAt: commit.authoredDate || null,
+          additions: commit.additions,
+          deletions: commit.deletions,
+        });
+      }
+      if (!listed.pageInfo.hasNextPage) break;
+      after = listed.pageInfo.endCursor;
     }
-    const jq =
-      '.commits[] | [.oid, (.authors[0].login // ""), .messageHeadline, (.authoredDate // "")] | join("\\u001f")';
-    const stdout = await run(pr.host, [
-      "pr",
-      "view",
-      String(pr.number),
-      "--repo",
-      repoArg(pr.host, slugOf(pr)),
-      "--json",
-      "commits",
-      "--jq",
-      jq,
-    ]);
-    return stdout
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => {
-        const [oid = "", author = "", headline = "", authoredAt = ""] = line.split("\u001f");
-        return { oid, author, headline, authoredAt: authoredAt || null };
-      });
+    return commits;
   },
 
   /**

@@ -282,7 +282,8 @@ const GITLAB_LIST: &str = r#"[
 const GITLAB_MR: &str = r#"{"iid": 13, "web_url": "https://gitlab.acme.org/group/sub/app/-/merge_requests/13",
   "title": "Draft: New", "source_branch": "new", "target_branch": "tidy", "sha": "n13",
   "state": "opened", "draft": true, "source_project_id": 5, "target_project_id": 5,
-  "author": {"username": "me"}, "changes_count": "2"}"#;
+  "author": {"username": "me"}, "changes_count": "2",
+  "description": "Tidies up.\n\n## Why\n\nIt was untidy."}"#;
 
 #[test]
 fn gitlab_lists_creates_and_reads_pipelines() {
@@ -448,11 +449,12 @@ fn a_merge_request_tab_reads_through_the_plugin() {
     assert!(gitlab.can(ForgeAbility::Tab));
     let mr = merge_request(&gitlab, "group/app!3");
     let info = block_on(gitlab.view(mr.clone())).expect("viewed");
-    assert_eq!((info.state.as_str(), info.changed_files), ("draft", 2));
+    assert_eq!((info.state.label(), info.changed_files), ("draft", 2));
     assert_eq!(
         (info.number, info.author.as_str(), info.totals),
         (13, "me", None)
     );
+    assert_eq!(info.body, "Tidies up.\n\n## Why\n\nIt was untidy.");
     assert_eq!(
         (info.base_ref.as_str(), info.head_ref.as_str()),
         ("tidy", "new")

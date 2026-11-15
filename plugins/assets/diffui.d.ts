@@ -302,6 +302,8 @@ declare module "diffui" {
     changedFiles?: number | null;
     /** The page to open in a browser. */
     url: string;
+    /** The description, in Markdown; empty or left out when it has none. Shown above the diff. */
+    body?: string | null;
   }
 
   export interface PrCommit {
@@ -310,8 +312,13 @@ declare module "diffui" {
     author?: string;
     /** The first line of its message. */
     headline: string;
+    /** The whole message, headline included. Without it the tab shows the headline alone. */
+    message?: string | null;
     /** When it was authored, RFC 3339 ("2026-11-14T09:30:00Z"). */
     authoredAt?: string | null;
+    /** Lines the commit adds and removes, when the forge counts them per commit. */
+    additions?: number | null;
+    deletions?: number | null;
   }
 
   /** Comments on lines (or a whole file) of a pull request's diff: the first one and its replies. */

@@ -416,6 +416,9 @@ pub struct PrInfo {
     #[serde(default)]
     pub changed_files: Option<u64>,
     pub url: String,
+    /// The description, in Markdown.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,9 +430,17 @@ pub struct PrCommit {
     pub author: String,
     /// The first line of the message.
     pub headline: String,
+    /// The whole message, headline included.
+    #[serde(default)]
+    pub message: Option<String>,
     /// When it was authored, as RFC 3339 (`2026-11-14T09:30:00Z`).
     #[serde(default)]
     pub authored_at: Option<String>,
+    /// Lines the commit adds and removes, when the forge counts them.
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
 }
 
 /// A pull request's review thread: comments on lines (or a file) of its

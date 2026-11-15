@@ -32,7 +32,7 @@ mod forge;
 #[cfg(test)]
 mod forge_scenarios;
 #[cfg(test)]
-mod github_scenarios;
+pub(crate) mod github_scenarios;
 mod page;
 mod query;
 #[cfg(test)]

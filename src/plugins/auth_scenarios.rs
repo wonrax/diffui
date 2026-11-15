@@ -85,14 +85,6 @@ fn authorized(request: &Request, how: &str) -> bool {
         || request.header("private-token") == Some(TOKEN) && how == "gitlab"
 }
 
-/// `<url>; rel="next"` for the server that got `request`.
-fn link(request: &Request, path: &str) -> String {
-    format!(
-        "<http://{}{path}>; rel=\"next\"",
-        request.header("host").unwrap_or_default()
-    )
-}
-
 const DIFF: &str =
     "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
 
@@ -102,6 +94,7 @@ fn rest_pull(number: u64, state: &str, draft: bool) -> serde_json::Value {
         "title": "Add the thing", "state": state, "draft": draft, "merged_at": null,
         "user": { "login": "ada" }, "additions": 3, "deletions": 1, "changed_files": 2,
         "head": { "ref": "thing", "sha": "abc" }, "base": { "ref": "main", "sha": "def" },
+        "body": "Adds **the** thing.\n\n- one\n- two",
     })
 }
 
@@ -143,8 +136,34 @@ fn github_server() -> Server {
                         "nodes": nodes, "pageInfo": { "hasNextPage": more, "endCursor": "c1" } } } } }),
                 )
             }
+            ("POST", "/api/graphql") if request.body.contains("commits(first") => {
+                let (commits, more) = if request.body.contains("\"after\":\"c1\"") {
+                    (vec![("bbb2", "", "Second", None, 0, 2)], false)
+                } else {
+                    (
+                        vec![(
+                            "aaa1",
+                            "ada",
+                            "First\n\nbody",
+                            Some("2026-11-14T09:30:00Z"),
+                            3,
+                            1,
+                        )],
+                        true,
+                    )
+                };
+                let mut page: serde_json::Value =
+                    serde_json::from_str(&super::github_scenarios::gh_commits(&commits)).unwrap();
+                page["data"]["repository"]["pullRequest"]["commits"]["pageInfo"] =
+                    json!({ "hasNextPage": more, "endCursor": "c1" });
+                Answer::json(200, page)
+            }
             ("POST", "/api/graphql") if request.body.contains("reviewThreads") => {
-                let page = if request.body.contains("\"after\":\"t1\"") { 2 } else { 1 };
+                let page = if request.body.contains("\"after\":\"t1\"") {
+                    2
+                } else {
+                    1
+                };
                 Answer::json(200, super::github_scenarios::review_threads(page))
             }
             ("POST", "/api/graphql") if request.body.contains("statusCheckRollup") => {
@@ -158,43 +177,38 @@ fn github_server() -> Server {
                     json!({ "data": { "repository": { "object": { "statusCheckRollup": state } } } }),
                 )
             }
-            ("POST", "/api/v3/repos/team/app/pulls") => Answer::json(201, rest_pull(7, "open", true)),
-            ("PATCH", "/api/v3/repos/team/app/pulls/7") => Answer::json(200, rest_pull(7, "open", false)),
+            ("POST", "/api/v3/repos/team/app/pulls") => {
+                Answer::json(201, rest_pull(7, "open", true))
+            }
+            ("PATCH", "/api/v3/repos/team/app/pulls/7") => {
+                Answer::json(200, rest_pull(7, "open", false))
+            }
             ("GET", "/api/v3/repos/team/app/pulls/5") if wants_diff => Answer {
                 status: 200,
                 headers: vec![("content-type".into(), "text/plain".into())],
                 body: DIFF.to_owned(),
             },
-            ("GET", "/api/v3/repos/team/app/pulls/5") => Answer::json(200, rest_pull(5, "open", false)),
-            ("GET", "/api/v3/repos/team/app/pulls/6") if wants_diff => {
-                Answer::json(406, json!({ "message": "Sorry, the diff exceeded the maximum number of files (300)." }))
+            ("GET", "/api/v3/repos/team/app/pulls/5") => {
+                Answer::json(200, rest_pull(5, "open", false))
             }
+            ("GET", "/api/v3/repos/team/app/pulls/6") if wants_diff => Answer::json(
+                406,
+                json!({ "message": "Sorry, the diff exceeded the maximum number of files (300)." }),
+            ),
             ("GET", "/api/v3/repos/team/app/pulls/6/files?per_page=100&page=1") => Answer::json(
                 200,
                 json!([{ "filename": "big.rs", "status": "added", "additions": 1, "deletions": 0,
                          "patch": "@@ -0,0 +1 @@\n+x" }]),
-            ),
-            ("GET", "/api/v3/repos/team/app/pulls/5/commits?per_page=100") => Answer::json(
-                200,
-                json!([{ "sha": "aaa1", "author": { "login": "ada" },
-                         "commit": { "message": "First\n\nbody", "author": { "date": "2026-11-14T09:30:00Z" } } }]),
-            )
-            .header(
-                "link",
-                link(request, "/api/v3/repos/team/app/pulls/5/commits?per_page=100&page=2"),
-            ),
-            ("GET", "/api/v3/repos/team/app/pulls/5/commits?per_page=100&page=2") => Answer::json(
-                200,
-                json!([{ "sha": "bbb2", "author": null, "commit": { "message": "Second" } }]),
             ),
             ("GET", "/api/v3/user") => Answer::json(200, json!({ "login": "octo" })),
             ("GET", "/api/v3/repos/team/busy/pulls/1") => {
                 Answer::json(403, json!({ "message": "API rate limit exceeded" }))
                     .header("x-ratelimit-remaining", "0")
             }
-            ("GET", "/api/v3/repos/team/sso/pulls/1") => {
-                Answer::json(403, json!({ "message": "Resource protected by organization SAML enforcement" }))
-            }
+            ("GET", "/api/v3/repos/team/sso/pulls/1") => Answer::json(
+                403,
+                json!({ "message": "Resource protected by organization SAML enforcement" }),
+            ),
             _ => Answer::json(404, json!({ "message": "Not Found" })),
         }
     })
@@ -294,12 +308,15 @@ fn github_pull_request_tab_with_a_token() {
         (
             info.title.as_str(),
             info.author.as_str(),
-            info.state.as_str()
+            info.state.label()
         ),
         ("Add the thing", "ada", "open")
     );
     assert_eq!((info.totals, info.changed_files), (Some((3, 1)), 2));
+    assert_eq!(info.body, "Adds **the** thing.\n\n- one\n- two");
     let commits = block_on(github.commits(tab.clone())).expect("commits");
+    assert_eq!(commits[0].message, "First\n\nbody");
+    assert_eq!(commits[0].counts, Some((3, 1)));
     let read: Vec<(&str, &str, &str)> = commits
         .iter()
         .map(|commit| {
@@ -313,7 +330,7 @@ fn github_pull_request_tab_with_a_token() {
     assert_eq!(
         read,
         [("aaa1", "ada", "First"), ("bbb2", "", "Second")],
-        "both pages, by Link"
+        "both pages, by cursor"
     );
 
     let mut files = Vec::new();
@@ -432,6 +449,8 @@ fn github_auto_takes_a_token_only_when_there_is_one() {
     );
     let info = block_on(cli.view(pr(&cli, &server, "app", 5))).expect("viewed with gh");
     assert_eq!(info.title, "Title");
+    // A gh too old to print a body, or a pull request without one: empty.
+    assert_eq!(info.body, "");
     assert_eq!(fake.calls().len(), 1);
     assert_eq!(server.requests().len(), 1, "the API wasn't asked");
 }
@@ -503,7 +522,7 @@ fn gitlab_server() -> Server {
             ("GET", "/api/v4/projects/team%2Fapp/merge_requests/9/commits?per_page=100&page=1") => {
                 Answer::json(
                     200,
-                    json!([{ "id": "c2", "title": "Second", "author_name": "Ada" },
+                    json!([{ "id": "c2", "title": "Second", "message": "Second\n\nIts body", "author_name": "Ada" },
                        { "id": "c1", "title": "First", "author_name": "Ada" }]),
                 )
             }
@@ -573,6 +592,8 @@ fn gitlab_does_everything_with_a_token() {
     let tab = pr(&gitlab, &server, "app", 9);
     let info = block_on(gitlab.view(tab.clone())).expect("viewed");
     assert_eq!((info.title.as_str(), info.changed_files), ("MR 9", 2));
+    // A merge request without a description.
+    assert_eq!(info.body, "");
     let commits = block_on(gitlab.commits(tab.clone())).expect("commits");
     assert_eq!(
         commits
@@ -580,6 +601,14 @@ fn gitlab_does_everything_with_a_token() {
             .map(|c| c.headline.as_str())
             .collect::<Vec<_>>(),
         ["First", "Second"]
+    );
+    // The whole message when the API has it; the title alone when not.
+    assert_eq!(
+        commits
+            .iter()
+            .map(|c| c.message.as_str())
+            .collect::<Vec<_>>(),
+        ["First", "Second\n\nIts body"]
     );
     let mut files = Vec::new();
     block_on(gitlab.stream_diff(

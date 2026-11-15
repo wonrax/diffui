@@ -140,16 +140,6 @@ export async function get<T>(api: Api, path: string, signal?: AbortSignal): Prom
   return (await rest<T>(api, "GET", path, { signal })).data;
 }
 
-/** Every page of a listing at `path`, following the `Link` header's `next`. */
-export async function* pages<T>(api: Api, path: string, signal?: AbortSignal): AsyncGenerator<T[]> {
-  let next: string | null = path;
-  while (next !== null) {
-    const page: { data: T[]; next: string | null } = await rest<T[]>(api, "GET", next, { signal });
-    yield page.data;
-    next = page.next;
-  }
-}
-
 /** The `rel="next"` URL of a `Link` header. */
 export function nextPage(link: string | null): string | null {
   for (const part of (link ?? "").split(",")) {

@@ -452,7 +452,7 @@ impl ForgeProvider for ScriptForge {
                 number: info.number,
                 title: info.title,
                 author: info.author,
-                state: state(info.state).label().to_owned(),
+                state: state(info.state),
                 base_ref: info.base,
                 head_ref: info.head,
                 totals: info
@@ -461,6 +461,7 @@ impl ForgeProvider for ScriptForge {
                     .map(|(added, deleted)| (added as usize, deleted as usize)),
                 changed_files: info.changed_files.unwrap_or(0) as usize,
                 url: info.url,
+                body: info.body.unwrap_or_default(),
             })
         })
     }
@@ -477,6 +478,11 @@ impl ForgeProvider for ScriptForge {
                         .authored_at
                         .as_deref()
                         .and_then(diffui_core::history::parse_timestamp_millis),
+                    counts: commit
+                        .additions
+                        .zip(commit.deletions)
+                        .map(|(added, deleted)| (added as usize, deleted as usize)),
+                    message: commit.message.unwrap_or_default(),
                     oid: commit.oid,
                     author: commit.author,
                     headline: commit.headline,
@@ -1058,7 +1064,7 @@ pub(super) mod tests {
             (
                 info.number,
                 info.title.as_str(),
-                info.state.as_str(),
+                info.state.label(),
                 info.totals
             ),
             (1, "Stream it", "open", Some((3, 1)))

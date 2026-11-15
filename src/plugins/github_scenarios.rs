@@ -28,6 +28,35 @@ fn fake(name: &str, rules: &[(&str, &str, i32)]) -> FakeCli {
     fake
 }
 
+/// A commit as [`gh_commits`] takes it: `(oid, login, message, authored at,
+/// additions, deletions)`.
+pub(crate) type GhCommit<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, u64, u64);
+
+/// What GitHub's GraphQL API answers for a pull request's commits.
+pub(crate) fn gh_commits(commits: &[GhCommit<'_>]) -> String {
+    let nodes: Vec<serde_json::Value> = commits
+        .iter()
+        .map(|(oid, login, message, date, additions, deletions)| {
+            serde_json::json!({ "commit": {
+                "oid": oid,
+                "message": message,
+                "messageHeadline": message.lines().next().unwrap_or(""),
+                "additions": additions,
+                "deletions": deletions,
+                "authoredDate": date,
+                // A commit by no one GitHub knows, from a deleted account.
+                "author": (!login.is_empty())
+                    .then(|| serde_json::json!({ "name": "Someone", "user": { "login": login } })),
+            }})
+        })
+        .collect();
+    serde_json::json!({ "data": { "repository": { "pullRequest": { "commits": {
+        "nodes": nodes,
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
+    }}}}})
+    .to_string()
+}
+
 fn has(call: &[String], args: &[&str]) -> bool {
     call.windows(args.len())
         .any(|window| window.iter().zip(args).all(|(a, b)| a == b))
@@ -237,12 +266,22 @@ fn a_pull_request_tab_reads_through_the_plugin() {
         &[
             (
                 "pr view 5 --repo github.acme.com/team/app --json number,title,*",
-                "5\u{1f}Title\u{1f}me\u{1f}OPEN\u{1f}main\u{1f}topic\u{1f}1\u{1f}1\u{1f}1\u{1f}https://github.acme.com/team/app/pull/5\n",
+                "5\u{1f}Title\u{1f}me\u{1f}OPEN\u{1f}main\u{1f}topic\u{1f}1\u{1f}1\u{1f}1\u{1f}https://github.acme.com/team/app/pull/5\u{1f}## Why\n\nTwo lines\u{1f} and a separator.\n",
                 0,
             ),
             (
-                "pr view 5 --repo github.acme.com/team/app --json commits *",
-                "aaa1\u{1f}ada\u{1f}First\u{1f}2026-11-14T09:30:00Z\nbbb2\u{1f}\u{1f}Second\u{1f}\n",
+                "api graphql *commits(first:100*",
+                &gh_commits(&[
+                    (
+                        "aaa1",
+                        "ada",
+                        "First\n\nWhy it's first.",
+                        Some("2026-11-14T09:30:00Z"),
+                        3,
+                        1,
+                    ),
+                    ("bbb2", "", "Second", None, 0, 2),
+                ]),
                 0,
             ),
             ("pr diff 5 *", diff, 0),
@@ -255,14 +294,27 @@ fn a_pull_request_tab_reads_through_the_plugin() {
     assert_eq!(
         (
             info.title.as_str(),
-            info.state.as_str(),
+            info.state.label(),
             info.author.as_str()
         ),
         ("Title", "open", "me")
     );
     assert_eq!(info.totals, Some((1, 1)));
     assert_eq!(info.url, "https://github.acme.com/team/app/pull/5");
+    // The body comes last and keeps its line breaks and separators.
+    assert_eq!(info.body, "## Why\n\nTwo lines\u{1f} and a separator.");
     let commits = block_on(github.commits(pr.clone())).expect("the commits");
+    let messages: Vec<(&str, Option<(usize, usize)>)> = commits
+        .iter()
+        .map(|commit| (commit.message.as_str(), commit.counts))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            ("First\n\nWhy it's first.", Some((3, 1))),
+            ("Second", Some((0, 2)))
+        ]
+    );
     let read: Vec<(&str, &str, &str, bool)> = commits
         .iter()
         .map(|commit| {
@@ -552,15 +604,13 @@ fn measure_github_badges_and_a_pull_requests_diff() {
         .collect();
     let list = format!("[{}]", rows.join(","));
     let view = "1\u{1f}Big\u{1f}me\u{1f}OPEN\u{1f}main\u{1f}topic\u{1f}20000\u{1f}0\u{1f}200\u{1f}https://github.invalid/team/app/pull/1\n";
-    let commits = format!(
-        "{}\u{1f}me\u{1f}Big\u{1f}2026-11-14T09:30:00Z\n",
-        "a".repeat(40)
-    );
+    let oid = "a".repeat(40);
+    let commits = gh_commits(&[(&oid, "me", "Big", Some("2026-11-14T09:30:00Z"), 20000, 0)]);
     let diff = big_diff(200, 100);
     answer_forge(&[
         ("pr list *", &list),
+        ("api graphql *commits(first:100*", &commits),
         ("api graphql *", "SUCCESS\n"),
-        ("pr view 1 * --json commits *", &commits),
         ("pr view 1 *", view),
         ("pr diff 1 *", &diff),
     ]);
