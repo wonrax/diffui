@@ -8,12 +8,13 @@
 
 pub(crate) mod app;
 pub(crate) mod cli;
+pub(crate) mod export;
 pub(crate) mod inline;
 pub(crate) mod locate;
 pub(crate) mod review;
 pub(crate) mod store;
 pub(crate) mod view;
 
-pub(crate) use app::{NoteReply, NotesMsg, TabNotes};
+pub(crate) use app::{NoteReply, NoteTarget, NotesMsg, TabNotes};
 #[cfg(test)]
 pub(crate) mod scenarios;

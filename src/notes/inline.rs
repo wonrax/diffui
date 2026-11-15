@@ -7,7 +7,7 @@ use std::rc::Rc;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, ElementId, SharedString, Window, div, px};
 
-use super::app::{Note, NotesMsg, SpotKind, diff_notes, spots};
+use super::app::{Note, NoteTarget, NotesMsg, SpotKind, diff_notes, shown_change, spots};
 use super::locate::Place;
 use super::store::{Role, Side};
 use crate::commands::Context;
@@ -75,7 +75,7 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
                 blocks,
                 expanded: tab.notes.expanded.contains(id),
                 replying: replying
-                    .filter(|reply| reply.id == *id)
+                    .filter(|reply| reply.thread() == Some(id.as_str()))
                     .map(|reply| reply.draft.clone()),
                 off_line,
                 send_keys: send_keys.clone(),
@@ -93,8 +93,43 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
             }
         })
         .collect();
+    let mut insets = insets;
+    if let Some(reply) = replying
+        && let super::app::ReplyTo::New(note) = &reply.to
+    {
+        let title = match &note.anchor {
+            None => "on the whole change".to_owned(),
+            Some(anchor) => match &anchor.lines {
+                None => anchor.path.clone(),
+                Some(lines) => lines_label(&anchor.path, lines.start, lines.end(), lines.side),
+            },
+        };
+        let card = Rc::new(NewCard {
+            title,
+            draft: reply.draft.clone(),
+            send_keys: send_keys.clone(),
+            cancel_keys: cancel_keys.clone(),
+            look,
+            on: on.clone(),
+        });
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        note.spot.hash(&mut hasher);
+        reply.draft.lines().count().hash(&mut hasher);
+        insets.push(Inset {
+            at: note.spot,
+            key: hasher.finish(),
+            build: Rc::new(move |window, cx| card.render(window, cx)),
+        });
+    }
     if !insets.is_empty() {
         props = props.insets(insets);
+    }
+    if shown_change(tab).is_some() {
+        let start = on.clone();
+        props = props.on_gutter_press(move |press, window, cx| {
+            start(&NotesMsg::StartNote(NoteTarget::Line(*press)), window, cx);
+        });
     }
     let Look { theme, .. } = look;
     let spots = spots(tab);
@@ -220,8 +255,17 @@ impl Card {
             .child(self.header());
         if self.expanded && !resolved || self.replying.is_some() {
             card = card.children(self.messages());
-            if self.replying.is_some() {
-                card = card.child(self.reply_field(window, cx));
+            if let Some(draft) = &self.replying {
+                card = card.child(reply_field(
+                    draft,
+                    "Reply",
+                    &self.send_keys,
+                    &self.cancel_keys,
+                    self.look,
+                    &self.on,
+                    window,
+                    cx,
+                ));
             }
         } else {
             card = card.child(self.summary());
@@ -242,7 +286,10 @@ impl Card {
         let Look { theme, font, mono } = self.look;
         let thread = &self.note.thread;
         let first = thread.messages.first();
-        let author = first.map_or("agent", |message| message.author.as_str());
+        let author = first.map_or("agent", |message| match message.role {
+            Role::User => "You",
+            Role::Agent => message.author.as_str(),
+        });
         let resolved = thread.resolved.is_some();
         let ink = if resolved {
             theme.subtle_text
@@ -325,6 +372,13 @@ impl Card {
                     .on_click(self.send(NotesMsg::StartReply(thread.id.clone()))),
             );
         }
+        row = row.child(
+            self.look
+                .icon_button(id(&thread.id, "copy"), icons::COPY, theme.muted_text)
+                .small()
+                .tip("Copy as Markdown")
+                .on_click(self.send(NotesMsg::Copy(vec![thread.id.clone()]))),
+        );
         let (label, message) = if resolved {
             ("Reopen", NotesMsg::Reopen(vec![thread.id.clone()]))
         } else {
@@ -457,77 +511,168 @@ impl Card {
             })
             .collect()
     }
+}
 
-    /// The reply field, and its footer.
-    fn reply_field(&self, window: &mut Window, cx: &mut App) -> AnyElement {
-        let Look { theme, font, mono } = self.look;
-        let draft = self.replying.clone().unwrap_or_default();
-        let on = self.on.clone();
-        let spec = crate::input::FieldSpec::new(REPLY_FIELD, &draft)
-            .placeholder("Reply, in Markdown\u{2026}")
-            .on_input(move |text, window, cx| on(&NotesMsg::ReplyEdited(text), window, cx));
-        let (field, focused) = crate::input::multi_line_with_focus(spec, font, window, cx);
-        let lines = draft.lines().count().clamp(2, 10) as f32;
-        let height = lines * text_size::BODY * crate::typography::DEFAULT_LINE_HEIGHT
-            + 2.0 * theme::space::MD;
-        let input = div()
-            .w_full()
-            .h(px(height))
-            .font(font.gpui())
-            .text_size(px(text_size::BODY))
-            .child(
-                field
-                    .appearance(false)
-                    .text_size(px(text_size::BODY))
-                    .h_full(),
-            );
-        fn keys(keys: &[String]) -> Vec<&str> {
-            keys.iter().map(String::as_str).collect()
-        }
-        let mut hints = Vec::new();
-        if !self.send_keys.is_empty() {
-            hints.push(
-                crate::overlay_kit::key_hint(&keys(&self.send_keys), "Reply", self.look)
-                    .into_any_element(),
-            );
-        }
-        if !self.cancel_keys.is_empty() {
-            hints.push(
-                crate::overlay_kit::key_hint(&keys(&self.cancel_keys), "Cancel", self.look)
-                    .into_any_element(),
-            );
-        }
-        let _ = mono;
-        let cancel = self
-            .look
-            .cancel_button("note-reply-cancel")
-            .compact()
-            .on_click(self.send(NotesMsg::CancelReply));
-        let send = self
-            .look
-            .button("note-reply-send", "Reply")
-            .primary()
-            .compact()
-            .disabled(draft.trim().is_empty())
-            .on_click(self.send(NotesMsg::SendReply));
-        let footer = crate::overlay_kit::footer_with_buttons(
-            crate::overlay_kit::Density::Well,
-            theme::radius::inner(theme::radius::CONTROL, theme::HAIRLINE),
-            hints,
-            [cancel.into_any_element(), send.into_any_element()],
-            theme,
+/// The reply field and its footer: for a reply (`send` "Reply") or a new
+/// note ("Add note").
+#[allow(clippy::too_many_arguments)]
+fn reply_field(
+    draft: &str,
+    send_label: &'static str,
+    send_keys: &[String],
+    cancel_keys: &[String],
+    look: Look,
+    on: &On,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let Look { theme, font, .. } = look;
+    let typed = on.clone();
+    let spec = crate::input::FieldSpec::new(REPLY_FIELD, draft)
+        .placeholder("Write in Markdown\u{2026}")
+        .on_input(move |text, window, cx| typed(&NotesMsg::ReplyEdited(text), window, cx));
+    let (field, focused) = crate::input::multi_line_with_focus(spec, font, window, cx);
+    let lines = draft.lines().count().clamp(2, 10) as f32;
+    let height =
+        lines * text_size::BODY * crate::typography::DEFAULT_LINE_HEIGHT + 2.0 * theme::space::MD;
+    let input = div()
+        .w_full()
+        .h(px(height))
+        .font(font.gpui())
+        .text_size(px(text_size::BODY))
+        .child(
+            field
+                .appearance(false)
+                .text_size(px(text_size::BODY))
+                .h_full(),
         );
+    fn keys(keys: &[String]) -> Vec<&str> {
+        keys.iter().map(String::as_str).collect()
+    }
+    let mut hints = Vec::new();
+    if !send_keys.is_empty() {
+        hints.push(
+            crate::overlay_kit::key_hint(&keys(send_keys), send_label, look).into_any_element(),
+        );
+    }
+    if !cancel_keys.is_empty() {
+        hints.push(
+            crate::overlay_kit::key_hint(&keys(cancel_keys), "Cancel", look).into_any_element(),
+        );
+    }
+    let click = |message: NotesMsg| {
+        let on = on.clone();
+        move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| on(&message, window, cx)
+    };
+    let cancel = look
+        .cancel_button("note-reply-cancel")
+        .compact()
+        .on_click(click(NotesMsg::CancelReply));
+    let send = look
+        .button("note-reply-send", send_label)
+        .primary()
+        .compact()
+        .disabled(draft.trim().is_empty())
+        .on_click(click(NotesMsg::SendReply));
+    let footer = crate::overlay_kit::footer_with_buttons(
+        crate::overlay_kit::Density::Well,
+        theme::radius::inner(theme::radius::CONTROL, theme::HAIRLINE),
+        hints,
+        [cancel.into_any_element(), send.into_any_element()],
+        theme,
+    );
+    div()
+        .w_full()
+        .px(px(theme::space::MD_LG))
+        .pb(px(theme::space::MD_LG))
+        .child(
+            crate::field::field_well(focused, theme)
+                .flex()
+                .flex_col()
+                .child(input)
+                .child(footer),
+        )
+        .into_any_element()
+}
+
+/// The card a new note of the user's is written in, at its spot.
+struct NewCard {
+    title: String,
+    draft: String,
+    send_keys: Vec<String>,
+    cancel_keys: Vec<String>,
+    look: Look,
+    on: On,
+}
+
+impl NewCard {
+    fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        let Look { theme, font, mono } = self.look;
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::space::SM))
+            .w_full()
+            .min_w_0()
+            .px(px(theme::space::MD_LG))
+            .py(px(theme::space::SM))
+            .child(icons::icon(
+                icons::MESSAGE_SQUARE,
+                theme::icon::SM,
+                theme.accent,
+            ))
+            .child(
+                typography::line(
+                    "New note",
+                    theme::emphasis_font(font, Weight::SEMIBOLD),
+                    text_size::BODY,
+                    theme.text,
+                )
+                .flex_none(),
+            )
+            .child(
+                typography::line(
+                    self.title.clone(),
+                    mono,
+                    text_size::CAPTION,
+                    theme.muted_text,
+                )
+                .min_w_0()
+                .text_ellipsis(),
+            );
+        let card = div()
+            .id("note-new-card")
+            .flex()
+            .flex_col()
+            .w_full()
+            .overflow_hidden()
+            .map(|card| {
+                theme::squircle(
+                    card,
+                    theme::radius::CARD,
+                    Some(theme.panel_background_elevated),
+                    Some(theme.border),
+                )
+            })
+            .child(header)
+            .child(reply_field(
+                &self.draft,
+                "Add note",
+                &self.send_keys,
+                &self.cancel_keys,
+                self.look,
+                &self.on,
+                window,
+                cx,
+            ));
         div()
             .w_full()
-            .px(px(theme::space::MD_LG))
-            .pb(px(theme::space::MD_LG))
-            .child(
-                crate::field::field_well(focused, theme)
-                    .flex()
-                    .flex_col()
-                    .child(input)
-                    .child(footer),
-            )
+            .pl(px(theme::space::XL))
+            .pr(px(crate::scrollbar::GUTTER + theme::space::MD))
+            .py(px(theme::space::SM))
+            .block_mouse_except_scroll()
+            .child(card)
             .into_any_element()
     }
 }

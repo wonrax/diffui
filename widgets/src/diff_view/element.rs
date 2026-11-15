@@ -796,6 +796,22 @@ impl State {
             send(out, &props.on_edit_description, ());
             return;
         }
+        let gutter_line = {
+            let index = self.height_index.borrow();
+            view.gutter_line_at(&index, offset, bounds, point)
+        };
+        if let Some(line) = gutter_line {
+            send(
+                out,
+                &props.on_gutter_press,
+                LinePress {
+                    line,
+                    extend: modifiers.shift,
+                    one_side: false,
+                },
+            );
+            return;
+        }
         let (hit, check, file_control, annotation, expand, pickable) = {
             let index = self.height_index.borrow();
             let index = &*index;

@@ -112,7 +112,8 @@ enum Verb {
         /// Only the changes this revset names. Default: every change.
         #[arg(short = 'r', long = "revisions", value_name = "REVSET")]
         revisions: Option<String>,
-        /// Only notes the user replied to: your turn.
+        /// Only notes the user wrote in last (a reply, or a note of theirs):
+        /// your turn.
         #[arg(long)]
         waiting: bool,
         /// Resolved notes too.
@@ -140,6 +141,21 @@ enum Verb {
         /// Ignore replies already waiting; wait for a new one.
         #[arg(long)]
         new: bool,
+    },
+    /// Notes as Markdown, to paste into a coding agent's prompt, a pull
+    /// request or a message: each with where it is, the lines it's on and
+    /// every message. Open notes on live changes, unless --resolved or ids.
+    Export {
+        /// These notes only.
+        ids: Vec<String>,
+        /// Only notes on the changes this revset names.
+        #[arg(short = 'r', long = "revisions", value_name = "REVSET")]
+        revisions: Option<String>,
+        /// Resolved notes too.
+        #[arg(long)]
+        resolved: bool,
+        #[arg(long, value_name = "FORMAT", default_value = "md", value_parser = ["md"])]
+        format: String,
     },
     /// Delete notes by id.
     Delete {
@@ -351,6 +367,52 @@ fn execute(
             let scope = scope(&opened.repo, revisions.as_deref())?;
             wait(&opened, &scope, timeout, new, json, out)
         }
+        Verb::Export {
+            ids,
+            revisions,
+            resolved,
+            format: _,
+        } => {
+            let opened = open(repo, cwd, false)?;
+            let scope = scope(&opened.repo, revisions.as_deref())?;
+            let threads: Vec<Thread> = if ids.is_empty() {
+                opened
+                    .store
+                    .load()
+                    .into_iter()
+                    .filter(|thread| in_scope(&scope, thread))
+                    .filter(|thread| resolved || thread.resolved.is_none())
+                    .collect()
+            } else {
+                ids.iter()
+                    .map(|id| opened.store.get(id).ok_or_else(|| no_note(id)))
+                    .collect::<Result<_, _>>()?
+            };
+            let places = locate(&opened.repo, &threads);
+            let mut notes: Vec<(&Thread, &Located)> = threads
+                .iter()
+                .zip(&places)
+                .filter(|(_, place)| !ids.is_empty() || !place.archived())
+                .collect();
+            notes.sort_by_key(|(thread, _)| std::cmp::Reverse(thread.activity()));
+            let text = if notes.is_empty() {
+                String::new()
+            } else {
+                super::export::markdown(&notes)
+            };
+            if json {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    json!({ "ok": true, "count": notes.len(), "markdown": text })
+                );
+            } else if notes.is_empty() {
+                let _ = writeln!(out, "No notes");
+            } else {
+                let _ = write!(out, "{text}");
+            }
+            Ok(0)
+        }
         Verb::Delete { ids } => {
             let opened = open(repo, cwd, false)?;
             for id in &ids {
@@ -468,7 +530,7 @@ fn scope(repo: &NotesRepo, revisions: Option<&str>) -> Result<Option<HashSet<Str
 fn in_scope(scope: &Option<HashSet<String>>, thread: &Thread) -> bool {
     scope
         .as_ref()
-        .is_none_or(|changes| changes.contains(&thread.change_id))
+        .is_none_or(|changes| changes.contains(thread.change_id()))
 }
 
 /// `--line 40` or `--line 40-52`, as (first, last).
@@ -589,20 +651,16 @@ fn new_thread(
             Some(Anchor { path, lines })
         }
     };
-    Ok(Thread {
-        id: String::new(),
-        change_id: change.change_id,
-        commit_id: change.commit_id,
-        title: change.title,
+    Ok(Thread::on_change(
+        &change,
         anchor,
-        resolved: None,
-        messages: vec![Message {
+        Message {
             author: author.to_owned(),
             role: Role::Agent,
             at: store::now(),
             body,
-        }],
-    })
+        },
+    ))
 }
 
 /// `90s`, `10m`, `1h`, a bare number of seconds; `0` is no limit.
@@ -757,9 +815,9 @@ fn thread_json(thread: &Thread, located: &Located) -> Value {
     };
     json!({
         "id": thread.id,
-        "change_id": thread.change_id,
+        "change_id": thread.change_id(),
         "commit_id": located.now.as_ref().map(|now| now.commit_id.clone()),
-        "title": located.now.as_ref().map_or(thread.title.clone(), |now| now.title.clone()),
+        "title": located.now.as_ref().map_or(thread.title().to_owned(), |now| now.title.clone()),
         "path": thread.anchor.as_ref().map(|anchor| anchor.path.clone()),
         "side": lines.map(|lines| match lines.side { Side::Old => "old", Side::New => "new" }),
         "start": start,
@@ -785,16 +843,16 @@ fn print_threads(repo: &NotesRepo, threads: &[Thread], json: bool, out: &mut dyn
     let latest = |change: &str| {
         threads
             .iter()
-            .filter(|thread| thread.change_id == change)
+            .filter(|thread| thread.change_id() == change)
             .map(Thread::activity)
             .max()
             .unwrap_or(0)
     };
     order.sort_by(|&a, &b| {
         let (a_thread, b_thread) = (&threads[a], &threads[b]);
-        latest(&b_thread.change_id)
-            .cmp(&latest(&a_thread.change_id))
-            .then_with(|| a_thread.change_id.cmp(&b_thread.change_id))
+        latest(b_thread.change_id())
+            .cmp(&latest(a_thread.change_id()))
+            .then_with(|| a_thread.change_id().cmp(b_thread.change_id()))
             .then_with(|| doc_order(a_thread, &places[a]).cmp(&doc_order(b_thread, &places[b])))
     });
     if json {
@@ -809,12 +867,12 @@ fn print_threads(repo: &NotesRepo, threads: &[Thread], json: bool, out: &mut dyn
     let mut change = None;
     for index in order {
         let (thread, located) = (&threads[index], &places[index]);
-        if change != Some(&thread.change_id) {
-            change = Some(&thread.change_id);
+        if change != Some(thread.change_id()) {
+            change = Some(thread.change_id());
             let title = located
                 .now
                 .as_ref()
-                .map_or(thread.title.as_str(), |now| now.title.as_str());
+                .map_or(thread.title(), |now| now.title.as_str());
             let title = if title.is_empty() {
                 "(no description)"
             } else {
@@ -828,7 +886,7 @@ fn print_threads(repo: &NotesRepo, threads: &[Thread], json: bool, out: &mut dyn
             let _ = writeln!(
                 out,
                 "{}  {title}{gone}",
-                &thread.change_id[..thread.change_id.len().min(8)]
+                &thread.change_id()[..thread.change_id().len().min(8)]
             );
         }
         let mut flags = vec![status(thread)];

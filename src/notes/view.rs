@@ -32,25 +32,25 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
         .filter(|note| {
             view.change
                 .as_deref()
-                .is_none_or(|change| note.thread.change_id == change)
+                .is_none_or(|change| note.thread.change_id() == change)
         })
         .collect();
     let latest = |change: &str| {
         notes
             .iter()
-            .filter(|note| note.thread.change_id == change)
+            .filter(|note| note.thread.change_id() == change)
             .map(|note| note.thread.activity())
             .max()
             .unwrap_or(0)
     };
     let mut keyed: Vec<(u64, &Note)> = notes
         .iter()
-        .map(|note| (latest(&note.thread.change_id), *note))
+        .map(|note| (latest(note.thread.change_id()), *note))
         .collect();
     keyed.sort_by(|(a_latest, a), (b_latest, b)| {
         b_latest
             .cmp(a_latest)
-            .then_with(|| a.thread.change_id.cmp(&b.thread.change_id))
+            .then_with(|| a.thread.change_id().cmp(b.thread.change_id()))
             .then_with(|| b.thread.activity().cmp(&a.thread.activity()))
     });
     notes = keyed.into_iter().map(|(_, note)| note).collect();
@@ -262,6 +262,13 @@ pub(crate) fn build_notes_panel(
             if !selected.is_empty() {
                 row = row
                     .child(
+                        look.button("notes-view-copy", "Copy")
+                            .icon(icons::COPY, theme.muted_text)
+                            .compact()
+                            .tip("Copy as Markdown, to paste into an agent's prompt")
+                            .on_click(send(NotesMsg::Copy(selected.clone()))),
+                    )
+                    .child(
                         look.button("notes-view-resolve", "Resolve")
                             .compact()
                             .on_click(send(NotesMsg::Resolve(selected.clone()))),
@@ -282,9 +289,25 @@ pub(crate) fn build_notes_panel(
     let now = super::store::now();
     for note in &listed {
         let thread = &note.thread;
-        if change != Some(thread.change_id.as_str()) {
-            change = Some(thread.change_id.as_str());
-            list = list.child(group_header(note, look));
+        if change != Some(thread.change_id()) {
+            change = Some(thread.change_id());
+            let ids: Vec<String> = listed
+                .iter()
+                .filter(|other| other.thread.change_id() == thread.change_id())
+                .map(|other| other.thread.id.clone())
+                .collect();
+            list = list.child(
+                group_header(note, look).child(
+                    look.icon_button(
+                        id(thread.change_id(), "copy"),
+                        icons::COPY,
+                        theme.muted_text,
+                    )
+                    .small()
+                    .tip("Copy this change's notes as Markdown")
+                    .on_click(send(NotesMsg::Copy(ids))),
+                ),
+            );
         }
         list = list.child(row(
             note,
@@ -338,14 +361,14 @@ fn short(change: &str) -> &str {
 }
 
 /// A change's header: its id and title.
-fn group_header(note: &Note, look: Look) -> AnyElement {
+fn group_header(note: &Note, look: Look) -> gpui_kit::Div {
     let Look { theme, font, mono } = look;
     let thread = &note.thread;
     let title = note
         .located
         .now
         .as_ref()
-        .map_or(thread.title.as_str(), |now| now.title.as_str());
+        .map_or(thread.title(), |now| now.title.as_str());
     let (title, ink) = if title.is_empty() {
         ("No description", theme.subtle_text)
     } else {
@@ -363,7 +386,7 @@ fn group_header(note: &Note, look: Look) -> AnyElement {
         .pb(px(theme::space::XS))
         .child(
             typography::line(
-                short(&thread.change_id).to_owned(),
+                short(thread.change_id()).to_owned(),
                 mono,
                 text_size::BODY,
                 theme.change_id,
@@ -389,7 +412,7 @@ fn group_header(note: &Note, look: Look) -> AnyElement {
                 .bg(theme::chip_background(theme.subtle_text)),
         );
     }
-    header.into_any_element()
+    header.child(div().flex_1())
 }
 
 /// One note: its box, where it is, who had the last word and what they said.

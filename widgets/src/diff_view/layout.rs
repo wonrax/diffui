@@ -2688,6 +2688,57 @@ impl<'a> View<'a> {
         self.line_mark(at).map(|_| (at, lane))
     }
 
+    /// The line whose line-number gutter is under `point`, when the props take
+    /// gutter presses. A side-by-side row answers with the side it's in.
+    pub(super) fn gutter_line_at(
+        &self,
+        index: &HeightIndex,
+        vertical_offset: f32,
+        bounds: Rectangle,
+        point: Point,
+    ) -> Option<LineAt> {
+        self.props.on_gutter_press.as_ref()?;
+        if self.props.plain || !bounds.contains(point) {
+            return None;
+        }
+        let over_header = self
+            .visible_file_header_positions(index, bounds, vertical_offset)
+            .into_iter()
+            .any(|(_, y)| point.y >= y && point.y < y + self.metrics.file_header_height);
+        if over_header {
+            return None;
+        }
+        let content_y = point.y - bounds.y + vertical_offset;
+        let row = index.row_at(content_y)?;
+        if content_y >= index.row_tops[row] + index.row_heights[row] {
+            return None;
+        }
+        let (file, hunk, line) = index.row_ids[row];
+        let (file, hunk) = (file as usize, hunk as usize);
+        let x = point.x - bounds.x;
+        let line = match index.pair_lines.get(row) {
+            Some(&(left, right)) if self.props.side_by_side && !index.is_full_width(file) => {
+                let split = self.split_layout(bounds.width);
+                let member = if x < split.gutter_width {
+                    left
+                } else if x >= split.right_gutter_x && x < split.right_gutter_x + split.gutter_width
+                {
+                    right
+                } else {
+                    return None;
+                };
+                if member == NO_LINE {
+                    return None;
+                }
+                member as usize
+            }
+            _ if x < self.metrics.gutter_width => line as usize,
+            _ => return None,
+        };
+        let at = LineAt { file, hunk, line };
+        (self.line(file, hunk, line)?.kind != DiffLineKind::Note).then_some(at)
+    }
+
     /// The file header checkbox under `point`, if any (the pinned sticky header
     /// included).
     pub(super) fn check_at(

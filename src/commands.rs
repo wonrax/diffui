@@ -348,6 +348,19 @@ fn has_local_bookmark(ui: &Diffui, arg: &CommandArg) -> Availability {
 }
 
 /// Picking changes out of the diff: the reason `changes::editable` is false.
+/// The diff on screen is one jj change, which notes can go on.
+fn on_a_change(ui: &Diffui) -> Availability {
+    require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+    require(
+        ui.active().main_view == MainView::Diff,
+        "Only in the diff view",
+    )?;
+    require(
+        crate::notes::app::shown_change(ui.active()).is_some(),
+        "Only on one revision's own diff",
+    )
+}
+
 fn can_pick_changes(ui: &Diffui) -> Availability {
     let tab = ui.active();
     require(tab.session.capabilities.mutate, reason::NOT_JJ)?;
@@ -2726,6 +2739,70 @@ pub(crate) static REGISTRY: &[Command] = &[
             )
         },
         build: |_ui, _arg| Some(Action::SetMainView(MainView::Notes)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.add-change",
+        label: "Add a note on this change",
+        hint: "Write feedback on the change on screen, for the agent or to copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Change,
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.add-file",
+        label: "Add a note on this file",
+        hint: "Write feedback on the file, for the agent or to copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            on_a_change(ui)?;
+            require(matches!(arg, CommandArg::Path(_)), "Needs a file")
+        },
+        build: |_ui, arg| match arg {
+            CommandArg::Path(path) => Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::File(path.clone()),
+            ))),
+            _ => None,
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "notes.copy",
+        label: "Copy this change's notes",
+        hint: "Its open review notes as Markdown, to paste into an agent's prompt",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::CopyChange {
+                resolved: false,
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.copy-all",
+        label: "Copy this change's notes, resolved too",
+        hint: "Every review note on it as Markdown, resolved ones included",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::CopyChange {
+                resolved: true,
+            }))
+        },
         palette: PaletteScope::Root,
     },
     Command {

@@ -47,8 +47,8 @@ pub(crate) fn locate(repo: &NotesRepo, threads: &[Thread]) -> Vec<Located> {
         .iter()
         .map(|thread| {
             let now = changes
-                .entry(thread.change_id.as_str())
-                .or_insert_with(|| repo.change(&thread.change_id))
+                .entry(thread.change_id())
+                .or_insert_with(|| repo.change(thread.change_id()))
                 .clone();
             let Some(change) = &now else {
                 return Located {

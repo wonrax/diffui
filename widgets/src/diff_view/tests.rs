@@ -1640,3 +1640,40 @@ fn a_spot_span_covers_its_insets() {
     assert_eq!(top, index.row_tops[row]);
     assert_eq!(height, index.row_heights[row] + 75.0);
 }
+
+/// A press on a row's line numbers names its line when the props take
+/// gutter presses; one on its text doesn't.
+#[test]
+fn the_gutter_names_the_line_under_a_press() {
+    let hunks = test_hunks();
+    let props = test_props(hunks.len()).on_gutter_press(|_, _, _| {});
+    let view = view_of(&props, &hunks);
+    let cells = TestCaches::default();
+    let bounds = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 2000.0,
+    };
+    view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+    let index = cells.index.borrow();
+    let row = index.row_of_line(1, 0, 1).unwrap();
+    let y = index.row_tops[row] + 2.0;
+    assert_eq!(
+        view.gutter_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
+        Some(LineAt {
+            file: 1,
+            hunk: 0,
+            line: 1
+        })
+    );
+    assert_eq!(
+        view.gutter_line_at(&index, 0.0, bounds, Point::new(400.0, y)),
+        None
+    );
+    let without = test_props(hunks.len());
+    assert_eq!(
+        view_of(&without, &hunks).gutter_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
+        None
+    );
+}

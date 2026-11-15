@@ -2709,12 +2709,8 @@ impl Diffui {
         // A reply's field is under its thread in the diff, or nowhere.
         let stale = {
             let tab = self.active();
-            tab.note_reply().is_some_and(|reply| {
-                tab.main_view != MainView::Diff
-                    || !crate::notes::app::diff_notes(tab)
-                        .iter()
-                        .any(|(_, note)| note.thread.id == reply.id)
-            })
+            tab.note_reply()
+                .is_some_and(|reply| !crate::notes::app::reply_on_screen(tab, reply))
         };
         if stale {
             self.active_mut().pop_mode(ModeKind::NoteReply);

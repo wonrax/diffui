@@ -77,18 +77,39 @@ pub(crate) struct Resolved {
     pub(crate) at: u64,
 }
 
+/// What a thread is about. Tagged by `kind` in the file, so another kind
+/// (a patch, a folder compare, keyed by content) can join without migrating
+/// the store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Subject {
+    /// A jj change of the repository the store belongs to.
+    Change {
+        /// Full, in jj's reverse hex.
+        change_id: String,
+        /// The commit the note was written against.
+        commit_id: String,
+        /// The change's title then, shown once the change is gone.
+        #[serde(default)]
+        title: String,
+    },
+}
+
+/// The store format's version, written into every thread.
+pub(crate) const VERSION: u32 = 1;
+
+fn version() -> u32 {
+    VERSION
+}
+
 /// One note and its replies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Thread {
+    #[serde(default = "version")]
+    pub(crate) version: u32,
     pub(crate) id: String,
-    /// Full, in jj's reverse hex.
-    pub(crate) change_id: String,
-    /// The commit the note was written against.
-    pub(crate) commit_id: String,
-    /// The change's title then, shown once the change is gone.
-    #[serde(default)]
-    pub(crate) title: String,
-    /// `None`: a note on the whole change.
+    pub(crate) subject: Subject,
+    /// `None`: a note on the whole subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) anchor: Option<Anchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +118,41 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
+    /// A new thread on `change`, its first message `first`; the store
+    /// gives it its id.
+    pub(crate) fn on_change(
+        change: &diffui_core::notes::ChangeNow,
+        anchor: Option<Anchor>,
+        first: Message,
+    ) -> Self {
+        Self {
+            version: VERSION,
+            id: String::new(),
+            subject: Subject::Change {
+                change_id: change.change_id.clone(),
+                commit_id: change.commit_id.clone(),
+                title: change.title.clone(),
+            },
+            anchor,
+            resolved: None,
+            messages: vec![first],
+        }
+    }
+
+    /// The change it's on.
+    pub(crate) fn change_id(&self) -> &str {
+        match &self.subject {
+            Subject::Change { change_id, .. } => change_id,
+        }
+    }
+
+    /// The change's title when the note was written.
+    pub(crate) fn title(&self) -> &str {
+        match &self.subject {
+            Subject::Change { title, .. } => title,
+        }
+    }
+
     pub(crate) fn last(&self) -> Option<&Message> {
         self.messages.last()
     }
@@ -272,7 +328,7 @@ impl Store {
         let _lock = self.lock()?;
         let mut seed = fnv(&now().to_le_bytes())
             ^ u64::from(std::process::id()).rotate_left(32)
-            ^ fnv(thread.change_id.as_bytes());
+            ^ fnv(thread.change_id().as_bytes());
         seed ^= SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| u64::from(since.subsec_nanos()));
@@ -319,6 +375,43 @@ impl Store {
     }
 }
 
+/// Where a tab's threads come from and go to. The app reads and writes
+/// notes only through this, so a source that isn't the on-disk [`Store`]
+/// (threads kept in memory for a tab with no repository) can stand in.
+pub(crate) trait Source: Send + Sync + std::fmt::Debug {
+    fn load(&self) -> Vec<Thread>;
+    /// Keep `thread` under a fresh id, which it returns.
+    fn create(&self, thread: Thread) -> io::Result<String>;
+    /// Change thread `id`; `change` says whether it did anything.
+    fn update(&self, id: &str, change: &mut dyn FnMut(&mut Thread) -> bool) -> io::Result<Thread>;
+    fn delete(&self, ids: &[String]) -> io::Result<usize>;
+    /// A folder whose changes mean the threads changed, when something
+    /// outside the app can change them.
+    fn watched(&self) -> Option<PathBuf>;
+}
+
+impl Source for Store {
+    fn load(&self) -> Vec<Thread> {
+        Store::load(self)
+    }
+
+    fn create(&self, thread: Thread) -> io::Result<String> {
+        Store::create(self, thread)
+    }
+
+    fn update(&self, id: &str, change: &mut dyn FnMut(&mut Thread) -> bool) -> io::Result<Thread> {
+        Store::update(self, id, change)
+    }
+
+    fn delete(&self, ids: &[String]) -> io::Result<usize> {
+        Store::delete(self, ids)
+    }
+
+    fn watched(&self) -> Option<PathBuf> {
+        Some(self.threads_dir())
+    }
+}
+
 /// Six characters from an alphabet without look-alikes.
 fn short_id(seed: u64) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
@@ -358,20 +451,21 @@ mod tests {
     }
 
     pub(crate) fn thread(change: &str, body: &str) -> Thread {
-        Thread {
-            id: String::new(),
+        let change = diffui_core::notes::ChangeNow {
             change_id: change.to_owned(),
             commit_id: "00".to_owned(),
             title: String::new(),
-            anchor: None,
-            resolved: None,
-            messages: vec![Message {
+        };
+        Thread::on_change(
+            &change,
+            None,
+            Message {
                 author: "claude".to_owned(),
                 role: Role::Agent,
                 at: now(),
                 body: body.to_owned(),
-            }],
-        }
+            },
+        )
     }
 
     #[test]

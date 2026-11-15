@@ -33,6 +33,14 @@ Notes follow the change through amends and rebases: they're anchored to its
 change id and the text of the lines, not to a commit. When those lines are
 rewritten, the note stays on its file, marked outdated.
 
+**The user writes notes too.** Reviewing, the user starts notes of their
+own on lines, files or the change: feedback for you. They wait on you like
+a reply does (status `replied`, the first message's role `user`), so `wait`
+and `list --waiting` return them. Treat each as a request: fix it, then
+reply under it. The user may also paste notes into your chat as Markdown
+(what `diffui notes export` prints); the ids aren't in the paste, so find
+them with `list --waiting` before replying.
+
 **The loop.**
 
 1. Finish the change, then leave notes:
@@ -58,15 +66,16 @@ rewritten, the note stays on its file, marked outdated.
 | `diffui notes add [-r REV] [--file PATH [--line N[-M]] [--old]] --as NAME TEXT` | Leave a note; prints it with its id. |
 | `diffui notes reply ID --as NAME [--resolve] TEXT` | Answer under a note. |
 | `diffui notes resolve ID…` / `diffui notes reopen ID…` | Resolve, or open again. |
-| `diffui notes list [-r REVSET] [--waiting] [--resolved] [--by NAME]` | Notes grouped by change, newest activity first: open ones, or with `--resolved` all; `--waiting` only those the user replied to. |
+| `diffui notes list [-r REVSET] [--waiting] [--resolved] [--by NAME]` | Notes grouped by change, newest activity first: open ones, or with `--resolved` all; `--waiting` only those the user wrote in last (replied to, or started). |
 | `diffui notes show ID` | One note and its replies. |
 | `diffui notes wait [-r REVSET] [--timeout 30m] [--new]` | Block until the user replies (see above). |
+| `diffui notes export [ID…] [-r REVSET] [--resolved]` | Notes as Markdown (`--format md`, the default and only one): each change's id and title, each note's `path:lines`, the lines in a fence, and every message. What the app's Copy writes. |
 | `diffui notes delete ID…` | Delete notes. |
 | `diffui notes prune [--resolved] [--archived] [-r REVSET] [--dry-run]` | Delete in bulk: resolved notes, archived ones (their change was abandoned), or every note on some changes. |
 
 Every verb takes `--repo <path>` (default: the current directory) and
 `--json`. In the output a note's status is `open` (no reply), `replied` (the
-user answered: your turn) or `resolved`; `outdated` means its lines are gone
+user wrote last, a reply or a note of theirs: your turn) or `resolved`; `outdated` means its lines are gone
 from the change, `archived` that the change was abandoned. The user's
 messages have the role `user`.
 

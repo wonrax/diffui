@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use diffui_core::RevisionSelection;
 use diffui_core::notes::{NotesRepo, Side};
 
-use super::store::{Anchor, Lines, Message, Role, Store, Thread, now};
+use super::store::{Anchor, Lines, Message, Role, Source, Thread, now};
 use crate::{Cx, Diffui, TabId};
 
 /// One finding: where it points and what it says.
@@ -117,19 +117,17 @@ fn threads_for(
         .into_iter()
         .next()
         .ok_or("the revision is gone")?;
-    let thread = |anchor: Option<Anchor>, body: String| Thread {
-        id: String::new(),
-        change_id: change.change_id.clone(),
-        commit_id: change.commit_id.clone(),
-        title: change.title.clone(),
-        anchor,
-        resolved: None,
-        messages: vec![Message {
-            author: author.to_owned(),
-            role: Role::Agent,
-            at: now(),
-            body,
-        }],
+    let thread = |anchor: Option<Anchor>, body: String| {
+        Thread::on_change(
+            &change,
+            anchor,
+            Message {
+                author: author.to_owned(),
+                role: Role::Agent,
+                at: now(),
+                body,
+            },
+        )
     };
     let mut threads = Vec::new();
     let mut rest = Vec::new();
@@ -181,7 +179,8 @@ impl Diffui {
         let root: Option<PathBuf> = state
             .and_then(|state| state.repository.as_ref())
             .map(|repository| repository.root.clone());
-        let store: Option<Store> = state.and_then(|state| state.notes.store.clone());
+        let store: Option<std::sync::Arc<dyn Source>> =
+            state.and_then(|state| state.notes.source.clone());
         let (Some(revision), Some(root), Some(store), false) = (
             revision,
             root,

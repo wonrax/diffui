@@ -622,11 +622,175 @@ fn an_ai_review_without_findings_stays_in_the_panel() {
 #[test]
 fn the_skill_teaches_every_notes_verb() {
     for verb in [
-        "add", "reply", "resolve", "reopen", "list", "show", "wait", "delete", "prune",
+        "add", "reply", "resolve", "reopen", "list", "show", "wait", "export", "delete", "prune",
     ] {
         assert!(
             crate::ctl::SKILL.contains(&format!("`diffui notes {verb}")),
             "{verb}"
         );
     }
+}
+
+#[test]
+fn export_writes_the_markdown_copy_writes() {
+    let repo = scratch_repo("export");
+    let id = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "--file",
+            "a.txt",
+            "--line",
+            "2-3",
+            "Why these?",
+        ],
+    );
+    add(&repo, &["--as", "claude", "Done otherwise."]);
+    let resolved = add(&repo, &["--as", "codex", "--file", "a.txt", "Old."]);
+    notes(&repo, &["resolve", &resolved]);
+    user_reply(&repo, &id, "Make it one line.");
+    let change = jj(&repo, &["log", "--no-graph", "-r", "@", "-T", "change_id"]);
+    let (code, out, err) = notes(&repo, &["export"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "# Review notes
+
+## Change `{change}`: Add a
+
+### The whole change
+
+**claude:** Done otherwise.
+
+### `a.txt:2-3`
+
+```
+two
+three
+```
+
+**claude:** Why these?
+
+**Reviewer:** Make it one line.
+"
+        )
+    );
+    // Resolved ones on asking, by id too; the same text as JSON.
+    let (_, all, _) = notes(&repo, &["export", "--resolved"]);
+    assert!(
+        all.contains("### `a.txt` (the whole file) (resolved)"),
+        "{all}"
+    );
+    let one = notes_json(&repo, &["export", &resolved]);
+    assert_eq!(one["count"], 1);
+    assert!(
+        one["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("**codex:** Old.")
+    );
+}
+
+#[test]
+fn the_user_starts_notes_that_wait_on_the_agent_and_copies_them() {
+    let repo = scratch_repo("user-notes");
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the diff and notes", |ui| {
+        ui.active().notes.settled() && !ui.active().session.document.files.is_empty()
+    });
+    let row = |h: &mut Harness, text: &str| {
+        let text = text.to_owned();
+        h.read(move |ui| {
+            let file = &ui.active().session.document.files[0];
+            file.hunks.iter().enumerate().find_map(|(hunk, view)| {
+                let line = view.lines.iter().position(|line| line.content == text)?;
+                Some(crate::diff_view::LineAt {
+                    file: 0,
+                    hunk,
+                    line,
+                })
+            })
+        })
+        .expect("the row")
+    };
+    let press = |line, extend| crate::diff_view::LinePress {
+        line,
+        extend,
+        one_side: false,
+    };
+    // A gutter press on "one", shift on "three": the note is on lines 1-3.
+    let (one, three) = (row(&mut h, "one"), row(&mut h, "three"));
+    h.perform(Action::Notes(NotesMsg::StartNote(super::NoteTarget::Line(
+        press(one, false),
+    ))));
+    h.perform(Action::Notes(NotesMsg::StartNote(super::NoteTarget::Line(
+        press(three, true),
+    ))));
+    h.perform(Action::Notes(NotesMsg::ReplyEdited(
+        "Use a loop here.".to_owned(),
+    )));
+    h.frames();
+    let field = h.bounds("note-reply-send");
+    assert!(field.size.height > gpui_kit::px(10.0));
+    h.press("cmd-enter");
+    h.wait_until("the note", |ui| ui.active().notes.notes.len() == 1);
+    h.perform(Action::Notes(NotesMsg::StartNote(super::NoteTarget::File(
+        "a.txt".to_owned(),
+    ))));
+    h.perform(Action::Notes(NotesMsg::ReplyEdited(
+        "Rename the file.".to_owned(),
+    )));
+    h.perform(Action::Notes(NotesMsg::SendReply));
+    h.perform(Action::Notes(NotesMsg::StartNote(
+        super::NoteTarget::Change,
+    )));
+    h.perform(Action::Notes(NotesMsg::ReplyEdited(
+        "Split this change.".to_owned(),
+    )));
+    h.perform(Action::Notes(NotesMsg::SendReply));
+    h.wait_until("three notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 3
+    });
+
+    // The agent sees all three waiting on it.
+    let waiting = threads(&repo, &["list", "--waiting"]);
+    assert_eq!(waiting.len(), 3);
+    assert!(waiting.iter().all(|thread| thread["status"] == "replied"));
+    assert!(
+        waiting
+            .iter()
+            .all(|thread| thread["messages"][0]["role"] == "user")
+    );
+    let lines = waiting
+        .iter()
+        .find(|thread| thread["start"] != Value::Null)
+        .expect("the line note");
+    assert_eq!(
+        (lines["start"].clone(), lines["end"].clone()),
+        (1.into(), 3.into())
+    );
+    assert_eq!(lines["text"], serde_json::json!(["one", "two", "three"]));
+    assert_eq!(notes(&repo, &["wait", "--timeout", "5s"]).0, 0);
+    // The Notes view's agent filter has them too.
+    h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnAgent)));
+    assert_eq!(h.read(|ui| super::view::listed(ui.active()).len()), 3);
+
+    // Copy: the change's open notes, as the export writes them, and a toast.
+    h.perform(Action::Notes(NotesMsg::CopyChange { resolved: false }));
+    let copied = h
+        .with_window(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .expect("copied text");
+    let (_, exported, _) = notes(&repo, &["export"]);
+    assert_eq!(copied, exported);
+    assert!(
+        copied.contains("**Reviewer:** Use a loop here."),
+        "{copied}"
+    );
+    assert_eq!(
+        h.read(|ui| ui.toasts.last().map(|toast| toast.title.to_string())),
+        Some("Copied 3 notes as Markdown".to_owned())
+    );
 }

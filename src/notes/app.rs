@@ -10,7 +10,7 @@ use diffui_core::{DiffFileStatus, DiffLineKind, hunk_conflict_region};
 use futures::StreamExt as _;
 
 use super::locate::{Located, Place, locate};
-use super::store::{self, Role, Side, Store, Thread};
+use super::store::{self, Role, Side, Source, Store, Thread};
 use crate::diff_view::{DocSpot, LineAt};
 use crate::modes::ModeKind;
 use crate::{Action, Cx, Diffui, MainView, TabId, TabState, Vcs};
@@ -22,6 +22,14 @@ pub(crate) enum NotesMsg {
     Toggle(String),
     /// Open the reply field under a thread.
     StartReply(String),
+    /// Open the field for a new note of the user's own.
+    StartNote(NoteTarget),
+    /// Copy these threads as Markdown.
+    Copy(Vec<String>),
+    /// Copy the open notes on the change on screen, or all of them.
+    CopyChange {
+        resolved: bool,
+    },
     ReplyEdited(String),
     SendReply,
     CancelReply,
@@ -115,11 +123,49 @@ impl Note {
     }
 }
 
-/// The reply being written: the [`crate::modes::TabMode::NoteReply`] mode.
+/// What's being written in the reply field: the
+/// [`crate::modes::TabMode::NoteReply`] mode.
 #[derive(Debug, Clone)]
 pub(crate) struct NoteReply {
-    pub(crate) id: String,
+    pub(crate) to: ReplyTo,
     pub(crate) draft: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ReplyTo {
+    /// A reply under this thread.
+    Thread(String),
+    /// A note the user starts.
+    New(NewNote),
+}
+
+impl NoteReply {
+    /// The thread it answers, when it answers one.
+    pub(crate) fn thread(&self) -> Option<&str> {
+        match &self.to {
+            ReplyTo::Thread(id) => Some(id),
+            ReplyTo::New(_) => None,
+        }
+    }
+}
+
+/// A note the user is starting: on what, and where its field shows.
+#[derive(Debug, Clone)]
+pub(crate) struct NewNote {
+    pub(crate) change: diffui_core::notes::ChangeNow,
+    pub(crate) anchor: Option<super::store::Anchor>,
+    pub(crate) spot: DocSpot,
+    /// The rows of the diff it's on, first and last, to extend from.
+    rows: Option<(LineAt, LineAt)>,
+}
+
+/// Where the user starts a note.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NoteTarget {
+    /// The line under a gutter press (shift: from the line already picked).
+    Line(crate::diff_view::LinePress),
+    File(String),
+    Change,
 }
 
 /// The Notes view's own state.
@@ -143,7 +189,8 @@ struct Watch {
 /// One tab's notes.
 #[derive(Default)]
 pub(crate) struct TabNotes {
-    pub(crate) store: Option<Store>,
+    /// Where the threads live: the repository's store on disk.
+    pub(crate) source: Option<std::sync::Arc<dyn Source>>,
     /// Every thread of the repository and where it sits, as last loaded.
     pub(crate) notes: Rc<Vec<Note>>,
     /// The operation the threads were located at.
@@ -185,7 +232,7 @@ impl TabNotes {
     pub(crate) fn open_on_change(&self, change_id: &str) -> usize {
         self.notes
             .iter()
-            .filter(|note| note.counts() && note.thread.change_id == change_id)
+            .filter(|note| note.counts() && note.thread.change_id() == change_id)
             .count()
     }
 
@@ -220,7 +267,7 @@ pub(crate) fn shown_change(tab: &TabState) -> Option<&str> {
 /// Where `note` goes in the diff on screen, or `None` when it isn't on its
 /// change, or is hidden.
 pub(crate) fn spot_of(tab: &TabState, note: &Note) -> Option<DocSpot> {
-    if shown_change(tab)? != note.thread.change_id || note.located.archived() {
+    if shown_change(tab)? != note.thread.change_id() || note.located.archived() {
         return None;
     }
     if tab.notes.hide_resolved && note.thread.resolved.is_some() {
@@ -270,6 +317,20 @@ pub(crate) fn diff_notes(tab: &TabState) -> Vec<(DocSpot, &Note)> {
 
 fn first_at(thread: &Thread) -> u64 {
     thread.messages.first().map_or(0, |message| message.at)
+}
+
+/// Whether `reply`'s field is on screen: its thread, or the change a new
+/// note is on, in the diff.
+pub(crate) fn reply_on_screen(tab: &TabState, reply: &NoteReply) -> bool {
+    if tab.main_view != MainView::Diff {
+        return false;
+    }
+    match &reply.to {
+        ReplyTo::Thread(id) => diff_notes(tab)
+            .iter()
+            .any(|(_, note)| note.thread.id == *id),
+        ReplyTo::New(note) => shown_change(tab) == Some(note.change.change_id.as_str()),
+    }
 }
 
 /// What a spot of the diff is, for next/previous and the overview strip.
@@ -348,7 +409,7 @@ pub(crate) fn file_note_count(ui: &Diffui, index: usize) -> usize {
         .iter()
         .filter(|note| {
             note.counts()
-                && note.thread.change_id == change
+                && note.thread.change_id() == change
                 && note
                     .thread
                     .anchor
@@ -397,6 +458,7 @@ enum Write {
     Resolve(Vec<String>),
     Reopen(Vec<String>),
     Delete(Vec<String>),
+    Create(Thread),
 }
 
 impl Diffui {
@@ -415,14 +477,15 @@ impl Diffui {
             else {
                 continue;
             };
-            if state.notes.store.is_none() {
+            if state.notes.source.is_none() {
                 let Some(store) =
                     diffui_core::notes::repo_dir(&root).and_then(|dir| Store::for_repo(&dir))
                 else {
                     continue;
                 };
-                state.notes.watch = watch(&store, tab, cx);
-                state.notes.store = Some(store);
+                let source: std::sync::Arc<dyn Source> = std::sync::Arc::new(store);
+                state.notes.watch = watch(source.as_ref(), tab, cx);
+                state.notes.source = Some(source);
                 state.notes.stale = true;
             }
             let operation = state.session.graph_operation().map(str::to_owned);
@@ -440,7 +503,7 @@ impl Diffui {
         let Some(state) = self.tab_mut(tab) else {
             return;
         };
-        let Some(store) = state.notes.store.clone() else {
+        let Some(store) = state.notes.source.clone() else {
             return;
         };
         state.notes.loading = true;
@@ -506,7 +569,7 @@ impl Diffui {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
-        let Some(store) = self.active().notes.store.clone() else {
+        let Some(store) = self.active().notes.source.clone() else {
             return;
         };
         let (send, receive) = futures::channel::oneshot::channel();
@@ -515,14 +578,14 @@ impl Diffui {
             .spawn(move || {
                 let result = match write {
                     Write::Reply { id, body } => store
-                        .update(&id, |thread| {
+                        .update(&id, &mut |thread| {
                             store::reply(thread, "you", Role::User, &body);
                             true
                         })
                         .map(|_| ()),
                     Write::Resolve(ids) => ids.iter().try_for_each(|id| {
                         store
-                            .update(id, |thread| {
+                            .update(id, &mut |thread| {
                                 let open = thread.resolved.is_none();
                                 if open {
                                     thread.resolved = Some(store::Resolved {
@@ -536,10 +599,11 @@ impl Diffui {
                     }),
                     Write::Reopen(ids) => ids.iter().try_for_each(|id| {
                         store
-                            .update(id, |thread| thread.resolved.take().is_some())
+                            .update(id, &mut |thread| thread.resolved.take().is_some())
                             .map(|_| ())
                     }),
                     Write::Delete(ids) => store.delete(&ids).map(|_| ()),
+                    Write::Create(thread) => store.create(thread).map(|_| ()),
                 };
                 let _ = send.send(result.map_err(|error| error.to_string()));
             });
@@ -570,10 +634,27 @@ impl Diffui {
                 let tab = self.active_mut();
                 tab.notes.expanded.insert(id.clone());
                 tab.push_mode(crate::modes::TabMode::NoteReply(NoteReply {
-                    id,
+                    to: ReplyTo::Thread(id),
                     draft: String::new(),
                 }));
                 crate::input::focus(super::inline::REPLY_FIELD, cx);
+            }
+            NotesMsg::StartNote(target) => self.start_note(target, cx),
+            NotesMsg::Copy(ids) => self.copy_notes(&ids, cx),
+            NotesMsg::CopyChange { resolved } => {
+                let tab = self.active();
+                let Some(change) = shown_change(tab) else {
+                    return;
+                };
+                let ids: Vec<String> = tab
+                    .notes
+                    .notes
+                    .iter()
+                    .filter(|note| note.thread.change_id() == change)
+                    .filter(|note| resolved || note.thread.resolved.is_none())
+                    .map(|note| note.thread.id.clone())
+                    .collect();
+                self.copy_notes(&ids, cx);
             }
             NotesMsg::ReplyEdited(text) => {
                 if let Some(reply) = self.active_mut().note_reply_mut() {
@@ -589,7 +670,20 @@ impl Diffui {
                     return;
                 }
                 self.active_mut().pop_mode(ModeKind::NoteReply);
-                self.write_notes(Write::Reply { id: reply.id, body }, cx);
+                let write = match reply.to {
+                    ReplyTo::Thread(id) => Write::Reply { id, body },
+                    ReplyTo::New(note) => Write::Create(Thread::on_change(
+                        &note.change,
+                        note.anchor,
+                        store::Message {
+                            author: "you".to_owned(),
+                            role: Role::User,
+                            at: store::now(),
+                            body,
+                        },
+                    )),
+                };
+                self.write_notes(write, cx);
             }
             NotesMsg::CancelReply => {
                 self.active_mut().pop_mode(ModeKind::NoteReply);
@@ -657,6 +751,102 @@ impl Diffui {
                 self.active_mut().notes.view.selected = ids.into_iter().collect();
             }
         }
+    }
+
+    /// Copy the threads `ids` names as Markdown (see [`super::export`]).
+    fn copy_notes(&mut self, ids: &[String], cx: &mut Cx) {
+        let tab = self.active();
+        let mut notes: Vec<&Note> = ids.iter().filter_map(|id| tab.notes.get(id)).collect();
+        if notes.is_empty() {
+            self.push_info_toast("No notes to copy", "");
+            return;
+        }
+        notes.sort_by_key(|note| std::cmp::Reverse(note.thread.activity()));
+        let pairs: Vec<(&Thread, &Located)> = notes
+            .iter()
+            .map(|note| (&note.thread, &note.located))
+            .collect();
+        let text = super::export::markdown(&pairs);
+        let count = notes.len();
+        crate::write_clipboard(text, cx);
+        let noun = if count == 1 { "note" } else { "notes" };
+        self.push_info_toast(format!("Copied {count} {noun} as Markdown"), "");
+    }
+
+    /// Open the field for a new note of the user's on `target` of the change
+    /// on screen.
+    fn start_note(&mut self, target: NoteTarget, cx: &mut Cx) {
+        let tab = self.active();
+        let Some(details) = tab.session.revision_details.as_ref() else {
+            return;
+        };
+        let Some(change_id) = shown_change(tab) else {
+            return;
+        };
+        let change = diffui_core::notes::ChangeNow {
+            change_id: change_id.to_owned(),
+            commit_id: details.commit_id.clone(),
+            title: details.description.lines().next().unwrap_or("").to_owned(),
+        };
+        let files = &tab.session.document.files;
+        let earlier = tab.note_reply().and_then(|reply| match &reply.to {
+            ReplyTo::New(note) => note.rows,
+            ReplyTo::Thread(_) => None,
+        });
+        let new = match target {
+            NoteTarget::Change => NewNote {
+                change,
+                anchor: None,
+                spot: DocSpot::Top,
+                rows: None,
+            },
+            NoteTarget::File(path) => {
+                let Some(file) = files.iter().position(|file| file.path == path) else {
+                    return;
+                };
+                NewNote {
+                    change,
+                    anchor: Some(super::store::Anchor { path, lines: None }),
+                    spot: DocSpot::File(file),
+                    rows: None,
+                }
+            }
+            NoteTarget::Line(press) => {
+                let at = press.line;
+                let (from, to) = match earlier {
+                    Some((first, last))
+                        if press.extend && (first.file, first.hunk) == (at.file, at.hunk) =>
+                    {
+                        (first.min(at).min(last), last.max(at).max(first))
+                    }
+                    _ => (at, at),
+                };
+                let Some(lines) = picked_lines(tab, from, to) else {
+                    return;
+                };
+                NewNote {
+                    change,
+                    anchor: Some(super::store::Anchor {
+                        path: files[at.file].path.clone(),
+                        lines: Some(lines),
+                    }),
+                    spot: DocSpot::Line(to),
+                    rows: Some((from, to)),
+                }
+            }
+        };
+        let draft = self
+            .active()
+            .note_reply()
+            .filter(|reply| matches!(reply.to, ReplyTo::New(_)))
+            .map(|reply| reply.draft.clone())
+            .unwrap_or_default();
+        self.active_mut()
+            .push_mode(crate::modes::TabMode::NoteReply(NoteReply {
+                to: ReplyTo::New(new),
+                draft,
+            }));
+        crate::input::focus(super::inline::REPLY_FIELD, cx);
     }
 
     fn step_spot(&mut self, by: isize) {
@@ -744,7 +934,7 @@ impl Diffui {
             state.notes.pending_open = None;
             return;
         };
-        if shown_change(state) != Some(note.thread.change_id.as_str())
+        if shown_change(state) != Some(note.thread.change_id())
             || state.session.document.files.is_empty() && note.thread.anchor.is_some()
         {
             return;
@@ -759,11 +949,45 @@ impl Diffui {
     }
 }
 
+/// The lines of one side from row `from` to row `to` of a hunk, as an
+/// anchor: the side of `to` (a removed line's old side, else the new), and
+/// that side's rows between.
+fn picked_lines(tab: &TabState, from: LineAt, to: LineAt) -> Option<super::store::Lines> {
+    let hunk = tab
+        .session
+        .document
+        .files
+        .get(to.file)?
+        .hunks
+        .get(to.hunk)?;
+    let side = match hunk.lines.get(to.line)?.kind {
+        DiffLineKind::Deletion => Side::Old,
+        _ => Side::New,
+    };
+    let rows: Vec<&diffui_core::DiffLine> = hunk.lines[from.line..=to.line]
+        .iter()
+        .filter(|line| match side {
+            Side::Old => line.kind != DiffLineKind::Addition && line.old_line.is_some(),
+            Side::New => line.kind != DiffLineKind::Deletion && line.new_line.is_some(),
+        })
+        .collect();
+    let first = rows.first()?;
+    let start = match side {
+        Side::Old => first.old_line?,
+        Side::New => first.new_line?,
+    };
+    Some(super::store::Lines {
+        side,
+        start,
+        text: rows.iter().map(|line| line.content.clone()).collect(),
+    })
+}
+
 /// Watch `store` and tell the app when it changes. `None` when the platform
 /// won't watch; the notes then refresh with the graph.
-fn watch(store: &Store, tab: TabId, cx: &mut Cx) -> Option<Watch> {
+fn watch(source: &dyn Source, tab: TabId, cx: &mut Cx) -> Option<Watch> {
     use notify::Watcher as _;
-    let dir = store.threads_dir();
+    let dir = source.watched()?;
     std::fs::create_dir_all(&dir).ok()?;
     let (send, mut receive) = futures::channel::mpsc::unbounded::<()>();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {

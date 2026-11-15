@@ -609,6 +609,8 @@ pub struct DiffProps {
     overview: Option<Marks>,
     /// Scroll `spot` (and an inset under it) into view when the token changes.
     reveal: Option<(DocSpot, u64)>,
+    /// A press on a diff row's line numbers.
+    on_gutter_press: Option<Callback<LinePress>>,
 }
 
 impl DiffProps {
@@ -664,6 +666,7 @@ impl DiffProps {
             inset_heights: Default::default(),
             overview: None,
             reveal: None,
+            on_gutter_press: None,
         }
     }
 
@@ -850,6 +853,16 @@ impl DiffProps {
     /// Draw the overview strip along the scrollbar (see [`Mark`]).
     pub fn overview(mut self, marks: Marks) -> Self {
         self.overview = Some(marks);
+        self
+    }
+
+    /// Fire `f` for a press on a diff row's line numbers (shift held:
+    /// `extend`). The press then starts no selection.
+    pub fn on_gutter_press(
+        mut self,
+        f: impl Fn(&LinePress, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_gutter_press = Some(callback(f));
         self
     }
 

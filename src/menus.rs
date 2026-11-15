@@ -850,6 +850,13 @@ impl Diffui {
                     path: Some(path.clone()),
                 },
             ));
+            if crate::notes::app::available(self) {
+                items.push(self.menu_row(
+                    "Add a note",
+                    "notes.add-file",
+                    CommandArg::Path(path.clone()),
+                ));
+            }
             items.push(MenuEntry::Separator);
         }
         if is_file
