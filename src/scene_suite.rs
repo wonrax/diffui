@@ -3188,7 +3188,7 @@ fn all() -> Vec<Scene> {
     );
     t.add(s(
         "notes-view",
-        "The Notes view on Waiting on you: the left pane is the notes list, grouped under change ids and titles, the filter in its head; the line note selected, its change, author and time, its lines as a diff excerpt and its thread on the right with Open in diff.",
+        "The Notes view on For you with the working copy's line note selected: the list grouped under change sections, and on the right its change's three notes stacked in one scroll (the change note, the frame_loop.rs file note, the main.rs line note with its highlighted excerpt), scrolled to the line note.",
         "Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, select the line note.",
         |c| {
             let (line, file, _) = working_copy_notes(c);
@@ -3218,6 +3218,26 @@ fn all() -> Vec<Scene> {
             for id in [line, file, change] {
                 c.act(Action::Notes(crate::notes::NotesMsg::Select(id)));
             }
+        },
+    ));
+    t.add(s(
+        "notes-view-narrow",
+        "The Notes view with its pane at its narrowest: the filter's three segments sharing the track, each label whole or cut inside its own segment, the menu button in its own room.",
+        "Leave the working copy's notes; open the Notes view; drag the pane to its minimum.",
+        |c| {
+            working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.h.act(|ui, _| ui.sidebar_width = ui.sidebar_min_width);
+        },
+    ));
+    t.add(s(
+        "notes-view-wide",
+        "The Notes view with a wide pane: the filter's segments filling the track in equal shares, no gap at its end.",
+        "Leave the working copy's notes; open the Notes view; widen the pane.",
+        |c| {
+            working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.h.act(|ui, _| ui.sidebar_width = 560.0);
         },
     ));
     t.add(s(

@@ -56,8 +56,16 @@ pub(crate) enum NotesMsg {
     Filter(Filter),
     /// Every change's notes again, after [`NotesMsg::ShowChange`].
     AllChanges,
-    /// Show this thread on the Notes view's right.
+    /// Show this thread's change on the Notes view's right, scrolled to it.
     SelectThread(String),
+    /// Show this change's threads on the Notes view's right, from the top.
+    SelectChange(String),
+    /// The stack scrolled to its `n`th thread: the list follows.
+    StackScrolled(usize),
+    /// Move to the next (`1`) or previous (`-1`) thread of the stack.
+    StackStep(isize),
+    /// Stack every thread of the shown change, or only the filter's.
+    AllInChange(bool),
     /// The filter menu's pick: a [`Filter::name`], `author:NAME` or
     /// `everyone`.
     FilterNamed(String),
@@ -115,6 +123,16 @@ impl Filter {
         ]
         .into_iter()
         .find(|filter| filter.name() == name)
+    }
+
+    /// Its label in the Notes view's head, short enough not to need cutting
+    /// at the pane's usual widths.
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Filter::WaitingOnYou => "For you",
+            Filter::WaitingOnAgent => "For agent",
+            other => other.label(),
+        }
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -213,11 +231,36 @@ pub(crate) struct ViewState {
     pub(crate) confirm_delete: Option<Vec<String>>,
     /// The thread shown on the right.
     pub(crate) thread: Option<String>,
-    /// Its anchored lines, as the diff view's excerpt reads them.
-    pub(crate) excerpt: Vec<diffui_core::DiffHunkView>,
-    /// The excerpt's file as the diff has it: its status and counts, once
-    /// read.
-    pub(crate) excerpt_file: Option<diffui_core::DiffFile>,
+    /// The change the right side shows, all its threads stacked.
+    pub(crate) shown: Option<String>,
+    /// Every thread of the shown change, the filter set aside.
+    pub(crate) all_in_change: bool,
+    /// The stack, in document order: one diff "file" per thread.
+    pub(crate) stack: Vec<StackItem>,
+    /// Bumped when the stack is rebuilt or its excerpts land.
+    pub(crate) stack_version: u64,
+    /// Where the stack scrolls to, and the token that asks.
+    pub(crate) reveal: Option<(DocSpot, u64)>,
+    /// A reveal was just asked for: the stack's next scroll report is its
+    /// answer (or, when it couldn't scroll there, wherever it stayed), not
+    /// the user moving.
+    pub(crate) revealing: bool,
+}
+
+/// One thread in the Notes view's stack: its excerpt as diff rows, and
+/// what its file header says.
+#[derive(Debug, Clone)]
+pub(crate) struct StackItem {
+    pub(crate) id: String,
+    /// The path, or "Whole change".
+    pub(crate) title: String,
+    pub(crate) status: diffui_core::DiffFileStatus,
+    pub(crate) additions: usize,
+    pub(crate) deletions: usize,
+    /// The excerpt; empty for a note without lines.
+    pub(crate) hunks: Vec<diffui_core::DiffHunkView>,
+    /// The file's real diff has replaced the anchored lines.
+    pub(crate) loaded: bool,
 }
 
 /// The store watch: dropped with the tab.
@@ -281,42 +324,6 @@ impl TabNotes {
     }
 
     /// Load again: the store changed.
-    /// The anchored lines of the Notes view's thread, as rows.
-    fn excerpt_of(&self) -> Vec<diffui_core::DiffHunkView> {
-        let Some(note) = self.view.thread.as_deref().and_then(|id| self.get(id)) else {
-            return Vec::new();
-        };
-        let Some(lines) = note
-            .thread
-            .anchor
-            .as_ref()
-            .and_then(|anchor| anchor.lines.as_ref())
-        else {
-            return Vec::new();
-        };
-        let start = match note.located.place {
-            Place::Lines { start, .. } => start,
-            _ => lines.start,
-        };
-        let rows = lines
-            .text
-            .iter()
-            .enumerate()
-            .map(|(offset, text)| diffui_core::DiffLine {
-                kind: DiffLineKind::Context,
-                old_line: Some(start + offset),
-                new_line: Some(start + offset),
-                content: text.clone(),
-                syntax: Vec::new(),
-                emphasis: Vec::new(),
-            })
-            .collect();
-        vec![diffui_core::DiffHunkView {
-            header: String::new(),
-            lines: rows,
-        }]
-    }
-
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
     }
@@ -403,7 +410,9 @@ fn first_at(thread: &Thread) -> u64 {
 /// note is on, in the diff.
 pub(crate) fn reply_on_screen(tab: &TabState, reply: &NoteReply) -> bool {
     if tab.main_view == MainView::Notes {
-        return reply.thread().is_some() && reply.thread() == tab.notes.view.thread.as_deref();
+        return reply
+            .thread()
+            .is_some_and(|id| tab.notes.view.stack.iter().any(|item| item.id == id));
     }
     if tab.main_view != MainView::Diff {
         return false;
@@ -677,7 +686,7 @@ impl Diffui {
                 let Some(state) = this.tab_mut(tab) else {
                     return;
                 };
-                let mut reread_excerpt = false;
+                let mut restack = false;
                 state.notes.loading = false;
                 match loaded {
                     Some((threads, Ok(located))) => {
@@ -696,9 +705,7 @@ impl Diffui {
                             }
                         }
                         state.notes.notes = Rc::new(notes);
-                        state.notes.view.excerpt = state.notes.excerpt_of();
-                        state.notes.view.excerpt_file = None;
-                        reread_excerpt = true;
+                        restack = state.notes.view.shown.is_some();
                         state.notes.located_at = operation;
                     }
                     Some((_, Err(error))) => {
@@ -707,11 +714,8 @@ impl Diffui {
                     }
                     None => {}
                 }
-                if reread_excerpt
-                    && this.is_active(tab)
-                    && this.active().notes.view.thread.is_some()
-                {
-                    this.refresh_excerpt(cx);
+                if restack && this.is_active(tab) {
+                    this.restack(cx);
                 }
             },
         );
@@ -890,10 +894,70 @@ impl Diffui {
                 view.filter = filter;
                 view.selected.clear();
                 view.confirm_delete = None;
+                self.restack(cx);
             }
             NotesMsg::SelectThread(id) => {
-                self.active_mut().notes.view.thread = Some(id);
-                self.refresh_excerpt(cx);
+                let Some(change) = self
+                    .active()
+                    .notes
+                    .get(&id)
+                    .map(|note| note.thread.change_id().to_owned())
+                else {
+                    return;
+                };
+                let view = &mut self.active_mut().notes.view;
+                if view.shown.as_deref() != Some(change.as_str()) {
+                    view.shown = Some(change);
+                    view.all_in_change = false;
+                    self.restack(cx);
+                }
+                self.focus_thread(&id, cx);
+            }
+            NotesMsg::SelectChange(change) => {
+                let view = &mut self.active_mut().notes.view;
+                if view.shown.as_deref() != Some(change.as_str()) {
+                    view.shown = Some(change);
+                    view.all_in_change = false;
+                    self.restack(cx);
+                }
+                if let Some(first) = self
+                    .active()
+                    .notes
+                    .view
+                    .stack
+                    .first()
+                    .map(|item| item.id.clone())
+                {
+                    self.focus_thread(&first, cx);
+                }
+            }
+            NotesMsg::StackScrolled(index) => {
+                let view = &mut self.active_mut().notes.view;
+                if std::mem::take(&mut view.revealing) {
+                    return;
+                }
+                if let Some(item) = view.stack.get(index) {
+                    view.thread = Some(item.id.clone());
+                }
+            }
+            NotesMsg::StackStep(by) => {
+                let view = &self.active().notes.view;
+                let at = view
+                    .thread
+                    .as_deref()
+                    .and_then(|id| view.stack.iter().position(|item| item.id == id));
+                let last = view.stack.len().saturating_sub(1);
+                let next = match at {
+                    None => 0,
+                    Some(at) => (at as isize + by).clamp(0, last as isize) as usize,
+                };
+                if let Some(id) = view.stack.get(next).map(|item| item.id.clone()) {
+                    self.focus_thread(&id, cx);
+                }
+            }
+            NotesMsg::AllInChange(all) => {
+                self.active_mut().notes.view.all_in_change = all;
+                self.restack(cx);
             }
             NotesMsg::FilterNamed(name) => {
                 let view = &mut self.active_mut().notes.view;
@@ -906,6 +970,7 @@ impl Diffui {
                 }
                 view.selected.clear();
                 view.confirm_delete = None;
+                self.restack(cx);
             }
             NotesMsg::FilterMenu => self.open_filter_menu(cx),
             NotesMsg::AllChanges => {
@@ -933,77 +998,141 @@ impl Diffui {
         }
     }
 
-    /// Recompute the Notes view's excerpt for its thread: its lines at once,
-    /// then, read off the UI thread, the file's diff around them: both sides'
-    /// numbers, the add and remove colours and word emphasis, and three rows
-    /// of context either side.
-    pub(crate) fn refresh_excerpt(&mut self, cx: &mut Cx) {
+    /// Scroll the stack to thread `id` and make it the list's selection.
+    fn focus_thread(&mut self, id: &str, cx: &mut Cx) {
+        let view = &mut self.active_mut().notes.view;
+        view.thread = Some(id.to_owned());
+        if let Some(index) = view.stack.iter().position(|item| item.id == id) {
+            let token = view.reveal.map_or(1, |(_, token)| token + 1);
+            view.reveal = Some((DocSpot::File(index), token));
+            view.revealing = true;
+            // What the stack reports while it moves there is the reveal's
+            // doing; after a beat, its reports are the user's scrolling.
+            let Some(tab) = self.active_tab_id() else {
+                return;
+            };
+            Self::after(std::time::Duration::from_millis(300), cx, move |this, _| {
+                if let Some(state) = this.tab_mut(tab) {
+                    state.notes.view.revealing = false;
+                }
+            });
+        }
+    }
+
+    /// Rebuild the Notes view's stack for its change: the threads at once,
+    /// each with its anchored lines, then, read off the UI thread, each
+    /// file's diff around them, highlighted as the diff pane highlights it.
+    pub(crate) fn restack(&mut self, cx: &mut Cx) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
-        let notes = &mut self.active_mut().notes;
-        notes.view.excerpt = notes.excerpt_of();
-        notes.view.excerpt_file = None;
-        self.document_version = self.document_version.wrapping_add(1);
         let state = self.active();
-        let Some(note) = state
-            .notes
-            .view
+        let notes: Vec<Note> = stack_notes(state).into_iter().cloned().collect();
+        let stack: Vec<StackItem> = notes.iter().map(fallback_item).collect();
+        let root = state
+            .repository
+            .as_ref()
+            .map(|repository| repository.root.clone());
+        let view = &mut self.active_mut().notes.view;
+        view.stack = stack;
+        view.stack_version = view.stack_version.wrapping_add(1);
+        if view
             .thread
             .as_deref()
-            .and_then(|id| state.notes.get(id))
-            .cloned()
-        else {
+            .is_some_and(|id| !view.stack.iter().any(|item| item.id == id))
+        {
+            view.thread = view.stack.first().map(|item| item.id.clone());
+        }
+        self.document_version = self.document_version.wrapping_add(1);
+        let Some(root) = root else {
             return;
         };
-        let (Some(now), Some(anchor), Some(root)) = (
-            note.located.now.clone(),
-            note.thread.anchor.clone(),
-            state
-                .repository
-                .as_ref()
-                .map(|repository| repository.root.clone()),
-        ) else {
+        // What to read: per thread with lines on a live change, its commit,
+        // path, side and lines.
+        let wanted: Vec<(String, String, String, Side, usize, usize)> = notes
+            .iter()
+            .filter_map(|note| {
+                let now = note.located.now.as_ref()?;
+                let anchor = note.thread.anchor.as_ref()?;
+                let side = anchor.lines.as_ref()?.side;
+                let Place::Lines { start, end } = note.located.place else {
+                    return None;
+                };
+                Some((
+                    note.thread.id.clone(),
+                    now.commit_id.clone(),
+                    anchor.path.clone(),
+                    side,
+                    start,
+                    end,
+                ))
+            })
+            .collect();
+        if wanted.is_empty() {
             return;
-        };
-        let Place::Lines { start, end } = note.located.place else {
-            return;
-        };
-        let Some(side) = anchor.lines.as_ref().map(|lines| lines.side) else {
-            return;
-        };
+        }
         let (send, receive) = futures::channel::oneshot::channel();
-        let path = anchor.path.clone();
         let spawned = std::thread::Builder::new()
-            .name("notes-excerpt".to_owned())
+            .name("notes-stack".to_owned())
             .spawn(move || {
-                let file = diffui_core::notes::NotesRepo::open(&root, false)
-                    .ok()
-                    .and_then(|repo| repo.file_diff(&now.commit_id, &path));
-                let _ = send.send(file);
+                let Ok(repo) = diffui_core::notes::NotesRepo::open(&root, false) else {
+                    let _ = send.send(Vec::new());
+                    return;
+                };
+                let mut files: std::collections::HashMap<
+                    (String, String),
+                    Option<diffui_core::DiffFile>,
+                > = Default::default();
+                let mut read = Vec::new();
+                for (id, commit, path, side, start, end) in wanted {
+                    let file = files
+                        .entry((commit.clone(), path.clone()))
+                        .or_insert_with(|| {
+                            // Highlighted as the diff pane does: the
+                            // language from the path, spans from each
+                            // side's full source when it reads.
+                            let mut file = repo.file_diff(&commit, &path)?;
+                            let old_path = file.old_path.clone().unwrap_or_else(|| path.clone());
+                            let old = repo.read(&commit, &old_path, Side::Old);
+                            let new = repo.read(&commit, &path, Side::New);
+                            diffui_core::syntax::apply_syntax_highlighting_with_sources(
+                                &mut file,
+                                old.as_deref(),
+                                new.as_deref(),
+                            );
+                            Some(file)
+                        })
+                        .clone();
+                    if let Some(file) = file
+                        && let Some(hunk) = excerpt_hunk(&file, side, start, end)
+                    {
+                        read.push((id, file.status, file.additions, file.deletions, hunk));
+                    }
+                }
+                let _ = send.send(read);
             });
         if spawned.is_err() {
             return;
         }
-        let id = note.thread.id.clone();
         Self::run_async(
-            async move { receive.await.ok().flatten() },
+            async move { receive.await.ok().unwrap_or_default() },
             cx,
-            move |this, file, _| {
-                let Some(file) = file else {
-                    return;
-                };
+            move |this, read, _| {
                 let Some(state) = this.tab_mut(tab) else {
                     return;
                 };
-                if state.notes.view.thread.as_deref() != Some(id.as_str()) {
-                    return;
+                let view = &mut state.notes.view;
+                for (id, status, additions, deletions, hunk) in read {
+                    if let Some(item) = view.stack.iter_mut().find(|item| item.id == id) {
+                        item.status = status;
+                        item.additions = additions;
+                        item.deletions = deletions;
+                        item.hunks = vec![hunk];
+                        item.loaded = true;
+                    }
                 }
-                if let Some(hunk) = excerpt_hunk(&file, side, start, end) {
-                    state.notes.view.excerpt = vec![hunk];
-                    state.notes.view.excerpt_file = Some(file);
-                    this.document_version = this.document_version.wrapping_add(1);
-                }
+                view.stack_version = view.stack_version.wrapping_add(1);
+                this.document_version = this.document_version.wrapping_add(1);
             },
         );
     }
@@ -1293,6 +1422,89 @@ fn picked_lines(tab: &TabState, from: LineAt, to: LineAt) -> Option<super::store
         start,
         text: rows.iter().map(|line| line.content.clone()).collect(),
     })
+}
+
+/// The Notes view's stack for its change: the filter's threads (or all of
+/// them), the change's own notes first, then each file's by path and line.
+pub(crate) fn stack_notes(tab: &TabState) -> Vec<&Note> {
+    let view = &tab.notes.view;
+    let Some(change) = view.shown.as_deref() else {
+        return Vec::new();
+    };
+    let mut notes: Vec<&Note> = tab
+        .notes
+        .notes
+        .iter()
+        .filter(|note| note.thread.change_id() == change)
+        .filter(|note| {
+            view.all_in_change
+                || (view.filter.admits(note)
+                    && view
+                        .author
+                        .as_deref()
+                        .is_none_or(|author| note.thread.agents().any(|agent| agent == author)))
+        })
+        .collect();
+    notes.sort_by_key(|note| document_order(note));
+    notes
+}
+
+/// Where a thread sits in its change: the change's own notes first, then by
+/// path and line, ties by when they were started.
+pub(crate) fn document_order(note: &Note) -> (Option<String>, usize, u64) {
+    let line = match (&note.located.place, &note.thread.anchor) {
+        (Place::Lines { start, .. }, _) => *start,
+        (_, Some(anchor)) => anchor.lines.as_ref().map_or(0, |lines| lines.start),
+        _ => 0,
+    };
+    (
+        note.thread
+            .anchor
+            .as_ref()
+            .map(|anchor| anchor.path.clone()),
+        line,
+        note.thread.messages.first().map_or(0, |message| message.at),
+    )
+}
+
+/// A thread's stack item before its file's diff is read: its anchored lines
+/// as context rows with their numbers on both sides.
+fn fallback_item(note: &Note) -> StackItem {
+    let anchor = note.thread.anchor.as_ref();
+    let hunks = anchor
+        .and_then(|anchor| anchor.lines.as_ref())
+        .map(|lines| {
+            let start = match note.located.place {
+                Place::Lines { start, .. } => start,
+                _ => lines.start,
+            };
+            vec![diffui_core::DiffHunkView {
+                header: String::new(),
+                lines: lines
+                    .text
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, text)| diffui_core::DiffLine {
+                        kind: DiffLineKind::Context,
+                        old_line: Some(start + offset),
+                        new_line: Some(start + offset),
+                        content: text.clone(),
+                        syntax: Vec::new(),
+                        emphasis: Vec::new(),
+                    })
+                    .collect(),
+            }]
+        })
+        .unwrap_or_default();
+    StackItem {
+        id: note.thread.id.clone(),
+        title: anchor.map_or_else(|| "Whole change".to_owned(), |anchor| anchor.path.clone()),
+        status: DiffFileStatus::Modified,
+        additions: 0,
+        deletions: 0,
+        hunks,
+        loaded: false,
+    }
 }
 
 /// The rows of `file`'s diff around lines `start..=end` of `side`: the hunk

@@ -3,6 +3,7 @@
 //! shows the selected thread in context, and picks act through a floating bar
 //! like the diff's picks.
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, ElementId, SharedString, Window, canvas, div, px};
 
@@ -12,9 +13,10 @@ use super::locate::Place;
 use super::store::Role;
 use crate::diff_view::CheckState;
 use crate::history_panel::{
-    DETAIL_EDGE, caption_on_line, fill_on_line, header_bar, list_column, list_row, mono_on_line,
-    note, two_line,
+    DETAIL_EDGE, ROW_CONTENT_LEFT, caption_on_line, fill_on_line, header_bar, list_column,
+    list_row, note, two_line,
 };
+use crate::overlay_kit::GROUP_HEIGHT;
 use crate::revision_list::{
     AGE_TEXT_SIZE, CAPTION_TEXT_SIZE, REVISION_ROW_HEIGHT, ROW_CARD_INSET_Y, SMALL_TEXT_SIZE,
 };
@@ -60,7 +62,8 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
         b_latest
             .cmp(a_latest)
             .then_with(|| a.thread.change_id().cmp(b.thread.change_id()))
-            .then_with(|| b.thread.activity().cmp(&a.thread.activity()))
+            // Within a change, the order its stack reads in.
+            .then_with(|| super::app::document_order(a).cmp(&super::app::document_order(b)))
     });
     keyed.into_iter().map(|(_, note)| note).collect()
 }
@@ -68,10 +71,6 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
 fn id(name: &str, part: &str) -> ElementId {
     ElementId::Name(SharedString::from(format!("notes-view-{name}-{part}")))
 }
-
-/// The detail column's widest: a comfortable measure of body text, past
-/// which a wide window only lengthens its lines.
-const DETAIL_MAX_WIDTH: f32 = 760.0;
 
 /// A change's title as the log shows it: `(no description set)` in the
 /// log's colour for a change without one.
@@ -114,7 +113,7 @@ fn click(
 pub(crate) fn build_notes_sidebar(
     ui: &Diffui,
     look: Look,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
     let Look { theme, .. } = look;
@@ -122,8 +121,12 @@ pub(crate) fn build_notes_sidebar(
     let view = &tab.notes.view;
     let on = sender(cx);
 
-    // One filter control: the three that matter, their counts quiet at zero.
-    let mut filters = ui::segmented(theme);
+    // One filter control filling the head, the "…" keeping its own room:
+    // the three that matter, short labels so they don't need cutting at the
+    // pane's usual widths, counts quiet at zero.
+    let mut filters = ui::segmented_in(theme, ui::SegmentFit::Fill)
+        .id("notes-view-filter-track")
+        .test_support();
     for filter in Filter::SHOWN {
         let count = tab
             .notes
@@ -131,21 +134,25 @@ pub(crate) fn build_notes_sidebar(
             .iter()
             .filter(|note| filter.admits(note))
             .count();
-        filters = filters.child(
-            ui::segment(
-                id(filter.name(), "filter"),
-                ui::Segment {
-                    icon: None,
-                    label: filter.label().into(),
-                    count: Some((count, count > 0)),
-                    active: view.filter == filter,
-                    enabled: true,
-                },
-                ui::Segmented::Small,
-                look,
-            )
-            .on_click(click(&on, NotesMsg::Filter(filter))),
-        );
+        let mut segment = ui::segment_in(
+            id(filter.name(), "filter"),
+            ui::Segment {
+                icon: None,
+                label: filter.short_label().into(),
+                count: Some((count, count > 0)),
+                active: view.filter == filter,
+                enabled: true,
+            },
+            ui::Segmented::Small,
+            ui::SegmentFit::Fill,
+            look,
+        )
+        .on_click(click(&on, NotesMsg::Filter(filter)));
+        // The short label's full name.
+        if filter.short_label() != filter.label() {
+            segment = segment.tip(filter.label());
+        }
+        filters = filters.child(segment);
     }
     let more = look
         .icon_button("notes-view-filter-menu", icons::ELLIPSIS, theme.muted_text)
@@ -157,15 +164,19 @@ pub(crate) fn build_notes_sidebar(
         .flex_row()
         .items_center()
         .gap(px(space::SM))
-        .child(div().flex_1().min_w_0().overflow_hidden().child(filters))
-        .child(more);
+        .child(div().flex_1().min_w_0().flex().child(filters))
+        .child(div().flex_none().child(more));
 
     let mut pane = div()
         .size_full()
         .flex()
         .flex_col()
         .bg(theme.panel_background)
-        .child(header_bar(head, false, theme));
+        .child(
+            header_bar(head, false, theme)
+                .border_b_1()
+                .border_color(theme.border),
+        );
 
     // What the head's control doesn't say: a filter from the menu, an
     // author, a change. Each clears with its own ✕.
@@ -234,13 +245,22 @@ pub(crate) fn build_notes_sidebar(
 
     let picking = !view.selected.is_empty();
     let now = super::store::now();
+    // Every row and group header has a fixed height, so where each group
+    // starts is known here: the group the list has scrolled into keeps its
+    // header pinned at the top.
+    let handle = ui::scroll_handle("notes-view-list-scroll", window, cx);
+    let scrolled = -f32::from(handle.read(cx).offset().y);
     let mut list = div().w_full().flex().flex_col().pb(px(space::XXL * 3.0));
+    let mut groups: Vec<(f32, &Note)> = Vec::new();
+    let mut y = 0.0;
     let mut change: Option<&str> = None;
     for note in &listed {
         let thread = &note.thread;
         if change != Some(thread.change_id()) {
             change = Some(thread.change_id());
-            list = list.child(group_header(note, ui, look));
+            groups.push((y, note));
+            list = list.child(group_header(note, &listed, ui, look, &on));
+            y += GROUP_HEIGHT;
         }
         let picked = view.selected.contains(&thread.id);
         let selected = view.thread.as_deref() == Some(thread.id.as_str());
@@ -253,51 +273,112 @@ pub(crate) fn build_notes_sidebar(
             &on,
             cx,
         )));
+        y += REVISION_ROW_HEIGHT;
     }
+    let pinned = groups
+        .iter()
+        .rev()
+        .find(|(top, _)| *top < scrolled)
+        .map(|(_, note)| *note);
+    let handle = handle.read(cx).clone();
     pane.child(
         div()
+            .relative()
             .flex_1()
             .min_h_0()
-            .child(ui::scrollable("notes-view-list", list)),
+            .child(ui::scrollable_with("notes-view-list", &handle, list))
+            .children(pinned.map(|note| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right(px(crate::scrollbar::GUTTER))
+                    .bg(theme.panel_background)
+                    .child(group_header(note, &listed, ui, look, &on))
+            })),
     )
     .into_any_element()
 }
 
-/// A change's header over its notes: its id, as ids are styled, and its
-/// title.
-fn group_header(note: &Note, ui: &Diffui, look: Look) -> AnyElement {
-    let Look { theme, font, .. } = look;
+/// A change's section over its notes, as a list's group band is drawn: its
+/// id styled as an id, its description (or the log's no-description words)
+/// in the section label's weight, ellipsised, and its open notes' count at
+/// the end. Its text starts where its rows' does.
+fn group_header(note: &Note, listed: &[&Note], ui: &Diffui, look: Look, on: &Send) -> AnyElement {
+    let Look { theme, font, mono } = look;
     let thread = &note.thread;
     let (title, ink) = change_title(note, theme);
-    let mut line = vec![mono_on_line(
-        short(thread.change_id()).to_owned(),
-        theme.change_id,
-        ui,
+    let label = theme::emphasis_font(font, Weight::SEMIBOLD);
+    let open = listed
+        .iter()
+        .filter(|other| other.thread.change_id() == thread.change_id() && other.counts())
+        .count();
+    let mut line = vec![Aligned::text(
+        typography::line(
+            short(thread.change_id()).to_owned(),
+            mono,
+            text_size::BODY,
+            theme.change_id,
+        )
+        .flex_none(),
+        mono,
+        text_size::BODY,
     )];
     if note.located.archived() {
         line.push(ui::tag("Abandoned", theme.subtle_text, ui::TagSize::Small, font).aligned());
     }
     line.push(fill_on_line(
-        typography::line(title, font, CAPTION_TEXT_SIZE, ink).text_ellipsis(),
-        font,
-        CAPTION_TEXT_SIZE,
+        typography::line(
+            title,
+            label,
+            text_size::BODY,
+            if ink == theme.text {
+                theme.muted_text
+            } else {
+                ink
+            },
+        )
+        .text_ellipsis(),
+        label,
+        text_size::BODY,
     ));
+    if open > 0 {
+        line.push(Aligned::text(
+            typography::line(open.to_string(), font, text_size::BODY, theme.subtle_text),
+            font,
+            text_size::BODY,
+        ));
+    }
+    let _ = ui;
     div()
+        .id(id(thread.change_id(), "group"))
+        .cursor_pointer()
+        .on_click(click(
+            on,
+            NotesMsg::SelectChange(thread.change_id().to_owned()),
+        ))
         .w_full()
-        .pl(px(DETAIL_EDGE))
-        .pr(px(crate::scrollbar::GUTTER))
-        .pt(px(space::LG))
-        .pb(px(space::XXS))
+        .h(px(GROUP_HEIGHT))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .justify_end()
+        .pb(px(space::XS))
+        .pl(px(ROW_CONTENT_LEFT))
+        .pr(px(crate::revision_list::ROW_CARD_INSET_X
+            + theme::list::PAD_END
+            - crate::revision_list::ROW_CARD_INSET_X))
+        .bg(theme.panel_background)
         .child(typography::baseline_row(line, space::SM).min_w_0())
         .into_any_element()
 }
 
-/// Where a note is, for its row and its header: `path:12–18`, or the file's
-/// path, in mono at the size the rows give ids and paths; "Whole change" in
-/// prose at `size`.
-fn location(note: &Note, look: Look, size: f32, ink: Color) -> Aligned {
+/// Where a note is, quietly, for its row and its header: `path:12–18` (or
+/// the file's path) in mono at the size rows give ids and paths, or "Whole
+/// change" in prose at that size.
+fn location(note: &Note, look: Look, ink: Color) -> Aligned {
     let Look { font, mono, .. } = look;
-    let path_size = CAPTION_TEXT_SIZE;
+    let size = CAPTION_TEXT_SIZE;
     match &note.thread.anchor {
         None => Aligned::text(
             typography::line("Whole change", font, size, ink).text_ellipsis(),
@@ -313,17 +394,19 @@ fn location(note: &Note, look: Look, size: f32, ink: Color) -> Aligned {
                 (_, None) => anchor.path.clone(),
             };
             Aligned::text(
-                typography::line(text, mono, path_size, ink).text_ellipsis(),
+                typography::line(text, mono, size, ink).text_ellipsis(),
                 mono,
-                path_size,
+                size,
             )
         }
     }
 }
 
-/// One note, as a revision row is laid out: its location and age on the
-/// title line; the author, the latest message's first line and the reply
-/// count under it. Its box shows on hover, or for every row once picking.
+/// One note, as History's operation rows are laid out: the latest message's
+/// first line, the age at its end; under it, quieter, where it is, who wrote
+/// last and how many replies. Every row the same shape. Its box sits at the
+/// row's end, as the file list's does, on hover or for every row once
+/// picking.
 fn row(
     note: &Note,
     (selected, picked, picking): (bool, bool, bool),
@@ -337,52 +420,41 @@ fn row(
     let thread = &note.thread;
     let dim = thread.resolved.is_some();
     let latest = thread.last();
-    let mut title = vec![
-        location(
-            note,
-            look,
-            SMALL_TEXT_SIZE,
-            if dim { theme.muted_text } else { theme.text },
-        )
-        .shrink(),
-    ];
-    if note.located.outdated() {
-        title.push(ui::tag("Outdated", theme.note_text, ui::TagSize::Small, font).aligned());
-    }
-    title.push(fill_on_line(div(), font, SMALL_TEXT_SIZE));
-    title.push(Aligned::text(
-        typography::line(
-            latest.map_or(String::new(), |message| age(message.at, now)),
-            font,
-            AGE_TEXT_SIZE,
-            theme.subtle_text,
-        ),
-        font,
-        AGE_TEXT_SIZE,
-    ));
-    let author = latest.map_or(String::new(), |message| match message.role {
-        Role::User => "You".to_owned(),
-        Role::Agent => message.author.clone(),
-    });
-    let bold = theme::emphasis_font(font, Weight::MEDIUM);
-    let mut meta = vec![
-        Aligned::text(
-            typography::line(author, bold, CAPTION_TEXT_SIZE, theme.muted_text).flex_none(),
-            bold,
-            CAPTION_TEXT_SIZE,
-        ),
+    let title = vec![
         fill_on_line(
             typography::line(
                 latest.map_or(String::new(), |message| plain_line(&message.body)),
                 font,
-                CAPTION_TEXT_SIZE,
-                theme.subtle_text,
+                SMALL_TEXT_SIZE,
+                if dim { theme.muted_text } else { theme.text },
             )
             .text_ellipsis(),
             font,
-            CAPTION_TEXT_SIZE,
+            SMALL_TEXT_SIZE,
+        ),
+        Aligned::text(
+            typography::line(
+                latest.map_or(String::new(), |message| age(message.at, now)),
+                font,
+                AGE_TEXT_SIZE,
+                theme.subtle_text,
+            ),
+            font,
+            AGE_TEXT_SIZE,
         ),
     ];
+    let author = latest.map_or(String::new(), |message| match message.role {
+        Role::User => "You".to_owned(),
+        Role::Agent => message.author.clone(),
+    });
+    let mut meta = vec![location(note, look, theme.muted_text).shrink()];
+    if note.located.outdated() {
+        meta.push(ui::tag("Outdated", theme.note_text, ui::TagSize::Small, font).aligned());
+    }
+    meta.push(caption_on_line(
+        crate::history_panel::caption(author, theme.subtle_text, ui),
+        ui,
+    ));
     let replies = thread.messages.len().saturating_sub(1);
     if replies > 0 {
         let noun = if replies == 1 { "reply" } else { "replies" };
@@ -403,7 +475,7 @@ fn row(
     let check = div()
         .id(id(&thread.id, "check"))
         .flex_none()
-        .mr(px(space::SM))
+        .ml(px(space::SM))
         .on_click(toggle)
         .child(checkbox(
             if picked {
@@ -427,16 +499,16 @@ fn row(
         cx,
     )
     .group(group)
-    .child(check)
     .child(two_line(
-        typography::baseline_row(title, space::SM).min_w_0(),
+        typography::baseline_row(title, space::MD).min_w_0(),
         typography::baseline_row(meta, space::SM).min_w_0(),
     ))
+    .child(check)
     .into_any_element()
 }
 
-/// The main area while the Notes view is open: the selected thread in
-/// context, and the picks' bar.
+/// The main area while the Notes view is open: the shown change's threads
+/// stacked in one scrolling diff, and the picks' bar.
 pub(crate) fn build_notes_panel(
     ui: &Diffui,
     look: Look,
@@ -453,24 +525,29 @@ pub(crate) fn build_notes_panel(
         .flex_col()
         .overflow_hidden()
         .bg(theme.panel_background);
-    let thread = view
-        .thread
-        .as_deref()
-        .and_then(|id| tab.notes.get(id))
-        .filter(|note| listed(tab).iter().any(|it| it.thread.id == note.thread.id));
-    panel = match thread {
-        Some(note) => panel.child(ui::scrollable(
-            "notes-view-thread",
-            detail(note, ui, look, window, cx),
-        )),
+    let notes = super::app::stack_notes(tab);
+    panel = match notes.first() {
+        Some(first) => panel
+            .child(stack_header(first, notes.len(), ui, look, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(stack(&notes, ui, look, window, cx)),
+            ),
         None if tab.notes.notes.is_empty() => panel.child(empty(
             "No review notes yet",
             "Agents leave them with diffui notes add. Start one with the + on a line of a diff.",
             look,
         )),
+        None if view.shown.is_some() => panel.child(empty(
+            "Nothing here under this filter",
+            "Pick another filter, or show all of the change's notes.",
+            look,
+        )),
         None => panel.child(empty(
-            "Select a note",
-            "Its lines and its thread show here.",
+            "Select a change or a note",
+            "Its notes show here, one after another.",
             look,
         )),
     };
@@ -506,22 +583,32 @@ fn empty(title: &'static str, detail: &'static str, look: Look) -> AnyElement {
         .into_any_element()
 }
 
-/// A thread in context, as History shows an operation: a header naming
-/// where it sits (its change's id and description, as the log draws them,
-/// and its location), the lines it's on as the diff draws them, then the
-/// thread itself. Who wrote it and when is on the card.
-fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+/// The stack's header, naming the change once (its id and description as
+/// the log draws them) with Open in diff, and how many of its notes show:
+/// "3 of 5 notes, filtered" with a way to show them all.
+fn stack_header(note: &Note, shown: usize, ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
     let Look { theme, font, .. } = look;
     let thread = &note.thread;
     let on = sender(cx);
+    let tab = ui.active();
+    let view = &tab.notes.view;
     let (title, ink) = change_title(note, theme);
+    let total = tab
+        .notes
+        .notes
+        .iter()
+        .filter(|other| other.thread.change_id() == thread.change_id())
+        .count();
     let open = look
         .button("notes-view-open", "Open in diff")
         .compact()
         .icon(icons::FILE_DIFF, theme.muted_text)
         .disabled(note.located.archived())
-        .tip("Show the note in its change's diff")
-        .on_click(click(&on, NotesMsg::Open(thread.id.clone())));
+        .tip("Show the change's diff, at this note")
+        .on_click(click(
+            &on,
+            NotesMsg::Open(view.thread.clone().unwrap_or_else(|| thread.id.clone())),
+        ));
     let mut change = vec![
         meta_line::id_text(
             meta_line::Id::plain(short(thread.change_id()), theme.change_id),
@@ -539,22 +626,50 @@ fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx
             ui::tag("Abandoned", theme.subtle_text, ui::TagSize::Small, font).aligned(),
         );
     }
-    let mut place = vec![location(note, look, SMALL_TEXT_SIZE, theme.muted_text).shrink()];
-    if thread.resolved.is_some() {
-        place.push(ui::tag("Resolved", theme.subtle_text, ui::TagSize::Small, font).aligned());
-    }
-    if note.located.outdated() {
-        place.push(ui::tag("Outdated", theme.note_text, ui::TagSize::Small, font).aligned());
-    }
-    let mut block = div()
+    let noun = |count: usize| if count == 1 { "note" } else { "notes" };
+    let (count, toggle) = if shown < total {
+        (
+            format!("{shown} of {total} {}, filtered", noun(total)),
+            Some(("Show all", NotesMsg::AllInChange(true))),
+        )
+    } else if view.all_in_change {
+        (
+            format!("{total} {}", noun(total)),
+            Some(("Filter them", NotesMsg::AllInChange(false))),
+        )
+    } else {
+        (format!("{total} {}", noun(total)), None)
+    };
+    let mut second = div()
         .w_full()
-        .max_w(px(DETAIL_MAX_WIDTH))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SM))
+        .child(typography::centered(
+            typography::line(count, font, text_size::CAPTION, theme.subtle_text),
+            font,
+            text_size::CAPTION,
+        ));
+    if let Some((label, message)) = toggle {
+        second = second.child(
+            look.button("notes-view-all", label)
+                .ghost()
+                .small()
+                .on_click(click(&on, message)),
+        );
+    }
+    div()
+        .w_full()
+        .flex_none()
         .flex()
         .flex_col()
-        .gap(px(space::MD))
+        .gap(px(space::XS))
         .px(px(DETAIL_EDGE))
-        .pt(px(space::XL))
-        .pb(px(space::XXL * 3.0))
+        .pt(px(space::LG))
+        .pb(px(space::MD))
+        .border_b_1()
+        .border_color(theme.border)
         .child(
             div()
                 .w_full()
@@ -570,99 +685,116 @@ fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx
                 )
                 .child(open),
         )
-        .child(typography::baseline_row(place, space::SM).min_w_0());
-    if let Some(excerpt) = excerpt(note, ui, look, window, cx) {
-        block = block.child(excerpt);
-    }
-    block
-        .child(crate::notes::inline::thread_card(
-            ui, look, note, window, cx,
-        ))
+        .child(second)
         .into_any_element()
 }
 
-/// The note's lines as the diff draws them, read-only: a plain document of
-/// just those lines, in a well.
-fn excerpt(
-    note: &Note,
-    ui: &Diffui,
-    look: Look,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
+/// The stack itself: one diff view, a "file" per thread holding its excerpt
+/// (or, for a note without lines, a line saying what it's on), its card laid
+/// under its last row. Drawn lazily, as the diff draws its files; scrolling
+/// past a thread moves the list's selection.
+fn stack(notes: &[&Note], ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     let Look { theme, .. } = look;
-    let anchor = note.thread.anchor.as_ref()?;
-    // Only a note on lines has an excerpt.
-    anchor.lines.as_ref()?;
-    let tab = ui.active();
-    if tab.notes.view.excerpt.is_empty() {
-        return None;
-    }
-    let view = &tab.notes.view;
-    let rows: usize = view.excerpt.iter().map(|hunk| hunk.lines.len()).sum();
-    // The well's hairline edges sit inside its box.
-    let height = crate::diff_view::unwrapped_height(
-        ui.config.code_type,
-        look.mono,
-        1,
-        view.excerpt.len(),
-        rows,
-    ) + 2.0 * theme::HAIRLINE;
-    let (status, additions, deletions) = view
-        .excerpt_file
-        .as_ref()
-        .map_or((diffui_core::DiffFileStatus::Modified, 0, 0), |file| {
-            (file.status, file.additions, file.deletions)
-        });
-    let status_color = theme::file_status_color(status, theme);
-    let file = crate::diff_view::DiffFileView {
-        title: anchor.path.clone(),
-        status,
-        status_color,
-        status_fill: theme::chip_background(status_color),
-        additions,
-        deletions,
-        tag: None,
-        note: None,
-    };
-    let props = crate::diff_view::DiffProps::new(
-        vec![file],
-        crate::diff_view::DocSource::new(cx.entity(), |ui: &Diffui, _| {
-            &ui.active().notes.view.excerpt
+    let view = &ui.active().notes.view;
+    let files: Vec<crate::diff_view::DiffFileView> = view
+        .stack
+        .iter()
+        .map(|item| {
+            let status_color = if item.title == "Whole change" {
+                theme.subtle_text
+            } else {
+                theme::file_status_color(item.status, theme)
+            };
+            crate::diff_view::DiffFileView {
+                title: item.title.clone(),
+                status: item.status,
+                status_color,
+                status_fill: theme::chip_background(status_color),
+                additions: item.additions,
+                deletions: item.deletions,
+                tag: None,
+                // The header names it ("Whole change", the file); the card
+                // under it is the body.
+                note: None,
+            }
+        })
+        .collect();
+    let insets = notes
+        .iter()
+        .enumerate()
+        .filter_map(|(file, note)| {
+            let item = view.stack.get(file)?;
+            let at = match item.hunks.first() {
+                Some(hunk) if !hunk.lines.is_empty() => {
+                    crate::diff_view::DocSpot::Line(crate::diff_view::LineAt {
+                        file,
+                        hunk: 0,
+                        line: hunk.lines.len() - 1,
+                    })
+                }
+                _ => crate::diff_view::DocSpot::File(file),
+            };
+            Some(crate::notes::inline::stack_inset(ui, look, note, at, cx))
+        })
+        .collect();
+    // The thread in focus: its rows marked as an open note's are.
+    let focused: Vec<crate::diff_view::Highlight> = view
+        .thread
+        .as_deref()
+        .and_then(|id| view.stack.iter().position(|item| item.id == id))
+        .and_then(|file| {
+            let rows = view.stack[file].hunks.first()?.lines.len();
+            (rows > 0).then(|| crate::diff_view::Highlight {
+                from: crate::diff_view::LineAt {
+                    file,
+                    hunk: 0,
+                    line: 0,
+                },
+                to: crate::diff_view::LineAt {
+                    file,
+                    hunk: 0,
+                    line: rows - 1,
+                },
+                strong: false,
+            })
+        })
+        .into_iter()
+        .collect();
+    let selected = view
+        .thread
+        .as_deref()
+        .and_then(|id| view.stack.iter().position(|item| item.id == id))
+        .unwrap_or(0);
+    let mut props = crate::diff_view::DiffProps::new(
+        files,
+        crate::diff_view::DocSource::new(cx.entity(), |ui: &Diffui, file| {
+            ui.active()
+                .notes
+                .view
+                .stack
+                .get(file)
+                .map_or(&[][..], |item| &item.hunks)
         }),
-        0,
-        format!("notes-excerpt-{}", note.thread.id),
+        selected,
+        format!("notes-stack-{}", view.shown.as_deref().unwrap_or_default()),
         crate::theme::diff_palette(theme),
         look.mono,
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
     .ui_font(look.font)
-    .wrap(false)
+    .wrap(ui.diff_wrap)
     .content_version(ui.document_version)
-    .layout_version(ui.document_version);
-    Some(
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .w_full()
-                    .h(px(height))
-                    .overflow_hidden()
-                    .map(|well| {
-                        theme::squircle(
-                            well,
-                            theme::radius::CARD,
-                            Some(theme.panel_background),
-                            Some(theme.border),
-                        )
-                    })
-                    .child(crate::diff_view::view("notes-excerpt", props, window, cx)),
-            )
-            .into_any_element(),
-    )
+    .layout_version(view.stack_version)
+    .insets(insets)
+    .highlights(focused)
+    .on_selected_file_changed(Diffui::listen(cx, |this, index: &usize, _, cx| {
+        this.perform(Action::Notes(NotesMsg::StackScrolled(*index)), cx);
+    }));
+    if let Some((spot, token)) = view.reveal {
+        props = props.reveal(spot, token).reveal_at_top();
+    }
+    crate::diff_view::view("notes-stack", props, window, cx)
 }
 
 /// The picks' floating bar, as the diff's picks have it: what's picked, then

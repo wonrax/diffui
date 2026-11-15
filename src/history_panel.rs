@@ -987,7 +987,7 @@ pub(crate) fn annotate_on(ui: &Diffui) -> bool {
 // as a revision row and one-line rows as a file row.
 
 /// Where row content starts, from the pane's leading edge.
-const ROW_CONTENT_LEFT: f32 = GUTTER_LEFT_PADDING + GUTTER_PADDING;
+pub(crate) const ROW_CONTENT_LEFT: f32 = GUTTER_LEFT_PADDING + GUTTER_PADDING;
 /// GPUI centres text in a line box 1.3× its size; the graph stacks bare
 /// text boxes [`ROW_LINE_GAP`] apart, so a two-line row's spacing gives
 /// back both lines' half-leading.

@@ -665,6 +665,8 @@ pub struct DiffProps {
     overview: Option<Marks>,
     /// Scroll `spot` (and an inset under it) into view when the token changes.
     reveal: Option<(DocSpot, u64)>,
+    /// A reveal puts its spot at the top rather than centring it.
+    reveal_at_top: bool,
     /// The "+" on the hovered line that starts a note.
     add_button: Option<AddButton>,
     /// Rows washed in the accent.
@@ -726,6 +728,7 @@ impl DiffProps {
             inset_heights: Default::default(),
             overview: None,
             reveal: None,
+            reveal_at_top: false,
             add_button: None,
             highlights: Vec::new(),
             note_buttons: None,
@@ -936,6 +939,13 @@ impl DiffProps {
     /// header, before its other tools.
     pub fn note_buttons(mut self, buttons: NoteButtons) -> Self {
         self.note_buttons = Some(buttons);
+        self
+    }
+
+    /// Reveals put their spot at the top of the view, as a file jump does,
+    /// rather than centring it: for a document read spot by spot.
+    pub fn reveal_at_top(mut self) -> Self {
+        self.reveal_at_top = true;
         self
     }
 

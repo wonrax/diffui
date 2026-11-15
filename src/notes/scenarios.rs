@@ -15,6 +15,8 @@ use super::store::{self, Role, Store};
 use crate::Action;
 use crate::diff_view::DocSpot;
 use crate::harness::{Harness, fixture_jj, fixture_repo, scratch_home};
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::prelude::*;
 
 /// `jj <args>` in `repo`, its stdout.
 pub(crate) fn jj(repo: &Path, args: &[&str]) -> String {
@@ -1094,10 +1096,15 @@ fn the_notes_view_shows_a_threads_lines_as_the_diff_draws_them() {
     h.perform(Action::SetMainView(crate::MainView::Notes));
     h.perform(Action::Notes(NotesMsg::SelectThread(id)));
     h.wait_until("the excerpt", |ui| {
-        ui.active().notes.view.excerpt_file.is_some()
+        ui.active()
+            .notes
+            .view
+            .stack
+            .first()
+            .is_some_and(|item| item.loaded)
     });
     let rows = h.read(|ui| {
-        ui.active().notes.view.excerpt[0]
+        ui.active().notes.view.stack[0].hunks[0]
             .lines
             .iter()
             .map(|line| {
@@ -1130,4 +1137,239 @@ fn the_notes_view_shows_a_threads_lines_as_the_diff_draws_them() {
     h.frames();
     let open = h.bounds("notes-view-open");
     assert!(open.size.height > gpui_kit::px(10.0));
+}
+
+/// Notes on two files and the change, three of them waiting on you.
+fn stacked_repo(name: &str) -> (PathBuf, [String; 4]) {
+    let repo = scratch_repo(name);
+    std::fs::write(repo.join("b.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    jj(&repo, &["status"]);
+    let whole = add(&repo, &["--as", "claude", "On the change."]);
+    let a2 = add(
+        &repo,
+        &["--as", "claude", "--file", "a.txt", "--line", "2", "a two"],
+    );
+    let b3 = add(
+        &repo,
+        &["--as", "codex", "--file", "b.txt", "--line", "3", "b three"],
+    );
+    let b1 = add(
+        &repo,
+        &["--as", "codex", "--file", "b.txt", "--line", "1", "b one"],
+    );
+    // b1 waits on the agent, so the default filter leaves it out.
+    user_reply(&repo, &b1, "Why?");
+    (repo, [whole, a2, b1, b3])
+}
+
+fn open_notes_view(repo: &Path) -> Harness {
+    let mut h = Harness::open(Some(repo));
+    h.wait_for_graph();
+    h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 4
+    });
+    h.perform(Action::SetMainView(crate::MainView::Notes));
+    h
+}
+
+fn stack_ids(h: &mut Harness) -> Vec<String> {
+    h.read(|ui| {
+        ui.active()
+            .notes
+            .view
+            .stack
+            .iter()
+            .map(|item| item.id.clone())
+            .collect()
+    })
+}
+
+fn focused(h: &mut Harness) -> Option<String> {
+    h.read(|ui| ui.active().notes.view.thread.clone())
+}
+
+#[test]
+fn a_change_stacks_its_threads_in_document_order_under_the_filter() {
+    let (repo, [whole, a2, b1, b3]) = stacked_repo("stack-model");
+    let mut h = open_notes_view(&repo);
+    let change = h.read(|ui| ui.active().notes.notes[0].thread.change_id().to_owned());
+    // The change's header: its threads under the filter, the change's own
+    // first, then by file and line.
+    h.perform(Action::Notes(NotesMsg::SelectChange(change.clone())));
+    assert_eq!(stack_ids(&mut h), [whole.clone(), a2.clone(), b3.clone()]);
+    assert_eq!(focused(&mut h), Some(whole.clone()));
+    // All of them, the filter set aside.
+    h.perform(Action::Notes(NotesMsg::AllInChange(true)));
+    assert_eq!(
+        stack_ids(&mut h),
+        [whole.clone(), a2.clone(), b1.clone(), b3.clone()]
+    );
+    h.perform(Action::Notes(NotesMsg::AllInChange(false)));
+    // Another filter restacks.
+    h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnAgent)));
+    assert_eq!(stack_ids(&mut h), [b1]);
+    h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnYou)));
+
+    // A thread's row: the same stack, scrolled to it.
+    h.perform(Action::Notes(NotesMsg::SelectThread(b3.clone())));
+    assert_eq!(stack_ids(&mut h).len(), 3);
+    let revealed = h.read(|ui| ui.active().notes.view.reveal);
+    assert_eq!(revealed.map(|(spot, _)| spot), Some(DocSpot::File(2)));
+    assert_eq!(focused(&mut h), Some(b3.clone()));
+    // Within the change, a click scrolls; the stack stays.
+    h.perform(Action::Notes(NotesMsg::SelectThread(a2.clone())));
+    assert_eq!(stack_ids(&mut h), [whole, a2, b3]);
+    let moved = h.read(|ui| ui.active().notes.view.reveal);
+    assert_eq!(moved.map(|(spot, _)| spot), Some(DocSpot::File(1)));
+    assert_ne!(
+        moved.map(|(_, token)| token),
+        revealed.map(|(_, token)| token)
+    );
+}
+
+#[test]
+fn the_list_follows_the_stack_and_j_and_k_step_through_it() {
+    let (repo, [whole, a2, _, b3]) = stacked_repo("stack-keys");
+    let mut h = open_notes_view(&repo);
+    let change = h.read(|ui| ui.active().notes.notes[0].thread.change_id().to_owned());
+    h.perform(Action::Notes(NotesMsg::SelectChange(change)));
+    h.settle();
+    h.frames();
+    // The reveal's own scroll reports are spent; what comes now is the user's.
+    h.wait_until("the reveal to finish", |ui| {
+        !ui.active().notes.view.revealing
+    });
+    // Scrolling the stack to its third thread moves the list's selection.
+    h.perform(Action::Notes(NotesMsg::StackScrolled(2)));
+    assert_eq!(focused(&mut h), Some(b3.clone()));
+    // j and k: the next and previous thread, scrolled to.
+    h.press("k");
+    assert_eq!(focused(&mut h), Some(a2.clone()));
+    assert_eq!(
+        h.read(|ui| ui.active().notes.view.reveal.map(|(spot, _)| spot)),
+        Some(DocSpot::File(1))
+    );
+    h.press("k");
+    h.press("k");
+    assert_eq!(focused(&mut h), Some(whole));
+    h.press("j");
+    h.press("j");
+    h.press("j");
+    assert_eq!(focused(&mut h), Some(b3));
+    // The stack scrolled for real: the diff view's scroll spy reports the
+    // thread it reached, which the list keeps.
+    h.press("k");
+    h.settle();
+    h.frames();
+    h.wait_until("the reveal to finish", |ui| {
+        !ui.active().notes.view.revealing
+    });
+    h.frames();
+    h.settle();
+    assert_eq!(focused(&mut h), Some(a2));
+}
+
+/// The Notes pane head's filter fills its track, the segments tiling it
+/// exactly and staying inside it, at the pane's narrowest, a middle and a
+/// wide width.
+#[test]
+fn the_notes_filter_tiles_its_track_at_every_width() {
+    let (repo, _) = stacked_repo("segments");
+    let mut h = open_notes_view(&repo);
+    let narrowest = h.read(|ui| ui.sidebar_min_width);
+    for width in [narrowest, 380.0_f32.max(narrowest), 640.0] {
+        h.act(|ui, _| ui.sidebar_width = width);
+        h.settle();
+        h.frames();
+        let track = h.bounds("notes-view-filter-track");
+        let segments: Vec<_> = Filter::SHOWN
+            .iter()
+            .map(|filter| {
+                h.bounds(gpui_kit::ElementId::Name(
+                    format!("notes-view-{}-filter", filter.name()).into(),
+                ))
+            })
+            .collect();
+        let close = |a: f32, b: f32| (a - b).abs() < 1.0;
+        let inset = 2.0;
+        let x = |p: gpui_kit::Pixels| f32::from(p);
+        assert!(
+            close(x(segments[0].left()), x(track.left()) + inset),
+            "{width}: {track:?} {segments:?}"
+        );
+        assert!(
+            close(x(segments[2].right()), x(track.right()) - inset),
+            "{width}: no gap at the end: {track:?} {segments:?}"
+        );
+        for pair in segments.windows(2) {
+            assert!(
+                close(x(pair[1].left()) - x(pair[0].right()), inset),
+                "{width}: {segments:?}"
+            );
+            assert!(
+                close(x(pair[0].size.width), x(pair[1].size.width)),
+                "{width}: equal shares: {segments:?}"
+            );
+        }
+        for segment in &segments {
+            assert!(segment.left() >= track.left() && segment.right() <= track.right());
+            assert!(segment.top() >= track.top() && segment.bottom() <= track.bottom());
+        }
+        let more = h.bounds("notes-view-filter-menu");
+        assert!(more.left() >= track.right(), "the menu keeps its room");
+    }
+}
+
+/// The kit's filling segment control, squeezed far below its content:
+/// every segment stays inside the track, cut rather than spilling.
+#[test]
+fn a_squeezed_segment_control_keeps_its_segments_inside() {
+    let mut h = Harness::open(None);
+    h.show(|_, theme, _, _| {
+        let look = crate::ui::Look::new(
+            theme,
+            crate::theme::Font::DEFAULT,
+            crate::theme::Font::MONOSPACE,
+        );
+        let mut track = crate::ui::segmented_in(theme, crate::ui::SegmentFit::Fill)
+            .id("squeezed-track")
+            .test_support();
+        for (index, label) in ["Waiting on you", "Waiting on agent", "Resolved"]
+            .into_iter()
+            .enumerate()
+        {
+            track = track.child(crate::ui::segment_in(
+                ("squeezed", index),
+                crate::ui::Segment {
+                    icon: None,
+                    label: label.into(),
+                    count: Some((12, true)),
+                    active: index == 2,
+                    enabled: true,
+                },
+                crate::ui::Segmented::Small,
+                crate::ui::SegmentFit::Fill,
+                look,
+            ));
+        }
+        gpui_kit::div()
+            .p(gpui_kit::px(20.0))
+            .child(gpui_kit::div().w(gpui_kit::px(150.0)).child(track))
+            .into_any_element()
+    });
+    h.settle();
+    h.frames();
+    let track = h.bounds("squeezed-track");
+    assert!(f32::from(track.size.width) <= 150.5, "{track:?}");
+    for index in 0..3_usize {
+        let segment = h.bounds(("squeezed", index));
+        assert!(
+            segment.right() <= track.right() + gpui_kit::px(0.5),
+            "{index}: {segment:?} {track:?}"
+        );
+        assert!(
+            segment.left() >= track.left(),
+            "{index}: {segment:?} {track:?}"
+        );
+    }
 }

@@ -1600,7 +1600,7 @@ section of `assets/agent/SKILL.md`). New in the port.
 ### `notes-view`
 
 - Window: 1440x900, light
-- State: The Notes view on Waiting on you: the left pane is the notes list, grouped under change ids and titles, the filter in its head; the line note selected, its change, author and time, its lines as a diff excerpt and its thread on the right with Open in diff.
+- State: The Notes view on For you with the working copy's line note selected: the list grouped under change sections, and on the right its change's three notes stacked in one scroll (the change note, the frame_loop.rs file note, the main.rs line note with its highlighted excerpt), scrolled to the line note.
 - Steps: Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, select the line note.
 
 ### `notes-view-picking`
@@ -1608,6 +1608,18 @@ section of `assets/agent/SKILL.md`). New in the port.
 - Window: 1440x900, light
 - State: The Notes view on All open while picking: every row's box showing, three picked, and the floating bar with Picked 3 notes, Resolve, Copy, Delete and Clear.
 - Steps: Leave the working copy's notes; open the Notes view, pick All open from its menu, pick three rows.
+
+### `notes-view-narrow`
+
+- Window: 1440x900, light
+- State: The Notes view with its pane at its narrowest: the filter's three segments sharing the track, each label whole or cut inside its own segment, the menu button in its own room.
+- Steps: Leave the working copy's notes; open the Notes view; drag the pane to its minimum.
+
+### `notes-view-wide`
+
+- Window: 1440x900, light
+- State: The Notes view with a wide pane: the filter's segments filling the track in equal shares, no gap at its end.
+- Steps: Leave the working copy's notes; open the Notes view; widen the pane.
 
 ### `notes-view-empty`
 

@@ -867,6 +867,9 @@ impl Diffui {
                 }
             }
             Action::SelectNextFile => {
+                if self.active().main_view == MainView::Notes {
+                    return self.on_notes(crate::notes::NotesMsg::StackStep(1), cx);
+                }
                 if self.active().main_view == MainView::Source {
                     return self.source_select_neighbor(1);
                 }
@@ -879,6 +882,9 @@ impl Diffui {
                 }
             }
             Action::SelectPreviousFile => {
+                if self.active().main_view == MainView::Notes {
+                    return self.on_notes(crate::notes::NotesMsg::StackStep(-1), cx);
+                }
                 if self.active().main_view == MainView::Source {
                     return self.source_select_neighbor(-1);
                 }

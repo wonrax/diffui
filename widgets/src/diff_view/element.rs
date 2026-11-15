@@ -549,7 +549,9 @@ impl State {
             if let Some((top, height)) = span {
                 // Centred when it fits; else its top just under the sticky file header.
                 let room = bounds.height - metrics.file_header_height;
-                let target = if height <= room {
+                let target = if view.props.reveal_at_top {
+                    top
+                } else if height <= room {
                     top - metrics.file_header_height - (room - height) / 2.0
                 } else {
                     top - metrics.file_header_height - metrics.row_height

@@ -385,6 +385,14 @@ impl RenderOnce for Button {
         // The size's frame first, then whatever the caller styled over it.
         let mut inner = self.inner;
         let styled = std::mem::take(inner.style());
+        // How the caller sized it in its row (a filling segment's share): the
+        // tip's wrapper below takes these, being the row's child.
+        let share = (
+            styled.flex_grow,
+            styled.flex_shrink,
+            styled.flex_basis,
+            styled.min_size.width,
+        );
         // kit paints nothing of its own: its fill would be a circular quad. The
         // squircle behind the label paints each state instead.
         let clear = gpui_kit::Hsla::from(theme::TRANSPARENT);
@@ -417,8 +425,12 @@ impl RenderOnce for Button {
                 Some(icons::icon(glyph, size.icon_size(), color).into_any_element())
             }
         };
+        // Within the button's box: a button held narrower than its label
+        // (a filling segment) cuts the label instead of spilling.
         let mut row = div()
             .h_full()
+            .min_w_0()
+            .overflow_hidden()
             .flex()
             .flex_row()
             .items_center()
@@ -432,7 +444,9 @@ impl RenderOnce for Button {
             row = row.opacity(DISABLED_OPACITY);
         }
         let id = std::sync::Arc::new(self.id);
+        let fills = self.tip.is_some() && share.0.is_some();
         let button = inner
+            .when(fills, |button| button.w_full().min_w_0())
             .child(squircle::interactive_background(
                 ElementId::NamedChild(id.clone(), "squircle".into()),
                 states,
@@ -442,12 +456,21 @@ impl RenderOnce for Button {
         // kit's button takes only kit's tooltip, so the app's hangs off a
         // wrapper the size of the button.
         match self.tip {
-            Some(label) => div()
-                .id(ElementId::NamedChild(id, "tip".into()))
-                .flex_none()
-                .tip(label, self.look)
-                .child(button)
-                .into_any_element(),
+            Some(label) => {
+                let mut wrapper = div()
+                    .id(ElementId::NamedChild(id, "tip".into()))
+                    .flex_none();
+                let (grow, shrink, basis, min_width) = share;
+                let style = wrapper.style();
+                style.flex_grow = grow.or(style.flex_grow);
+                style.flex_shrink = shrink.or(style.flex_shrink);
+                style.flex_basis = basis.or(style.flex_basis);
+                style.min_size.width = min_width.or(style.min_size.width);
+                wrapper
+                    .tip(label, self.look)
+                    .child(button)
+                    .into_any_element()
+            }
             None => button.into_any_element(),
         }
     }
@@ -529,14 +552,38 @@ const SEGMENT_INSET: f32 = theme::space::XXS;
 /// A segment's text inset from its face.
 const SEGMENT_PAD_X: f32 = theme::space::MD;
 
-/// The well a run of segments sits in, a step into the surface under it. Add
-/// [`segment`]s as its children.
+/// The narrowest a filling segment gets before its label is cut short.
+pub const SEGMENT_MIN_WIDTH: f32 = 48.0;
+
+/// How a [`segmented`] control takes its room. Each caller picks one; a
+/// track that stretches with its segments packed at one end is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SegmentFit {
+    /// As wide as its segments, each its own width.
+    #[default]
+    Hug,
+    /// As wide as its parent gives it, the segments sharing that width
+    /// equally, their labels centred and cut short below
+    /// [`SEGMENT_MIN_WIDTH`].
+    Fill,
+}
+
+/// The well a run of segments sits in, a step into the surface under it,
+/// hugging them. Add [`segment`]s as its children.
 pub fn segmented(theme: ThemeSpec) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
+    segmented_in(theme, SegmentFit::Hug)
+}
+
+/// [`segmented`] with its fit chosen: for [`SegmentFit::Fill`], add
+/// [`segment_in`]s made with the same fit. Either way it never pushes past
+/// its parent, and its segments' faces and washes stay inside its track.
+pub fn segmented_in(theme: ThemeSpec, fit: SegmentFit) -> Div {
+    let well = div().flex().flex_row().max_w_full().overflow_hidden();
+    let well = match fit {
+        SegmentFit::Hug => well.flex_none(),
+        SegmentFit::Fill => well.w_full().min_w_0(),
+    };
+    well.items_center()
         .p(px(SEGMENT_INSET))
         .gap(px(SEGMENT_INSET))
         .map(|well| {
@@ -563,6 +610,18 @@ pub struct Segment {
 /// A segment: a quiet label in the well, raised out of it as a ringed face
 /// while `active`. Add the action with `.on_click`.
 pub fn segment(id: impl Into<ElementId>, segment: Segment, size: Segmented, look: Look) -> Button {
+    segment_in(id, segment, size, SegmentFit::Hug, look)
+}
+
+/// [`segment`] for a well of `fit`: a filling one takes an equal share of the
+/// track and cuts its label short when it must.
+pub fn segment_in(
+    id: impl Into<ElementId>,
+    segment: Segment,
+    size: Segmented,
+    fit: SegmentFit,
+    look: Look,
+) -> Button {
     let Look { theme, font, .. } = look;
     let label_font = theme::emphasis_font(font, Weight::MEDIUM);
     let text = size.text_size();
@@ -581,11 +640,15 @@ pub fn segment(id: impl Into<ElementId>, segment: Segment, size: Segmented, look
         ));
         line.push(typography::Aligned::gap(ICON_GAP));
     }
-    line.push(typography::Aligned::text(
-        typography::line(segment.label, label_font, text, ink),
+    let label = typography::Aligned::text(
+        typography::line(segment.label, label_font, text, ink).text_ellipsis(),
         label_font,
         text,
-    ));
+    );
+    line.push(match fit {
+        SegmentFit::Hug => label,
+        SegmentFit::Fill => label.shrink(),
+    });
     let mut pad_x = SEGMENT_PAD_X;
     if let Some((count, shown)) = segment.count {
         let count = count.to_string();
@@ -602,13 +665,22 @@ pub fn segment(id: impl Into<ElementId>, segment: Segment, size: Segmented, look
         }
     }
     let face = theme::radius::inner(theme::radius::CARD, SEGMENT_INSET);
-    look.bare_button(id)
+    let button = look
+        .bare_button(id)
         .h(px(size.segment_height()))
         .px(px(pad_x))
         .corner_radius(face)
         .disabled(!segment.enabled)
         .when(segment.active, Button::lifted)
-        .child(typography::baseline_row(line, 0.0))
+        .child(typography::baseline_row(line, 0.0));
+    match fit {
+        SegmentFit::Hug => button,
+        // Equal shares: grow from nothing, all alike.
+        SegmentFit::Fill => button
+            .flex_1()
+            .flex_basis(px(0.0))
+            .min_w(px(SEGMENT_MIN_WIDTH)),
+    }
 }
 
 // ── Panes ───────────────────────────────────────────────────────────────

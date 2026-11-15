@@ -592,6 +592,96 @@ mod tests {
         assert!((a - b).abs() < 1e-4, "{a} != {b}");
     }
 
+    /// Where each text run's baseline lands, and each glyph's centre, once a
+    /// line lays them out.
+    fn laid(lines: &[Line]) -> (Vec<f32>, Vec<f32>, f32) {
+        let layout = line_layout(lines);
+        let mut baselines = Vec::new();
+        let mut glyphs = Vec::new();
+        for (line, top) in lines.iter().zip(&layout.tops) {
+            if line.glyph {
+                glyphs.push(top + line.height / 2.0);
+            } else {
+                baselines.push(top + line.baseline);
+            }
+        }
+        let caps = layout.line.baseline - layout.line.cap_height / 2.0;
+        (baselines, glyphs, caps)
+    }
+
+    fn text(metrics: FontMetrics, size: f32) -> Line {
+        let text = TextBox::with_metrics(metrics, size, size * DEFAULT_LINE_HEIGHT);
+        Line {
+            baseline: text.baseline(),
+            cap_height: text.cap_height(),
+            height: text.line_height(),
+            glyph: false,
+        }
+    }
+
+    /// The review notes' rows each mix runs that `items_center` would set on
+    /// different baselines; laid out by `baseline_row` they share one, and an
+    /// icon sits on the caps. One case per kind of row.
+    #[test]
+    fn the_notes_rows_runs_share_one_baseline() {
+        let glyph = Line {
+            baseline: 14.0,
+            cap_height: 14.0,
+            height: 14.0,
+            glyph: true,
+        };
+        // A chip (Resolved, Outdated): caption text in a padded box.
+        let tag = {
+            let inner = text(SANS, 10.0);
+            Line {
+                baseline: 3.0 + inner.baseline,
+                height: 6.0 + inner.height,
+                ..inner
+            }
+        };
+        let rows: [(&str, Vec<Line>); 6] = [
+            // The composer's header: icon, "New note", the range in mono.
+            (
+                "composer header",
+                vec![glyph, text(SANS, 13.0), text(MONO, 11.0)],
+            ),
+            // A message's header and the folded card: author, time, tags.
+            (
+                "message header",
+                vec![tag, text(SANS, 13.0), text(SANS, 11.0)],
+            ),
+            // The Notes view's group header: id in mono, label, count.
+            (
+                "group header",
+                vec![text(MONO, 13.0), text(SANS, 13.0), text(SANS, 13.0)],
+            ),
+            // A row's first line: the message, the age.
+            ("row title", vec![text(SANS, 14.0), text(SANS, 11.5)]),
+            // A row's second line: location in mono, author, replies, a tag.
+            ("row meta", vec![text(MONO, 11.0), tag, text(SANS, 11.0)]),
+            // The detail header: id, description; then location and tags.
+            (
+                "detail header",
+                vec![text(MONO, 13.0), text(SANS, 14.0), tag],
+            ),
+        ];
+        for (name, lines) in rows {
+            let (baselines, glyphs, caps) = laid(&lines);
+            for baseline in &baselines {
+                assert!(
+                    (baseline - baselines[0]).abs() < 1e-4,
+                    "{name}: {baselines:?}"
+                );
+            }
+            for centre in glyphs {
+                assert!(
+                    (centre - caps).abs() < 1e-4,
+                    "{name}: icon at {centre}, caps at {caps}"
+                );
+            }
+        }
+    }
+
     /// The fonts the app draws with resolve to real faces whose metrics are
     /// sane: caps under the ascent, a positive descent.
     #[test]

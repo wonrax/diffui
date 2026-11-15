@@ -17,6 +17,10 @@ use crate::typography::Aligned;
 use crate::ui::Look;
 use crate::{Action, Cx, Diffui, icons, typography};
 
+/// A card's inner padding: around its messages, its footer and its
+/// composer.
+const CARD_PAD: f32 = theme::space::LG;
+
 /// The reply field's id: one reply is written at a time.
 pub(crate) const REPLY_FIELD: &str = "note-reply-field";
 
@@ -211,15 +215,8 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
     props
 }
 
-/// `note`'s card, open, for the Notes view: its messages, and its reply
-/// field when one is being written.
-pub(crate) fn thread_card(
-    ui: &Diffui,
-    look: Look,
-    note: &Note,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> AnyElement {
+/// `note`'s card, open, laid into the Notes view's stack under `at`.
+pub(crate) fn stack_inset(ui: &Diffui, look: Look, note: &Note, at: DocSpot, cx: &mut Cx) -> Inset {
     let tab = ui.active();
     let on: On = Rc::new(Diffui::listen(cx, |this, message: &NotesMsg, _, cx| {
         this.perform(Action::Notes(message.clone()), cx);
@@ -252,7 +249,13 @@ pub(crate) fn thread_card(
         look,
         on,
     };
-    card.card(window, cx)
+    let key = card.key();
+    let card = Rc::new(card);
+    Inset {
+        at,
+        key,
+        build: Rc::new(move |window, cx| card.render(window, cx)),
+    }
 }
 
 impl Diffui {
@@ -367,7 +370,7 @@ impl Card {
         card = match &self.replying {
             Some(draft) => card.child(reply_field(
                 draft,
-                "Send",
+                "Reply",
                 &self.send_keys,
                 &self.cancel_keys,
                 self.look,
@@ -456,8 +459,8 @@ impl Card {
             .id(id(&thread.id, "folded"))
             .w_full()
             .min_w_0()
-            .px(px(theme::space::MD_LG))
-            .py(px(theme::space::MD))
+            .px(px(CARD_PAD))
+            .py(px(theme::space::MD_LG))
             .cursor_pointer()
             .on_click(self.send(NotesMsg::Toggle(thread.id.clone())))
             .when(resolved, |row| row.opacity(0.75))
@@ -534,11 +537,11 @@ impl Card {
                     .flex_col()
                     .gap(px(theme::space::XS))
                     .w_full()
-                    .px(px(theme::space::MD_LG))
-                    .pt(px(theme::space::MD))
+                    .px(px(CARD_PAD))
+                    .pt(px(CARD_PAD))
                     .when(index > 0, |block| {
                         block
-                            .mt(px(theme::space::MD))
+                            .mt(px(CARD_PAD))
                             .border_t_1()
                             .border_color(theme.border)
                     })
@@ -558,8 +561,8 @@ impl Card {
         let lines = self.note.thread.anchor.as_ref()?.lines.as_ref()?;
         Some(
             div()
-                .px(px(theme::space::MD_LG))
-                .pt(px(theme::space::MD))
+                .px(px(CARD_PAD))
+                .pt(px(CARD_PAD))
                 .child(
                     div()
                         .w_full()
@@ -614,8 +617,9 @@ impl Card {
             .gap(px(theme::space::XS))
             .w_full()
             .min_w_0()
-            .px(px(theme::space::MD_LG))
-            .py(px(theme::space::SM))
+            .px(px(CARD_PAD))
+            .pt(px(theme::space::MD))
+            .pb(px(theme::space::MD_LG))
             .child(div().flex_1().min_w_0().child(typography::centered(
                 typography::line(hint, font, text_size::CAPTION, theme.subtle_text).text_ellipsis(),
                 font,
@@ -695,8 +699,12 @@ pub(crate) fn plain_line(body: &str) -> String {
         .replace('`', "")
 }
 
-/// The reply field and its footer: for a reply (`send` "Reply") or a new
-/// note ("Add note").
+/// The composer: the card's last section, past a hairline, at the card's
+/// padding. The kit's multi-line field in its own bordered style, three lines
+/// tall and growing with what's typed to a cap; under it "Markdown
+/// supported" and the dialog's Cancel and primary buttons, the primary's
+/// tooltip naming its key. `send_label` is "Reply", or "Add note" for a new
+/// thread.
 #[allow(clippy::too_many_arguments)]
 fn reply_field(
     draft: &str,
@@ -708,13 +716,22 @@ fn reply_field(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    /// The field's height in lines: three to start, then it grows to this
+    /// and scrolls.
+    const MIN_LINES: usize = 3;
+    const MAX_LINES: usize = 12;
     let Look { theme, font, .. } = look;
     let typed = on.clone();
+    let placeholder = if send_label == "Reply" {
+        "Reply\u{2026}"
+    } else {
+        "Add a note\u{2026}"
+    };
     let spec = crate::input::FieldSpec::new(REPLY_FIELD, draft)
-        .placeholder("Write in Markdown\u{2026}")
+        .placeholder(placeholder)
         .on_input(move |text, window, cx| typed(&NotesMsg::ReplyEdited(text), window, cx));
-    let (field, focused) = crate::input::multi_line_with_focus(spec, font, window, cx);
-    let lines = draft.lines().count().clamp(2, 10) as f32;
+    let field = crate::input::multi_line(spec, font, window, cx);
+    let lines = draft.lines().count().clamp(MIN_LINES, MAX_LINES) as f32;
     let height =
         lines * text_size::BODY * crate::typography::DEFAULT_LINE_HEIGHT + 2.0 * theme::space::MD;
     let input = div()
@@ -722,58 +739,57 @@ fn reply_field(
         .h(px(height))
         .font(font.gpui())
         .text_size(px(text_size::BODY))
-        .child(
-            field
-                .appearance(false)
-                .text_size(px(text_size::BODY))
-                .h_full(),
-        );
-    fn keys(keys: &[String]) -> Vec<&str> {
-        keys.iter().map(String::as_str).collect()
-    }
-    let mut hints = Vec::new();
-    if !send_keys.is_empty() {
-        hints.push(
-            crate::overlay_kit::key_hint(&keys(send_keys), send_label, look).into_any_element(),
-        );
-    }
-    if !cancel_keys.is_empty() {
-        hints.push(
-            crate::overlay_kit::key_hint(&keys(cancel_keys), "Cancel", look).into_any_element(),
-        );
-    }
+        .child(field.text_size(px(text_size::BODY)).h_full());
     let click = |message: NotesMsg| {
         let on = on.clone();
         move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| on(&message, window, cx)
     };
+    let shortcut = |label: &str, keys: &[String]| {
+        if keys.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label} ({})", keys.join(""))
+        }
+    };
     let cancel = look
         .cancel_button("note-reply-cancel")
-        .compact()
+        .tip(shortcut("Cancel", cancel_keys))
         .on_click(click(NotesMsg::CancelReply));
     let send = look
         .button("note-reply-send", send_label)
         .primary()
-        .compact()
         .disabled(draft.trim().is_empty())
+        .tip(shortcut(send_label, send_keys))
         .on_click(click(NotesMsg::SendReply));
-    let footer = crate::overlay_kit::footer_with_buttons(
-        crate::overlay_kit::Density::Well,
-        theme::radius::inner(theme::radius::CONTROL, theme::HAIRLINE),
-        hints,
-        [cancel.into_any_element(), send.into_any_element()],
-        theme,
-    );
+    let buttons = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(crate::ui::BUTTON_GAP))
+        .child(div().flex_1().min_w_0().child(typography::centered(
+            typography::line(
+                "Markdown supported",
+                font,
+                text_size::CAPTION,
+                theme.subtle_text,
+            ),
+            font,
+            text_size::CAPTION,
+        )))
+        .child(cancel)
+        .child(send);
     div()
         .w_full()
-        .px(px(theme::space::MD_LG))
-        .pb(px(theme::space::MD_LG))
-        .child(
-            crate::field::field_well(focused, theme)
-                .flex()
-                .flex_col()
-                .child(input)
-                .child(footer),
-        )
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::MD))
+        .px(px(CARD_PAD))
+        .py(px(CARD_PAD))
+        .border_t_1()
+        .border_color(theme.border)
+        .child(input)
+        .child(buttons)
         .into_any_element()
 }
 
@@ -790,38 +806,43 @@ struct NewCard {
 impl NewCard {
     fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let Look { theme, font, mono } = self.look;
+        let bold = theme::emphasis_font(font, Weight::SEMIBOLD);
+        // The title and the range in mono on one baseline, the icon on the
+        // caps.
         let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::space::SM))
             .w_full()
             .min_w_0()
-            .px(px(theme::space::MD_LG))
-            .py(px(theme::space::SM))
-            .child(icons::icon(
-                icons::MESSAGE_SQUARE,
-                theme::icon::SM,
-                theme.accent,
-            ))
+            .px(px(CARD_PAD))
+            .py(px(theme::space::MD))
             .child(
-                typography::line(
-                    "New note",
-                    theme::emphasis_font(font, Weight::SEMIBOLD),
-                    text_size::BODY,
-                    theme.text,
+                typography::baseline_row(
+                    [
+                        Aligned::glyph(
+                            icons::icon(icons::MESSAGE_SQUARE, theme::icon::SM, theme.accent),
+                            theme::icon::SM,
+                        ),
+                        Aligned::text(
+                            typography::line("New note", bold, text_size::BODY, theme.text)
+                                .flex_none(),
+                            bold,
+                            text_size::BODY,
+                        ),
+                        Aligned::text(
+                            typography::line(
+                                self.title.clone(),
+                                mono,
+                                text_size::CAPTION,
+                                theme.muted_text,
+                            )
+                            .text_ellipsis(),
+                            mono,
+                            text_size::CAPTION,
+                        )
+                        .shrink(),
+                    ],
+                    theme::space::SM,
                 )
-                .flex_none(),
-            )
-            .child(
-                typography::line(
-                    self.title.clone(),
-                    mono,
-                    text_size::CAPTION,
-                    theme.muted_text,
-                )
-                .min_w_0()
-                .text_ellipsis(),
+                .min_w_0(),
             );
         let card = div()
             .id("note-new-card")
@@ -833,7 +854,7 @@ impl NewCard {
                 theme::squircle(
                     card,
                     theme::radius::CARD,
-                    Some(theme.panel_background_elevated),
+                    Some(theme.panel_background),
                     Some(theme.border),
                 )
             })
