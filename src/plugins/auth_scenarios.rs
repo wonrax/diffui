@@ -143,6 +143,10 @@ fn github_server() -> Server {
                         "nodes": nodes, "pageInfo": { "hasNextPage": more, "endCursor": "c1" } } } } }),
                 )
             }
+            ("POST", "/api/graphql") if request.body.contains("reviewThreads") => {
+                let page = if request.body.contains("\"after\":\"t1\"") { 2 } else { 1 };
+                Answer::json(200, super::github_scenarios::review_threads(page))
+            }
             ("POST", "/api/graphql") if request.body.contains("statusCheckRollup") => {
                 let state = if request.body.contains("\"sha\":\"good\"") {
                     json!({ "state": "SUCCESS" })
@@ -335,6 +339,21 @@ fn github_pull_request_tab_with_a_token() {
         .filter(|request| request.header("accept") == Some("application/vnd.github.diff"))
         .count();
     assert_eq!(asked_diff, 2);
+}
+
+#[test]
+fn github_review_threads_with_a_token() {
+    let server = github_server();
+    let github = github_token(&server);
+    let threads = block_on(github.review_comments(pr(&github, &server, "app", 5))).expect("read");
+    super::github_scenarios::assert_review_threads(&threads);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "two pages");
+    let variables: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        variables["variables"],
+        json!({ "owner": "team", "name": "app", "number": 5, "after": null })
+    );
 }
 
 #[test]

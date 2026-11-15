@@ -240,6 +240,9 @@ pub enum ForgeCall {
     /// The whole pull request's diff. Streams [`DiffPart`]s through the
     /// call's parts, then replies `null`.
     Diff { pr: PrRef },
+    /// The pull request's review threads, read-only. Reply:
+    /// `Vec<`[`ReviewThread`]`>`.
+    ReviewComments { pr: PrRef },
     /// Who the user is on `host` and how the forge reaches it, or, with
     /// `token`, who that token belongs to. Reply: [`Account`].
     Account {
@@ -349,6 +352,7 @@ impl ForgeCall {
             ForgeCall::Commits { .. } => "commits",
             ForgeCall::CommitDiff { .. } => "commitDiff",
             ForgeCall::Diff { .. } => "diff",
+            ForgeCall::ReviewComments { .. } => "reviewComments",
             ForgeCall::Account { .. } => "account",
         }
     }
@@ -362,7 +366,7 @@ impl ForgeCall {
 
 /// The provider methods a script can register, in the order the host lists
 /// them.
-pub const FORGE_METHODS: [&str; 10] = [
+pub const FORGE_METHODS: [&str; 11] = [
     "pullRequests",
     "checks",
     "createPullRequest",
@@ -372,6 +376,7 @@ pub const FORGE_METHODS: [&str; 10] = [
     "commits",
     "commitDiff",
     "diff",
+    "reviewComments",
     "account",
 ];
 
@@ -425,6 +430,61 @@ pub struct PrCommit {
     /// When it was authored, as RFC 3339 (`2026-11-14T09:30:00Z`).
     #[serde(default)]
     pub authored_at: Option<String>,
+}
+
+/// A pull request's review thread: comments on lines (or a file) of its
+/// diff, the first one and the replies under it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThread {
+    pub path: String,
+    /// The side of the diff its lines are on.
+    pub side: ReviewSide,
+    /// The last line it is on, 1-based on `side` of the pull request's
+    /// diff now; `None` for a comment on the whole file, or one whose lines
+    /// the pull request no longer has.
+    #[serde(default)]
+    pub line: Option<u64>,
+    /// The first line of a comment on several.
+    #[serde(default)]
+    pub start_line: Option<u64>,
+    /// The last line when it was written, for an outdated thread.
+    #[serde(default)]
+    pub original_line: Option<u64>,
+    /// The text of the lines it is on, as they were when it was written
+    /// (from the comment's diff hunk), without the `+`/`-` mark.
+    #[serde(default)]
+    pub text: Vec<String>,
+    /// The forge says its lines changed since.
+    #[serde(default)]
+    pub outdated: bool,
+    #[serde(default)]
+    pub resolved: bool,
+    /// The thread's page on the forge.
+    pub url: String,
+    /// Oldest first.
+    pub comments: Vec<ReviewComment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewSide {
+    /// The base: lines the pull request removes.
+    Old,
+    /// The head.
+    New,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComment {
+    #[serde(default)]
+    pub author: String,
+    /// Markdown.
+    pub body: String,
+    /// RFC 3339.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// What `commitDiff` settles with, once its parts are all sent.

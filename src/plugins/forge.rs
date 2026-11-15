@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use diffui_core::forge::{
     CheckState, Checks, CreatePr, DiffParts, ForgeAbility, ForgeError, ForgeFuture, ForgeKind,
     ForgePr, ForgeProvider, ForgeRemote, ForgeSpec, Forges, OnFile, PrCommit, PrInfo, PrState,
-    PullRequest, ReviewDecision, UpdatePr, latest_per_branch, parse_remote_url,
+    PullRequest, ReviewComment, ReviewDecision, ReviewThread, UpdatePr, latest_per_branch,
+    parse_remote_url,
 };
 use diffui_core::model::{DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo};
 use diffui_core::repo::CancelFlag;
@@ -357,6 +358,7 @@ impl ForgeProvider for ScriptForge {
             ForgeAbility::Create => self.has("createPullRequest"),
             ForgeAbility::Update => self.has("updatePullRequest"),
             ForgeAbility::Tab => TAB_METHODS.iter().all(|method| self.has(method)),
+            ForgeAbility::ReviewComments => self.has("reviewComments"),
         }
     }
 
@@ -552,6 +554,44 @@ impl ForgeProvider for ScriptForge {
                 .await
                 .map(|_| ())
         })
+    }
+
+    fn review_comments(&self, pr: ForgePr) -> ForgeFuture<'_, Vec<ReviewThread>> {
+        let asked = self.ask_about::<Vec<protocol::ReviewThread>>(
+            &pr,
+            ForgeCall::ReviewComments { pr: pr_ref(&pr) },
+        );
+        Box::pin(async move { Ok(asked.await?.into_iter().map(review_thread).collect()) })
+    }
+}
+
+fn review_thread(thread: protocol::ReviewThread) -> ReviewThread {
+    let line = |line: Option<u64>| line.map(|line| line as usize);
+    ReviewThread {
+        path: thread.path,
+        side: match thread.side {
+            protocol::ReviewSide::Old => diffui_core::notes::Side::Old,
+            protocol::ReviewSide::New => diffui_core::notes::Side::New,
+        },
+        line: line(thread.line),
+        start_line: line(thread.start_line),
+        original_line: line(thread.original_line),
+        text: thread.text,
+        outdated: thread.outdated,
+        resolved: thread.resolved,
+        url: thread.url,
+        comments: thread
+            .comments
+            .into_iter()
+            .map(|comment| ReviewComment {
+                created_millis: comment
+                    .created_at
+                    .as_deref()
+                    .and_then(diffui_core::history::parse_timestamp_millis),
+                author: comment.author,
+                body: comment.body,
+            })
+            .collect(),
     }
 }
 

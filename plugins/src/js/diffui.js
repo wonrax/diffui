@@ -914,6 +914,8 @@ async function askForge(id, repo, request, signal) {
       return forgeProvider.view(freezePr(request.pr));
     case "commits":
       return forgeProvider.commits(freezePr(request.pr));
+    case "reviewComments":
+      return forgeProvider.reviewComments(freezePr(request.pr));
     case "diff":
       await sendParts(id, await forgeProvider.diff(freezePr(request.pr), { signal }), signal, "diff");
       return null;

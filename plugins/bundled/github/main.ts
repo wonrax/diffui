@@ -12,7 +12,18 @@
 // file once its last hunk is in, so a huge PR paints progressively while the
 // download is still running.
 import { ForgeError, auth, config, exec, files, forge } from "diffui";
-import type { Account, Checks, FilePatch, ForgeRemote, PrCommit, PrInfo, PrRef, PullRequest, Repo } from "diffui";
+import type {
+  Account,
+  Checks,
+  FilePatch,
+  ForgeRemote,
+  PrCommit,
+  PrInfo,
+  PrRef,
+  PullRequest,
+  Repo,
+  ReviewThread,
+} from "diffui";
 import * as rest from "./rest.ts";
 
 /**
@@ -376,6 +387,79 @@ const LIST_QUERY =
   "nodes{number url title headRefName baseRefName headRefOid state isDraft reviewDecision isCrossRepository}" +
   "pageInfo{hasNextPage endCursor}}}}";
 
+/**
+ * A pull request's review threads, a page of 100 at a time, each with its
+ * first 100 comments. GraphQL rather than REST: only it says which threads
+ * are outdated or resolved.
+ */
+const THREADS_QUERY =
+  "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){" +
+  "pullRequest(number:$number){reviewThreads(first:100,after:$after){" +
+  "nodes{path line startLine originalLine diffSide isOutdated isResolved " +
+  "comments(first:100){nodes{author{login} body createdAt url diffHunk}}}" +
+  "pageInfo{hasNextPage endCursor}}}}}";
+
+/** How many pages of threads a pull request is read to. */
+const THREAD_PAGES = 5;
+
+interface ApiThread {
+  path: string;
+  line: number | null;
+  startLine: number | null;
+  originalLine: number | null;
+  diffSide: "LEFT" | "RIGHT";
+  isOutdated: boolean;
+  isResolved: boolean;
+  comments: {
+    nodes: { author: { login: string } | null; body: string; createdAt: string; url: string; diffHunk: string }[];
+  };
+}
+
+type ThreadsPage = {
+  repository: {
+    pullRequest: {
+      reviewThreads: { nodes: ApiThread[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+    } | null;
+  } | null;
+};
+
+/**
+ * The text of the lines a comment is on: the end of its diff hunk, which
+ * GitHub cuts at the commented line, on the thread's side.
+ */
+function hunkLines(hunk: string, side: "LEFT" | "RIGHT", count: number): string[] {
+  const skip = side === "LEFT" ? "+" : "-";
+  const lines = hunk
+    .split("\n")
+    .filter((line) => !line.startsWith("@@") && !line.startsWith(skip) && !line.startsWith("\\"))
+    .map((line) => line.slice(1));
+  return lines.slice(Math.max(0, lines.length - count));
+}
+
+function reviewThread(thread: ApiThread): ReviewThread {
+  const comments = thread.comments.nodes;
+  const first = comments[0];
+  const end = thread.line ?? thread.originalLine;
+  const count = end !== null && thread.startLine !== null ? end - thread.startLine + 1 : 1;
+  return {
+    path: thread.path,
+    side: thread.diffSide === "LEFT" ? "old" : "new",
+    line: thread.isOutdated ? null : thread.line,
+    startLine: thread.isOutdated ? null : thread.startLine,
+    originalLine: thread.originalLine,
+    // A comment on a whole file has no lines, and no hunk to read.
+    text: end === null || !first ? [] : hunkLines(first.diffHunk, thread.diffSide, count),
+    outdated: thread.isOutdated,
+    resolved: thread.isResolved,
+    url: first?.url ?? "",
+    comments: comments.map((comment) => ({
+      author: comment.author?.login ?? "ghost",
+      body: comment.body,
+      createdAt: comment.createdAt,
+    })),
+  };
+}
+
 /** `gh pr list --limit 200`'s listing through the GraphQL API. */
 async function listWithToken(remote: ForgeRemote, via: rest.Api): Promise<ListedPr[]> {
   const listed: ListedPr[] = [];
@@ -712,6 +796,30 @@ forge.register({
       return;
     }
     throw failure(host, ended.stderr, "");
+  },
+
+  async reviewComments(pr): Promise<ReviewThread[]> {
+    const via = await tokenApi(pr.host, pr.webUrl);
+    const threads: ApiThread[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < THREAD_PAGES; page++) {
+      const variables = { owner: pr.owner, name: pr.name, number: pr.number, after };
+      let answer: ThreadsPage;
+      if (via !== null) {
+        answer = await rest.graphql<ThreadsPage>(via, THREADS_QUERY, variables);
+      } else {
+        const args = ["api", "graphql", "-f", `query=${THREADS_QUERY}`, "-f", `owner=${pr.owner}`];
+        args.push("-f", `name=${pr.name}`, "-F", `number=${pr.number}`);
+        if (after !== null) args.push("-f", `after=${after}`);
+        answer = (await json<{ data: ThreadsPage }>(pr.host, args)).data;
+      }
+      const listed = answer.repository?.pullRequest?.reviewThreads;
+      if (!listed) throw new ForgeError("not-found", `${slugOf(pr)}#${pr.number} wasn't found`, { host: pr.host });
+      threads.push(...listed.nodes);
+      if (!listed.pageInfo.hasNextPage) break;
+      after = listed.pageInfo.endCursor;
+    }
+    return threads.filter((thread) => thread.comments.nodes.length > 0).map(reviewThread);
   },
 
   async account(host, { token }) {

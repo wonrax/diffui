@@ -233,6 +233,12 @@ declare module "diffui" {
      */
     diff?(pr: PrRef, options: { signal: AbortSignal }): DiffSource | Promise<DiffSource>;
     /**
+     * A pull request's review threads, shown read-only in its diff: in its tab, and on the revision whose
+     * bookmark has it. Asked when that diff is on screen; a failure only leaves the comments out. Return
+     * resolved and outdated threads too, marked.
+     */
+    reviewComments?(pr: PrRef): Promise<ReviewThread[]>;
+    /**
      * Who the user is on `host`, and how this forge reaches it: for Settings' Account area. With `token`, check
      * that one instead (one the user pasted, before diffui keeps it): ask the API who it belongs to and throw a
      * `ForgeError` "auth" when the forge refuses it. Without, answer `{ method: null, login: null }` when
@@ -306,6 +312,42 @@ declare module "diffui" {
     headline: string;
     /** When it was authored, RFC 3339 ("2026-11-14T09:30:00Z"). */
     authoredAt?: string | null;
+  }
+
+  /** Comments on lines (or a whole file) of a pull request's diff: the first one and its replies. */
+  export interface ReviewThread {
+    path: string;
+    /** The side its lines are on: "old" for lines the pull request removes. */
+    side: "old" | "new";
+    /**
+     * The last line it is on, 1-based on `side` of the pull request's diff now. `null` for a comment on the
+     * whole file, or one whose lines the pull request no longer has (mark it `outdated`).
+     */
+    line?: number | null;
+    /** The first line of a comment on several. */
+    startLine?: number | null;
+    /** The last line when it was written, shown for an outdated thread. */
+    originalLine?: number | null;
+    /**
+     * The text of the lines it is on as they were when it was written, without the `+`/`-`/` ` mark: diffui
+     * checks it against the lines it lands on, and shows it for an outdated thread.
+     */
+    text?: string[];
+    /** Its lines changed since it was written. */
+    outdated?: boolean;
+    resolved?: boolean;
+    /** The thread's page on the forge. */
+    url: string;
+    /** Oldest first. */
+    comments: ReviewComment[];
+  }
+
+  export interface ReviewComment {
+    author?: string;
+    /** Markdown. */
+    body: string;
+    /** RFC 3339. */
+    createdAt?: string | null;
   }
 
   export interface CommitDiff {

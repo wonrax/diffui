@@ -626,3 +626,142 @@ fn measure_github_badges_and_a_pull_requests_diff() {
         show(&mut tabs)
     );
 }
+
+/// Page `page` (1 or 2) of `team/app#5`'s review threads, as GitHub's
+/// GraphQL API answers: a line comment and its reply, an outdated and
+/// resolved one, then a comment on two removed lines and one on a whole
+/// file.
+pub(crate) fn review_threads(page: u8) -> String {
+    let url = "https://github.com/team/app/pull/5#discussion_r";
+    let (nodes, more) = if page == 1 {
+        (
+            format!(
+                r#"{{"path": "src/a.rs", "line": 2, "startLine": null, "originalLine": 2, "diffSide": "RIGHT",
+                  "isOutdated": false, "isResolved": false, "comments": {{"nodes": [
+                    {{"author": {{"login": "ada"}}, "body": "Why **this**?", "createdAt": "2026-11-14T09:30:00Z",
+                     "url": "{url}1", "diffHunk": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO"}},
+                    {{"author": null, "body": "Because.", "createdAt": "2026-11-14T10:00:00Z",
+                     "url": "{url}2", "diffHunk": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO"}}]}}}},
+                 {{"path": "src/a.rs", "line": null, "startLine": null, "originalLine": 7, "diffSide": "RIGHT",
+                  "isOutdated": true, "isResolved": true, "comments": {{"nodes": [
+                    {{"author": {{"login": "lin"}}, "body": "Rename it.", "createdAt": "2026-11-13T09:00:00Z",
+                     "url": "{url}3", "diffHunk": "@@ -5,3 +5,3 @@\n five\n six\n-seven\n+SEVEN"}}]}}}}"#
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                r#"{{"path": "src/b.rs", "line": 4, "startLine": 3, "originalLine": 4, "diffSide": "LEFT",
+                  "isOutdated": false, "isResolved": false, "comments": {{"nodes": [
+                    {{"author": {{"login": "ada"}}, "body": "Keep these.", "createdAt": "2026-11-14T11:00:00Z",
+                     "url": "{url}4", "diffHunk": "@@ -1,4 +1,2 @@\n one\n two\n-three\n-four"}}]}}}},
+                 {{"path": "README.md", "line": null, "startLine": null, "originalLine": null, "diffSide": "RIGHT",
+                  "isOutdated": false, "isResolved": false, "comments": {{"nodes": [
+                    {{"author": {{"login": "lin"}}, "body": "A word on the file.", "createdAt": "2026-11-14T12:00:00Z",
+                     "url": "{url}5", "diffHunk": ""}}]}}}}"#
+            ),
+            false,
+        )
+    };
+    format!(
+        r#"{{"data": {{"repository": {{"pullRequest": {{"reviewThreads": {{"nodes": [{nodes}],
+           "pageInfo": {{"hasNextPage": {more}, "endCursor": "t1"}}}}}}}}}}}}"#
+    )
+}
+
+/// What [`review_threads`] reads as: both pages, in order.
+pub(crate) fn assert_review_threads(threads: &[diffui_core::forge::ReviewThread]) {
+    use diffui_core::notes::Side;
+    type Summary<'a> = (&'a str, Side, Option<usize>, Option<usize>, bool, bool);
+    let summary: Vec<Summary> = threads
+        .iter()
+        .map(|thread| {
+            (
+                thread.path.as_str(),
+                thread.side,
+                thread.start_line,
+                thread.line,
+                thread.outdated,
+                thread.resolved,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("src/a.rs", Side::New, None, Some(2), false, false),
+            ("src/a.rs", Side::New, None, None, true, true),
+            ("src/b.rs", Side::Old, Some(3), Some(4), false, false),
+            ("README.md", Side::New, None, None, false, false),
+        ]
+    );
+    let text: Vec<&[String]> = threads.iter().map(|thread| &thread.text[..]).collect();
+    assert_eq!(
+        text,
+        [
+            &["TWO".to_owned()][..],
+            &["SEVEN".to_owned()],
+            &["three".to_owned(), "four".to_owned()],
+            &[],
+        ],
+        "the commented lines, from the end of the hunk on the thread's side"
+    );
+    assert_eq!(threads[1].original_line, Some(7));
+    let first = &threads[0];
+    assert_eq!(
+        first.url,
+        "https://github.com/team/app/pull/5#discussion_r1"
+    );
+    let comments: Vec<(&str, &str, bool)> = first
+        .comments
+        .iter()
+        .map(|comment| {
+            (
+                comment.author.as_str(),
+                comment.body.as_str(),
+                comment.created_millis.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        comments,
+        [("ada", "Why **this**?", true), ("ghost", "Because.", true)]
+    );
+}
+
+#[test]
+fn github_reads_review_threads_through_gh() {
+    let fake = fake(
+        "gh-threads",
+        &[
+            ("api graphql *after=t1*", &review_threads(2), 0),
+            ("api graphql *", &review_threads(1), 0),
+        ],
+    );
+    let github = github(&fake);
+    assert!(github.can(ForgeAbility::ReviewComments));
+    let threads = block_on(github.review_comments(pr(&github, "github.com", 5))).expect("read");
+    assert_review_threads(&threads);
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 2, "two pages");
+    assert!(has(&calls[0], &["-F", "number=5"]));
+    assert!(has(&calls[0], &["-f", "owner=team"]));
+    assert!(!calls[0].iter().any(|arg| arg.starts_with("after=")));
+    assert!(has(&calls[1], &["-f", "after=t1"]));
+}
+
+#[test]
+fn a_failing_review_threads_read_is_a_typed_error() {
+    let fake = fake(
+        "gh-threads-fail",
+        &[(
+            "api graphql *",
+            "GraphQL: Could not resolve to a PullRequest with the number of 5. (repository.pullRequest)\n",
+            1,
+        )],
+    );
+    let github = github(&fake);
+    let error = block_on(github.review_comments(pr(&github, "github.com", 5))).unwrap_err();
+    assert!(matches!(error, ForgeError::NotFound { .. }), "{error:?}");
+}

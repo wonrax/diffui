@@ -994,7 +994,7 @@ mod tests {
         assert!(
             said.contains(
                 "forge github.com, github.*, *.github.*: pullRequests, checks, createPullRequest, \
-                 updatePullRequest, hosts, view, commits, commitDiff, diff, account\n"
+                 updatePullRequest, hosts, view, commits, commitDiff, diff, reviewComments, account\n"
             ),
             "{said}"
         );

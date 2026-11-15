@@ -334,6 +334,36 @@ pub struct PrCommit {
     pub authored_millis: Option<i64>,
 }
 
+/// A pull request's review thread, as the forge has it now: comments on
+/// lines of its diff (or on a whole file), the first one and its replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThread {
+    pub path: String,
+    pub side: crate::notes::Side,
+    /// The last line it is on, 1-based on `side` of the pull request's diff;
+    /// `None` on a whole file, or when its lines are gone.
+    pub line: Option<usize>,
+    pub start_line: Option<usize>,
+    /// The last line when it was written.
+    pub original_line: Option<usize>,
+    /// The lines' text when it was written.
+    pub text: Vec<String>,
+    pub outdated: bool,
+    pub resolved: bool,
+    pub url: String,
+    /// Oldest first.
+    pub comments: Vec<ReviewComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub author: String,
+    /// Markdown.
+    pub body: String,
+    /// Epoch millis, when it parses.
+    pub created_millis: Option<i64>,
+}
+
 /// Why a forge call failed, in terms the UI can explain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgeError {
@@ -469,6 +499,8 @@ pub enum ForgeAbility {
     Update,
     /// A pull request in a tab of its own: `view`, `commits` and the diffs.
     Tab,
+    /// [`ForgeProvider::review_comments`].
+    ReviewComments,
 }
 
 /// A forge, as diffui talks to it. See the module docs.
@@ -536,6 +568,11 @@ pub trait ForgeProvider: Send + Sync {
         _cancel: CancelFlag,
         _on_file: OnFile<'a>,
     ) -> ForgeFuture<'a, ()> {
+        Box::pin(async { Err(ForgeError::Unsupported) })
+    }
+
+    /// The pull request's review threads, read-only.
+    fn review_comments(&self, _pr: ForgePr) -> ForgeFuture<'_, Vec<ReviewThread>> {
         Box::pin(async { Err(ForgeError::Unsupported) })
     }
 }

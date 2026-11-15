@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 use diffui_plugins::protocol::{
     AI_METHODS, AiAccount, AiModel, AiRequest, Bookmark, CheckState, Checks, Choice,
     CreatePullRequest, Diff, EVENT_NAMES, FORGE_METHODS, JjRun, PrState, PullRequest, Remote,
-    RemoteBookmark, RevisionRef, Row, Selection, UpdatePullRequest,
+    RemoteBookmark, ReviewComment, ReviewSide, ReviewThread, RevisionRef, Row, Selection,
+    UpdatePullRequest,
 };
 use serde_json::{Value, json};
 
@@ -317,6 +318,29 @@ fn the_data_types_have_the_fields_the_protocol_sends() {
             url: None
         }),
         interface("Checks")
+    );
+    assert_eq!(
+        fields(ReviewThread {
+            path: text(),
+            side: ReviewSide::New,
+            line: None,
+            start_line: None,
+            original_line: None,
+            text: vec![],
+            outdated: false,
+            resolved: false,
+            url: text(),
+            comments: vec![],
+        }),
+        interface("ReviewThread")
+    );
+    assert_eq!(
+        fields(ReviewComment {
+            author: text(),
+            body: text(),
+            created_at: None,
+        }),
+        interface("ReviewComment")
     );
     assert_eq!(
         fields(CreatePullRequest {
