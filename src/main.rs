@@ -52,6 +52,7 @@ mod menus;
 mod meta_line;
 mod mode_hints;
 mod modes;
+mod notes;
 mod overlay_kit;
 #[cfg(test)]
 mod overlay_scenes;
@@ -216,6 +217,10 @@ fn main() {
     }
     // `diffui ctl …` talks to the running app; `diffui skill` prints its guide.
     if let Some(code) = ctl::client_main() {
+        std::process::exit(code);
+    }
+    // `diffui notes …` leaves and reads review notes, with the app or without.
+    if let Some(code) = notes::cli::client_main() {
         std::process::exit(code);
     }
     // `diffui plugin …` starts, checks and lists plugins.

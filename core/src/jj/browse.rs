@@ -44,7 +44,7 @@ pub(crate) async fn read_jj_file_pair(
 
 /// Materialize one tree entry as text, `None` for anything full-context
 /// highlighting can't use (absent, binary, conflicted, oversized, bad path).
-pub(super) async fn read_jj_tree_file(
+pub(crate) async fn read_jj_tree_file(
     repo: &ReadonlyRepo,
     tree: &jj_lib::merged_tree::MergedTree,
     path: &str,

@@ -88,7 +88,7 @@ impl<'a> RevsetScope<'a> {
     }
 
     /// The commit ids `expression` evaluates to, newest first.
-    async fn ids(
+    pub(crate) async fn ids(
         &self,
         src: &str,
         expression: &Arc<UserRevsetExpression>,

@@ -20,6 +20,7 @@ pub mod jj;
 pub mod media;
 pub mod model;
 pub mod mutations;
+pub mod notes;
 pub mod partial;
 pub mod plan;
 pub mod preview_graph;
