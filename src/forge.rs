@@ -78,6 +78,8 @@ pub(crate) struct TabForge {
     pub(crate) last_error: Option<ForgeError>,
     /// The create, update or stack submission under way.
     pub(crate) submission: Option<crate::forge_dialog::Submission>,
+    /// The review threads of the pull requests this tab showed.
+    pub(crate) comments: crate::notes::forge::Cache,
 }
 
 impl Drop for TabForge {
@@ -93,6 +95,11 @@ impl TabForge {
     /// The forge pull requests go to, if any.
     pub(crate) fn kind(&self) -> Option<ForgeKind> {
         self.home.as_ref().map(|(_, remote)| remote.kind)
+    }
+
+    /// Bumped by each refresh of the pull requests.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The pull request of the local bookmark `name`.

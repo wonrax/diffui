@@ -9,6 +9,7 @@
 pub(crate) mod app;
 pub(crate) mod cli;
 pub(crate) mod export;
+pub(crate) mod forge;
 pub(crate) mod inline;
 pub(crate) mod locate;
 pub(crate) mod review;

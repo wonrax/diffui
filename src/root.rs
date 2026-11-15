@@ -318,6 +318,7 @@ impl Diffui {
         self.sync_history(cx);
         self.sync_media(cx);
         self.sync_forge(cx);
+        self.sync_review_comments(cx);
         self.sync_plugins(cx);
         self.sync_notes(cx);
         // Chokepoint: if the active tab coalesced a refresh while busy and it's

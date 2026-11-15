@@ -37,6 +37,9 @@ struct Card {
     replying: Option<String>,
     /// Where the anchored lines are, when the card doesn't sit on them.
     off_line: Option<String>,
+    /// The forge it was read from, for a pull request's review thread:
+    /// read-only, its id the thread's page.
+    forge: Option<&'static str>,
     send_keys: Vec<String>,
     cancel_keys: Vec<String>,
     now: u64,
@@ -69,13 +72,7 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
                         .unwrap_or_default()
                 })
                 .collect();
-            let off_line = match (spot, &note.located.place, &note.thread.anchor) {
-                (DocSpot::File(_) | DocSpot::Top, Place::Lines { start, end }, Some(anchor)) => {
-                    Some(lines_label(&anchor.path, *start, *end, side_of(note)))
-                }
-                (DocSpot::Top, Place::File { .. }, Some(anchor)) => Some(anchor.path.clone()),
-                _ => None,
-            };
+            let off_line = off_line(spot, note);
             let card = Card {
                 note: note.clone(),
                 blocks,
@@ -84,6 +81,7 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
                     .filter(|reply| reply.thread() == Some(id.as_str()))
                     .map(|reply| reply.draft.clone()),
                 off_line,
+                forge: None,
                 send_keys: send_keys.clone(),
                 cancel_keys: cancel_keys.clone(),
                 now,
@@ -100,6 +98,31 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
         })
         .collect();
     let mut insets = insets;
+    // A pull request's review threads, read-only, beside the notes.
+    let forge = super::forge::shown_pull_request(ui).map(|pr| pr.kind.name());
+    for (spot, note, blocks) in super::forge::placed(ui) {
+        let card = Card {
+            expanded: tab.notes.expanded.contains(&note.thread.id),
+            off_line: off_line(spot, &note),
+            note,
+            blocks,
+            replying: None,
+            forge,
+            send_keys: Vec::new(),
+            cancel_keys: Vec::new(),
+            now,
+            look,
+            on: on.clone(),
+        };
+        let key = card.key();
+        let card = Rc::new(card);
+        insets.push(Inset {
+            at: spot,
+            key,
+            build: Rc::new(move |window, cx| card.render(window, cx)),
+        });
+    }
+
     if let Some(reply) = replying
         && let super::app::ReplyTo::New(note) = &reply.to
     {
@@ -240,6 +263,7 @@ pub(crate) fn stack_inset(ui: &Diffui, look: Look, note: &Note, at: DocSpot, cx:
             .filter(|reply| reply.thread() == Some(id.as_str()))
             .map(|reply| reply.draft.clone()),
         off_line: None,
+        forge: None,
         send_keys: crate::overlay_kit::bound_keys(ui, Context::NoteReply, &["notes.reply.send"]),
         cancel_keys: crate::overlay_kit::bound_keys(
             ui,
@@ -256,6 +280,17 @@ pub(crate) fn stack_inset(ui: &Diffui, look: Look, note: &Note, at: DocSpot, cx:
         at,
         key,
         build: Rc::new(move |window, cx| card.render(window, cx)),
+    }
+}
+
+/// Where a card's lines are, when it doesn't sit on them.
+fn off_line(spot: DocSpot, note: &Note) -> Option<String> {
+    match (spot, &note.located.place, &note.thread.anchor) {
+        (DocSpot::File(_) | DocSpot::Top, Place::Lines { start, end }, Some(anchor)) => {
+            Some(lines_label(&anchor.path, *start, *end, side_of(note)))
+        }
+        (DocSpot::Top, Place::File { .. }, Some(anchor)) => Some(anchor.path.clone()),
+        _ => None,
     }
 }
 
@@ -314,6 +349,7 @@ impl Card {
             .hash(&mut hasher);
         self.off_line.hash(&mut hasher);
         self.note.located.outdated().hash(&mut hasher);
+        self.forge.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -394,6 +430,11 @@ impl Card {
     fn tags(&self) -> Vec<Aligned> {
         let Look { theme, font, .. } = self.look;
         let mut tags = Vec::new();
+        if let Some(forge) = self.forge {
+            tags.push(
+                crate::ui::tag(forge, theme.muted_text, crate::ui::TagSize::Small, font).aligned(),
+            );
+        }
         if self.note.thread.resolved.is_some() {
             tags.push(
                 crate::ui::tag(
@@ -420,7 +461,13 @@ impl Card {
         let Look { theme, font, .. } = self.look;
         let thread = &self.note.thread;
         let resolved = thread.resolved.is_some();
-        let latest = thread.last();
+        // A review thread folds to its first comment, as the forge shows
+        // one; a note to its latest message, the one waiting on someone.
+        let latest = if self.forge.is_some() {
+            thread.messages.first()
+        } else {
+            thread.last()
+        };
         let first_line = latest.map_or(String::new(), |message| plain_line(&message.body));
         let replies = thread.messages.len().saturating_sub(1);
         let mut line = self.tags();
@@ -602,6 +649,9 @@ impl Card {
     /// words, then Copy, Reply and Resolve (or Reopen), the kit's quiet
     /// buttons.
     fn footer(&self) -> AnyElement {
+        if let Some(forge) = self.forge {
+            return self.forge_footer(forge);
+        }
         let Look { theme, font, .. } = self.look;
         let thread = &self.note.thread;
         let hint = if let Some(resolved) = &thread.resolved {
@@ -664,6 +714,45 @@ impl Card {
             );
         }
         row.into_any_element()
+    }
+}
+
+impl Card {
+    /// A review thread's footer: where it's from, in words, and a way there.
+    /// Replying and resolving happen on the forge.
+    fn forge_footer(&self, forge: &'static str) -> AnyElement {
+        let Look { theme, font, .. } = self.look;
+        let thread = &self.note.thread;
+        let hint = if thread.resolved.is_some() {
+            format!("Resolved on {forge}")
+        } else {
+            format!("From {forge}, read-only")
+        };
+        let url = thread.id.clone();
+        div()
+            .id(id(&thread.id, "footer"))
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::space::SM))
+            .w_full()
+            .min_w_0()
+            .px(px(CARD_PAD))
+            .pb(px(CARD_PAD))
+            .child(div().flex_1().min_w_0().child(typography::centered(
+                typography::line(hint, font, text_size::CAPTION, theme.subtle_text).text_ellipsis(),
+                font,
+                text_size::CAPTION,
+            )))
+            .child(
+                self.look
+                    .button(id(&thread.id, "open"), format!("Open on {forge}"))
+                    .raised()
+                    .small()
+                    .on_click(move |_, _, _| crate::open_url(&url)),
+            )
+            .into_any_element()
     }
 }
 
