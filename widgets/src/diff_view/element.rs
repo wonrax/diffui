@@ -165,6 +165,17 @@ pub(super) struct State {
     pub(super) frames: u64,
     /// How long the last height-index rebuild took, for the same.
     pub(super) last_index_build: std::time::Duration,
+    /// Each inset's last measured height by its key, and the width it was
+    /// measured at: an inset off screen isn't built.
+    inset_heights: std::collections::HashMap<u64, (u32, f32)>,
+    /// The keys of the insets on screen last frame: they're measured afresh.
+    shown_insets: std::collections::HashSet<u64>,
+    /// Last [`super::DiffProps::reveal`] token acted on, and the spot to
+    /// scroll to next.
+    last_spot_reveal: Option<u64>,
+    pending_spot_reveal: Option<super::DocSpot>,
+    /// The viewport's height last frame, for the overview strip.
+    pub(super) viewport_height: f32,
 }
 
 impl Default for State {
@@ -219,6 +230,11 @@ impl Default for State {
             geometry: RefCell::default(),
             frames: 0,
             last_index_build: std::time::Duration::ZERO,
+            inset_heights: Default::default(),
+            shown_insets: Default::default(),
+            last_spot_reveal: None,
+            pending_spot_reveal: None,
+            viewport_height: 0.0,
         }
     }
 }
@@ -365,6 +381,16 @@ impl State {
             None => self.hovered_hunk_action = None,
         }
 
+        if let Some((spot, token)) = props.reveal
+            && self.last_spot_reveal != Some(token)
+        {
+            // The first token seen is where the app stands, not a request.
+            if self.last_spot_reveal.is_some() {
+                self.pending_spot_reveal = Some(spot);
+            }
+            self.last_spot_reveal = Some(token);
+        }
+
         if let Some(find) = &props.find
             && self.last_find_scroll_token != Some(find.scroll_token)
         {
@@ -497,6 +523,24 @@ impl State {
                     self.vertical_offset = target;
                     self.publish_file(view, out);
                 }
+            }
+        }
+
+        if let Some(spot) = self.pending_spot_reveal.take() {
+            let span = {
+                let index = self.height_index.borrow();
+                index.spot_span(view.props, spot)
+            };
+            if let Some((top, height)) = span {
+                // Centred when it fits; else its top just under the sticky file header.
+                let room = bounds.height - metrics.file_header_height;
+                let target = if height <= room {
+                    top - metrics.file_header_height - (room - height) / 2.0
+                } else {
+                    top - metrics.file_header_height - metrics.row_height
+                };
+                self.vertical_offset = target.clamp(0.0, max_vertical);
+                self.publish_file(view, out);
             }
         }
 
@@ -1061,6 +1105,150 @@ impl DiffElement {
     pub(super) fn new(view: Entity<DiffView>) -> Self {
         Self { view }
     }
+
+    /// Sets each inset's height for the layout: measured now when it was on
+    /// screen last frame or its key is new, else what it measured under the
+    /// same key. Hands back the ones it built, by slot.
+    fn measure_insets(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<Option<gpui_kit::AnyElement>> {
+        let (insets, known, shown) = {
+            let view = self.view.read(cx);
+            let Some(props) = &view.props else {
+                return Vec::new();
+            };
+            if props.insets.is_empty() {
+                return Vec::new();
+            }
+            (
+                props.insets.clone(),
+                view.state.inset_heights.clone(),
+                view.state.shown_insets.clone(),
+            )
+        };
+        let width = f32::from(bounds.size.width);
+        let mut heights = Vec::with_capacity(insets.len());
+        let mut built = Vec::with_capacity(insets.len());
+        let mut measured = Vec::new();
+        for inset in &insets {
+            let cached = known
+                .get(&inset.key)
+                .filter(|(at, _)| *at == width.to_bits())
+                .map(|(_, height)| *height);
+            match cached.filter(|_| !shown.contains(&inset.key)) {
+                Some(height) => {
+                    heights.push(height);
+                    built.push(None);
+                }
+                None => {
+                    let (element, height) = build_inset(inset, width, window, cx);
+                    heights.push(height);
+                    built.push(Some(element));
+                    measured.push((inset.key, height));
+                }
+            }
+        }
+        self.view.update(cx, |view, _| {
+            for (key, height) in measured {
+                view.state
+                    .inset_heights
+                    .insert(key, (width.to_bits(), height));
+            }
+            if let Some(props) = &view.props {
+                props.inset_heights.replace(heights);
+            }
+        });
+        built
+    }
+
+    /// Prepaints the insets the frame shows where the layout put them, built
+    /// now if [`Self::measure_insets`] didn't.
+    fn place_insets(
+        &self,
+        frame: &mut Frame,
+        built: &mut [Option<gpui_kit::AnyElement>],
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (insets, visible, clip_top) = {
+            let view = self.view.read(cx);
+            let Some(props) = &view.props else {
+                return;
+            };
+            let index = view.state.height_index.borrow();
+            let offset = view.state.painted_offset;
+            let height = f32::from(bounds.size.height);
+            let visible: Vec<(usize, f32)> = index
+                .insets
+                .iter()
+                .filter(|(_, top, inset_height)| {
+                    top + inset_height > offset && *top < offset + height
+                })
+                .map(|&(slot, top, _)| (slot, top - offset))
+                .collect();
+            // Under the sticky file header, which the plan paints.
+            let sticky =
+                index.file_tops.first().is_some_and(|&first| offset > first) && !props.plain;
+            let clip_top = if sticky {
+                View::read(props, cx).metrics.file_header_height
+            } else {
+                0.0
+            };
+            (props.insets.clone(), visible, clip_top)
+        };
+        let width = f32::from(bounds.size.width);
+        let mut shown = std::collections::HashSet::new();
+        frame.inset_clip = Bounds {
+            origin: gpui_kit::point(bounds.origin.x, bounds.origin.y + gpui_kit::px(clip_top)),
+            size: gpui_kit::size(
+                bounds.size.width,
+                (bounds.size.height - gpui_kit::px(clip_top)).max(gpui_kit::px(0.0)),
+            ),
+        };
+        let clip = gpui_kit::ContentMask {
+            bounds: frame.inset_clip,
+        };
+        for (slot, y) in visible {
+            let Some(inset) = insets.get(slot) else {
+                continue;
+            };
+            shown.insert(inset.key);
+            let mut element = match built.get_mut(slot).and_then(Option::take) {
+                Some(element) => element,
+                None => build_inset(inset, width, window, cx).0,
+            };
+            let origin = gpui_kit::point(bounds.origin.x, bounds.origin.y + gpui_kit::px(y));
+            window.with_content_mask(Some(clip), |window| {
+                element.prepaint_at(origin, window, cx);
+            });
+            frame.insets.push(element);
+        }
+        self.view
+            .update(cx, |view, _| view.state.shown_insets = shown);
+    }
+}
+
+/// `inset`'s element, laid out at `width`, and its height.
+fn build_inset(
+    inset: &super::Inset,
+    width: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> (gpui_kit::AnyElement, f32) {
+    let mut element = (inset.build)(window, cx);
+    let size = element.layout_as_root(
+        gpui_kit::size(
+            gpui_kit::AvailableSpace::Definite(gpui_kit::px(width)),
+            gpui_kit::AvailableSpace::MinContent,
+        ),
+        window,
+        cx,
+    );
+    (element, f32::from(size.height).ceil())
 }
 
 impl IntoElement for DiffElement {
@@ -1078,6 +1266,9 @@ pub(super) struct Frame {
     cursor: CursorStyle,
     /// The drag's auto-scroll wants another frame.
     animating: bool,
+    /// The insets on screen, prepainted, and what they're clipped to.
+    insets: Vec<gpui_kit::AnyElement>,
+    inset_clip: Bounds<Pixels>,
 }
 
 impl DiffView {
@@ -1103,6 +1294,7 @@ impl DiffView {
             state.frames += 1;
             super::PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state.sync(&view);
+            state.viewport_height = bounds.height;
             let started = Instant::now();
             let key = state.height_index.borrow().key;
             crate::frame_log::time("diff.index", || {
@@ -1111,6 +1303,13 @@ impl DiffView {
             view.settle_extent(&state.height_index, &state.geometry);
             if state.height_index.borrow().key != key {
                 state.last_index_build = started.elapsed();
+                // The overview strip is drawn from the index in render.
+                if props.overview.is_some() {
+                    let entity = cx.entity();
+                    out.push(Box::new(move |_, cx| {
+                        entity.update(cx, |_, cx| cx.notify())
+                    }));
+                }
             }
             let prev_offset = state.vertical_offset;
             state.apply_pending(&view, bounds, &mut out);
@@ -1163,6 +1362,8 @@ impl DiffView {
             plan,
             cursor,
             animating,
+            insets: Vec::new(),
+            inset_clip: Bounds::default(),
         }
     }
 
@@ -1235,10 +1436,13 @@ impl Element for DiffElement {
     ) -> Frame {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let rect: Rectangle = bounds.into();
-        crate::frame_log::time("diff.prepare", || {
+        let mut built = self.measure_insets(bounds, window, cx);
+        let mut frame = crate::frame_log::time("diff.prepare", || {
             self.view
                 .update(cx, |view, cx| view.prepare(rect, hitbox, window, cx))
-        })
+        });
+        self.place_insets(&mut frame, &mut built, bounds, window, cx);
+        frame
     }
 
     fn paint(
@@ -1258,6 +1462,16 @@ impl Element for DiffElement {
                 plan.flush(window, cx);
             });
         });
+        if !frame.insets.is_empty() {
+            let clip = gpui_kit::ContentMask {
+                bounds: frame.inset_clip,
+            };
+            window.with_content_mask(Some(clip), |window| {
+                for inset in &mut frame.insets {
+                    inset.paint(window, cx);
+                }
+            });
+        }
         window.set_cursor_style(frame.cursor, &frame.hitbox);
         if frame.animating {
             window.request_animation_frame();

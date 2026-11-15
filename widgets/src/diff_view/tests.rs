@@ -1507,3 +1507,136 @@ fn a_non_ascii_line_reaches_as_far_as_it_is_drawn() {
     assert_eq!(index.max_columns, shaped);
     assert!(shaped < super::line::column_bound(&content));
 }
+
+fn inset_at(at: DocSpot, height: f32, props: &DiffProps) -> Inset {
+    let _ = props;
+    Inset {
+        at,
+        key: height.to_bits().into(),
+        build: Rc::new(|_, _| gpui_kit::div().into_any_element()),
+    }
+}
+
+/// Props with insets at `spots`, each measured `height` tall.
+fn with_insets(props: DiffProps, spots: &[(DocSpot, f32)]) -> DiffProps {
+    let insets = spots
+        .iter()
+        .map(|&(at, height)| inset_at(at, height, &props))
+        .collect();
+    let props = props.insets(insets);
+    let mut sorted: Vec<_> = spots.to_vec();
+    sorted.sort_by_key(|(at, _)| *at);
+    props
+        .inset_heights
+        .replace(sorted.iter().map(|(_, height)| *height).collect());
+    props
+}
+
+fn at(file: usize, hunk: usize, line: usize) -> DocSpot {
+    DocSpot::Line(LineAt { file, hunk, line })
+}
+
+/// Insets make room under their spot: everything below moves down by their
+/// height, in unified and in split, and the index says where each one is.
+#[test]
+fn insets_push_the_rows_below_them() {
+    let hunks = test_hunks();
+    for split in [false, true] {
+        let plain = test_props(hunks.len()).side_by_side(split);
+        let cells = TestCaches::default();
+        view_of(&plain, &hunks).ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        let before = cells.index.borrow().row_tops.clone();
+        let total = cells.index.borrow().total_height;
+
+        let props = with_insets(
+            test_props(hunks.len()).side_by_side(split),
+            &[
+                (DocSpot::Top, 30.0),
+                (DocSpot::File(1), 40.0),
+                (at(0, 0, 1), 50.0),
+                (at(1, 0, 1), 60.0),
+            ],
+        );
+        let cells = TestCaches::default();
+        view_of(&props, &hunks).ensure_height_index(&cells.index, &cells.geometry, 800.0);
+        let index = cells.index.borrow();
+        assert_eq!(index.total_height, total + 180.0, "split {split}");
+        // Rows: file 0 is lines 0..3, file 1 hunk 0 is 3..5, hunk 1 is 5.
+        let shifted: Vec<f32> = index
+            .row_tops
+            .iter()
+            .zip(&before)
+            .map(|(after, before)| after - before)
+            .collect();
+        if !split {
+            assert_eq!(shifted, [30.0, 30.0, 80.0, 120.0, 120.0, 180.0]);
+        }
+        // Each inset sits right under its row (or header).
+        // In document order: the top, file 0's line, file 1's header, its line.
+        let (_, line_top, _) = index.insets[1];
+        let row = index.row_of_line(0, 0, 1).unwrap();
+        assert_eq!(line_top, index.row_tops[row] + index.row_heights[row]);
+        let (_, file_top, _) = index.insets[2];
+        let row = index.row_of_line(1, 0, 0).unwrap();
+        assert!(file_top < index.row_tops[row]);
+        assert_eq!(index.insets.len(), 4);
+    }
+}
+
+/// The overview strip scales the document to the strip, and follows the
+/// layout when wrapping or folding moves things.
+#[test]
+fn overview_marks_follow_the_layout() {
+    let hunks = test_hunks();
+    let spots = [at(0, 0, 2), DocSpot::File(1), at(1, 1, 0)];
+    let positions = |props: &DiffProps, width: f32| {
+        let cells = TestCaches::default();
+        view_of(props, &hunks).ensure_height_index(&cells.index, &cells.geometry, width);
+        let index = cells.index.borrow();
+        let strip = 100.0;
+        let scale = strip / index.total_height.max(strip);
+        let expected: Vec<Option<f32>> = spots
+            .iter()
+            .map(|spot| index.spot_span(props, *spot).map(|(top, _)| top * scale))
+            .collect();
+        let found = index.overview_positions(props, spots.iter().copied(), strip);
+        assert_eq!(found, expected);
+        found.into_iter().map(Option::unwrap).collect::<Vec<f32>>()
+    };
+    let wrapped = positions(&test_props(hunks.len()), 300.0);
+    // In document order, inside the strip.
+    assert!(wrapped.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(wrapped.iter().all(|y| (0.0..=100.0).contains(y)));
+
+    // Unwrapped, the long line is one row: the marks after it move up.
+    let unwrapped = positions(&test_props(hunks.len()).wrap(false), 300.0);
+    assert_ne!(wrapped, unwrapped);
+
+    // Folding file 0 takes its rows away: its line's mark goes to its header,
+    // and the next file's marks move up.
+    let folded_props = test_props(hunks.len()).folds(vec![true, false], |_, _, _| {});
+    let folded = positions(&folded_props, 300.0);
+    let cells = TestCaches::default();
+    view_of(&folded_props, &hunks).ensure_height_index(&cells.index, &cells.geometry, 300.0);
+    let index = cells.index.borrow();
+    let scale = 100.0 / index.total_height.max(100.0);
+    assert_eq!(folded[0], index.file_tops[0] * scale);
+    assert!(folded[1] < wrapped[1] || index.total_height < 100.0);
+}
+
+/// A reveal scrolls the spot and its inset into view.
+#[test]
+fn a_spot_span_covers_its_insets() {
+    let hunks = test_hunks();
+    let props = with_insets(
+        test_props(hunks.len()),
+        &[(at(1, 0, 0), 70.0), (at(1, 0, 0), 5.0)],
+    );
+    let cells = TestCaches::default();
+    view_of(&props, &hunks).ensure_height_index(&cells.index, &cells.geometry, 800.0);
+    let index = cells.index.borrow();
+    let row = index.row_of_line(1, 0, 0).unwrap();
+    let (top, height) = index.spot_span(&props, at(1, 0, 0)).unwrap();
+    assert_eq!(top, index.row_tops[row]);
+    assert_eq!(height, index.row_heights[row] + 75.0);
+}

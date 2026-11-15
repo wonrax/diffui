@@ -392,6 +392,75 @@ pub struct AnnotationGutter {
     pub style: AnnotationStyle,
 }
 
+/// A place in the document, for what the app lays into it ([`Inset`]) and
+/// marks on the scrollbar ([`Mark`]): above the first file, under a file's
+/// header, or under one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocSpot {
+    Top,
+    File(usize),
+    Line(LineAt),
+}
+
+impl DocSpot {
+    /// Document order: the top, then each file's header and its lines.
+    fn order(self) -> (usize, usize, usize, usize) {
+        match self {
+            Self::Top => (0, 0, 0, 0),
+            Self::File(file) => (file + 1, 0, 0, 0),
+            Self::Line(at) => (at.file + 1, 1, at.hunk, at.line),
+        }
+    }
+}
+
+impl PartialOrd for DocSpot {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DocSpot {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+/// What builds an [`Inset`]'s element, each frame it shows.
+pub type BuildInset = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+
+/// A block of the app's own elements laid into the document under `at`: the
+/// rows below make room for it, and it scrolls with them. It spans the
+/// view's width (keep text clear of the scrollbar's gutter); the view
+/// measures it. One at a line of a folded file, or of a file shown as a
+/// preview or a note, isn't laid out.
+#[derive(Clone)]
+pub struct Inset {
+    pub at: DocSpot,
+    /// Changes whenever what `build` makes would change size: an inset off
+    /// screen keeps the height it had under the same key.
+    pub key: u64,
+    pub build: BuildInset,
+}
+
+/// One mark on the scrollbar's overview strip: where something sits in the
+/// whole document, in its kind's colour, named on hover.
+#[derive(Debug, Clone)]
+pub struct Mark {
+    pub at: DocSpot,
+    pub color: Color,
+    pub label: String,
+}
+
+/// The overview strip along the scrollbar: its marks, and where a click on
+/// one goes (with its index).
+#[derive(Clone)]
+pub struct Marks {
+    pub marks: Vec<Mark>,
+    pub on_click: Callback<usize>,
+    /// The tooltip's look.
+    pub tooltip: crate::ui::Look,
+}
+
 /// Line-select mode: changed lines take clicks and drags, and the keyboard has a
 /// line cursor.
 pub struct LineMode {
@@ -531,6 +600,15 @@ pub struct DiffProps {
     on_file_menu: Option<Callback<(usize, crate::geometry::Rectangle)>>,
     /// The gutter's digit count, worked out once per set of props.
     digits: Cell<Option<usize>>,
+    /// The app's blocks laid into the document, in document order.
+    insets: Vec<Inset>,
+    /// Each inset's measured height, set by the element before the layout
+    /// reads it.
+    inset_heights: std::cell::RefCell<Vec<f32>>,
+    /// The scrollbar's overview strip.
+    overview: Option<Marks>,
+    /// Scroll `spot` (and an inset under it) into view when the token changes.
+    reveal: Option<(DocSpot, u64)>,
 }
 
 impl DiffProps {
@@ -582,6 +660,10 @@ impl DiffProps {
             on_toggle_fold: None,
             on_file_menu: None,
             digits: Cell::new(None),
+            insets: Vec::new(),
+            inset_heights: Default::default(),
+            overview: None,
+            reveal: None,
         }
     }
 
@@ -756,6 +838,27 @@ impl DiffProps {
         self.find = Some(find);
         self
     }
+
+    /// Lay the app's blocks into the document (see [`Inset`]).
+    pub fn insets(mut self, mut insets: Vec<Inset>) -> Self {
+        insets.sort_by_key(|inset| inset.at);
+        self.inset_heights = std::cell::RefCell::new(vec![0.0; insets.len()]);
+        self.insets = insets;
+        self
+    }
+
+    /// Draw the overview strip along the scrollbar (see [`Mark`]).
+    pub fn overview(mut self, marks: Marks) -> Self {
+        self.overview = Some(marks);
+        self
+    }
+
+    /// Scroll `spot` into view, with an inset under it, whenever `token`
+    /// changes.
+    pub fn reveal(mut self, spot: DocSpot, token: u64) -> Self {
+        self.reveal = Some((spot, token));
+        self
+    }
 }
 
 /// Frames planned, across every diff view: lets a benchmark tell real frames from
@@ -843,6 +946,7 @@ pub struct FrameStats {
 
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let strip = self.overview_strip();
         div()
             .id(ElementId::NamedInteger(
                 "diff-view".into(),
@@ -852,6 +956,68 @@ impl Render for DiffView {
             .size_full()
             .child(DiffElement::new(cx.entity()))
             .vertical_scrollbar(&self.state.bar)
+            .children(strip)
+    }
+}
+
+/// An overview mark's height, and the taller band a pointer finds it by.
+const MARK_HEIGHT: f32 = 3.0;
+const MARK_HIT: f32 = 9.0;
+/// A mark's width, and its inset from the gutter's inner edge.
+const MARK_WIDTH: f32 = 5.0;
+const MARK_INSET: f32 = 2.0;
+
+impl DiffView {
+    /// The overview strip: one mark per spot, along the scrollbar's gutter.
+    /// Drawn from the last frame's layout; a new layout re-renders it.
+    fn overview_strip(&self) -> Option<AnyElement> {
+        use crate::ui::Tip as _;
+        let props = self.props.as_ref()?;
+        let marks = props.overview.as_ref()?;
+        let strip = self.state.viewport_height;
+        if marks.marks.is_empty() || strip <= 0.0 {
+            return None;
+        }
+        let positions = self.state.height_index.borrow().overview_positions(
+            props,
+            marks.marks.iter().map(|mark| mark.at),
+            strip,
+        );
+        let layer = div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(gpui_kit::px(crate::scrollbar::GUTTER))
+            .children(marks.marks.iter().zip(positions).enumerate().filter_map(
+                |(index, (mark, y))| {
+                    let y = y?.clamp(0.0, strip - MARK_HEIGHT);
+                    let on_click = marks.on_click.clone();
+                    Some(
+                        div()
+                            .id(("diff-mark", index))
+                            .absolute()
+                            .left_0()
+                            .w_full()
+                            .top(gpui_kit::px(y - (MARK_HIT - MARK_HEIGHT) / 2.0))
+                            .h(gpui_kit::px(MARK_HIT))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(gpui_kit::px(MARK_INSET))
+                                    .top(gpui_kit::px((MARK_HIT - MARK_HEIGHT) / 2.0))
+                                    .w(gpui_kit::px(MARK_WIDTH))
+                                    .h(gpui_kit::px(MARK_HEIGHT))
+                                    .rounded(gpui_kit::px(1.0))
+                                    .bg(mark.color),
+                            )
+                            .tip(mark.label.clone(), marks.tooltip)
+                            .on_click(move |_, window, cx| on_click(&index, window, cx)),
+                    )
+                },
+            ));
+        Some(layer.into_any_element())
     }
 }
 

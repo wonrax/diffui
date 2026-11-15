@@ -247,7 +247,18 @@ fn char_advance(font: Font, size: f32) -> f32 {
 }
 
 /// The shape of [`HeightIndex::key`].
-pub(super) type HeightKey = (u64, usize, usize, u32, bool, bool, Option<u64>, u64, u64);
+pub(super) type HeightKey = (
+    u64,
+    usize,
+    usize,
+    u32,
+    bool,
+    bool,
+    Option<u64>,
+    u64,
+    u64,
+    u64,
+);
 
 /// `pair_lines` sentinel: this side of the row has no line (padding).
 pub(super) const NO_LINE: u32 = u32::MAX;
@@ -324,6 +335,9 @@ pub(super) struct HeightIndex {
     pub(super) file_strips: Vec<(usize, f32)>,
     /// `(file, top)` of each file note, in document order.
     pub(super) note_bands: Vec<(usize, f32)>,
+    /// `(inset, top, height)` of each [`super::Inset`] laid out, `inset`
+    /// indexing the props', in document order.
+    pub(super) insets: Vec<(usize, f32, f32)>,
 }
 
 impl HeightIndex {
@@ -360,6 +374,51 @@ impl HeightIndex {
         } else {
             (below, false)
         })
+    }
+
+    /// Where `spot` is: its top and how far down it and the insets under it
+    /// reach. A line that isn't laid out (its file is folded) answers with its
+    /// file's header.
+    pub(super) fn spot_span(
+        &self,
+        props: &super::DiffProps,
+        spot: super::DocSpot,
+    ) -> Option<(f32, f32)> {
+        use super::DocSpot;
+        let (top, height) = match spot {
+            DocSpot::Top => (0.0, 0.0),
+            DocSpot::File(file) => (*self.file_tops.get(file)?, 0.0),
+            DocSpot::Line(at) => match self.row_of_line(at.file, at.hunk, at.line) {
+                Some(row) => (self.row_tops[row], self.row_heights[row]),
+                None => (*self.file_tops.get(at.file)?, 0.0),
+            },
+        };
+        let bottom = self
+            .insets
+            .iter()
+            .filter(|(slot, ..)| {
+                props
+                    .insets
+                    .get(*slot)
+                    .is_some_and(|inset| inset.at == spot)
+            })
+            .map(|(_, top, height)| top + height)
+            .fold(top + height, f32::max);
+        Some((top, bottom - top))
+    }
+
+    /// Where each of `spots` sits on an overview strip `strip` tall: the
+    /// document scaled to the strip (or drawn 1:1 when it's shorter).
+    pub(super) fn overview_positions(
+        &self,
+        props: &super::DiffProps,
+        spots: impl Iterator<Item = super::DocSpot>,
+        strip: f32,
+    ) -> Vec<Option<f32>> {
+        let scale = strip / self.total_height.max(strip).max(1.0);
+        spots
+            .map(|spot| self.spot_span(props, spot).map(|(top, _)| top * scale))
+            .collect()
     }
 
     /// Index of row `(file, hunk, line)`, by binary search over the sorted ids.
@@ -714,6 +773,55 @@ pub(super) fn grow(rect: Rectangle, by: f32) -> Rectangle {
     }
 }
 
+/// Walks the props' insets in document order while the index is built.
+struct InsetCursor<'a, I: Iterator<Item = (usize, (&'a super::Inset, &'a f32))>> {
+    insets: std::iter::Peekable<I>,
+}
+
+impl<'a, I: Iterator<Item = (usize, (&'a super::Inset, &'a f32))>> InsetCursor<'a, I> {
+    /// Lays every inset at `spot` from `y` down, and skips any before it
+    /// that had no place.
+    fn lay(&mut self, index: &mut HeightIndex, spot: super::DocSpot, y: &mut f32) {
+        while let Some(&(slot, (inset, &height))) = self.insets.peek() {
+            if inset.at > spot {
+                break;
+            }
+            self.insets.next();
+            if inset.at == spot {
+                index.insets.push((slot, *y, height));
+                *y += height;
+            }
+        }
+    }
+
+    /// The insets at lines of one hunk, `(slot, line, height)`: a split
+    /// hunk's rows pair lines out of document order.
+    fn take_hunk(&mut self, file: usize, hunk: usize) -> Vec<(usize, usize, f32)> {
+        let mut taken = Vec::new();
+        while let Some(&(slot, (inset, &height))) = self.insets.peek() {
+            let line = match inset.at {
+                super::DocSpot::Line(at) if (at.file, at.hunk) == (file, hunk) => at.line,
+                at if at
+                    > super::DocSpot::Line(super::LineAt {
+                        file,
+                        hunk,
+                        line: usize::MAX,
+                    }) =>
+                {
+                    break;
+                }
+                _ => {
+                    self.insets.next();
+                    continue;
+                }
+            };
+            self.insets.next();
+            taken.push((slot, line, height));
+        }
+        taken
+    }
+}
+
 /// The props and the document, read for one frame or one event. The app owns the
 /// lines, so this borrows them out of it; nothing here outlives the call it was
 /// made for.
@@ -837,6 +945,22 @@ impl<'a> View<'a> {
 
     /// Names which files have a strip or a note and which are folded, for
     /// [`HeightIndex::key`].
+    /// The insets' places and measured heights: a change moves rows.
+    fn insets_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (inset, height) in self
+            .props
+            .insets
+            .iter()
+            .zip(self.props.inset_heights.borrow().iter())
+        {
+            inset.at.hash(&mut hasher);
+            height.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn file_strips_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1385,6 +1509,7 @@ impl<'a> View<'a> {
             props.media_key,
             self.file_strips_key(),
             self.metrics.key(),
+            self.insets_key(),
         ));
         if cell.borrow().key == key {
             return;
@@ -1413,6 +1538,7 @@ impl<'a> View<'a> {
         index.media_bands.clear();
         index.file_strips.clear();
         index.note_bands.clear();
+        index.insets.clear();
         index.max_columns = 0.0;
         index.max_split_columns = 0.0;
         index.unmeasured_wide.clear();
@@ -1431,6 +1557,17 @@ impl<'a> View<'a> {
         let mut base = 0usize;
 
         let mut y = self.header_height() + self.metrics.top_inset;
+        let heights = props.inset_heights.borrow();
+        let mut insets = InsetCursor {
+            insets: props
+                .insets
+                .iter()
+                .zip(heights.iter())
+                .enumerate()
+                .peekable(),
+        };
+        let lay = &mut insets;
+        lay.lay(&mut index, super::DocSpot::Top, &mut y);
         for (file_index, hunks) in self.hunks.iter().enumerate() {
             index.file_tops.push(y);
             y += self.metrics.file_header_height;
@@ -1443,6 +1580,7 @@ impl<'a> View<'a> {
                 index.file_strips.push((file_index, y));
                 y += strip;
             }
+            lay.lay(&mut index, super::DocSpot::File(file_index), &mut y);
             if let Some(media) = props.media_of(file_index) {
                 // The preview stands in for the file's rows.
                 let height = media::layout(media, width, self.metrics.row_height).height;
@@ -1467,6 +1605,7 @@ impl<'a> View<'a> {
                 index.hunk_ids.push((file_index as u32, hunk_index as u32));
                 y += self.metrics.hunk_header_height;
                 if split_file {
+                    let first = index.row_tops.len();
                     y = self.push_split_rows(
                         &mut index,
                         memo,
@@ -1476,6 +1615,22 @@ impl<'a> View<'a> {
                         split_width,
                         base,
                     );
+                    // Each row's insets go under it, which moves every row after.
+                    let hunk_insets = lay.take_hunk(file_index, hunk_index);
+                    let mut shift = 0.0;
+                    for row in first..index.row_tops.len() {
+                        index.row_tops[row] += shift;
+                        let (left, right) = index.pair_lines[row];
+                        let mut bottom = index.row_tops[row] + index.row_heights[row];
+                        for &(slot, line, height) in &hunk_insets {
+                            if line == left as usize || line == right as usize {
+                                index.insets.push((slot, bottom, height));
+                                bottom += height;
+                                shift += height;
+                            }
+                        }
+                    }
+                    y += shift;
                 } else {
                     for (line_index, line) in hunk.lines.iter().enumerate() {
                         let key = body_geometry_key(
@@ -1510,11 +1665,21 @@ impl<'a> View<'a> {
                             }
                         }
                         y += height;
+                        lay.lay(
+                            &mut index,
+                            super::DocSpot::Line(super::LineAt {
+                                file: file_index,
+                                hunk: hunk_index,
+                                line: line_index,
+                            }),
+                            &mut y,
+                        );
                     }
                 }
                 base += hunk.lines.len();
             }
         }
+        drop(heights);
         index.file_tops.push(y);
         index.total_height = y;
         index.key = key;
