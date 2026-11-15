@@ -482,7 +482,7 @@ pub(crate) fn build_overlay(
             "ai-panel-view",
             ["Rendered", "Raw"],
             ui.ai.panel_raw,
-            crate::ai::AiAction::PanelRaw,
+            |raw| Action::Ai(crate::ai::AiAction::PanelRaw(raw)),
             cx,
         ));
     }

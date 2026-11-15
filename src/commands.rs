@@ -659,6 +659,58 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "review.step.next",
+        label: "Next commit",
+        hint: "Scope the pull request's diff to its next commit",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Review(crate::review::ReviewAction::Step { by: 1 })),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "review.step.previous",
+        label: "Previous commit",
+        hint: "Scope the pull request's diff to its previous commit",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Review(crate::review::ReviewAction::Step { by: -1 })),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "review.show-all-changes",
+        label: "Show all changes",
+        hint: "Scope the pull request's diff back to all of it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| {
+            Some(Action::Review(crate::review::ReviewAction::Scope(
+                crate::review::Scope::All,
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "theme.system",
         label: "Theme: System",
         hint: "Follow OS appearance",
@@ -2285,6 +2337,10 @@ pub(crate) static REGISTRY: &[Command] = &[
             require(
                 ui.active().main_view == MainView::Diff,
                 "Only the Diff view hides its panels",
+            )?;
+            require(
+                ui.active_steps() != crate::review::Steps::None,
+                "This tab has nothing to step through",
             )
         },
         build: |_ui, _arg| Some(Action::ToggleHistoryPanel),

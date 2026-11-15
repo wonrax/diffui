@@ -810,7 +810,14 @@ impl Panes {
 /// The revision list, or what the view shows in its place.
 fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
     match ui.active().main_view {
-        MainView::Diff => sidebar::build_sidebar(ui, look, window, cx),
+        MainView::Diff => match ui.active_steps() {
+            crate::review::Steps::List(names) => {
+                crate::review::build_steps_panel(ui, names, look, window, cx)
+            }
+            crate::review::Steps::Graph | crate::review::Steps::None => {
+                sidebar::build_sidebar(ui, look, window, cx)
+            }
+        },
         MainView::Source => source_panel::build_source_sidebar(ui, look, window, cx),
         MainView::History => history_panel::build_history_sidebar(ui, look, window, cx),
         MainView::Notes => crate::notes::view::build_notes_sidebar(ui, look, window, cx),
@@ -919,7 +926,9 @@ impl Diffui {
         let tab = self.active();
         tab.main_view == MainView::Diff
             && match panel {
-                Panel::Revisions => tab.history_panel_collapsed,
+                Panel::Revisions => {
+                    tab.history_panel_collapsed && self.active_steps() != crate::review::Steps::None
+                }
                 Panel::Files => tab.files_panel_collapsed && !tab.session.document.files.is_empty(),
             }
     }
@@ -1110,8 +1119,12 @@ impl Diffui {
     /// replaces it.
     /// Collapsing hides the Diff view's sidebar entirely. Source and History have
     /// no toggle of their own, so they keep their width whatever the flag says.
+    /// A tab with no steps has no panel for them.
     pub(crate) fn left_pane_width(&self) -> f32 {
-        if self.active().main_view == MainView::Diff && self.active().history_panel_collapsed {
+        if self.active().main_view == MainView::Diff
+            && (self.active().history_panel_collapsed
+                || self.active_steps() == crate::review::Steps::None)
+        {
             0.0
         } else {
             self.sidebar_width

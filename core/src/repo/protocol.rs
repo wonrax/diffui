@@ -475,6 +475,13 @@ pub enum Payload {
         job: JobId,
         tail: GraphTail,
     },
+    /// What a [`Command::LoadGraph`] answers for a source without a graph
+    /// (a pull request): its header and its steps, whole, in place of
+    /// [`Self::Batch`]es and [`Self::GraphLoaded`].
+    Outline {
+        job: JobId,
+        outline: crate::model::Outline,
+    },
     /// The next files of a diff that arrives in pieces (a pull request's,
     /// downloaded as it is shown), with the totals as far as they are known.
     /// Any number of these come before the job's [`Self::DiffLoaded`], whose
@@ -658,6 +665,7 @@ impl Payload {
         match self {
             Self::Batch { job, .. }
             | Self::GraphLoaded { job, .. }
+            | Self::Outline { job, .. }
             | Self::DiffPart { job, .. }
             | Self::DiffLoaded { job, .. }
             | Self::SnapshotDone { job, .. }

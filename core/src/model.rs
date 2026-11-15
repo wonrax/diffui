@@ -303,8 +303,7 @@ pub struct CommitSummary {
     pub description: String,
     pub author: String,
     /// When the author made the commit, in milliseconds since the epoch.
-    /// `None` when the backend doesn't say (git's synthesized working copy,
-    /// the PR "All changes" row).
+    /// `None` when the backend doesn't say (git's synthesized working copy).
     pub author_timestamp: Option<i64>,
     pub has_description: bool,
     pub is_empty: Option<bool>,
@@ -1290,6 +1289,37 @@ pub struct SignatureInfo {
     pub name: String,
     pub email: String,
     pub timestamp: Option<String>,
+}
+
+/// What a source without a graph says about itself: what the whole is (its
+/// header), and the steps it's made of, oldest first. A pull request's
+/// commits; a patch series' patches.
+#[derive(Debug, Clone)]
+pub struct Outline {
+    pub subject: Subject,
+    pub steps: Vec<Step>,
+}
+
+/// What an [`Outline`] is of.
+#[derive(Debug, Clone)]
+pub enum Subject {
+    PullRequest(crate::forge::PrInfo),
+}
+
+/// One of the ordered pieces an [`Outline`] is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// What selects it: [`RevisionSelection::Commit`] of this id.
+    pub id: String,
+    /// The first line of its message.
+    pub title: String,
+    /// The whole message, title included.
+    pub message: String,
+    pub author: String,
+    /// When it was authored, in epoch millis.
+    pub authored_millis: Option<i64>,
+    /// Lines added and removed, when the source counts them.
+    pub counts: Option<(usize, usize)>,
 }
 
 // ---- Diff line model (moved here from the UI `diff_view` module) ----

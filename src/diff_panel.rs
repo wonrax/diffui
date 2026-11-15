@@ -711,11 +711,16 @@ fn build_diff_panel_body(ui: &Diffui, look: Look, window: &mut Window, cx: &mut 
         );
         // No diff to carry the commit's header, so a header-only diff view stands in above
         // the empty state, selectable the same way.
-        let header = session
-            .revision_details
-            .as_ref()
-            .map(|details| {
-                crate::commit_info::header_lines(ui, details, look, true, diff_pane_width(ui))
+        let header = crate::commit_info::header(ui, look)
+            .map(|header| {
+                crate::commit_info::header_lines(
+                    ui,
+                    &header,
+                    look,
+                    true,
+                    diff_pane_width(ui),
+                    false,
+                )
             })
             .filter(|lines| !lines.is_empty());
         panel = panel.child(div().flex_none().w_full().child(summary));
@@ -861,14 +866,14 @@ fn diff_props(
     ));
     if let Some(range) = range {
         props = props.with_header(crate::range::header_lines(ui, range, look));
-    } else if let Some(details) = session.revision_details.as_ref() {
+    } else if let Some(header) = crate::commit_info::header(ui, look) {
+        let width = diff_pane_width(ui);
         props = props.with_header(crate::commit_info::header_lines(
-            ui,
-            details,
-            look,
-            true,
-            diff_pane_width(ui),
+            ui, &header, look, true, width, true,
         ));
+        if let Some(inset) = crate::commit_info::header_inset(ui, &header, look, width, cx) {
+            props = props.insets(vec![inset]);
+        }
     }
 
     let collapsed: Vec<bool> = session

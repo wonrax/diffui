@@ -23,14 +23,8 @@ use std::sync::Arc;
 
 pub use remote::{ForgePr, parse_remote_url, remotes};
 
-use jj_lib::graph::GraphEdge;
-
 use crate::diff_parse::DiffStreamParser;
-use crate::graph::assign_lanes;
-use crate::model::{
-    CommitSummary, DiffDocument, DiffFile, DiffFileStatus, RevisionDetails, SignatureInfo,
-    StreamRow,
-};
+use crate::model::{DiffDocument, DiffFile, DiffFileStatus, RevisionDetails};
 use crate::repo::CancelFlag;
 
 /// Which forge a remote or a pull request lives on: the spec of the plugin
@@ -208,8 +202,9 @@ impl ForgeRemote {
 }
 
 /// Where a pull request stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PrState {
+    #[default]
     Open,
     Draft,
     Closed,
@@ -314,14 +309,15 @@ pub struct PrInfo {
     pub number: u64,
     pub title: String,
     pub author: String,
-    /// The state, lowercase (`open`, `merged`, `closed`, `draft`).
-    pub state: String,
+    pub state: PrState,
     pub base_ref: String,
     pub head_ref: String,
     /// Lines added and removed, when the forge's header says.
     pub totals: Option<(usize, usize)>,
     pub changed_files: usize,
     pub url: String,
+    /// The description, in Markdown; empty when it has none.
+    pub body: String,
 }
 
 /// One commit of a pull request.
@@ -330,8 +326,12 @@ pub struct PrCommit {
     pub oid: String,
     pub author: String,
     pub headline: String,
+    /// The whole message; the headline alone when the forge didn't say.
+    pub message: String,
     /// The authored date, in epoch millis, when it parses.
     pub authored_millis: Option<i64>,
+    /// Lines added and removed, when the forge counts them per commit.
+    pub counts: Option<(usize, usize)>,
 }
 
 /// A pull request's review thread, as the forge has it now: comments on
@@ -817,93 +817,6 @@ impl DiffParts {
         if let Some(file) = self.parser.finish() {
             on_file(file);
         }
-    }
-}
-
-/// Lower a pull request's commits into the tab's graph, newest first
-/// (matching `jj log`), with a synthetic "All changes" row pinned on top.
-/// That row is flagged as the working copy, so the existing
-/// `RevisionSelection::WorkingCopy` selection (the tab's default) means "the
-/// whole diff", and clicking it brings the full diff back after viewing one
-/// commit.
-pub fn pr_commit_rows(commits: &[PrCommit]) -> Vec<StreamRow> {
-    let row = |id: &str, description: String, author: String, millis, working_copy| CommitSummary {
-        change_id: id.to_owned(),
-        commit_id: id.to_owned(),
-        shortest_change_id_len: None,
-        has_description: !description.is_empty(),
-        description: if description.is_empty() {
-            "(no description set)".to_owned()
-        } else {
-            description
-        },
-        author,
-        author_timestamp: millis,
-        is_empty: Some(false),
-        has_conflict: false,
-        is_divergent: false,
-        is_hidden: false,
-        change_offset: None,
-        is_working_copy: working_copy,
-        is_immutable: false,
-        on_trunk: false,
-        bookmarks: Vec::new(),
-        parent_ids: Vec::new(),
-    };
-    let mut rows = Vec::with_capacity(commits.len() + 1);
-    rows.push(row(
-        "pr",
-        "All changes".to_owned(),
-        String::new(),
-        None,
-        true,
-    ));
-    for commit in commits.iter().rev() {
-        rows.push(row(
-            &commit.oid,
-            commit.headline.clone(),
-            commit.author.clone(),
-            commit.authored_millis,
-            false,
-        ));
-    }
-
-    // A straight chain: each row's parent is the next one down; the last has
-    // no listed parent (its real parent is the base, outside this view).
-    let lane_inputs = rows.iter().enumerate().map(|(index, row)| {
-        let edges: Vec<GraphEdge<String>> = match rows.get(index + 1) {
-            Some(parent) => vec![GraphEdge::direct(parent.commit_id.clone())],
-            None => Vec::new(),
-        };
-        (row.commit_id.clone(), edges)
-    });
-    let frames = assign_lanes(lane_inputs);
-    rows.into_iter()
-        .zip(frames)
-        .map(|(summary, frame)| StreamRow { summary, frame })
-        .collect()
-}
-
-/// Map a pull request's header onto the [`RevisionDetails`] the diff pane
-/// already renders: the number (`#12`, `!12`) as the id, head→base and state
-/// as "bookmark" chips, the title and URL as the description.
-pub fn pr_revision_details(kind: ForgeKind, info: &PrInfo) -> RevisionDetails {
-    RevisionDetails {
-        commit_id: format!("{}{}", kind.sigil(), info.number),
-        change_id: None,
-        bookmarks: vec![
-            format!("{} \u{2192} {}", info.head_ref, info.base_ref),
-            info.state.clone(),
-        ],
-        author: SignatureInfo {
-            name: info.author.clone(),
-            email: String::new(),
-            timestamp: None,
-        },
-        committer: None,
-        signature: None,
-        description: format!("{}\n\n{}", info.title, info.url),
-        parents: Vec::new(),
     }
 }
 

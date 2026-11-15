@@ -455,7 +455,7 @@ pub(crate) fn view_toggle(
     id: &'static str,
     labels: [&'static str; 2],
     second: bool,
-    pick: fn(bool) -> AiAction,
+    pick: impl Fn(bool) -> Action,
     cx: &mut Cx,
 ) -> AnyElement {
     let Look { theme, .. } = look;
@@ -474,7 +474,7 @@ pub(crate) fn view_toggle(
                 ui::Segmented::Compact,
                 look,
             )
-            .on_click(send(Action::Ai(pick(this)), cx))
+            .on_click(send(pick(this), cx))
         }))
         .into_any_element()
 }

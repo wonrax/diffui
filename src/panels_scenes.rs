@@ -163,7 +163,8 @@ fn commit_header_actions_reach_the_clipboard_and_the_graph() {
             .revision_details
             .clone()
             .expect("details");
-        crate::commit_info::header_lines(ui, &details, look, true, 900.0)
+        let header = crate::commit_info::revision_header(ui, &details, look);
+        crate::commit_info::header_lines(ui, &header, look, true, 900.0, true)
     });
     let copy = lines.iter().find_map(|line| match line {
         HeaderLine::Rich(field) if field.label == "Commit" => Some(field.buttons[0].1.clone()),

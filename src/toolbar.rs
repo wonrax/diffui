@@ -531,21 +531,29 @@ fn panel_toggles(ui: &Diffui, look: Look, cx: &mut Cx) -> impl IntoElement {
             cx,
         )
     };
+    // A tab with nothing to step through has no panel, so no toggle.
+    let steps = match ui.active_steps() {
+        crate::review::Steps::Graph => Some("revisions"),
+        crate::review::Steps::List(names) => Some(names.steps),
+        crate::review::Steps::None => None,
+    };
     div()
         .flex()
         .flex_row()
         .flex_none()
         .items_center()
         .gap(px(GROUP_GAP))
-        .child(toggle(
-            "toolbar-revisions",
-            icons::PANEL_LEFT,
-            !tab.history_panel_collapsed,
-            "revisions",
-            "view.toggle-revisions",
-            Action::ToggleHistoryPanel,
-            cx,
-        ))
+        .children(steps.map(|what| {
+            toggle(
+                "toolbar-revisions",
+                icons::PANEL_LEFT,
+                !tab.history_panel_collapsed,
+                what,
+                "view.toggle-revisions",
+                Action::ToggleHistoryPanel,
+                cx,
+            )
+        }))
         .child(toggle(
             "toolbar-changed-files",
             icons::COLUMNS_3,

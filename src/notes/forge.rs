@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use diffui_core::forge::{ForgeAbility, ForgePr, ReviewThread};
 use diffui_core::notes::Side;
-use diffui_core::{DiffFile, DiffLineKind, RevisionSelection};
+use diffui_core::{DiffFile, DiffLineKind};
 
 use super::app::{Note, shown_change};
 use super::locate::{Located, Place};
@@ -54,7 +54,7 @@ pub(crate) fn shown_pull_request(ui: &Diffui) -> Option<ForgePr> {
     match &tab.source {
         // Its commits' own diffs aren't what the comments are on.
         TabSource::ForgePr(pr) => {
-            (state.session.selected_revision == RevisionSelection::WorkingCopy).then(|| pr.clone())
+            (state.scope() == Some(crate::review::Scope::All)).then(|| pr.clone())
         }
         TabSource::Repo { .. } => {
             shown_change(state)?;
@@ -276,8 +276,8 @@ pub(crate) fn fetched(threads: Vec<ReviewThread>) -> Fetched {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use diffui_core::DiffFileStatus;
     use diffui_core::forge::{ReviewComment, patch_to_file};
+    use diffui_core::{DiffFileStatus, RevisionSelection};
 
     use super::*;
 
@@ -541,8 +541,15 @@ pub(crate) mod tests {
                 0,
             ),
             (
-                "pr view 1 --repo github.invalid/team/app --json commits *",
-                "aaa1\u{1f}ada\u{1f}Stack one\u{1f}2026-11-14T09:30:00Z\n",
+                "api graphql *commits(first:100*",
+                &crate::plugins::github_scenarios::gh_commits(&[(
+                    "aaa1",
+                    "ada",
+                    "Stack one",
+                    Some("2026-11-14T09:30:00Z"),
+                    1,
+                    0,
+                )]),
                 0,
             ),
             ("pr diff 1 *", diff, 0),

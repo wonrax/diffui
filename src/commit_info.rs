@@ -15,8 +15,14 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, Window, div, px};
 
-use crate::diff_view::{HeaderAction, HeaderField, HeaderLine};
+use std::rc::Rc;
+
+use diffui_core::Subject;
+use diffui_core::forge::{ForgeKind, PrInfo};
+
+use crate::diff_view::{DocSpot, HeaderAction, HeaderField, HeaderLine, Inset};
 use crate::meta_line;
+use crate::review::{ReviewAction, Scope, TextKind};
 use crate::sidebar::{COMMIT_ID_CHARS, REVISION_ID_CHARS, revision_id_display_len};
 use crate::theme::{self, Color, ThemeSpec, Weight, emphasis_font, radius, space, text_size};
 use crate::typography::Aligned;
@@ -86,61 +92,140 @@ fn unique_prefix(ui: &Diffui, row: Option<diffui_core::RowView<'_>>) -> usize {
     .unwrap_or(REVISION_ID_CHARS)
 }
 
-/// The diff view's header for `details`: the description's body, then the
-/// field column. Empty when the block is folded, if `foldable` (the diff
-/// pane; the History view's headers already say what the revision is, so
-/// its diffs always carry the details).
-///
-/// `pane_width` is the width of the diff view it heads: with line wrap on,
-/// the description wraps to it, since a header line is one row.
-pub(crate) fn header_lines(
-    ui: &Diffui,
-    details: &RevisionDetails,
-    look: Look,
-    foldable: bool,
-    pane_width: f32,
-) -> Vec<HeaderLine> {
-    let Look { theme, .. } = look;
-    // The diff pane's bar names the revision by its ids only; the title
-    // leads the header under it. The History view's own headers carry it.
-    let mut lines = if foldable {
-        title_lines(ui, details, pane_width)
-    } else {
-        Vec::new()
-    };
-    if foldable && ui.commit_details_collapsed {
-        return lines;
+/// What the header over a diff says, whatever the tab views: the title,
+/// the facts as a column of fields, then the description (what follows the
+/// title). Each source fills it in its own terms ([`revision_header`],
+/// [`pull_request_header`]); [`header_lines`] lays any of them out.
+#[derive(Debug, Clone)]
+pub(crate) struct Header {
+    /// `None`: it has none, and the header says so.
+    pub(crate) title: Option<String>,
+    pub(crate) facts: Vec<HeaderLine>,
+    pub(crate) description: String,
+    pub(crate) kind: TextKind,
+}
+
+/// How many lines of a long description show until "Show all".
+pub(crate) const FOLD_LINES: usize = 10;
+
+/// The header of the diff on screen: the revision's, the pull request's
+/// whole, or the step's. `None` with nothing to describe yet, and for a
+/// range (which [`crate::range`] heads).
+pub(crate) fn header(ui: &Diffui, look: Look) -> Option<Header> {
+    let tab = ui.active();
+    if let (Some(outline), Some(Scope::All)) = (&tab.session.outline, tab.scope()) {
+        let Subject::PullRequest(info) = &outline.subject;
+        let kind = match &ui.tabs.get(ui.active)?.source {
+            crate::TabSource::ForgePr(spec) => spec.kind,
+            crate::TabSource::Repo { .. } => return None,
+        };
+        return Some(pull_request_header(kind, info, look));
     }
-    let text = details
+    if let Some(details) = &tab.session.revision_details {
+        return Some(revision_header(ui, details, look));
+    }
+    // A step whose diff hasn't brought its details: what the outline says.
+    let Some(Scope::Step(index)) = tab.scope() else {
+        return None;
+    };
+    let step = tab.outline_steps().get(index)?;
+    let details = RevisionDetails {
+        commit_id: step.id.clone(),
+        author: SignatureInfo {
+            name: step.author.clone(),
+            ..SignatureInfo::default()
+        },
+        description: step.message.clone(),
+        ..RevisionDetails::default()
+    };
+    Some(revision_header(ui, &details, look))
+}
+
+/// The hash the header's description is known by: what "Show all" keeps
+/// whole.
+pub(crate) fn shown_description(ui: &Diffui) -> Option<u64> {
+    let theme = ui.resolved_theme().spec();
+    header(ui, ui.look(theme)).map(|header| text_hash(&header.description))
+}
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A pull request's header: its title, its number with its state, who
+/// opened it, its branches, and its description in Markdown.
+pub(crate) fn pull_request_header(kind: ForgeKind, info: &PrInfo, look: Look) -> Header {
+    let Look { theme, .. } = look;
+    let reference = format!("{}{}", kind.sigil(), info.number);
+    let mut number = HeaderField::new(kind.title_noun(), reference.clone());
+    number.runs = vec![(0, theme.accent)];
+    if !info.url.is_empty() {
+        number.link = Some((
+            reference.chars().count(),
+            HeaderAction::OpenUrl(info.url.clone()),
+        ));
+        number.buttons = vec![(icons::COPY, HeaderAction::Copy(info.url.clone()))];
+    }
+    let (glyph, color) = crate::forge::state_mark(info.state, theme);
+    number.chips = vec![crate::chip::Chip {
+        label: info.state.label().to_owned(),
+        font: look.mono,
+        background: crate::theme::chip_background(color),
+        text_color: color,
+        border_color: None,
+        border_dashed: false,
+        icon: Some(glyph),
+        icon_color: None,
+        suffix: None,
+        marks: Vec::new(),
+        tip: None,
+    }];
+    let mut facts = vec![rich(number)];
+    if !info.author.is_empty() {
+        facts.push(rich(HeaderField::new("Author", info.author.clone())));
+    }
+    if !info.head_ref.is_empty() {
+        let head = info.head_ref.chars().count();
+        let mut branches = HeaderField::new(
+            "Branches",
+            format!("{} \u{2192} {}", info.head_ref, info.base_ref),
+        );
+        branches.runs = vec![
+            (0, theme.accent),
+            (head, theme.muted_text),
+            (head + 3, theme.accent),
+        ];
+        facts.push(rich(branches));
+    }
+    Header {
+        title: Some(info.title.clone()).filter(|title| !title.trim().is_empty()),
+        facts,
+        description: info.body.clone(),
+        kind: TextKind::Markdown,
+    }
+}
+
+/// A revision's header: its title, then author, date, ids, parents, refs
+/// and pull requests as fields, then the rest of its message.
+pub(crate) fn revision_header(ui: &Diffui, details: &RevisionDetails, look: Look) -> Header {
+    let Look { theme, .. } = look;
+    let title = details
+        .description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned);
+    let description = details
         .description
         .trim()
         .split_once('\n')
         .map_or("", |(_, body)| body)
-        .trim();
-    let columns = ui.diff_wrap.then(|| {
-        let size = ui.config.code_type.size;
-        let char_width = crate::measure::line_width("0000000000", size, look.mono) / 10.0;
-        let text_width = pane_width
-            - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
-            - crate::scrollbar::GUTTER;
-        (text_width / char_width.max(1.0)).floor().max(20.0) as usize
-    });
-    let body: Vec<HeaderLine> = text
-        .lines()
-        .flat_map(|line| match columns {
-            Some(columns) => wrap_columns(line, columns),
-            None => vec![line.to_owned()],
-        })
-        .map(|line| HeaderLine::description(&line))
-        .collect();
-    if !lines.is_empty() {
-        lines.push(HeaderLine::spacer(TITLE_GAP));
-    }
-    if !body.is_empty() {
-        lines.extend(body);
-        lines.push(HeaderLine::blank());
-    }
-
+        .trim()
+        .to_owned();
+    let mut lines = Vec::new();
     lines.push(rich(signature_field("Author", &details.author, theme)));
     if let Some(timestamp) = details
         .author
@@ -276,7 +361,180 @@ pub(crate) fn header_lines(
     if let Some(row) = row_of {
         lines.extend(pull_request_fields(ui, row.bookmarks(), look));
     }
+    Header {
+        title,
+        facts: lines,
+        description,
+        kind: TextKind::Message,
+    }
+}
+
+/// The diff view's header for `header`: the title (when `foldable`: the
+/// diff pane's; the History view's own headers already name the revision),
+/// the facts, then the description. Folded, it's the title alone.
+///
+/// The description reads as written (mono lines, wrapped to `pane_width`
+/// with line wrap on) or, with `inset` and its kind shown rendered, as
+/// Markdown in the header's inset ([`header_inset`]). A long one shows its
+/// first lines and "Show all" there.
+pub(crate) fn header_lines(
+    ui: &Diffui,
+    header: &Header,
+    look: Look,
+    foldable: bool,
+    pane_width: f32,
+    inset: bool,
+) -> Vec<HeaderLine> {
+    let mut lines = if foldable {
+        title_lines(ui, header.title.as_deref(), pane_width)
+    } else {
+        Vec::new()
+    };
+    if foldable && ui.commit_details_collapsed {
+        return lines;
+    }
+    if !lines.is_empty() {
+        lines.push(HeaderLine::spacer(TITLE_GAP));
+    }
+    lines.extend(header.facts.iter().cloned());
+    let text = header.description.trim();
+    if text.is_empty() {
+        return lines;
+    }
+    lines.push(HeaderLine::blank());
+    if inset && ui.text_views.rendered(header.kind) {
+        lines.push(HeaderLine::Inset);
+        return lines;
+    }
+    let mut body = raw_lines(ui, text, look, pane_width);
+    if inset && body.len() > FOLD_LINES && !shown_whole(ui, header) {
+        body.truncate(FOLD_LINES);
+        lines.extend(body.iter().map(|line| HeaderLine::description(line)));
+        lines.push(HeaderLine::Inset);
+        return lines;
+    }
+    let long = inset && body.len() > FOLD_LINES;
+    lines.extend(body.iter().map(|line| HeaderLine::description(line)));
+    if long {
+        lines.push(HeaderLine::Inset);
+    }
     lines
+}
+
+/// `text` as the header's mono lines: wrapped at spaces to the pane with
+/// line wrap on, so a header line is one row.
+fn raw_lines(ui: &Diffui, text: &str, look: Look, pane_width: f32) -> Vec<String> {
+    let columns = ui.diff_wrap.then(|| {
+        let size = ui.config.code_type.size;
+        let char_width = crate::measure::line_width("0000000000", size, look.mono) / 10.0;
+        let text_width = pane_width
+            - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING
+            - crate::scrollbar::GUTTER;
+        (text_width / char_width.max(1.0)).floor().max(20.0) as usize
+    });
+    text.lines()
+        .flat_map(|line| match columns {
+            Some(columns) => wrap_columns(line, columns),
+            None => vec![line.to_owned()],
+        })
+        .collect()
+}
+
+/// Whether the header's description was asked to show whole.
+fn shown_whole(ui: &Diffui, header: &Header) -> bool {
+    ui.active().description_whole == Some(text_hash(&header.description))
+}
+
+/// The first lines of a Markdown text: about [`FOLD_LINES`], cut back to
+/// the paragraph break before them when there's one.
+fn markdown_head(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().take(FOLD_LINES).collect();
+    let end = lines
+        .iter()
+        .rposition(|line| line.trim().is_empty())
+        .filter(|&blank| blank >= FOLD_LINES / 2)
+        .unwrap_or(lines.len());
+    lines[..end].join("\n")
+}
+
+/// A button's press, shared with each build of an inset.
+type OnClick = Rc<dyn Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App)>;
+
+/// What goes in the header's [`HeaderLine::Inset`]: the description
+/// rendered as Markdown, and "Show all" (or "Show less") when it's long.
+pub(crate) fn header_inset(
+    ui: &Diffui,
+    header: &Header,
+    look: Look,
+    pane_width: f32,
+    cx: &mut Cx,
+) -> Option<Inset> {
+    let text = header.description.trim();
+    if text.is_empty() || ui.commit_details_collapsed {
+        return None;
+    }
+    let rendered = ui.text_views.rendered(header.kind);
+    let long = if rendered {
+        text.lines().count() > FOLD_LINES
+    } else {
+        raw_lines(ui, text, look, pane_width).len() > FOLD_LINES
+    };
+    let whole = shown_whole(ui, header);
+    if !rendered && !long {
+        return None;
+    }
+    let shown = rendered.then(|| {
+        if long && !whole {
+            markdown_head(text)
+        } else {
+            text.to_owned()
+        }
+    });
+    let toggle = long.then(|| {
+        let on: OnClick = Rc::new(Diffui::on_action(
+            Action::Review(ReviewAction::ShowAll(!whole)),
+            cx,
+        ));
+        (if whole { "Show less" } else { "Show all" }, on)
+    });
+    let key = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (text, rendered, long, whole).hash(&mut hasher);
+        hasher.finish()
+    };
+    Some(Inset {
+        at: DocSpot::Header,
+        key,
+        build: Rc::new(move |_, _| {
+            let mut column = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(space::SM))
+                .pl(px(crate::diff_view::HEADER_HORIZONTAL_PADDING))
+                .pr(px(
+                    crate::diff_view::HEADER_HORIZONTAL_PADDING + crate::scrollbar::GUTTER
+                ));
+            if let Some(text) = &shown {
+                column = column.child(crate::ai::rendered_markdown("review-header", text, look));
+            }
+            if let Some((label, on)) = &toggle {
+                let on = on.clone();
+                // The label's text, not its wash, lines up with the text
+                // above it.
+                column = column.child(
+                    div().flex().ml(px(-ui::Size::Small.pad_x())).child(
+                        look.button("review-header-show-all", *label)
+                            .ghost()
+                            .small()
+                            .on_click(move |event, window, cx| on(event, window, cx)),
+                    ),
+                );
+            }
+            column.into_any_element()
+        }),
+    })
 }
 
 /// The pull requests of the revision's bookmarks: each a link to it with its
@@ -445,19 +703,18 @@ pub(crate) fn view(ui: &Diffui, look: Look, _window: &mut Window, cx: &mut Cx) -
         }
         return block(theme).child(bar(line, Vec::new())).into_any_element();
     }
-    let Some(details) = session.revision_details.as_ref() else {
-        let line = if has_files {
-            diff_stats(ui, look, cx)
-        } else {
-            Vec::new()
-        };
-        return block(theme).child(bar(line, Vec::new())).into_any_element();
+    let scope = ui.active().scope();
+    let mut line = match (scope, session.revision_details.as_ref()) {
+        (Some(scope), _) => outline_ids(ui, scope, look, cx),
+        (None, Some(details)) => vec![revision_ids(ui, details, look, cx)],
+        (None, None) => Vec::new(),
     };
-
-    let mut line = vec![revision_ids(ui, details, look, cx)];
     if has_files {
         line.extend(diff_stats(ui, look, cx));
     }
+    let Some(header) = header(ui, look) else {
+        return block(theme).child(bar(line, Vec::new())).into_any_element();
+    };
 
     let mut actions = Vec::new();
     if session.capabilities.mutate {
@@ -477,7 +734,49 @@ pub(crate) fn view(ui: &Diffui, look: Look, _window: &mut Window, cx: &mut Cx) -
                 .into_any_element(),
         );
     }
+    if let Some(Scope::Step(index)) = scope {
+        let count = ui.active().outline_steps().len();
+        let noun = steps_names(ui).map_or("step", |names| names.step);
+        for (id, icon, by, enabled, tip) in [
+            (
+                "review-step-previous",
+                icons::CHEVRON_UP,
+                -1,
+                index > 0,
+                "Previous",
+            ),
+            (
+                "review-step-next",
+                icons::CHEVRON_DOWN,
+                1,
+                index + 1 < count,
+                "Next",
+            ),
+        ] {
+            actions.push(
+                look.icon_button(id, icon, theme.muted_text)
+                    .disabled(!enabled)
+                    .on_click(Diffui::on_action(
+                        Action::Review(ReviewAction::Step { by }),
+                        cx,
+                    ))
+                    .tip(format!("{tip} {}", noun.to_lowercase()))
+                    .into_any_element(),
+            );
+        }
+    }
     let folded = ui.commit_details_collapsed;
+    if !folded && !header.description.trim().is_empty() {
+        let kind = header.kind;
+        actions.push(crate::ai::view_toggle(
+            look,
+            "review-header-view",
+            ["Rendered", "Raw"],
+            !ui.text_views.rendered(kind),
+            move |raw| Action::Review(ReviewAction::Rendered(kind, !raw)),
+            cx,
+        ));
+    }
     actions.push(
         look.icon_button(
             "commit-fold",
@@ -563,15 +862,51 @@ fn panel_trigger(
         return group;
     };
     let open = ui.panel_peek.is_some_and(|peek| peek.panel == panel);
-    let mut content = vec![group];
-    content.push(Aligned::glyph(
-        icons::icon(icons::CHEVRON_DOWN, 11.0, theme.muted_text),
-        META_SIZE,
-    ));
+    let content = vec![
+        group,
+        Aligned::glyph(
+            icons::icon(icons::CHEVRON_DOWN, 11.0, theme.muted_text),
+            META_SIZE,
+        ),
+    ];
     let (anchor, tracker) = crate::menu::anchor_tracker();
     let on_click = Diffui::listen(cx, move |this, _: &gpui_kit::ClickEvent, _, _| {
         this.toggle_panel_peek(panel, anchor.get());
     });
+    trigger_with(id, content, open, tooltip, on_click, Some(tracker), look)
+}
+
+/// `content` as a control in the bar's line: a wash on hover (and while
+/// `open`) that reaches past the text without moving it.
+fn trigger(
+    id: &'static str,
+    content: Vec<Aligned>,
+    open: bool,
+    tooltip: &'static str,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+    look: Look,
+) -> Aligned {
+    trigger_with(
+        id,
+        content,
+        open,
+        tooltip,
+        on_click,
+        None::<gpui_kit::Div>,
+        look,
+    )
+}
+
+fn trigger_with(
+    id: &'static str,
+    content: Vec<Aligned>,
+    open: bool,
+    tooltip: &'static str,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+    tracker: Option<impl IntoElement + 'static>,
+    look: Look,
+) -> Aligned {
+    let Look { theme, .. } = look;
     let [py, px_] = TRIGGER_PAD;
     typography::group(content, 3.0).map(move |line| {
         div()
@@ -589,7 +924,7 @@ fn panel_trigger(
             .hover(move |trigger| trigger.bg(theme::hover_wash(theme)))
             .tip(tooltip, look)
             .on_click(on_click)
-            .child(tracker)
+            .children(tracker)
             .child(line)
             .into_any_element()
     })
@@ -600,10 +935,94 @@ fn hidden(ui: &Diffui, panel: crate::root::Panel) -> Option<crate::root::Panel> 
     let tab = ui.active();
     let hidden = tab.main_view == crate::MainView::Diff
         && match panel {
-            crate::root::Panel::Revisions => tab.history_panel_collapsed,
+            crate::root::Panel::Revisions => {
+                tab.history_panel_collapsed && ui.active_steps() != crate::review::Steps::None
+            }
             crate::root::Panel::Files => tab.files_panel_collapsed,
         };
     hidden.then_some(panel)
+}
+
+/// What a list source's bar names: the pull request's number on the
+/// whole; on a step, where it is ("All changes / Commit 2 of 4", the first
+/// part leading back to the whole) and its short id.
+fn outline_ids(ui: &Diffui, scope: Scope, look: Look, cx: &mut Cx) -> Vec<Aligned> {
+    let Look { theme, .. } = look;
+    let (mono, font) = (look.mono, look.font);
+    let text = |value: String, font, color: Color| {
+        Aligned::text(
+            typography::line(value, font, META_SIZE, color),
+            font,
+            META_SIZE,
+        )
+    };
+    let tab = &ui.tabs[ui.active];
+    let names = steps_names(ui);
+    let panel = crate::root::Panel::Revisions;
+    match scope {
+        Scope::All => {
+            let crate::TabSource::ForgePr(spec) = &tab.source else {
+                return Vec::new();
+            };
+            vec![panel_trigger(
+                "commit-revisions-trigger",
+                vec![text(
+                    format!("{}{}", spec.kind.sigil(), spec.number),
+                    mono,
+                    theme.muted_text,
+                )],
+                hidden(ui, panel),
+                "Show commits",
+                ui,
+                look,
+                cx,
+            )]
+        }
+        Scope::Step(index) => {
+            let steps = tab.state.outline_steps();
+            let Some(step) = steps.get(index) else {
+                return Vec::new();
+            };
+            let whole = names.map_or("All changes", |names| names.whole);
+            let back = trigger(
+                "review-scope-all",
+                vec![text(whole.to_owned(), font, theme.accent)],
+                false,
+                "Show all changes",
+                Diffui::on_action(Action::Review(ReviewAction::Scope(Scope::All)), cx),
+                look,
+            );
+            let place = format!(
+                "{} {} of {}",
+                names.map_or("Step", |names| names.step),
+                index + 1,
+                steps.len()
+            );
+            vec![
+                typography::group(
+                    vec![
+                        back,
+                        text("/".to_owned(), font, theme.subtle_text),
+                        text(place, font, theme.text),
+                    ],
+                    space::SM,
+                ),
+                text(
+                    step.id.chars().take(COMMIT_ID_CHARS).collect(),
+                    mono,
+                    theme.subtle_text,
+                ),
+            ]
+        }
+    }
+}
+
+/// What the tab's list source calls its whole and its steps.
+fn steps_names(ui: &Diffui) -> Option<crate::review::StepsNames> {
+    match ui.tabs.get(ui.active)?.steps() {
+        crate::review::Steps::List(names) => Some(names),
+        _ => None,
+    }
 }
 
 /// The change id as jj prints it (its shortest unique prefix bright), then
@@ -784,14 +1203,9 @@ fn more_button(ui: &Diffui, look: Look, cx: &mut Cx) -> Option<AnyElement> {
     )
 }
 
-/// The revision's title as header lines, wrapped at spaces to the pane so
+/// A title as header lines, wrapped at spaces to the pane so
 /// a narrow pane shows all of it.
-fn title_lines(ui: &Diffui, details: &RevisionDetails, pane_width: f32) -> Vec<HeaderLine> {
-    let summary = details
-        .description
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty());
+fn title_lines(ui: &Diffui, summary: Option<&str>, pane_width: f32) -> Vec<HeaderLine> {
     let font = emphasis_font(ui.config.ui_font, Weight::SEMIBOLD);
     let room =
         (pane_width - 2.0 * crate::diff_view::HEADER_HORIZONTAL_PADDING - crate::scrollbar::GUTTER)
@@ -869,6 +1283,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+                HeaderLine::Inset => "[inset]".to_owned(),
                 other => panic!("unexpected header line: {other:?}"),
             })
             .collect()
@@ -899,38 +1314,36 @@ mod tests {
             }],
         };
 
-        let lines = header_lines(&ui, &details, look, true, 2000.0);
+        let header = super::revision_header(&ui, &details, look);
+        let lines = header_lines(&ui, &header, look, true, 2000.0, true);
         let rendered = render(&lines);
+        // The title, the facts, then the body: as a pull request's header.
         assert_eq!(
-            rendered[..6],
-            [
-                "# subject",
-                "~",
-                "| body one",
-                "| body two",
-                "",
-                "Author: Ada Lovelace <ada@example.com>"
-            ]
+            rendered[..3],
+            ["# subject", "~", "Author: Ada Lovelace <ada@example.com>"]
         );
-        assert!(rendered[6].starts_with("Date: Sep 7, 2026, 10:00  "));
+        assert!(rendered[3].starts_with("Date: Sep 7, 2026, 10:00  "));
         assert_eq!(
-            rendered[7..],
+            rendered[4..],
             [
                 "Change: zyxwvutsrqponmlkzyxwvutsrqponmlk",
                 "Commit: abcdef0123456789abcdef0123456789abcdef01",
                 "Parent: kkkkkkkk  the parent",
                 "Bookmarks: main",
+                "",
+                "| body one",
+                "| body two",
             ]
         );
         // The copy buttons copy whole ids; the parent's id opens it.
-        let HeaderLine::Rich(commit) = &lines[8] else {
+        let HeaderLine::Rich(commit) = &lines[5] else {
             panic!("the commit line is a field");
         };
         assert_eq!(
             commit.buttons[0].1,
             HeaderAction::Copy(details.commit_id.clone())
         );
-        let HeaderLine::Rich(parent) = &lines[9] else {
+        let HeaderLine::Rich(parent) = &lines[6] else {
             panic!("the parent line is a field");
         };
         assert_eq!(
@@ -938,15 +1351,26 @@ mod tests {
             Some((8, HeaderAction::Open(details.parents[0].commit_id.clone())))
         );
 
+        // Rendered, the body goes to the header's inset.
+        ui.text_views.messages_rendered = true;
+        let rendered_lines = render(&header_lines(&ui, &header, look, true, 2000.0, true));
+        assert_eq!(rendered_lines[rendered_lines.len() - 2..], ["", "[inset]"]);
+        // A header-only view has no inset: it shows the text as written.
+        assert_eq!(
+            render(&header_lines(&ui, &header, look, true, 2000.0, false)),
+            rendered
+        );
+        ui.text_views.messages_rendered = false;
+
         // Folded, the diff pane's header is the title alone; the History
         // view's, which names the revision itself, keeps the rest.
         ui.commit_details_collapsed = true;
         assert_eq!(
-            render(&header_lines(&ui, &details, look, true, 2000.0)),
+            render(&header_lines(&ui, &header, look, true, 2000.0, true)),
             ["# subject"]
         );
         assert_eq!(
-            header_lines(&ui, &details, look, false, 2000.0).len(),
+            header_lines(&ui, &header, look, false, 2000.0, false).len(),
             lines.len() - 2
         );
     }

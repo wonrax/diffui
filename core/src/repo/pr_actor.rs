@@ -8,12 +8,12 @@
 use tokio::sync::mpsc;
 
 use super::cancel::CancelFlag;
-use super::protocol::{Command, Event, GraphTail, JobId, Payload, RepoError, RepoId};
+use super::protocol::{Command, Event, JobId, Payload, RepoError, RepoId};
 use super::{Envelope, Jobs, route_commands, run_job};
 use std::sync::Arc;
 
-use crate::forge::{self, ForgePr, ForgeProvider, PrInfo};
-use crate::model::{DiffBase, DiffDocument, DiffFile, RevisionSelection};
+use crate::forge::{self, ForgePr, ForgeProvider, PrCommit, PrInfo};
+use crate::model::{DiffBase, DiffDocument, DiffFile, Outline, RevisionSelection, Step, Subject};
 
 /// Flush the pending file batch once it holds this many diff lines. Small
 /// enough that the first screenful paints quickly, large enough that a
@@ -103,25 +103,29 @@ async fn run(
         let _ = events.send(Event::new(id.clone(), payload));
     };
     match command {
-        // The PR's commit list is its graph: an "All changes" row on top, then
-        // one row per commit. It arrives whole, in a single batch.
-        Command::LoadGraph { job, .. } => match provider.commits(spec.clone()).await {
-            Ok(commits) => {
-                *info = None;
-                emit(Payload::Batch {
+        // A PR has no graph: its header and its commits, oldest first, are
+        // its outline. Both are read afresh on every load.
+        Command::LoadGraph { job, .. } => {
+            *info = None;
+            let read = async {
+                let commits = provider.commits(spec.clone()).await?;
+                let header = pr_info(provider, spec, info).await?.clone();
+                Ok::<_, forge::ForgeError>((header, commits))
+            };
+            match read.await {
+                Ok((header, commits)) => emit(Payload::Outline {
                     job,
-                    rows: forge::pr_commit_rows(&commits),
-                });
-                emit(Payload::GraphLoaded {
+                    outline: Outline {
+                        subject: Subject::PullRequest(header),
+                        steps: commits.into_iter().map(step).collect(),
+                    },
+                }),
+                Err(error) => emit(Payload::Failed {
                     job,
-                    tail: GraphTail::default(),
-                });
+                    error: RepoError::Other(error.to_string()),
+                }),
             }
-            Err(error) => emit(Payload::Failed {
-                job,
-                error: RepoError::Other(error.to_string()),
-            }),
-        },
+        }
         Command::LoadDiff {
             job,
             revision,
@@ -135,20 +139,10 @@ async fn run(
             job,
             error: RepoError::Unsupported,
         }),
-        Command::RevisionDetails { job, revision } => match pr_info(provider, spec, info).await {
-            Ok(info) => emit(Payload::DetailsLoaded {
-                job,
-                revision,
-                details: forge::pr_revision_details(spec.kind, info),
-            }),
-            Err(error) => emit(Payload::Failed {
-                job,
-                error: RepoError::Other(error.to_string()),
-            }),
-        },
         // A PR carries no working copy, no operations and no local tree, and
         // `Capabilities` says so — a frontend that asks anyway gets told.
         Command::Snapshot { job, .. }
+        | Command::RevisionDetails { job, .. }
         | Command::Mutate { job, .. }
         | Command::Preview { job, .. }
         | Command::Fetch { job, .. }
@@ -172,6 +166,23 @@ async fn run(
         Command::Cancel { .. } | Command::SetRefreshMode { .. } => {
             unreachable!("jobless commands are handled before dispatch")
         }
+    }
+}
+
+/// A commit as a step of the pull request.
+fn step(commit: PrCommit) -> Step {
+    let message = if commit.message.trim().is_empty() {
+        commit.headline.clone()
+    } else {
+        commit.message
+    };
+    Step {
+        id: commit.oid,
+        title: commit.headline,
+        message,
+        author: commit.author,
+        authored_millis: commit.authored_millis,
+        counts: commit.counts,
     }
 }
 
@@ -343,12 +354,13 @@ mod tests {
                     number: 7,
                     title: "Big".to_owned(),
                     author: "someone".to_owned(),
-                    state: "open".to_owned(),
+                    state: crate::forge::PrState::Open,
                     base_ref: "main".to_owned(),
                     head_ref: "big".to_owned(),
                     totals: Some(totals),
                     changed_files,
                     url: String::new(),
+                    body: String::new(),
                 })
             })
         }

@@ -106,16 +106,21 @@ pub(crate) fn build_status_bar(
             None => bookmark,
         });
     }
-    // jj counts changes; git has only commits.
-    let noun = match vcs {
-        Some(Vcs::Git) => "commits",
-        _ => "changes",
+    // jj counts changes; git has only commits; a list source its steps.
+    let count = match ui.active_steps() {
+        crate::review::Steps::Graph => Some((
+            ui.active().session.commits.len(),
+            match vcs {
+                Some(Vcs::Git) => "commits",
+                _ => "changes",
+            },
+        )),
+        crate::review::Steps::List(names) => Some((ui.active().outline_steps().len(), names.steps)),
+        crate::review::Steps::None => None,
     };
-    left.push(text(
-        format!("{} {noun}", thousands(ui.active().session.commits.len())),
-        font,
-        dim,
-    ));
+    if let Some((count, noun)) = count {
+        left.push(text(format!("{} {noun}", thousands(count)), font, dim));
+    }
 
     div()
         .flex()

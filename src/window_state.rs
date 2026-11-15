@@ -71,6 +71,14 @@ pub struct WindowState {
     /// `None` falls back to unfolded.
     #[serde(default)]
     pub commit_details_collapsed: Option<bool>,
+    /// Whether pull request descriptions show as written rather than
+    /// rendered. `None` falls back to rendered.
+    #[serde(default)]
+    pub markdown_raw: Option<bool>,
+    /// Whether commit messages show rendered as Markdown. `None` falls back
+    /// to as written.
+    #[serde(default)]
+    pub messages_rendered: Option<bool>,
     /// Repository roots that were open as tabs, in tab order. Restored on the
     /// next launch when no repositories are given on the command line.
     #[serde(default)]
@@ -329,6 +337,8 @@ mod tests {
             diff_wrap: Some(false),
             diff_split: Some(true),
             commit_details_collapsed: Some(true),
+            markdown_raw: Some(true),
+            messages_rendered: Some(false),
             open_repos: vec!["/a/repo".to_owned(), "/b/repo".to_owned()],
             active_repo: Some("/b/repo".to_owned()),
             revsets: BTreeMap::from([

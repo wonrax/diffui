@@ -210,6 +210,10 @@ impl Diffui {
             diff_wrap: saved.diff_wrap.unwrap_or(true),
             diff_split: saved.diff_split.unwrap_or(false),
             commit_details_collapsed: saved.commit_details_collapsed.unwrap_or(false),
+            text_views: crate::review::TextViews {
+                markdown_raw: saved.markdown_raw.unwrap_or(false),
+                messages_rendered: saved.messages_rendered.unwrap_or(false),
+            },
             svg_source: false,
             media: Default::default(),
             sidebar_min_width,
@@ -1263,6 +1267,7 @@ impl Diffui {
             Action::RevealConfigFile(file) => self.reveal_config_file(file),
             Action::Compare(action) => self.perform_compare(action),
             Action::Range(action) => self.perform_range(action, cx),
+            Action::Review(action) => self.perform_review(action, cx),
             Action::ExpandFile(index) => self.expand_collapsed_file(index),
         }
     }
@@ -4733,6 +4738,8 @@ impl Diffui {
             diff_wrap: Some(self.diff_wrap),
             diff_split: Some(self.diff_split),
             commit_details_collapsed: Some(self.commit_details_collapsed),
+            markdown_raw: Some(self.text_views.markdown_raw),
+            messages_rendered: Some(self.text_views.messages_rendered),
             // GitHub-PR tabs are session-only (no local root to restore from),
             // so they drop out of the persisted set here.
             open_repos: self

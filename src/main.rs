@@ -65,6 +65,7 @@ mod path_browse;
 mod plan;
 mod plugins;
 mod range;
+mod review;
 mod revision_rows;
 mod revops;
 mod revset_assist;
@@ -319,6 +320,9 @@ pub(crate) struct Diffui {
     /// of the description body and the field grid. Global, persisted with
     /// the window state.
     pub(crate) commit_details_collapsed: bool,
+    /// Whether descriptions and messages read rendered or as written.
+    /// Persisted with the window state.
+    pub(crate) text_views: review::TextViews,
     /// SVG files show their text diff rather than the rendered preview.
     /// Global across tabs and diff sources.
     pub(crate) svg_source: bool,
@@ -855,6 +859,9 @@ pub(crate) struct TabState {
     pub(crate) plugins: plugins::TabPlugins,
     /// Review notes on this repository (see [`notes`]).
     pub(crate) notes: notes::TabNotes,
+    /// The description the header shows whole, by its hash, after "Show
+    /// all"; any other shows its first lines.
+    pub(crate) description_whole: Option<u64>,
 }
 
 impl TabState {
@@ -907,6 +914,7 @@ impl TabState {
             forge: Default::default(),
             plugins: Default::default(),
             notes: Default::default(),
+            description_whole: None,
         }
     }
 

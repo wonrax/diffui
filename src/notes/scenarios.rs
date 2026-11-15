@@ -533,7 +533,7 @@ fn next_and_previous_step_through_notes_and_conflicts_across_files() {
         .filter_map(|(spot, _)| match spot {
             DocSpot::File(file) => Some(*file),
             DocSpot::Line(at) => Some(at.file),
-            DocSpot::Top => None,
+            DocSpot::Header | DocSpot::Top => None,
         })
         .collect();
     assert!(files.len() > 1, "across files: {spots:?}");

@@ -259,6 +259,9 @@ pub struct Session {
     /// (so our own snapshot writes don't trigger a re-walk).
     pub repository_snapshot: Option<RepositorySnapshot>,
     pub revision_details: Option<RevisionDetails>,
+    /// What a source without a graph (a pull request) loaded in its place:
+    /// its header and its steps. `None` for a repository.
+    pub outline: Option<crate::model::Outline>,
     /// Working-copy branch summary (nearest local bookmark + ahead/behind) for
     /// the sidebar footer. `None` until a load resolves it.
     pub branch_status: Option<BranchStatus>,
@@ -1032,6 +1035,7 @@ impl Session {
             Payload::Ready { .. } => Vec::new(),
             Payload::Batch { job, rows } => self.on_batch(job, rows),
             Payload::GraphLoaded { job, tail } => self.on_graph_loaded(job, tail),
+            Payload::Outline { job, outline } => self.on_outline(job, outline),
             Payload::DiffPart {
                 job,
                 files,
@@ -1219,6 +1223,25 @@ impl Session {
             effects.push(Effect::RevealSelection);
         }
         effects.extend(self.resolve_empty_status());
+        effects.extend(self.drain_pending_refresh());
+        effects
+    }
+
+    /// A source without a graph loaded: its outline stands where the graph
+    /// would, and the load is over.
+    fn on_outline(&mut self, job: JobId, outline: crate::model::Outline) -> Vec<Effect> {
+        if self.graph_job.take_if(|load| load.id == job).is_none() {
+            return Vec::new();
+        }
+        self.outline = Some(outline);
+        self.graph_version = Some(job);
+        self.status = LoadStatus::Loaded;
+        self.loading_since = None;
+        self.repaint_version = self.repaint_version.wrapping_add(1);
+        let mut effects = vec![Effect::Activity(Activity::LoadFinished {
+            ok: true,
+            detail: None,
+        })];
         effects.extend(self.drain_pending_refresh());
         effects
     }

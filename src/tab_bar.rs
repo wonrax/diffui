@@ -168,11 +168,6 @@ fn tab_tooltip(tab: &crate::Tab) -> String {
 /// the working copy's emptiness may still be unresolved (it resolves lazily),
 /// in which case we draw no dot rather than guess.
 fn tab_is_dirty(tab: &crate::Tab) -> bool {
-    // PR tabs have no working copy; their synthetic "All changes" row would
-    // otherwise read as permanently dirty.
-    if matches!(tab.source, crate::TabSource::ForgePr(_)) {
-        return false;
-    }
     tab.state
         .session
         .commits

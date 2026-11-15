@@ -2688,10 +2688,11 @@ fn history_diff(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> An
         props = props
             .with_header(crate::commit_info::header_lines(
                 ui,
-                details,
+                &crate::commit_info::revision_header(ui, details, look),
                 look,
                 false, // The History view's right pane: the window less its list.
                 ui.window_size.width - ui.sidebar_width - 1.0,
+                false,
             ))
             .on_header_action(Diffui::listen(
                 cx,

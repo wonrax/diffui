@@ -1050,7 +1050,7 @@ pub(crate) fn build_dialog(
                             "pull-request-body-view",
                             ["Edit", "Preview"],
                             ui.ai.pr_preview,
-                            crate::ai::AiAction::PrPreview,
+                            |preview| Action::Ai(crate::ai::AiAction::PrPreview(preview)),
                             cx,
                         )),
                 )
