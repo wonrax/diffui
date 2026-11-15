@@ -176,6 +176,11 @@ pub(super) struct State {
     pending_spot_reveal: Option<super::DocSpot>,
     /// The viewport's height last frame, for the overview strip.
     pub(super) viewport_height: f32,
+    /// The line the "+" shows on, and its split column.
+    pub(super) hovered_add: Option<(LineAt, Option<SplitSide>)>,
+    /// A press on the "+": the line it was on, and the line a drag from it
+    /// has reached.
+    pub(super) add_drag: Option<(LineAt, LineAt)>,
 }
 
 impl Default for State {
@@ -235,6 +240,8 @@ impl Default for State {
             last_spot_reveal: None,
             pending_spot_reveal: None,
             viewport_height: 0.0,
+            hovered_add: None,
+            add_drag: None,
         }
     }
 }
@@ -275,6 +282,8 @@ impl State {
             && self.hovered_header_action.is_none()
             && self.hovered_line.is_none()
             && self.hovered_hunk_action.is_none()
+            && self.hovered_add.is_none()
+            && self.add_drag.is_none()
     }
 
     fn clear_selection(&mut self) {
@@ -381,14 +390,20 @@ impl State {
             None => self.hovered_hunk_action = None,
         }
 
-        if let Some((spot, token)) = props.reveal
-            && self.last_spot_reveal != Some(token)
-        {
-            // The first token seen is where the app stands, not a request.
-            if self.last_spot_reveal.is_some() {
-                self.pending_spot_reveal = Some(spot);
+        match props.reveal {
+            // Nothing asked yet: the next token is a request.
+            None => {
+                self.last_spot_reveal.get_or_insert(0);
             }
-            self.last_spot_reveal = Some(token);
+            Some((spot, token)) if self.last_spot_reveal != Some(token) => {
+                // A token already standing when the view first shows is where
+                // the app was, not a request.
+                if self.last_spot_reveal.is_some() {
+                    self.pending_spot_reveal = Some(spot);
+                }
+                self.last_spot_reveal = Some(token);
+            }
+            Some(_) => {}
         }
 
         if let Some(find) = &props.find
@@ -617,7 +632,17 @@ impl State {
                     .map(|(line, _)| line),
             )
         };
+        let add = {
+            let index = self.height_index.borrow();
+            point.and_then(|p| view.add_line_at(&index, offset, bounds, p))
+        };
+        let add_changed = add != self.hovered_add;
+        // A drag from the "+" keeps it where the drag began.
+        if self.add_drag.is_none() {
+            self.hovered_add = add;
+        }
         let changed = hunk_changed
+            || add_changed
             || file_header != self.hovered_file_header
             || annotation != self.hovered_annotation
             || action != self.hovered_hunk_action
@@ -796,22 +821,6 @@ impl State {
             send(out, &props.on_edit_description, ());
             return;
         }
-        let gutter_line = {
-            let index = self.height_index.borrow();
-            view.gutter_line_at(&index, offset, bounds, point)
-        };
-        if let Some(line) = gutter_line {
-            send(
-                out,
-                &props.on_gutter_press,
-                LinePress {
-                    line,
-                    extend: modifiers.shift,
-                    one_side: false,
-                },
-            );
-            return;
-        }
         let (hit, check, file_control, annotation, expand, pickable) = {
             let index = self.height_index.borrow();
             let index = &*index;
@@ -963,6 +972,21 @@ impl State {
         left_held: bool,
         out: &mut Outbox,
     ) -> bool {
+        if let Some((from, reached)) = self.add_drag {
+            let side = self.hovered_add.and_then(|(_, side)| side);
+            let line = {
+                let index = self.height_index.borrow();
+                view.add_line_at(&index, self.vertical_offset, bounds, position)
+            };
+            if let Some((line, line_side)) = line
+                && line_side == side
+                && line != reached
+            {
+                self.add_drag = Some((from, line));
+                return true;
+            }
+            return false;
+        }
         if let Some((last, lane)) = self.line_drag {
             let reached = {
                 let index = self.height_index.borrow();
@@ -1248,6 +1272,90 @@ impl DiffElement {
     }
 }
 
+impl DiffElement {
+    /// Prepaints the "+" over the hovered line's gutter: kit's icon button,
+    /// its press starting a note (a drag from it picks a range).
+    fn place_add_button(
+        &self,
+        frame: &mut Frame,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        use crate::ui::Tip as _;
+        let (button, rect, line) = {
+            let view = self.view.read(cx);
+            let Some(props) = &view.props else {
+                return;
+            };
+            let (Some(button), Some(hovered)) = (&props.add_button, view.state.hovered_add) else {
+                return;
+            };
+            let at = View::read(props, cx);
+            let index = view.state.height_index.borrow();
+            let Some(rect) =
+                at.add_button_rect(&index, view.state.painted_offset, bounds.into(), hovered)
+            else {
+                return;
+            };
+            (button.clone(), rect, hovered.0)
+        };
+        let entity = self.view.clone();
+        let on_press = button.on_press.clone();
+        let theme = button.look.theme;
+        use gpui_kit::prelude::*;
+        let mut element = InteractiveElement::id(gpui_kit::div(), "diff-add-note")
+            .block_mouse_except_scroll()
+            .capture_any_mouse_down(move |event, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if event.modifiers.shift {
+                    let press = LinePress {
+                        line,
+                        extend: true,
+                        one_side: false,
+                    };
+                    on_press(&press, window, cx);
+                } else {
+                    entity.update(cx, |view, cx| {
+                        view.state.add_drag = Some((line, line));
+                        cx.notify();
+                    });
+                }
+            })
+            .child(
+                button
+                    .look
+                    .icon_button(
+                        "diff-add-note-button",
+                        crate::icons::PLUS,
+                        theme.panel_background,
+                    )
+                    .small()
+                    .primary(),
+            )
+            .tip(button.tip, button.look)
+            .into_any_element();
+        let size = gpui_kit::size(
+            gpui_kit::AvailableSpace::Definite(gpui_kit::px(rect.width)),
+            gpui_kit::AvailableSpace::Definite(gpui_kit::px(rect.height)),
+        );
+        element.layout_as_root(size, window, cx);
+        let clip = gpui_kit::ContentMask {
+            bounds: frame.inset_clip,
+        };
+        window.with_content_mask(Some(clip), |window| {
+            element.prepaint_at(
+                gpui_kit::point(gpui_kit::px(rect.x), gpui_kit::px(rect.y)),
+                window,
+                cx,
+            );
+        });
+        frame.add = Some(element);
+    }
+}
+
 /// `inset`'s element, laid out at `width`, and its height.
 fn build_inset(
     inset: &super::Inset,
@@ -1285,6 +1393,8 @@ pub(super) struct Frame {
     /// The insets on screen, prepainted, and what they're clipped to.
     insets: Vec<gpui_kit::AnyElement>,
     inset_clip: Bounds<Pixels>,
+    /// The "+" on the hovered line, prepainted.
+    add: Option<gpui_kit::AnyElement>,
 }
 
 impl DiffView {
@@ -1380,6 +1490,7 @@ impl DiffView {
             animating,
             insets: Vec::new(),
             inset_clip: Bounds::default(),
+            add: None,
         }
     }
 
@@ -1458,6 +1569,7 @@ impl Element for DiffElement {
                 .update(cx, |view, cx| view.prepare(rect, hitbox, window, cx))
         });
         self.place_insets(&mut frame, &mut built, bounds, window, cx);
+        self.place_add_button(&mut frame, bounds, window, cx);
         frame
     }
 
@@ -1487,6 +1599,12 @@ impl Element for DiffElement {
                     inset.paint(window, cx);
                 }
             });
+        }
+        if let Some(add) = &mut frame.add {
+            let clip = gpui_kit::ContentMask {
+                bounds: frame.inset_clip,
+            };
+            window.with_content_mask(Some(clip), |window| add.paint(window, cx));
         }
         window.set_cursor_style(frame.cursor, &frame.hitbox);
         if frame.animating {
@@ -1558,7 +1676,23 @@ impl Element for DiffElement {
             if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                 return;
             }
-            DiffView::handle(&entity, window, cx, |_, state, _| state.on_release());
+            DiffView::handle(&entity, window, cx, |view, state, out| {
+                if let Some((from, to)) = state.add_drag.take() {
+                    if let Some(button) = &view.props.add_button {
+                        let press = |line, extend| LinePress {
+                            line,
+                            extend,
+                            one_side: false,
+                        };
+                        send(out, &Some(button.on_press.clone()), press(from, false));
+                        if to != from {
+                            send(out, &Some(button.on_press.clone()), press(to, true));
+                        }
+                    }
+                    return true;
+                }
+                state.on_release()
+            });
         });
     }
 }

@@ -1570,8 +1570,8 @@ section of `assets/agent/SKILL.md`). New in the port.
 ### `notes-diff`
 
 - Window: 1440x900, light
-- State: The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line.
-- Steps: Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view.
+- State: The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line. The pointer rests on a line, which shows its + in the gutter.
+- Steps: Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view; hover a line of the diff.
 
 ### `notes-reply`
 

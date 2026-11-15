@@ -148,6 +148,11 @@ pub(crate) struct LineSelect {
 }
 
 impl LineSelect {
+    /// The keyboard's line.
+    pub(crate) fn cursor(&self) -> Option<LineAt> {
+        self.cursor
+    }
+
     pub(crate) fn new(revision: RevisionSelection, document: u64) -> Self {
         Self {
             revision,

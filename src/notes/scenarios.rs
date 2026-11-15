@@ -794,3 +794,114 @@ fn the_user_starts_notes_that_wait_on_the_agent_and_copies_them() {
         Some("Copied 3 notes as Markdown".to_owned())
     );
 }
+
+/// The "+" of the line under the pointer: where it is, if one shows.
+fn add_button(h: &mut Harness) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    use gpui_kit::test::TestWindowExt as _;
+    h.with_window(|window, _| {
+        window
+            .try_find("diff-add-note-button")
+            .map(|found| found.bounds())
+    })
+}
+
+/// The lines of the note being started, if one is.
+fn new_note_lines(h: &mut Harness) -> Option<(usize, Vec<String>)> {
+    h.read(|ui| {
+        let reply = ui.active().note_reply()?;
+        let super::app::ReplyTo::New(note) = &reply.to else {
+            return None;
+        };
+        let lines = note.anchor.as_ref()?.lines.as_ref()?;
+        Some((lines.start, lines.text.clone()))
+    })
+}
+
+#[test]
+fn the_plus_on_a_hovered_line_starts_a_note_and_drags_a_range() {
+    let repo = scratch_repo("plus");
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the diff and notes", |ui| {
+        ui.active().notes.settled() && !ui.active().session.document.files.is_empty()
+    });
+    h.frames();
+    // Hover down the diff's text: each of a.txt's rows shows its "+".
+    let x = h.read(|ui| ui.left_pane_width() + ui.files_pane_width()) + 300.0;
+    let mut rows: Vec<(f32, gpui_kit::Bounds<gpui_kit::Pixels>)> = Vec::new();
+    let mut y = 60.0;
+    while y < 780.0 {
+        h.hover_point(crate::harness::at(x, y));
+        h.frames();
+        if let Some(button) = add_button(&mut h)
+            && rows
+                .last()
+                .is_none_or(|(_, last)| last.origin.y != button.origin.y)
+        {
+            rows.push((y, button));
+        }
+        y += 4.0;
+    }
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let (first_y, first) = rows[0];
+    let (third_y, _) = rows[2];
+    // It overlays the gutter, left of the text, on its row.
+    assert!(f32::from(first.right()) < x - 100.0, "{first:?}");
+    assert!((f32::from(first.top()) - 6.0..f32::from(first.bottom()) + 6.0).contains(&first_y));
+
+    // A click on it: a note on that line.
+    h.hover_point(crate::harness::at(x, first_y));
+    h.frames();
+    let plus = add_button(&mut h).expect("the +");
+    h.click_point(plus.center());
+    h.settle();
+    assert_eq!(new_note_lines(&mut h), Some((1, vec!["one".to_owned()])));
+    h.press("escape");
+    assert!(new_note_lines(&mut h).is_none());
+
+    // A drag from it down to the third line: the range.
+    h.pointer_down(plus.center(), gpui_kit::MouseButton::Left);
+    h.pointer_move(
+        crate::harness::at(x, third_y),
+        Some(gpui_kit::MouseButton::Left),
+    );
+    h.pointer_up(crate::harness::at(x, third_y), gpui_kit::MouseButton::Left);
+    h.settle();
+    assert_eq!(
+        new_note_lines(&mut h),
+        Some((
+            1,
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
+        ))
+    );
+    h.press("escape");
+
+    // The line numbers are what they were: a press there starts no note, and
+    // a drag from them selects text to copy.
+    let numbers = crate::harness::at(f32::from(plus.left()) - 30.0, first_y);
+    h.click_point(numbers);
+    h.settle();
+    assert!(new_note_lines(&mut h).is_none());
+    h.drag(numbers, crate::harness::at(x + 200.0, third_y));
+    h.settle();
+    h.press("cmd-c");
+    let copied = h
+        .with_window(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .unwrap_or_default();
+    assert!(copied.contains("two"), "{copied:?}");
+}
+
+#[test]
+fn the_cursor_line_takes_a_note_from_the_keyboard() {
+    let repo = scratch_repo("keyboard");
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the diff and notes", |ui| {
+        ui.active().notes.settled() && !ui.active().session.document.files.is_empty()
+    });
+    h.act(|ui, cx| ui.run_command("lines.toggle", crate::commands::CommandArg::None, cx));
+    h.press("j");
+    h.press("n");
+    h.settle();
+    assert!(new_note_lines(&mut h).is_some_and(|(_, text)| text.len() == 1));
+}

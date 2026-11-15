@@ -425,6 +425,16 @@ impl Ord for DocSpot {
     }
 }
 
+/// The "+" the hovered line shows over its gutter (see
+/// [`DiffProps::add_button`]).
+#[derive(Clone)]
+pub struct AddButton {
+    pub on_press: Callback<LinePress>,
+    /// Its hover label.
+    pub tip: &'static str,
+    pub look: crate::ui::Look,
+}
+
 /// What builds an [`Inset`]'s element, each frame it shows.
 pub type BuildInset = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
@@ -609,8 +619,8 @@ pub struct DiffProps {
     overview: Option<Marks>,
     /// Scroll `spot` (and an inset under it) into view when the token changes.
     reveal: Option<(DocSpot, u64)>,
-    /// A press on a diff row's line numbers.
-    on_gutter_press: Option<Callback<LinePress>>,
+    /// The "+" on the hovered line that starts a note.
+    add_button: Option<AddButton>,
 }
 
 impl DiffProps {
@@ -666,7 +676,7 @@ impl DiffProps {
             inset_heights: Default::default(),
             overview: None,
             reveal: None,
-            on_gutter_press: None,
+            add_button: None,
         }
     }
 
@@ -856,13 +866,11 @@ impl DiffProps {
         self
     }
 
-    /// Fire `f` for a press on a diff row's line numbers (shift held:
-    /// `extend`). The press then starts no selection.
-    pub fn on_gutter_press(
-        mut self,
-        f: impl Fn(&LinePress, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_gutter_press = Some(callback(f));
+    /// Show a "+" over the gutter of the line under the pointer. A click
+    /// on it fires `on_press` with that line; a drag from it to another line,
+    /// or a shift-click, fires again with `extend` for the far end.
+    pub fn add_button(mut self, button: AddButton) -> Self {
+        self.add_button = Some(button);
         self
     }
 

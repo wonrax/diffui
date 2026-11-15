@@ -127,8 +127,12 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
     }
     if shown_change(tab).is_some() {
         let start = on.clone();
-        props = props.on_gutter_press(move |press, window, cx| {
-            start(&NotesMsg::StartNote(NoteTarget::Line(*press)), window, cx);
+        props = props.add_button(crate::diff_view::AddButton {
+            on_press: Rc::new(move |press, window, cx| {
+                start(&NotesMsg::StartNote(NoteTarget::Line(*press)), window, cx);
+            }),
+            tip: "Add a note",
+            look,
         });
     }
     let Look { theme, .. } = look;

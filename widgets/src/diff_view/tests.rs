@@ -1641,12 +1641,20 @@ fn a_spot_span_covers_its_insets() {
     assert_eq!(height, index.row_heights[row] + 75.0);
 }
 
-/// A press on a row's line numbers names its line when the props take
-/// gutter presses; one on its text doesn't.
+/// The "+" shows for the row under the pointer, wherever on the row, when the
+/// props have one, and sits over the right end of the line numbers.
 #[test]
-fn the_gutter_names_the_line_under_a_press() {
+fn the_add_button_sits_on_the_hovered_line_over_its_gutter() {
     let hunks = test_hunks();
-    let props = test_props(hunks.len()).on_gutter_press(|_, _, _| {});
+    let props = test_props(hunks.len()).add_button(AddButton {
+        on_press: Rc::new(|_, _, _| {}),
+        tip: "Add a note",
+        look: crate::ui::Look::new(
+            crate::theme::ResolvedTheme::Light.spec(),
+            Font::MONOSPACE,
+            Font::MONOSPACE,
+        ),
+    });
     let view = view_of(&props, &hunks);
     let cells = TestCaches::default();
     let bounds = Rectangle {
@@ -1659,21 +1667,29 @@ fn the_gutter_names_the_line_under_a_press() {
     let index = cells.index.borrow();
     let row = index.row_of_line(1, 0, 1).unwrap();
     let y = index.row_tops[row] + 2.0;
-    assert_eq!(
-        view.gutter_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
-        Some(LineAt {
-            file: 1,
-            hunk: 0,
-            line: 1
-        })
+    let line = LineAt {
+        file: 1,
+        hunk: 0,
+        line: 1,
+    };
+    for x in [4.0, 400.0] {
+        assert_eq!(
+            view.add_line_at(&index, 0.0, bounds, Point::new(x, y)),
+            Some((line, None))
+        );
+    }
+    let rect = view
+        .add_button_rect(&index, 0.0, bounds, (line, None))
+        .unwrap();
+    assert!(
+        rect.x > 0.0 && rect.x + rect.width <= view.metrics.gutter_width,
+        "{rect:?}"
     );
-    assert_eq!(
-        view.gutter_line_at(&index, 0.0, bounds, Point::new(400.0, y)),
-        None
-    );
+    assert!(rect.y >= index.row_tops[row] && rect.y < index.row_tops[row] + index.row_heights[row]);
+    // No button asked for: nothing shows.
     let without = test_props(hunks.len());
     assert_eq!(
-        view_of(&without, &hunks).gutter_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
+        view_of(&without, &hunks).add_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
         None
     );
 }

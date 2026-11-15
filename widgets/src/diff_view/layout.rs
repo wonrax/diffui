@@ -61,6 +61,10 @@ pub(super) const HEADER_BUTTON_SIZE: f32 = 20.0;
 const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
 pub(super) const HEADER_EDIT_WIDTH: f32 = 66.0;
 pub(super) const HEADER_EDIT_HEIGHT: f32 = 26.0;
+/// The "+" that starts a note: its side, and its gap from the gutter's
+/// right edge.
+pub(super) const ADD_BUTTON_SIZE: f32 = 18.0;
+const ADD_BUTTON_INSET: f32 = 2.0;
 /// Side of a change-selection checkbox.
 pub(super) const CHECK_SIZE: f32 = 14.0;
 /// A file header: never shorter than this, its insets, the gap between its
@@ -2688,16 +2692,16 @@ impl<'a> View<'a> {
         self.line_mark(at).map(|_| (at, lane))
     }
 
-    /// The line whose line-number gutter is under `point`, when the props take
-    /// gutter presses. A side-by-side row answers with the side it's in.
-    pub(super) fn gutter_line_at(
+    /// The line under `point` the "+" goes on, and the split column it's in,
+    /// when the props have one.
+    pub(super) fn add_line_at(
         &self,
         index: &HeightIndex,
         vertical_offset: f32,
         bounds: Rectangle,
         point: Point,
-    ) -> Option<LineAt> {
-        self.props.on_gutter_press.as_ref()?;
+    ) -> Option<(LineAt, Option<SplitSide>)> {
+        self.props.add_button.as_ref()?;
         if self.props.plain || !bounds.contains(point) {
             return None;
         }
@@ -2715,28 +2719,54 @@ impl<'a> View<'a> {
         }
         let (file, hunk, line) = index.row_ids[row];
         let (file, hunk) = (file as usize, hunk as usize);
-        let x = point.x - bounds.x;
-        let line = match index.pair_lines.get(row) {
+        let (line, side) = match index.pair_lines.get(row) {
             Some(&(left, right)) if self.props.side_by_side && !index.is_full_width(file) => {
-                let split = self.split_layout(bounds.width);
-                let member = if x < split.gutter_width {
-                    left
-                } else if x >= split.right_gutter_x && x < split.right_gutter_x + split.gutter_width
-                {
-                    right
+                let side = if point.x >= bounds.x + self.split_layout(bounds.width).divider_x {
+                    SplitSide::Right
                 } else {
-                    return None;
+                    SplitSide::Left
+                };
+                let member = match side {
+                    SplitSide::Left => left,
+                    SplitSide::Right => right,
                 };
                 if member == NO_LINE {
                     return None;
                 }
-                member as usize
+                (member as usize, Some(side))
             }
-            _ if x < self.metrics.gutter_width => line as usize,
-            _ => return None,
+            _ => (line as usize, None),
         };
         let at = LineAt { file, hunk, line };
-        (self.line(file, hunk, line)?.kind != DiffLineKind::Note).then_some(at)
+        (self.line(file, hunk, line)?.kind != DiffLineKind::Note).then_some((at, side))
+    }
+
+    /// Where the "+" of `at` (in split column `side`) sits in the window: over
+    /// the right end of its line numbers, on the row's first line.
+    pub(super) fn add_button_rect(
+        &self,
+        index: &HeightIndex,
+        vertical_offset: f32,
+        bounds: Rectangle,
+        (at, side): (LineAt, Option<SplitSide>),
+    ) -> Option<Rectangle> {
+        let row = index.row_of_line(at.file, at.hunk, at.line)?;
+        let gutter_right = match side {
+            Some(SplitSide::Right) => {
+                let split = self.split_layout(bounds.width);
+                split.right_gutter_x + split.gutter_width
+            }
+            Some(SplitSide::Left) => self.split_layout(bounds.width).gutter_width,
+            None => self.metrics.gutter_width,
+        };
+        let size = ADD_BUTTON_SIZE;
+        Some(Rectangle {
+            x: bounds.x + gutter_right - size - ADD_BUTTON_INSET,
+            y: bounds.y + index.row_tops[row] - vertical_offset
+                + ((self.metrics.row_height - size) / 2.0).max(0.0),
+            width: size,
+            height: size,
+        })
     }
 
     /// The file header checkbox under `point`, if any (the pinned sticky header

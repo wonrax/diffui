@@ -2757,6 +2757,35 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "notes.add-line",
+        label: "Add a note on the cursor line",
+        hint: "Write feedback on the line under the keyboard's cursor",
+        contexts: &[Context::Lines],
+        chords: &["n"],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            on_a_change(ui)?;
+            require(
+                ui.active()
+                    .line_select()
+                    .and_then(|select| select.cursor())
+                    .is_some(),
+                "Move the line cursor first",
+            )
+        },
+        build: |ui, _arg| {
+            let line = ui.active().line_select()?.cursor()?;
+            Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(crate::diff_view::LinePress {
+                    line,
+                    extend: false,
+                    one_side: false,
+                }),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "notes.add-file",
         label: "Add a note on this file",
         hint: "Write feedback on the file, for the agent or to copy",

@@ -3093,11 +3093,13 @@ fn all() -> Vec<Scene> {
     t.group("Review notes");
     t.add(s(
         "notes-diff",
-        "The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line.",
+        "The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line. The pointer rests on a line, which shows its + in the gutter.",
         "Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view.",
         |c| {
             let (line, _, _) = working_copy_notes(c);
             c.act(Action::Notes(crate::notes::NotesMsg::Open(line)));
+            c.settle();
+            hover_a_diff_line(c);
         },
     ));
     t.add(s(
@@ -3167,6 +3169,24 @@ fn all() -> Vec<Scene> {
     ));
 
     t.scenes
+}
+
+/// Hovers the pointer down the diff's text until a line shows its "+".
+fn hover_a_diff_line(c: &mut Ctx) {
+    use gpui_kit::test::TestWindowExt as _;
+    let x = c.h.read(|ui| ui.left_pane_width() + ui.files_pane_width()) + 400.0;
+    let mut y = H / 2.0;
+    while y < H - 40.0 {
+        c.h.hover_point(at(x, y));
+        c.h.frames();
+        let shown =
+            c.h.with_window(|window, _| window.try_find("diff-add-note-button").is_some());
+        if shown {
+            return;
+        }
+        y += 6.0;
+    }
+    panic!("no line showed its +");
 }
 
 /// The 1-based line of `path` holding `needle`, in `revision` of `repo`.
