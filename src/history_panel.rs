@@ -1009,9 +1009,9 @@ enum OpRow<'a> {
 const RUN_CHEVRON: f32 = 12.0;
 /// The detail pane's left and right edge: the diff header's under it, and
 /// the commit bar's in the Diff view.
-const DETAIL_EDGE: f32 = crate::diff_view::HEADER_HORIZONTAL_PADDING;
+pub(crate) const DETAIL_EDGE: f32 = crate::diff_view::HEADER_HORIZONTAL_PADDING;
 /// The op detail's title.
-const DETAIL_TITLE_SIZE: f32 = 18.0;
+pub(crate) const DETAIL_TITLE_SIZE: f32 = 18.0;
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {
@@ -1226,7 +1226,7 @@ fn row_card(
 }
 
 /// A row card holding one or two lines of content at the graph's inset.
-fn list_row(
+pub(crate) fn list_row(
     id: impl Into<ElementId>,
     row_height: f32,
     selected: bool,
@@ -1248,7 +1248,7 @@ fn list_row(
 
 /// The graph's two-line stack: a title, and a caption-size line of ids and
 /// meta under it.
-fn two_line(title: impl IntoElement, meta: impl IntoElement) -> Div {
+pub(crate) fn two_line(title: impl IntoElement, meta: impl IntoElement) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -1259,12 +1259,12 @@ fn two_line(title: impl IntoElement, meta: impl IntoElement) -> Div {
         .child(meta)
 }
 
-fn caption(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
+pub(crate) fn caption(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
     typography::line(value, ui.config.ui_font, text_size::CAPTION, color)
 }
 
 /// [`caption`] taking what's left of its row, cut to fit.
-fn caption_fill(value: impl Into<String>, color: Color, ui: &Diffui) -> AnyElement {
+pub(crate) fn caption_fill(value: impl Into<String>, color: Color, ui: &Diffui) -> AnyElement {
     let value: String = value.into();
     Line::new(
         vec![Span::new(value)],
@@ -1277,7 +1277,7 @@ fn caption_fill(value: impl Into<String>, color: Color, ui: &Diffui) -> AnyEleme
 }
 
 /// A mono id placed on its line's baseline.
-fn mono_on_line(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Aligned {
+pub(crate) fn mono_on_line(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Aligned {
     Aligned::text(
         typography::line(value, ui.config.mono_font, CAPTION_TEXT_SIZE, color),
         ui.config.mono_font,
@@ -1287,12 +1287,12 @@ fn mono_on_line(value: impl Into<SharedString>, color: Color, ui: &Diffui) -> Al
 
 /// A [`caption`] (or anything at its font and size), placed on its line's
 /// baseline.
-fn caption_on_line(caption: impl IntoElement, ui: &Diffui) -> Aligned {
+pub(crate) fn caption_on_line(caption: impl IntoElement, ui: &Diffui) -> Aligned {
     Aligned::text(caption, ui.config.ui_font, text_size::CAPTION)
 }
 
 /// A caption that takes what's left of a baseline row, cut to fit.
-fn fill_on_line(element: impl IntoElement, font: Font, size: f32) -> Aligned {
+pub(crate) fn fill_on_line(element: impl IntoElement, font: Font, size: f32) -> Aligned {
     Aligned::text(element, font, size).fill()
 }
 
@@ -1437,7 +1437,7 @@ fn snapshot_dot(theme: ThemeSpec) -> Div {
 
 /// A two-line row's title: the text cut to fit, and the age right-aligned on
 /// its baseline.
-fn title_with_age(title: impl IntoElement, age: String, look: Look) -> Div {
+pub(crate) fn title_with_age(title: impl IntoElement, age: String, look: Look) -> Div {
     let Look { theme, .. } = look;
     let font = look.font;
     typography::baseline_row(
@@ -1621,7 +1621,7 @@ fn summary_line(commit: &CommitBrief, size: f32, look: Look) -> Div {
 /// A list's header, its leading glyph on the rows' content edge and its
 /// trailing button's glyph on their right edge. `leading_button`: the
 /// header starts with an icon button, whose glyph sits centred in it.
-fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec) -> Div {
+pub(crate) fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec) -> Div {
     let glyph_inset = (ui::Size::Compact.height() - ui::ICON_SIZE) / 2.0;
     ui::panel_header()
         .pl(px(
@@ -1632,7 +1632,7 @@ fn header_bar(content: impl IntoElement, leading_button: bool, theme: ThemeSpec)
         .child(content)
 }
 
-fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
+pub(crate) fn note(message: impl Into<SharedString>, color: Color, ui: &Diffui) -> Div {
     ui::empty_state(message, ui::Placement::Inline, ui.config.ui_font, color)
 }
 
@@ -1712,7 +1712,7 @@ pub(crate) fn build_history_sidebar(
 }
 
 /// A column of history rows, inset like the graph's.
-fn list_column() -> Div {
+pub(crate) fn list_column() -> Div {
     div()
         .w_full()
         .flex()

@@ -1600,5 +1600,23 @@ section of `assets/agent/SKILL.md`). New in the port.
 ### `notes-view`
 
 - Window: 1440x900, light
-- State: The Notes view filtered to Waiting on you: notes on two changes grouped under their ids and titles, where each is, its author and last message; the author filter, one row selected, Resolve and Delete in the bar.
-- Steps: Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, pick Waiting on you, select a row.
+- State: The Notes view on Waiting on you: the left pane is the notes list, grouped under change ids and titles, the filter in its head; the line note selected, its change, author and time, its lines as a diff excerpt and its thread on the right with Open in diff.
+- Steps: Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, select the line note.
+
+### `notes-view-picking`
+
+- Window: 1440x900, light
+- State: The Notes view on All open while picking: every row's box showing, three picked, and the floating bar with Picked 3 notes, Resolve, Copy, Delete and Clear.
+- Steps: Leave the working copy's notes; open the Notes view, pick All open from its menu, pick three rows.
+
+### `notes-view-empty`
+
+- Window: 1440x900, light
+- State: The Notes view on a repository with no notes: the list says No notes yet, the main area No review notes yet and how notes start.
+- Steps: Open the Notes view.
+
+### `notes-card-states`
+
+- Window: 1440x900, light
+- State: Thread cards in the diff: a resolved change note folded and dimmed with its Resolved tag, an outdated line note open at its file's header with its Outdated tag and the lines it lost, a folded line note with its reply count.
+- Steps: Leave the working copy's notes; resolve the change note; an agent's note on lines the change no longer has; open it.

@@ -13,6 +13,7 @@ use super::store::{Role, Side};
 use crate::commands::Context;
 use crate::diff_view::{DiffProps, DocSpot, Inset, Mark, Marks};
 use crate::theme::{self, Weight, text_size};
+use crate::typography::Aligned;
 use crate::ui::Look;
 use crate::{Action, Cx, Diffui, icons, typography};
 
@@ -210,6 +211,50 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
     props
 }
 
+/// `note`'s card, open, for the Notes view: its messages, and its reply
+/// field when one is being written.
+pub(crate) fn thread_card(
+    ui: &Diffui,
+    look: Look,
+    note: &Note,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let tab = ui.active();
+    let on: On = Rc::new(Diffui::listen(cx, |this, message: &NotesMsg, _, cx| {
+        this.perform(Action::Notes(message.clone()), cx);
+    }));
+    let id = &note.thread.id;
+    let card = Card {
+        note: note.clone(),
+        blocks: (0..note.thread.messages.len())
+            .map(|index| {
+                tab.notes
+                    .parsed
+                    .get(&(id.clone(), index))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect(),
+        expanded: true,
+        replying: tab
+            .note_reply()
+            .filter(|reply| reply.thread() == Some(id.as_str()))
+            .map(|reply| reply.draft.clone()),
+        off_line: None,
+        send_keys: crate::overlay_kit::bound_keys(ui, Context::NoteReply, &["notes.reply.send"]),
+        cancel_keys: crate::overlay_kit::bound_keys(
+            ui,
+            Context::NoteReply,
+            &["notes.reply.cancel"],
+        ),
+        now: super::store::now(),
+        look,
+        on,
+    };
+    card.card(window, cx)
+}
+
 impl Diffui {
     /// Scroll the diff to `spot`, and make it where next/previous go on from.
     pub(crate) fn reveal_spot(&mut self, spot: DocSpot) {
@@ -277,9 +322,20 @@ impl Card {
     }
 
     fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        div()
+            .w_full()
+            .pl(px(theme::space::XL))
+            .pr(px(crate::scrollbar::GUTTER + theme::space::MD))
+            .py(px(theme::space::SM))
+            .block_mouse_except_scroll()
+            .child(self.card(window, cx))
+            .into_any_element()
+    }
+
+    /// The card alone: in the diff under its line, and in the Notes view.
+    fn card(&self, window: &mut Window, cx: &mut App) -> AnyElement {
         let Look { theme, .. } = self.look;
         let thread = &self.note.thread;
-        let resolved = thread.resolved.is_some();
         let hover = self.on.clone();
         let hovered_id = thread.id.clone();
         let mut card = div()
@@ -291,209 +347,127 @@ impl Card {
             .flex_col()
             .w_full()
             .overflow_hidden()
+            // The overlay cards' radius on a hairline, no lift: it sits in the
+            // content.
             .map(|card| {
                 theme::squircle(
                     card,
                     theme::radius::CARD,
-                    Some(theme.panel_background_elevated),
+                    Some(theme.panel_background),
                     Some(theme.border),
                 )
-            })
-            .child(self.header());
-        if self.expanded && !resolved || self.replying.is_some() {
-            card = card.children(self.messages());
-            if let Some(draft) = &self.replying {
-                card = card.child(reply_field(
-                    draft,
-                    "Reply",
-                    &self.send_keys,
-                    &self.cancel_keys,
-                    self.look,
-                    &self.on,
-                    window,
-                    cx,
-                ));
-            }
-        } else {
-            card = card.child(self.summary());
+            });
+        if !self.open() {
+            return card.child(self.folded()).into_any_element();
+        }
+        if let Some(lost) = self.lost_lines() {
+            card = card.child(lost);
+        }
+        card = card.children(self.messages());
+        card = match &self.replying {
+            Some(draft) => card.child(reply_field(
+                draft,
+                "Send",
+                &self.send_keys,
+                &self.cancel_keys,
+                self.look,
+                &self.on,
+                window,
+                cx,
+            )),
+            None => card.child(self.footer()),
+        };
+        card.into_any_element()
+    }
+
+    fn open(&self) -> bool {
+        self.expanded || self.replying.is_some()
+    }
+
+    /// The thread's states worth a word: resolved, outdated. Kit tags, as
+    /// the History view's badges are.
+    fn tags(&self) -> Vec<Aligned> {
+        let Look { theme, font, .. } = self.look;
+        let mut tags = Vec::new();
+        if self.note.thread.resolved.is_some() {
+            tags.push(
+                crate::ui::tag(
+                    "Resolved",
+                    theme.subtle_text,
+                    crate::ui::TagSize::Small,
+                    font,
+                )
+                .aligned(),
+            );
+        }
+        if self.note.located.outdated() {
+            tags.push(
+                crate::ui::tag("Outdated", theme.note_text, crate::ui::TagSize::Small, font)
+                    .aligned(),
+            );
+        }
+        tags
+    }
+
+    /// Folded: one line of the author, the latest message's first line, the
+    /// reply count and the time. A press opens it.
+    fn folded(&self) -> AnyElement {
+        let Look { theme, font, .. } = self.look;
+        let thread = &self.note.thread;
+        let resolved = thread.resolved.is_some();
+        let latest = thread.last();
+        let first_line = latest.map_or(String::new(), |message| plain_line(&message.body));
+        let replies = thread.messages.len().saturating_sub(1);
+        let mut line = self.tags();
+        line.push(author_on_line(
+            latest,
+            if resolved {
+                theme.muted_text
+            } else {
+                theme.text
+            },
+            self.look,
+        ));
+        line.push(
+            Aligned::text(
+                typography::line(first_line, font, text_size::BODY, theme.muted_text)
+                    .text_ellipsis(),
+                font,
+                text_size::BODY,
+            )
+            .shrink(),
+        );
+        if replies > 0 {
+            let noun = if replies == 1 { "reply" } else { "replies" };
+            line.push(caption_on_line(
+                format!("{replies} {noun}"),
+                theme.subtle_text,
+                font,
+            ));
+        }
+        if let Some(latest) = latest {
+            line.push(caption_on_line(
+                age(latest.at, self.now),
+                theme.subtle_text,
+                font,
+            ));
         }
         div()
+            .id(id(&thread.id, "folded"))
             .w_full()
-            .pl(px(theme::space::XL))
-            .pr(px(crate::scrollbar::GUTTER + theme::space::MD))
-            .py(px(theme::space::SM))
-            .block_mouse_except_scroll()
-            .child(card)
+            .min_w_0()
+            .px(px(theme::space::MD_LG))
+            .py(px(theme::space::MD))
+            .cursor_pointer()
+            .on_click(self.send(NotesMsg::Toggle(thread.id.clone())))
+            .when(resolved, |row| row.opacity(0.75))
+            .child(typography::baseline_row(line, theme::space::SM).min_w_0())
             .into_any_element()
     }
 
-    /// Who wrote it and when, what state it's in, and its buttons. A click
-    /// on it folds or unfolds the thread.
-    fn header(&self) -> AnyElement {
-        let Look { theme, font, mono } = self.look;
-        let thread = &self.note.thread;
-        let first = thread.messages.first();
-        let author = first.map_or("agent", |message| match message.role {
-            Role::User => "You",
-            Role::Agent => message.author.as_str(),
-        });
-        let resolved = thread.resolved.is_some();
-        let ink = if resolved {
-            theme.subtle_text
-        } else {
-            theme.text
-        };
-        let mut row = div()
-            .id(id(&thread.id, "header"))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::space::SM))
-            .w_full()
-            .min_w_0()
-            .px(px(theme::space::MD_LG))
-            .py(px(theme::space::SM))
-            .cursor_pointer()
-            .on_click(self.send(NotesMsg::Toggle(thread.id.clone())))
-            .child(icons::icon(
-                icons::MESSAGE_SQUARE,
-                theme::icon::SM,
-                if resolved {
-                    theme.subtle_text
-                } else {
-                    theme.accent
-                },
-            ))
-            .child(
-                typography::line(
-                    author.to_owned(),
-                    theme::emphasis_font(font, Weight::SEMIBOLD),
-                    text_size::BODY,
-                    ink,
-                )
-                .flex_none(),
-            )
-            .child(
-                typography::line(
-                    first.map_or_else(String::new, |message| age(message.at, self.now)),
-                    font,
-                    text_size::CAPTION,
-                    theme.subtle_text,
-                )
-                .flex_none(),
-            );
-        if let Some(off_line) = &self.off_line {
-            row = row.child(
-                typography::line(off_line.clone(), mono, text_size::CAPTION, theme.muted_text)
-                    .min_w_0()
-                    .text_ellipsis(),
-            );
-        }
-        let state = if resolved {
-            Some(("resolved", theme.subtle_text))
-        } else if self.note.located.outdated() {
-            Some(("outdated", theme.note_text))
-        } else if thread.waiting_on_agent() {
-            Some(("replied", theme.info))
-        } else {
-            None
-        };
-        if let Some((label, color)) = state {
-            row = row.child(
-                typography::line(label, mono, text_size::BADGE, color)
-                    .flex_none()
-                    .px(px(theme::space::XS))
-                    .rounded(px(theme::radius::CHIP))
-                    .bg(theme::chip_background(color)),
-            );
-        }
-        row = row.child(div().flex_1());
-        let replying = self.replying.is_some();
-        if !resolved && !replying {
-            row = row.child(
-                self.look
-                    .button(id(&thread.id, "reply"), "Reply")
-                    .icon(icons::REPLY, theme.muted_text)
-                    .ghost()
-                    .small()
-                    .on_click(self.send(NotesMsg::StartReply(thread.id.clone()))),
-            );
-        }
-        row = row.child(
-            self.look
-                .icon_button(id(&thread.id, "copy"), icons::COPY, theme.muted_text)
-                .small()
-                .tip("Copy as Markdown")
-                .on_click(self.send(NotesMsg::Copy(vec![thread.id.clone()]))),
-        );
-        let (label, message) = if resolved {
-            ("Reopen", NotesMsg::Reopen(vec![thread.id.clone()]))
-        } else {
-            ("Resolve", NotesMsg::Resolve(vec![thread.id.clone()]))
-        };
-        row.child(
-            self.look
-                .button(id(&thread.id, "resolve"), label)
-                .ghost()
-                .small()
-                .on_click(self.send(message)),
-        )
-        .into_any_element()
-    }
-
-    /// Folded: the first message's first line, and how many replies.
-    fn summary(&self) -> AnyElement {
-        let Look { theme, font, .. } = self.look;
-        let thread = &self.note.thread;
-        let first = thread
-            .messages
-            .first()
-            .map_or("", |message| message.body.lines().next().unwrap_or(""));
-        let replies = thread.messages.len().saturating_sub(1);
-        let mut row = div()
-            .id(id(&thread.id, "summary"))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::space::SM))
-            .w_full()
-            .min_w_0()
-            .px(px(theme::space::MD_LG))
-            .pb(px(theme::space::SM))
-            .cursor_pointer()
-            .on_click(self.send(NotesMsg::Toggle(thread.id.clone())))
-            .child(
-                typography::line(
-                    first.to_owned(),
-                    font,
-                    text_size::BODY,
-                    if thread.resolved.is_some() {
-                        theme.subtle_text
-                    } else {
-                        theme.muted_text
-                    },
-                )
-                .flex_1()
-                .min_w_0()
-                .text_ellipsis(),
-            );
-        if replies > 0 {
-            let noun = if replies == 1 { "reply" } else { "replies" };
-            row = row.child(
-                typography::line(
-                    format!("{replies} {noun}"),
-                    font,
-                    text_size::CAPTION,
-                    theme.subtle_text,
-                )
-                .flex_none(),
-            );
-        }
-        row.into_any_element()
-    }
-
-    /// Unfolded: every message, the first under the header, each reply under
-    /// its author and age.
+    /// Every message alike: the author and the time dimmed on one baseline,
+    /// the Markdown body under them. The first message's line folds the
+    /// thread, and carries its tags.
     fn messages(&self) -> Vec<AnyElement> {
         let Look { theme, font, mono } = self.look;
         let thread = &self.note.thread;
@@ -518,46 +492,199 @@ impl Card {
                         }
                     }),
                 );
-                let mut block = div()
+                let mut line = if index == 0 { self.tags() } else { Vec::new() };
+                line.push(author_on_line(Some(message), theme.text, self.look));
+                line.push(caption_on_line(
+                    age(message.at, self.now),
+                    theme.subtle_text,
+                    font,
+                ));
+                if index == 0
+                    && let Some(off_line) = &self.off_line
+                {
+                    line.push(
+                        Aligned::text(
+                            typography::line(
+                                off_line.clone(),
+                                mono,
+                                text_size::CAPTION,
+                                theme.subtle_text,
+                            )
+                            .text_ellipsis(),
+                            mono,
+                            text_size::CAPTION,
+                        )
+                        .shrink(),
+                    );
+                }
+                let mut head = div()
+                    .id(id(&thread.id, &format!("message-{index}")))
+                    .w_full()
+                    .min_w_0()
+                    .child(typography::baseline_row(line, theme::space::SM).min_w_0());
+                if index == 0 {
+                    head = head
+                        .cursor_pointer()
+                        .on_click(self.send(NotesMsg::Toggle(thread.id.clone())));
+                }
+                div()
                     .flex()
                     .flex_col()
                     .gap(px(theme::space::XS))
                     .w_full()
                     .px(px(theme::space::MD_LG))
-                    .pb(px(theme::space::MD));
-                if index > 0 {
-                    let who = match message.role {
-                        Role::User => "You".to_owned(),
-                        Role::Agent => message.author.clone(),
-                    };
-                    block = block
-                        .pt(px(theme::space::MD))
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::space::SM))
-                                .child(typography::line(
-                                    who,
-                                    theme::emphasis_font(font, Weight::SEMIBOLD),
-                                    text_size::BODY,
-                                    theme.text,
-                                ))
-                                .child(typography::line(
-                                    age(message.at, self.now),
-                                    font,
-                                    text_size::CAPTION,
-                                    theme.subtle_text,
-                                )),
-                        );
-                }
-                block.child(body).into_any_element()
+                    .pt(px(theme::space::MD))
+                    .child(head)
+                    .child(body)
+                    .into_any_element()
             })
             .collect()
     }
+
+    /// An outdated note's lines as they were, in a well: what it was about.
+    fn lost_lines(&self) -> Option<AnyElement> {
+        if !self.note.located.outdated() {
+            return None;
+        }
+        let Look { theme, mono, .. } = self.look;
+        let lines = self.note.thread.anchor.as_ref()?.lines.as_ref()?;
+        Some(
+            div()
+                .px(px(theme::space::MD_LG))
+                .pt(px(theme::space::MD))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .px(px(theme::space::MD))
+                        .py(px(theme::space::XS))
+                        .map(|well| {
+                            theme::squircle(
+                                well,
+                                theme::radius::MD,
+                                Some(theme.background),
+                                Some(theme.border),
+                            )
+                        })
+                        .children(lines.text.iter().map(|line| {
+                            typography::line(
+                                line.clone(),
+                                mono,
+                                text_size::CAPTION,
+                                theme.muted_text,
+                            )
+                            .text_ellipsis()
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The thread's actions, once for the whole thread: who it waits on, in
+    /// words, then Copy, Reply and Resolve (or Reopen), the kit's quiet
+    /// buttons.
+    fn footer(&self) -> AnyElement {
+        let Look { theme, font, .. } = self.look;
+        let thread = &self.note.thread;
+        let hint = if let Some(resolved) = &thread.resolved {
+            let by = if resolved.by == "you" {
+                "you"
+            } else {
+                resolved.by.as_str()
+            };
+            format!("Resolved by {by} {}", age(resolved.at, self.now))
+        } else if thread.waiting_on_agent() {
+            "Waiting on the agent".to_owned()
+        } else {
+            "Waiting on you".to_owned()
+        };
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::space::XS))
+            .w_full()
+            .min_w_0()
+            .px(px(theme::space::MD_LG))
+            .py(px(theme::space::SM))
+            .child(div().flex_1().min_w_0().child(typography::centered(
+                typography::line(hint, font, text_size::CAPTION, theme.subtle_text).text_ellipsis(),
+                font,
+                text_size::CAPTION,
+            )))
+            .child(
+                self.look
+                    .icon_button(id(&thread.id, "copy"), icons::COPY, theme.muted_text)
+                    .small()
+                    .tip("Copy as Markdown")
+                    .on_click(self.send(NotesMsg::Copy(vec![thread.id.clone()]))),
+            );
+        if thread.resolved.is_none() {
+            row = row.child(
+                self.look
+                    .button(id(&thread.id, "reply"), "Reply")
+                    .ghost()
+                    .small()
+                    .on_click(self.send(NotesMsg::StartReply(thread.id.clone()))),
+            );
+        }
+        let (label, message) = if thread.resolved.is_some() {
+            ("Reopen", NotesMsg::Reopen(vec![thread.id.clone()]))
+        } else {
+            ("Resolve", NotesMsg::Resolve(vec![thread.id.clone()]))
+        };
+        row.child(
+            self.look
+                .button(id(&thread.id, "resolve"), label)
+                .ghost()
+                .small()
+                .on_click(self.send(message)),
+        )
+        .into_any_element()
+    }
+}
+
+/// A message's author on a line: the agent's name or "You", semibold.
+fn author_on_line(
+    message: Option<&super::store::Message>,
+    ink: crate::theme::Color,
+    look: Look,
+) -> Aligned {
+    let font = theme::emphasis_font(look.font, Weight::SEMIBOLD);
+    let name = match message {
+        Some(message) if message.role == Role::User => "You".to_owned(),
+        Some(message) => message.author.clone(),
+        None => String::new(),
+    };
+    Aligned::text(
+        typography::line(name, font, text_size::BODY, ink).flex_none(),
+        font,
+        text_size::BODY,
+    )
+}
+
+/// A caption on a line's baseline.
+fn caption_on_line(text: String, ink: crate::theme::Color, font: crate::theme::Font) -> Aligned {
+    Aligned::text(
+        typography::line(text, font, text_size::CAPTION, ink).flex_none(),
+        font,
+        text_size::CAPTION,
+    )
+}
+
+/// A message's first line as plain words: its Markdown marks dropped.
+pub(crate) fn plain_line(body: &str) -> String {
+    let first = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    first
+        .trim()
+        .trim_start_matches(['#', '>', '-', '*', ' '])
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
 }
 
 /// The reply field and its footer: for a reply (`send` "Reply") or a new

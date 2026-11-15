@@ -1,25 +1,34 @@
-//! The Notes view: every note in the repository, grouped by change, newest
-//! activity first, filtered, and cleaned up in bulk. It takes the main area
-//! the way the history view does.
+//! The Notes view, built like History: the left pane becomes the list of
+//! notes (grouped under their change, filtered from its head), the main area
+//! shows the selected thread in context, and picks act through a floating bar
+//! like the diff's picks.
 
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, ElementId, SharedString, Window, canvas, div, px};
 
 use super::app::{Filter, Note, NotesMsg};
-use super::inline::{age, lines_label};
+use super::inline::{age, lines_label, plain_line};
 use super::locate::Place;
-use super::store::Role;
+use super::store::{Role, Side};
 use crate::diff_view::CheckState;
-use crate::theme::{self, Weight, text_size};
+use crate::history_panel::{
+    DETAIL_EDGE, DETAIL_TITLE_SIZE, caption_on_line, fill_on_line, header_bar, list_column,
+    list_row, mono_on_line, note, two_line,
+};
+use crate::revision_list::{
+    AGE_TEXT_SIZE, CAPTION_TEXT_SIZE, REVISION_ROW_HEIGHT, ROW_CARD_INSET_Y, SMALL_TEXT_SIZE,
+};
+use crate::theme::{self, Color, Weight, space, text_size};
+use crate::typography::{self, Aligned};
 use crate::ui::{self, Look};
-use crate::{Action, Cx, Diffui, TabState, icons, typography};
+use crate::{Action, Cx, Diffui, TabState, icons, meta_line};
 
 /// The notes the view lists: its filter, author and change applied, grouped
 /// by change (the change with the latest activity first), newest first in
 /// each.
 pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
     let view = &tab.notes.view;
-    let mut notes: Vec<&Note> = tab
+    let notes: Vec<&Note> = tab
         .notes
         .notes
         .iter()
@@ -53,47 +62,50 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
             .then_with(|| a.thread.change_id().cmp(b.thread.change_id()))
             .then_with(|| b.thread.activity().cmp(&a.thread.activity()))
     });
-    notes = keyed.into_iter().map(|(_, note)| note).collect();
-    notes
-}
-
-/// Every agent that wrote a note, for the author filter.
-fn authors(tab: &TabState) -> Vec<String> {
-    let mut authors: Vec<String> = tab
-        .notes
-        .notes
-        .iter()
-        .flat_map(|note| note.thread.agents().map(str::to_owned))
-        .collect();
-    authors.sort();
-    authors.dedup();
-    authors
+    keyed.into_iter().map(|(_, note)| note).collect()
 }
 
 fn id(name: &str, part: &str) -> ElementId {
     ElementId::Name(SharedString::from(format!("notes-view-{name}-{part}")))
 }
 
-pub(crate) fn build_notes_panel(
+fn short(change: &str) -> &str {
+    &change[..change.len().min(8)]
+}
+
+type Send = std::rc::Rc<dyn Fn(&NotesMsg, &mut Window, &mut App)>;
+
+/// A listener for a notes message.
+fn sender(cx: &mut Cx) -> Send {
+    std::rc::Rc::new(Diffui::listen(cx, |this, message: &NotesMsg, _, cx| {
+        this.perform(Action::Notes(message.clone()), cx);
+    }))
+}
+
+fn click(
+    on: &Send,
+    message: NotesMsg,
+) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    let on = on.clone();
+    move |_, window, cx| on(&message, window, cx)
+}
+
+/// The left pane while the Notes view is open: its head with the filter,
+/// then the notes under their changes.
+pub(crate) fn build_notes_sidebar(
     ui: &Diffui,
     look: Look,
     _window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
-    let Look { theme, font, .. } = look;
+    let Look { theme, .. } = look;
     let tab = ui.active();
     let view = &tab.notes.view;
-    let on = std::rc::Rc::new(Diffui::listen(cx, |this, message: &NotesMsg, _, cx| {
-        this.perform(Action::Notes(message.clone()), cx);
-    }));
-    let send = |message: NotesMsg| {
-        let on = on.clone();
-        move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| on(&message, window, cx)
-    };
+    let on = sender(cx);
 
-    // The filter, each with its count.
+    // One filter control: the three that matter, their counts quiet at zero.
     let mut filters = ui::segmented(theme);
-    for filter in Filter::ALL {
+    for filter in Filter::SHOWN {
         let count = tab
             .notes
             .notes
@@ -102,267 +114,140 @@ pub(crate) fn build_notes_panel(
             .count();
         filters = filters.child(
             ui::segment(
-                id(filter.label(), "filter"),
+                id(filter.name(), "filter"),
                 ui::Segment {
                     icon: None,
                     label: filter.label().into(),
-                    count: Some((count, true)),
+                    count: Some((count, count > 0)),
                     active: view.filter == filter,
                     enabled: true,
                 },
                 ui::Segmented::Small,
                 look,
             )
-            .on_click(send(NotesMsg::Filter(filter))),
+            .on_click(click(&on, NotesMsg::Filter(filter))),
         );
     }
-    let mut bar = div()
+    let more = look
+        .icon_button("notes-view-filter-menu", icons::ELLIPSIS, theme.muted_text)
+        .tip("More filters")
+        .on_click(click(&on, NotesMsg::FilterMenu));
+    let head = div()
+        .w_full()
         .flex()
         .flex_row()
-        .flex_wrap()
         .items_center()
-        .gap(px(theme::space::MD))
-        .w_full()
-        .px(px(theme::space::XL))
-        .py(px(theme::space::MD_LG))
-        .border_b_1()
-        .border_color(theme.border)
-        .child(filters);
-    let authors = authors(tab);
-    if authors.len() > 1 || view.author.is_some() {
-        let mut by = ui::segmented(theme).child(
-            ui::segment(
-                "notes-view-author-all",
-                ui::Segment {
-                    icon: None,
-                    label: "Everyone".into(),
-                    count: None,
-                    active: view.author.is_none(),
-                    enabled: true,
-                },
-                ui::Segmented::Small,
-                look,
-            )
-            .on_click(send(NotesMsg::Author(None))),
-        );
-        for author in authors {
-            by = by.child(
-                ui::segment(
-                    id(&author, "author"),
-                    ui::Segment {
-                        icon: None,
-                        label: author.clone().into(),
-                        count: None,
-                        active: view.author.as_deref() == Some(author.as_str()),
-                        enabled: true,
-                    },
-                    ui::Segmented::Small,
-                    look,
-                )
-                .on_click(send(NotesMsg::Author(Some(author)))),
-            );
-        }
-        bar = bar.child(by);
+        .gap(px(space::SM))
+        .child(div().flex_1().min_w_0().overflow_hidden().child(filters))
+        .child(more);
+
+    let mut pane = div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme.panel_background)
+        .child(header_bar(head, false, theme));
+
+    // What the head's control doesn't say: a filter from the menu, an
+    // author, a change. Each clears with its own ✕.
+    let mut applied: Vec<(String, NotesMsg)> = Vec::new();
+    if !Filter::SHOWN.contains(&view.filter) {
+        applied.push((
+            view.filter.label().to_owned(),
+            NotesMsg::Filter(Filter::WaitingOnYou),
+        ));
+    }
+    if let Some(author) = &view.author {
+        applied.push((
+            format!("By {author}"),
+            NotesMsg::FilterNamed("everyone".to_owned()),
+        ));
     }
     if let Some(change) = &view.change {
-        bar = bar.child(
-            look.button("notes-view-change", format!("Only {}", short(change)))
-                .icon(icons::CLOSE, theme.muted_text)
-                .ghost()
-                .small()
-                .tip("Show every change's notes")
-                .on_click(send(NotesMsg::AllChanges)),
-        );
+        applied.push((format!("On {}", short(change)), NotesMsg::AllChanges));
+    }
+    if !applied.is_empty() {
+        let mut strip = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(space::XS))
+            .pl(px(DETAIL_EDGE))
+            .pr(px(crate::scrollbar::GUTTER))
+            .pb(px(space::SM));
+        for (index, (label, clear)) in applied.into_iter().enumerate() {
+            strip = strip.child(
+                look.button(id(&index.to_string(), "applied"), label)
+                    .icon(icons::CLOSE, theme.muted_text)
+                    .ghost()
+                    .small()
+                    .on_click(click(&on, clear)),
+            );
+        }
+        pane = pane.child(strip);
     }
 
     let listed = listed(tab);
-    let selected: Vec<String> = listed
-        .iter()
-        .filter(|note| view.selected.contains(&note.thread.id))
-        .map(|note| note.thread.id.clone())
-        .collect();
-
-    // The selection's actions, or the question before a delete.
-    let actions = match &view.confirm_delete {
-        Some(ids) => {
-            let noun = if ids.len() == 1 { "note" } else { "notes" };
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(theme::space::MD))
-                .w_full()
-                .px(px(theme::space::XL))
-                .py(px(theme::space::SM))
-                .bg(theme.panel_background_elevated)
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    typography::line(
-                        format!("Delete {} {noun}? This can't be undone.", ids.len()),
-                        font,
-                        text_size::BODY,
-                        theme.text,
-                    )
-                    .flex_1(),
-                )
-                .child(
-                    look.cancel_button("notes-view-delete-cancel")
-                        .compact()
-                        .on_click(send(NotesMsg::CancelDelete)),
-                )
-                .child(
-                    look.button("notes-view-delete-confirm", format!("Delete {}", ids.len()))
-                        .destructive()
-                        .compact()
-                        .on_click(send(NotesMsg::Delete(ids.clone()))),
-                )
-        }
-        None => {
-            let all = !listed.is_empty() && selected.len() == listed.len();
-            let state = if all {
-                CheckState::On
-            } else if selected.is_empty() {
-                CheckState::Off
-            } else {
-                CheckState::Partial
-            };
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(theme::space::MD))
-                .w_full()
-                .px(px(theme::space::XL))
-                .py(px(theme::space::SM))
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .id("notes-view-select-all")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::space::SM))
-                        .cursor_pointer()
-                        .on_click(send(NotesMsg::SelectAll(!all)))
-                        .child(checkbox(state, look))
-                        .child(typography::line(
-                            if selected.is_empty() {
-                                format!("{} notes", listed.len())
-                            } else {
-                                format!("{} of {} selected", selected.len(), listed.len())
-                            },
-                            font,
-                            text_size::CAPTION,
-                            theme.muted_text,
-                        )),
-                )
-                .child(div().flex_1());
-            if !selected.is_empty() {
-                row = row
-                    .child(
-                        look.button("notes-view-copy", "Copy")
-                            .icon(icons::COPY, theme.muted_text)
-                            .compact()
-                            .tip("Copy as Markdown, to paste into an agent's prompt")
-                            .on_click(send(NotesMsg::Copy(selected.clone()))),
-                    )
-                    .child(
-                        look.button("notes-view-resolve", "Resolve")
-                            .compact()
-                            .on_click(send(NotesMsg::Resolve(selected.clone()))),
-                    )
-                    .child(
-                        look.button("notes-view-delete", "Delete\u{2026}")
-                            .icon(icons::TRASH, theme.removed_text)
-                            .compact()
-                            .on_click(send(NotesMsg::AskDelete(selected.clone()))),
-                    );
+    if listed.is_empty() {
+        let message = if tab.notes.notes.is_empty() {
+            "No notes yet"
+        } else {
+            match view.filter {
+                Filter::WaitingOnYou => "Nothing waiting on you",
+                Filter::WaitingOnAgent => "Nothing waiting on an agent",
+                Filter::Resolved => "No resolved notes",
+                Filter::Outdated => "No outdated notes",
+                Filter::Archived => "No archived notes",
+                Filter::Open => "No open notes",
             }
-            row
-        }
-    };
+        };
+        return pane
+            .child(
+                div()
+                    .w_full()
+                    .pt(px(space::XL))
+                    .child(note(message, theme.subtle_text, ui)),
+            )
+            .into_any_element();
+    }
 
-    let mut list = div().flex().flex_col().w_full().pb(px(theme::space::XL));
-    let mut change: Option<&str> = None;
+    let picking = !view.selected.is_empty();
     let now = super::store::now();
+    let mut list = div().w_full().flex().flex_col().pb(px(space::XXL * 3.0));
+    let mut change: Option<&str> = None;
     for note in &listed {
         let thread = &note.thread;
         if change != Some(thread.change_id()) {
             change = Some(thread.change_id());
-            let ids: Vec<String> = listed
-                .iter()
-                .filter(|other| other.thread.change_id() == thread.change_id())
-                .map(|other| other.thread.id.clone())
-                .collect();
-            list = list.child(
-                group_header(note, look).child(
-                    look.icon_button(
-                        id(thread.change_id(), "copy"),
-                        icons::COPY,
-                        theme.muted_text,
-                    )
-                    .small()
-                    .tip("Copy this change's notes as Markdown")
-                    .on_click(send(NotesMsg::Copy(ids))),
-                ),
-            );
+            list = list.child(group_header(note, ui, look));
         }
-        list = list.child(row(
+        let picked = view.selected.contains(&thread.id);
+        let selected = view.thread.as_deref() == Some(thread.id.as_str());
+        list = list.child(list_column().py(px(ROW_CARD_INSET_Y)).child(row(
             note,
-            view.selected.contains(&thread.id),
+            (selected, picked, picking),
             now,
+            ui,
             look,
             &on,
-        ));
+            cx,
+        )));
     }
-    if listed.is_empty() {
-        let message = match view.filter {
-            Filter::Open => "No open notes. Agents leave them with diffui notes add.",
-            Filter::WaitingOnYou => "Nothing waiting on you",
-            Filter::WaitingOnAgent => "Nothing waiting on an agent",
-            Filter::Resolved => "No resolved notes",
-            Filter::Outdated => "No outdated notes",
-            Filter::Archived => "No archived notes",
-        };
-        list = list.child(
-            div()
-                .w_full()
-                .py(px(theme::space::XXL))
-                .child(ui::empty_state(
-                    message,
-                    ui::Placement::Centered,
-                    font,
-                    theme.subtle_text,
-                )),
-        );
-    }
-
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .bg(theme.panel_background)
-        .child(bar)
-        .child(actions)
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(ui::scrollable("notes-view-list", list)),
-        )
-        .into_any_element()
+    pane.child(
+        div()
+            .flex_1()
+            .min_h_0()
+            .child(ui::scrollable("notes-view-list", list)),
+    )
+    .into_any_element()
 }
 
-fn short(change: &str) -> &str {
-    &change[..change.len().min(8)]
-}
-
-/// A change's header: its id and title.
-fn group_header(note: &Note, look: Look) -> gpui_kit::Div {
-    let Look { theme, font, mono } = look;
+/// A change's header over its notes: its id, as ids are styled, and its
+/// title.
+fn group_header(note: &Note, ui: &Diffui, look: Look) -> AnyElement {
+    let Look { theme, font, .. } = look;
     let thread = &note.thread;
     let title = note
         .located
@@ -372,92 +257,129 @@ fn group_header(note: &Note, look: Look) -> gpui_kit::Div {
     let (title, ink) = if title.is_empty() {
         ("No description", theme.subtle_text)
     } else {
-        (title, theme.text)
+        (title, theme.muted_text)
     };
-    let mut header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::space::MD))
-        .w_full()
-        .min_w_0()
-        .px(px(theme::space::XL))
-        .pt(px(theme::space::LG))
-        .pb(px(theme::space::XS))
-        .child(
-            typography::line(
-                short(thread.change_id()).to_owned(),
-                mono,
-                text_size::BODY,
-                theme.change_id,
-            )
-            .flex_none(),
-        )
-        .child(
-            typography::line(
-                title.to_owned(),
-                theme::emphasis_font(font, Weight::MEDIUM),
-                text_size::BODY,
-                ink,
-            )
-            .min_w_0()
-            .text_ellipsis(),
-        );
+    let mut line = vec![mono_on_line(
+        short(thread.change_id()).to_owned(),
+        theme.change_id,
+        ui,
+    )];
     if note.located.archived() {
-        header = header.child(
-            typography::line("abandoned", mono, text_size::BADGE, theme.subtle_text)
-                .flex_none()
-                .px(px(theme::space::XS))
-                .rounded(px(theme::radius::CHIP))
-                .bg(theme::chip_background(theme.subtle_text)),
-        );
+        line.push(ui::tag("Abandoned", theme.subtle_text, ui::TagSize::Small, font).aligned());
     }
-    header.child(div().flex_1())
+    line.push(fill_on_line(
+        typography::line(title.to_owned(), font, CAPTION_TEXT_SIZE, ink).text_ellipsis(),
+        font,
+        CAPTION_TEXT_SIZE,
+    ));
+    div()
+        .w_full()
+        .pl(px(DETAIL_EDGE))
+        .pr(px(crate::scrollbar::GUTTER))
+        .pt(px(space::LG))
+        .pb(px(space::XXS))
+        .child(typography::baseline_row(line, space::SM).min_w_0())
+        .into_any_element()
 }
 
-/// One note: its box, where it is, who had the last word and what they said.
+/// Where a note is, for its row and its header: `path:12–18` in mono, the
+/// file's path, or "Whole change" in prose.
+fn location(note: &Note, look: Look, size: f32, ink: Color) -> Aligned {
+    let Look { font, mono, .. } = look;
+    match &note.thread.anchor {
+        None => Aligned::text(
+            typography::line("Whole change", font, size, ink).text_ellipsis(),
+            font,
+            size,
+        ),
+        Some(anchor) => {
+            let text = match (&note.located.place, &anchor.lines) {
+                (Place::Lines { start, end }, Some(lines)) => {
+                    lines_label(&anchor.path, *start, *end, lines.side)
+                }
+                (_, Some(lines)) => lines_label(&anchor.path, lines.start, lines.end(), lines.side),
+                (_, None) => anchor.path.clone(),
+            };
+            Aligned::text(
+                typography::line(text, mono, size, ink).text_ellipsis(),
+                mono,
+                size,
+            )
+        }
+    }
+}
+
+/// One note, as a revision row is laid out: its location and age on the
+/// title line; the author, the latest message's first line and the reply
+/// count under it. Its box shows on hover, or for every row once picking.
 fn row(
     note: &Note,
-    selected: bool,
+    (selected, picked, picking): (bool, bool, bool),
     now: u64,
+    ui: &Diffui,
     look: Look,
-    on: &std::rc::Rc<impl Fn(&NotesMsg, &mut Window, &mut App) + 'static>,
+    on: &Send,
+    cx: &mut Cx,
 ) -> AnyElement {
-    let Look { theme, font, mono } = look;
+    let Look { theme, font, .. } = look;
     let thread = &note.thread;
-    let where_ = match (&thread.anchor, &note.located.place) {
-        (None, _) => "change".to_owned(),
-        (Some(anchor), Place::Lines { start, end }) => lines_label(
-            &anchor.path,
-            *start,
-            *end,
-            anchor
-                .lines
-                .as_ref()
-                .map_or(super::store::Side::New, |lines| lines.side),
+    let dim = thread.resolved.is_some();
+    let latest = thread.last();
+    let mut title = vec![
+        location(
+            note,
+            look,
+            SMALL_TEXT_SIZE,
+            if dim { theme.muted_text } else { theme.text },
+        )
+        .shrink(),
+    ];
+    if note.located.outdated() {
+        title.push(ui::tag("Outdated", theme.note_text, ui::TagSize::Small, font).aligned());
+    }
+    title.push(fill_on_line(div(), font, SMALL_TEXT_SIZE));
+    title.push(Aligned::text(
+        typography::line(
+            latest.map_or(String::new(), |message| age(message.at, now)),
+            font,
+            AGE_TEXT_SIZE,
+            theme.subtle_text,
         ),
-        (Some(anchor), _) => anchor.path.clone(),
-    };
-    let last = thread.last();
-    let who = last.map_or_else(String::new, |message| match message.role {
+        font,
+        AGE_TEXT_SIZE,
+    ));
+    let author = latest.map_or(String::new(), |message| match message.role {
         Role::User => "You".to_owned(),
         Role::Agent => message.author.clone(),
     });
-    let said = last.map_or("", |message| message.body.lines().next().unwrap_or(""));
-    let state = if thread.resolved.is_some() {
-        Some(("resolved", theme.subtle_text))
-    } else if note.located.outdated() {
-        Some(("outdated", theme.note_text))
-    } else if thread.waiting_on_agent() {
-        Some(("replied", theme.info))
-    } else {
-        None
-    };
-    let open = {
-        let on = on.clone();
-        let message = NotesMsg::Open(thread.id.clone());
-        move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| on(&message, window, cx)
-    };
+    let bold = theme::emphasis_font(font, Weight::MEDIUM);
+    let mut meta = vec![
+        Aligned::text(
+            typography::line(author, bold, CAPTION_TEXT_SIZE, theme.muted_text).flex_none(),
+            bold,
+            CAPTION_TEXT_SIZE,
+        ),
+        fill_on_line(
+            typography::line(
+                latest.map_or(String::new(), |message| plain_line(&message.body)),
+                font,
+                CAPTION_TEXT_SIZE,
+                theme.subtle_text,
+            )
+            .text_ellipsis(),
+            font,
+            CAPTION_TEXT_SIZE,
+        ),
+    ];
+    let replies = thread.messages.len().saturating_sub(1);
+    if replies > 0 {
+        let noun = if replies == 1 { "reply" } else { "replies" };
+        meta.push(caption_on_line(
+            crate::history_panel::caption(format!("{replies} {noun}"), theme.subtle_text, ui),
+            ui,
+        ));
+    }
+    let group = SharedString::from(format!("notes-view-row-{}", thread.id));
     let toggle = {
         let on = on.clone();
         let message = NotesMsg::Select(thread.id.clone());
@@ -466,115 +388,465 @@ fn row(
             on(&message, window, cx)
         }
     };
-    let mut line = div()
+    let check = div()
+        .id(id(&thread.id, "check"))
+        .flex_none()
+        .mr(px(space::SM))
+        .on_click(toggle)
+        .child(checkbox(
+            if picked {
+                CheckState::On
+            } else {
+                CheckState::Off
+            },
+            look,
+        ))
+        .when(!picking, |check| {
+            check
+                .opacity(0.0)
+                .group_hover(group.clone(), |style| style.opacity(1.0))
+        });
+    list_row(
+        group.clone(),
+        REVISION_ROW_HEIGHT,
+        selected,
+        Action::Notes(NotesMsg::SelectThread(thread.id.clone())),
+        theme,
+        cx,
+    )
+    .group(group)
+    .child(check)
+    .child(two_line(
+        typography::baseline_row(title, space::SM).min_w_0(),
+        typography::baseline_row(meta, space::SM).min_w_0(),
+    ))
+    .into_any_element()
+}
+
+/// The main area while the Notes view is open: the selected thread in
+/// context, and the picks' bar.
+pub(crate) fn build_notes_panel(
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let tab = ui.active();
+    let view = &tab.notes.view;
+    let mut panel = div()
+        .relative()
+        .size_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .bg(theme.panel_background);
+    let thread = view
+        .thread
+        .as_deref()
+        .and_then(|id| tab.notes.get(id))
+        .filter(|note| listed(tab).iter().any(|it| it.thread.id == note.thread.id));
+    panel = match thread {
+        Some(note) => panel.child(ui::scrollable(
+            "notes-view-thread",
+            detail(note, ui, look, window, cx),
+        )),
+        None if tab.notes.notes.is_empty() => panel.child(empty(
+            "No review notes yet",
+            "Agents leave them with diffui notes add. Start one with the + on a line of a diff.",
+            look,
+        )),
+        None => panel.child(empty(
+            "Select a note",
+            "Its lines and its thread show here.",
+            look,
+        )),
+    };
+    panel.child(action_bar(ui, look, cx)).into_any_element()
+}
+
+/// An empty state as the revision list's: a title and a caption under it.
+fn empty(title: &'static str, detail: &'static str, look: Look) -> AnyElement {
+    let Look { theme, font, .. } = look;
+    div()
+        .flex_1()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            ui::empty_state(
+                title,
+                ui::Placement::Top,
+                theme::emphasis_font(font, Weight::MEDIUM),
+                theme.text,
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .font(font.gpui())
+                    .text_size(px(text_size::CAPTION))
+                    .text_color(theme.subtle_text)
+                    .child(detail),
+            ),
+        )
+        .into_any_element()
+}
+
+/// A thread in context, as History shows an operation: a header with its
+/// change, author and time and its actions, the lines it's on as the diff
+/// draws them, then the thread itself.
+fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let Look { theme, .. } = look;
+    let thread = &note.thread;
+    let on = sender(cx);
+    let title_font = theme::emphasis_font(look.font, Weight::SEMIBOLD);
+    let title = note
+        .located
+        .now
+        .as_ref()
+        .map_or(thread.title(), |now| now.title.as_str());
+    let title = if title.is_empty() {
+        "No description"
+    } else {
+        title
+    };
+    let first = thread.messages.first();
+    let mut badges = Vec::new();
+    if thread.resolved.is_some() {
+        badges.push(meta_line::Badge {
+            label: "resolved",
+            color: theme.subtle_text,
+        });
+    }
+    if note.located.outdated() {
+        badges.push(meta_line::Badge {
+            label: "outdated",
+            color: theme.note_text,
+        });
+    }
+    let meta = meta_line::view(
+        meta_line::Meta {
+            ids: vec![meta_line::Id::plain(
+                short(thread.change_id()),
+                theme.change_id,
+            )],
+            badges,
+            who: first.map(|message| {
+                (
+                    match message.role {
+                        Role::User => "You".to_owned(),
+                        Role::Agent => message.author.clone(),
+                    },
+                    None,
+                )
+            }),
+            when: first.map(|message| {
+                (
+                    Some(message.at as i64 * 1000),
+                    age(message.at, super::store::now()),
+                )
+            }),
+            operation: None,
+        },
+        ui,
+        look,
+        window,
+        cx,
+    );
+    let open = look
+        .button("notes-view-open", "Open in diff")
+        .compact()
+        .icon(icons::FILE_DIFF, theme.muted_text)
+        .disabled(note.located.archived())
+        .tip("Show the note in its change's diff")
+        .on_click(click(&on, NotesMsg::Open(thread.id.clone())));
+    let mut block = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(space::MD))
+        .px(px(DETAIL_EDGE))
+        .pt(px(space::XL))
+        .pb(px(space::XXL * 3.0))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SM))
+                .child(
+                    div().flex_1().min_w_0().child(typography::centered(
+                        typography::line(
+                            title.to_owned(),
+                            title_font,
+                            DETAIL_TITLE_SIZE,
+                            theme.text,
+                        )
+                        .text_ellipsis(),
+                        title_font,
+                        DETAIL_TITLE_SIZE,
+                    )),
+                )
+                .child(open),
+        )
+        .child(meta)
+        .child(typography::baseline_row(
+            [location(note, look, text_size::BODY, theme.muted_text)],
+            0.0,
+        ));
+    if let Some(excerpt) = excerpt(note, ui, look, window, cx) {
+        block = block.child(excerpt);
+    }
+    block
+        .child(crate::notes::inline::thread_card(
+            ui, look, note, window, cx,
+        ))
+        .into_any_element()
+}
+
+/// The note's lines as the diff draws them, read-only: a plain document of
+/// just those lines, in a well.
+fn excerpt(
+    note: &Note,
+    ui: &Diffui,
+    look: Look,
+    window: &mut Window,
+    cx: &mut Cx,
+) -> Option<AnyElement> {
+    let Look { theme, .. } = look;
+    let anchor = note.thread.anchor.as_ref()?;
+    let lines = anchor.lines.as_ref()?;
+    let tab = ui.active();
+    if tab.notes.view.excerpt.is_empty() {
+        return None;
+    }
+    let row_height = (ui.config.code_type.size * ui.config.code_type.line_height).round();
+    let height = lines.text.len() as f32 * row_height + 2.0 * space::LG;
+    let file = crate::diff_view::DiffFileView {
+        title: anchor.path.clone(),
+        status: diffui_core::DiffFileStatus::Modified,
+        status_color: theme.muted_text,
+        status_fill: theme::TRANSPARENT,
+        additions: 0,
+        deletions: 0,
+        tag: None,
+        note: None,
+    };
+    let props = crate::diff_view::DiffProps::new(
+        vec![file],
+        crate::diff_view::DocSource::new(cx.entity(), |ui: &Diffui, _| {
+            &ui.active().notes.view.excerpt
+        }),
+        0,
+        format!("notes-excerpt-{}", note.thread.id),
+        crate::theme::diff_palette(theme),
+        look.mono,
+        ui.config.code_type,
+        ui.config.multi_click_ms,
+    )
+    .plain(true)
+    .wrap(ui.diff_wrap)
+    .content_version(ui.document_version)
+    .layout_version(ui.document_version);
+    let side = match lines.side {
+        Side::New => None,
+        Side::Old => Some("Before the change"),
+    };
+    Some(
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(space::XS))
+            .children(side.map(|side| {
+                typography::line(side, look.font, text_size::CAPTION, theme.subtle_text)
+            }))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(height))
+                    .overflow_hidden()
+                    .map(|well| {
+                        theme::squircle(
+                            well,
+                            theme::radius::CARD,
+                            Some(theme.panel_background),
+                            Some(theme.border),
+                        )
+                    })
+                    .child(crate::diff_view::view("notes-excerpt", props, window, cx)),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The picks' floating bar, as the diff's picks have it: what's picked, then
+/// Resolve, Copy and Delete; Delete asks first, in the bar.
+fn action_bar(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
+    let Look { theme, font, .. } = look;
+    let view = &ui.active().notes.view;
+    let picked: Vec<String> = listed(ui.active())
+        .into_iter()
+        .filter(|note| view.selected.contains(&note.thread.id))
+        .map(|note| note.thread.id.clone())
+        .collect();
+    if picked.is_empty() && view.confirm_delete.is_none() {
+        return div().into_any_element();
+    }
+    let on = sender(cx);
+    let bold = theme::emphasis_font(font, Weight::SEMIBOLD);
+    let ink = theme.panel_background;
+    let faded = Color { a: 0.7, ..ink };
+    let hover = Color {
+        r: 0.5,
+        g: 0.5,
+        b: 0.5,
+        a: 0.24,
+    };
+    let noun = |count: usize| if count == 1 { "note" } else { "notes" };
+    let (title, detail) = match &view.confirm_delete {
+        Some(ids) => (
+            format!("Delete {} {}?", ids.len(), noun(ids.len())),
+            "This can't be undone".to_owned(),
+        ),
+        None => (
+            "Picked".to_owned(),
+            format!("{} {}", picked.len(), noun(picked.len())),
+        ),
+    };
+    let label = typography::baseline_row(
+        vec![
+            Aligned::text(
+                typography::line(title, bold, text_size::BODY, ink),
+                bold,
+                text_size::BODY,
+            ),
+            Aligned::gap(space::SM),
+            Aligned::text(
+                typography::line(detail, font, text_size::BODY, faded),
+                font,
+                text_size::BODY,
+            ),
+        ],
+        0.0,
+    );
+    let button = |name: &'static str,
+                  icon: Option<&'static str>,
+                  text: &'static str,
+                  message: NotesMsg| {
+        let mut content = div().flex().flex_row().items_center().gap(px(6.0));
+        if let Some(icon) = icon {
+            content = content.child(icons::icon(icon, ui::ICON_SIZE, ink));
+        }
+        content = content.child(typography::centered(
+            typography::line(text, font, text_size::BODY, ink),
+            font,
+            text_size::BODY,
+        ));
+        div()
+            .id(name)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .h(px(30.0))
+            .px(px(9.0))
+            .child(crate::squircle::hover_background(
+                crate::squircle::Fill::new(crate::squircle::Corners::all(theme::radius::CONTROL))
+                    .background(hover),
+                0.0,
+            ))
+            .child(content)
+            .cursor_pointer()
+            .on_click(click(&on, message))
+            .into_any_element()
+    };
+    let separator = || {
+        div()
+            .flex_none()
+            .w(px(1.0))
+            .h(px(18.0))
+            .mx(px(4.0))
+            .bg(Color { a: 0.18, ..ink })
+            .into_any_element()
+    };
+    let mut items = vec![
+        div()
+            .flex_none()
+            .pl(px(8.0))
+            .pr(px(10.0))
+            .child(label)
+            .into_any_element(),
+        separator(),
+    ];
+    match &view.confirm_delete {
+        Some(ids) => {
+            items.push(button(
+                "notes-bar-cancel",
+                None,
+                "Cancel",
+                NotesMsg::CancelDelete,
+            ));
+            items.push(button(
+                "notes-bar-delete-confirm",
+                Some(icons::TRASH),
+                "Delete",
+                NotesMsg::Delete(ids.clone()),
+            ));
+        }
+        None => {
+            items.push(button(
+                "notes-bar-resolve",
+                Some(icons::CHECK),
+                "Resolve",
+                NotesMsg::Resolve(picked.clone()),
+            ));
+            items.push(button(
+                "notes-bar-copy",
+                Some(icons::COPY),
+                "Copy",
+                NotesMsg::Copy(picked.clone()),
+            ));
+            items.push(button(
+                "notes-bar-delete",
+                Some(icons::TRASH),
+                "Delete\u{2026}",
+                NotesMsg::AskDelete(picked.clone()),
+            ));
+            items.push(separator());
+            items.push(button(
+                "notes-bar-clear",
+                None,
+                "Clear",
+                NotesMsg::SelectAll(false),
+            ));
+        }
+    }
+    let bar = div()
+        .id("notes-bar")
+        .occlude()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(theme::space::SM))
-        .w_full()
-        .min_w_0()
-        .child(
-            typography::line(where_, mono, text_size::CAPTION, theme.muted_text)
-                .min_w_0()
-                .text_ellipsis(),
-        );
-    if let Some((label, color)) = state {
-        line = line.child(
-            typography::line(label, mono, text_size::BADGE, color)
-                .flex_none()
-                .px(px(theme::space::XS))
-                .rounded(px(theme::radius::CHIP))
-                .bg(theme::chip_background(color)),
-        );
-    }
-    line = line.child(div().flex_1()).child(
-        typography::line(
-            last.map_or_else(String::new, |message| age(message.at, now)),
-            font,
-            text_size::CAPTION,
-            theme.subtle_text,
-        )
-        .flex_none(),
-    );
+        .gap(px(2.0))
+        .p(px(5.0))
+        .max_w_full()
+        .overflow_hidden()
+        .map(|bar| theme::squircle(bar, theme::radius::LG, Some(theme.text), None))
+        .shadow(vec![theme::Elevation::Popover.shadow(theme)])
+        .children(items);
     div()
-        .id(ElementId::Name(SharedString::from(format!(
-            "notes-view-row-{}",
-            thread.id
-        ))))
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom(px(40.0))
+        .px(px(16.0))
         .flex()
-        .flex_row()
-        .items_start()
-        .gap(px(theme::space::MD))
-        .w_full()
-        .px(px(theme::space::XL))
-        .pr(px(crate::scrollbar::GUTTER + theme::space::MD))
-        .py(px(theme::space::SM))
-        .cursor_pointer()
-        .when(selected, |row| row.bg(theme.selected_file))
-        .hover(|row| row.bg(theme::chip_background(theme.muted_text)))
-        .on_click(open)
-        .child(
-            div()
-                .id(ElementId::Name(SharedString::from(format!(
-                    "notes-view-check-{}",
-                    thread.id
-                ))))
-                .flex_none()
-                .pt(px(2.0))
-                .on_click(toggle)
-                .child(checkbox(
-                    if selected {
-                        CheckState::On
-                    } else {
-                        CheckState::Off
-                    },
-                    look,
-                )),
-        )
-        .child(icons::icon(
-            icons::MESSAGE_SQUARE,
-            theme::icon::SM,
-            if thread.resolved.is_some() {
-                theme.subtle_text
-            } else {
-                theme.accent
-            },
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(theme::space::XXS))
-                .flex_1()
-                .min_w_0()
-                .child(line)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(theme::space::SM))
-                        .min_w_0()
-                        .child(
-                            typography::line(
-                                who,
-                                theme::emphasis_font(font, Weight::SEMIBOLD),
-                                text_size::BODY,
-                                theme.text,
-                            )
-                            .flex_none(),
-                        )
-                        .child(
-                            typography::line(
-                                said.to_owned(),
-                                font,
-                                text_size::BODY,
-                                theme.muted_text,
-                            )
-                            .min_w_0()
-                            .text_ellipsis(),
-                        ),
-                ),
-        )
+        .justify_center()
+        .child(bar)
         .into_any_element()
 }
 

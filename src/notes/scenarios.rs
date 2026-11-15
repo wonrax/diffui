@@ -360,7 +360,10 @@ fn the_open_app_shows_notes_live_and_replies_into_the_store() {
     });
     assert_eq!(line, "two");
     h.frames();
-    // Its card is laid under the line, inside the diff.
+    // Its card is laid under the line, inside the diff; opened, its
+    // actions sit together in its footer.
+    h.perform(Action::Notes(NotesMsg::Toggle(id.clone())));
+    h.frames();
     let reply = h.bounds(gpui_kit::ElementId::Name(format!("note-{id}-reply").into()));
     let resolve = h.bounds(gpui_kit::ElementId::Name(
         format!("note-{id}-resolve").into(),
@@ -422,7 +425,9 @@ fn the_notes_view_filters_and_deletes_in_bulk() {
     assert_eq!(h.read(|ui| ui.active().main_view), crate::MainView::Notes);
     h.settle();
     h.frames();
-    let filter = h.bounds("notes-view-Open-filter");
+    // The left pane is the notes list now, its head the filter, which
+    // starts on Waiting on you.
+    let filter = h.bounds("notes-view-waiting-on-you-filter");
     assert!(filter.size.height > gpui_kit::px(10.0), "{filter:?}");
     let listed = |h: &mut Harness| {
         h.read(|ui| {
@@ -432,15 +437,24 @@ fn the_notes_view_filters_and_deletes_in_bulk() {
                 .collect::<Vec<_>>()
         })
     };
-    assert_eq!(listed(&mut h).len(), 3);
+    assert_eq!(listed(&mut h).len(), 2);
     h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnAgent)));
     assert_eq!(listed(&mut h), std::slice::from_ref(&first));
     h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnYou)));
-    assert_eq!(listed(&mut h).len(), 2);
-    h.perform(Action::Notes(NotesMsg::Author(Some("codex".to_owned()))));
+    h.perform(Action::Notes(NotesMsg::FilterNamed(
+        "author:codex".to_owned(),
+    )));
     assert_eq!(listed(&mut h), std::slice::from_ref(&second));
-    h.perform(Action::Notes(NotesMsg::Author(None)));
-    h.perform(Action::Notes(NotesMsg::Filter(Filter::Open)));
+    h.perform(Action::Notes(NotesMsg::FilterNamed("everyone".to_owned())));
+    h.perform(Action::Notes(NotesMsg::FilterNamed("open".to_owned())));
+    assert_eq!(listed(&mut h).len(), 3);
+
+    // A thread selected: its detail on the right, with Open in diff.
+    h.perform(Action::Notes(NotesMsg::SelectThread(second.clone())));
+    h.settle();
+    h.frames();
+    let open = h.bounds("notes-view-open");
+    assert!(open.size.height > gpui_kit::px(10.0), "{open:?}");
 
     // Select all, delete: asked first, with how many.
     h.perform(Action::Notes(NotesMsg::SelectAll(true)));

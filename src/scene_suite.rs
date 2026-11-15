@@ -3188,8 +3188,8 @@ fn all() -> Vec<Scene> {
     );
     t.add(s(
         "notes-view",
-        "The Notes view filtered to Waiting on you: notes on two changes grouped under their ids and titles, where each is, its author and last message; the author filter, one row selected, Resolve and Delete in the bar.",
-        "Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, pick Waiting on you, select a row.",
+        "The Notes view on Waiting on you: the left pane is the notes list, grouped under change ids and titles, the filter in its head; the line note selected, its change, author and time, its lines as a diff excerpt and its thread on the right with Open in diff.",
+        "Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, select the line note.",
         |c| {
             let (line, file, _) = working_copy_notes(c);
             let parser = c.commit_of("fix/parser-crash");
@@ -3198,11 +3198,47 @@ fn all() -> Vec<Scene> {
             crate::notes::scenarios::notes(&c.repo, &["resolve", &resolved]);
             wait_notes(c, 5);
             let _ = line;
+            let _ = file;
             c.act(Action::SetMainView(MainView::Notes));
             c.act(Action::Notes(crate::notes::NotesMsg::Filter(
                 crate::notes::app::Filter::WaitingOnYou,
             )));
-            c.act(Action::Notes(crate::notes::NotesMsg::Select(file)));
+            c.act(Action::Notes(crate::notes::NotesMsg::SelectThread(line)));
+        },
+    ));
+    t.add(s(
+        "notes-view-picking",
+        "The Notes view on All open while picking: every row's box showing, three picked, and the floating bar with Picked 3 notes, Resolve, Copy, Delete and Clear.",
+        "Leave the working copy's notes; open the Notes view, pick All open from its menu, pick three rows.",
+        |c| {
+            let (line, file, change) = working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.act(Action::Notes(crate::notes::NotesMsg::FilterNamed("open".to_owned())));
+            c.act(Action::Notes(crate::notes::NotesMsg::SelectThread(line.clone())));
+            for id in [line, file, change] {
+                c.act(Action::Notes(crate::notes::NotesMsg::Select(id)));
+            }
+        },
+    ));
+    t.add(s(
+        "notes-view-empty",
+        "The Notes view on a repository with no notes: the list says No notes yet, the main area No review notes yet and how notes start.",
+        "Open the Notes view.",
+        |c| {
+            c.act(Action::SetMainView(MainView::Notes));
+        },
+    ));
+    t.add(s(
+        "notes-card-states",
+        "Thread cards in the diff: a resolved change note folded and dimmed with its Resolved tag, an outdated line note open at its file's header with its Outdated tag and the lines it lost, a folded line note with its reply count.",
+        "Leave the working copy's notes; resolve the change note; an agent's note on lines the change no longer has; open it.",
+        |c| {
+            let (_, _, change) = working_copy_notes(c);
+            crate::notes::scenarios::notes(&c.repo, &["resolve", &change]);
+            let repo = c.repo.clone();
+            let outdated = outdated_note(&repo);
+            wait_notes(c, 4);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(outdated)));
         },
     ));
 
@@ -3240,6 +3276,39 @@ fn line_in(repo: &Path, revision: &str, path: &str, needle: &str) -> usize {
         .position(|line| line.contains(needle))
         .unwrap_or_else(|| panic!("no {needle} in {path}"))
         + 1
+}
+
+/// An agent's note on lines of src/main.rs the working copy doesn't have:
+/// outdated from the start. Its id.
+fn outdated_note(repo: &Path) -> String {
+    use crate::notes::store::{Anchor, Lines, Message, Role, Side, Store, Thread, now};
+    let notes = diffui_core::notes::NotesRepo::open(repo, true).expect("the repo");
+    let change = notes.resolve("@").expect("@").remove(0);
+    let store = Store::for_repo(&notes.repo_dir()).expect("the store");
+    store
+        .create(Thread::on_change(
+            &change,
+            Some(Anchor {
+                path: "src/main.rs".to_owned(),
+                lines: Some(Lines {
+                    side: Side::New,
+                    start: 20,
+                    text: vec![
+                        "    let settings = config::load();".to_owned(),
+                        "    let frames = render(path, &settings)?;".to_owned(),
+                    ],
+                }),
+            }),
+            Message {
+                author: "codex".to_owned(),
+                role: Role::Agent,
+                at: now(),
+                body:
+                    "Loading the config before the args are checked costs a disk read on `--help`."
+                        .to_owned(),
+            },
+        ))
+        .expect("store the note")
 }
 
 /// Waits until the active tab holds `count` notes, located.

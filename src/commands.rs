@@ -2835,6 +2835,25 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "notes.filter",
+        label: "Filter the review notes",
+        hint: "Which notes the Notes view lists",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+            require(matches!(arg, CommandArg::Text(_)), "Needs a filter")
+        },
+        build: |_ui, arg| match arg {
+            CommandArg::Text(name) => Some(Action::Notes(crate::notes::NotesMsg::FilterNamed(
+                name.clone(),
+            ))),
+            _ => None,
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "notes.toggle-resolved",
         label: "Show or hide resolved notes",
         hint: "Resolved review notes stay in the diff, folded, or leave it",

@@ -56,7 +56,13 @@ pub(crate) enum NotesMsg {
     Filter(Filter),
     /// Every change's notes again, after [`NotesMsg::ShowChange`].
     AllChanges,
-    Author(Option<String>),
+    /// Show this thread on the Notes view's right.
+    SelectThread(String),
+    /// The filter menu's pick: a [`Filter::name`], `author:NAME` or
+    /// `everyone`.
+    FilterNamed(String),
+    /// Open the Notes view's filter menu.
+    FilterMenu,
     Select(String),
     SelectAll(bool),
 }
@@ -65,9 +71,9 @@ pub(crate) enum NotesMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Filter {
     /// Every open note on a live change.
-    #[default]
     Open,
     /// The agent wrote last: yours to read.
+    #[default]
     WaitingOnYou,
     /// You replied: the agent's turn.
     WaitingOnAgent,
@@ -79,18 +85,41 @@ pub(crate) enum Filter {
 }
 
 impl Filter {
-    pub(crate) const ALL: [Filter; 6] = [
-        Filter::Open,
+    /// The ones the Notes view's head shows; the rest are in its menu.
+    pub(crate) const SHOWN: [Filter; 3] = [
         Filter::WaitingOnYou,
         Filter::WaitingOnAgent,
         Filter::Resolved,
-        Filter::Outdated,
-        Filter::Archived,
     ];
+
+    /// The name `notes.filter` takes for it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Filter::Open => "open",
+            Filter::WaitingOnYou => "waiting-on-you",
+            Filter::WaitingOnAgent => "waiting-on-agent",
+            Filter::Resolved => "resolved",
+            Filter::Outdated => "outdated",
+            Filter::Archived => "archived",
+        }
+    }
+
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        [
+            Filter::Open,
+            Filter::WaitingOnYou,
+            Filter::WaitingOnAgent,
+            Filter::Resolved,
+            Filter::Outdated,
+            Filter::Archived,
+        ]
+        .into_iter()
+        .find(|filter| filter.name() == name)
+    }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Filter::Open => "Open",
+            Filter::Open => "All open",
             Filter::WaitingOnYou => "Waiting on you",
             Filter::WaitingOnAgent => "Waiting on agent",
             Filter::Resolved => "Resolved",
@@ -182,6 +211,10 @@ pub(crate) struct ViewState {
     pub(crate) selected: HashSet<String>,
     /// Asked to delete these; waiting for the answer.
     pub(crate) confirm_delete: Option<Vec<String>>,
+    /// The thread shown on the right.
+    pub(crate) thread: Option<String>,
+    /// Its anchored lines, as the diff view's excerpt reads them.
+    pub(crate) excerpt: Vec<diffui_core::DiffHunkView>,
 }
 
 /// The store watch: dropped with the tab.
@@ -245,6 +278,42 @@ impl TabNotes {
     }
 
     /// Load again: the store changed.
+    /// The anchored lines of the Notes view's thread, as rows.
+    fn excerpt_of(&self) -> Vec<diffui_core::DiffHunkView> {
+        let Some(note) = self.view.thread.as_deref().and_then(|id| self.get(id)) else {
+            return Vec::new();
+        };
+        let Some(lines) = note
+            .thread
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.lines.as_ref())
+        else {
+            return Vec::new();
+        };
+        let start = match note.located.place {
+            Place::Lines { start, .. } => start,
+            _ => lines.start,
+        };
+        let rows = lines
+            .text
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| diffui_core::DiffLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(start + offset),
+                new_line: Some(start + offset),
+                content: text.clone(),
+                syntax: Vec::new(),
+                emphasis: Vec::new(),
+            })
+            .collect();
+        vec![diffui_core::DiffHunkView {
+            header: String::new(),
+            lines: rows,
+        }]
+    }
+
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
     }
@@ -330,6 +399,9 @@ fn first_at(thread: &Thread) -> u64 {
 /// Whether `reply`'s field is on screen: its thread, or the change a new
 /// note is on, in the diff.
 pub(crate) fn reply_on_screen(tab: &TabState, reply: &NoteReply) -> bool {
+    if tab.main_view == MainView::Notes {
+        return reply.thread().is_some() && reply.thread() == tab.notes.view.thread.as_deref();
+    }
     if tab.main_view != MainView::Diff {
         return false;
     }
@@ -620,6 +692,7 @@ impl Diffui {
                             }
                         }
                         state.notes.notes = Rc::new(notes);
+                        state.notes.view.excerpt = state.notes.excerpt_of();
                         state.notes.located_at = operation;
                     }
                     Some((_, Err(error))) => {
@@ -806,14 +879,26 @@ impl Diffui {
                 view.selected.clear();
                 view.confirm_delete = None;
             }
+            NotesMsg::SelectThread(id) => {
+                self.active_mut().notes.view.thread = Some(id);
+                self.refresh_excerpt();
+            }
+            NotesMsg::FilterNamed(name) => {
+                let view = &mut self.active_mut().notes.view;
+                if let Some(author) = name.strip_prefix("author:") {
+                    view.author = Some(author.to_owned());
+                } else if name == "everyone" {
+                    view.author = None;
+                } else if let Some(filter) = Filter::named(&name) {
+                    view.filter = filter;
+                }
+                view.selected.clear();
+                view.confirm_delete = None;
+            }
+            NotesMsg::FilterMenu => self.open_filter_menu(cx),
             NotesMsg::AllChanges => {
                 let view = &mut self.active_mut().notes.view;
                 view.change = None;
-                view.selected.clear();
-            }
-            NotesMsg::Author(author) => {
-                let view = &mut self.active_mut().notes.view;
-                view.author = author;
                 view.selected.clear();
             }
             NotesMsg::Select(id) => {
@@ -833,6 +918,68 @@ impl Diffui {
                 };
                 self.active_mut().notes.view.selected = ids.into_iter().collect();
             }
+        }
+    }
+
+    /// Recompute the Notes view's excerpt for its thread as it is now.
+    pub(crate) fn refresh_excerpt(&mut self) {
+        let notes = &mut self.active_mut().notes;
+        notes.view.excerpt = notes.excerpt_of();
+        self.document_version = self.document_version.wrapping_add(1);
+    }
+
+    /// The Notes view's filter menu: the filters its head leaves out, and the
+    /// authors.
+    fn open_filter_menu(&mut self, cx: &mut Cx) {
+        use crate::commands::CommandArg;
+        use crate::menu::MenuEntry;
+        let row = |this: &Self, label: String, name: String| {
+            this.menu_row(label, "notes.filter", CommandArg::Text(name))
+        };
+        let mut tree = vec![
+            row(self, "All open".to_owned(), Filter::Open.name().to_owned()),
+            row(
+                self,
+                "Outdated".to_owned(),
+                Filter::Outdated.name().to_owned(),
+            ),
+            row(
+                self,
+                "Archived".to_owned(),
+                Filter::Archived.name().to_owned(),
+            ),
+        ];
+        let mut authors: Vec<String> = self
+            .active()
+            .notes
+            .notes
+            .iter()
+            .flat_map(|note| note.thread.agents().map(str::to_owned))
+            .collect();
+        authors.sort();
+        authors.dedup();
+        if !authors.is_empty() {
+            tree.push(MenuEntry::Separator);
+            tree.push(row(self, "Everyone".to_owned(), "everyone".to_owned()));
+            for author in authors {
+                tree.push(row(
+                    self,
+                    format!("By {author}"),
+                    format!("author:{author}"),
+                ));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Self::popup_tree(&tree, None, cx);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            let at = crate::geometry::Point::new(self.left_pane_width() - 24.0, 72.0);
+            self.push_mode(crate::modes::Mode::Menu(crate::menu::OverlayMenu::new(
+                tree,
+                crate::menu::AnchorSpec::At(at),
+                None,
+            )));
         }
     }
 

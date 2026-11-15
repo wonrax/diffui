@@ -812,7 +812,7 @@ fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
         MainView::Diff => sidebar::build_sidebar(ui, look, window, cx),
         MainView::Source => source_panel::build_source_sidebar(ui, look, window, cx),
         MainView::History => history_panel::build_history_sidebar(ui, look, window, cx),
-        MainView::Notes => sidebar::build_sidebar(ui, look, window, cx),
+        MainView::Notes => crate::notes::view::build_notes_sidebar(ui, look, window, cx),
     }
 }
 
