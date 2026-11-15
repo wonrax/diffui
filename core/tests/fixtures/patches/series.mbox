@@ -1,0 +1,70 @@
+From c0b00974bdac0e31561e83549d52d55d0b2d0026 Mon Sep 17 00:00:00 2001
+From: Ada Lovelace <ada@example.com>
+Date: Mon, 4 Mar 2024 10:00:00 +0000
+Subject: [PATCH v2 0/2] Make the list louder
+
+Two small changes to the list.
+
+The second copies it.
+
+Ada Lovelace (2):
+  Shout beta and add delta
+  Copy the list
+
+ copy.txt | 5 +++++
+ list.txt | 3 ++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+ create mode 100644 copy.txt
+
+-- 
+2.54.0
+
+From 2bd9b96d002b47b81681b17953ff17c9f7113b06 Mon Sep 17 00:00:00 2001
+From: Ada Lovelace <ada@example.com>
+Date: Mon, 4 Mar 2024 10:00:00 +0000
+Subject: [PATCH v2 1/2] Shout beta and add delta
+
+The list reads better with one loud entry.
+Delta was missing.
+---
+ list.txt | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/list.txt b/list.txt
+index 85c3040..3cc64f7 100644
+--- a/list.txt
++++ b/list.txt
+@@ -1,3 +1,4 @@
+ alpha
+-beta
++BETA
+ gamma
++delta
+-- 
+2.54.0
+
+From c0b00974bdac0e31561e83549d52d55d0b2d0026 Mon Sep 17 00:00:00 2001
+From: Ada Lovelace <ada@example.com>
+Date: Mon, 4 Mar 2024 10:00:00 +0000
+Subject: [PATCH v2 2/2] Copy the list
+
+---
+ list.txt => copy.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ copy list.txt => copy.txt (74%)
+
+diff --git a/list.txt b/copy.txt
+similarity index 74%
+copy from list.txt
+copy to copy.txt
+index 3cc64f7..24941eb 100644
+--- a/list.txt
++++ b/copy.txt
+@@ -2,3 +2,4 @@ alpha
+ BETA
+ gamma
+ delta
++epsilon
+-- 
+2.54.0
+

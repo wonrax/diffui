@@ -1,0 +1,22 @@
+# HG changeset patch
+# User Grace Hopper <grace@example.com>
+# Date 1709546400 0
+#      Mon Mar 04 10:00:00 2024 +0000
+# Node ID 6f1c2b3a4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90
+# Parent  1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+Count the bugs
+
+diff -r 1a2b3c4d5e6f -r 6f1c2b3a4d5e bugs.py
+--- a/bugs.py	Mon Mar 04 09:00:00 2024 +0000
++++ b/bugs.py	Mon Mar 04 10:00:00 2024 +0000
+@@ -1,3 +1,4 @@
+ def count(bugs):
+-    return 0
++    found = [bug for bug in bugs if bug.alive]
++    return len(found)
+ 
+diff -r 1a2b3c4d5e6f -r 6f1c2b3a4d5e moth.txt
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/moth.txt	Mon Mar 04 10:00:00 2024 +0000
+@@ -0,0 +1,1 @@
++First actual bug found.

@@ -1,0 +1,21 @@
+Index: trunk/src/parse.c
+===================================================================
+--- trunk/src/parse.c	(revision 1412)
++++ trunk/src/parse.c	(working copy)
+@@ -10,7 +10,7 @@
+ static int
+ parse_line(const char *line)
+ {
+-    if (line == NULL)
++    if (line == NULL || *line == '\0')
+         return -1;
+     return 0;
+ }
+Index: trunk/README
+===================================================================
+--- trunk/README	(revision 1412)
++++ trunk/README	(working copy)
+@@ -1,2 +1,3 @@
+ A parser.
+ Run make.
++Then run make check.
