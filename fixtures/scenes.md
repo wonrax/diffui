@@ -1564,3 +1564,35 @@ section of `assets/agent/SKILL.md`). New in the port.
 - Window: 1440x900, light
 - State: A plugin's commands in the palette under the plugin's name: one runs, one of a plugin that isn't allowed is greyed with why.
 - Steps: Launch with the three plugins; cmd+K, type >labels.
+
+## Review notes
+
+### `notes-diff`
+
+- Window: 1440x900, light
+- State: The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line.
+- Steps: Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view.
+
+### `notes-reply`
+
+- Window: 1440x900, light
+- State: A line note in the diff with the reply field open under it, two lines typed, Cancel and Reply with their keys.
+- Steps: Press Reply on the line note and type.
+
+### `notes-log-count`
+
+- Window: 1440x900, light
+- State: The revision list with open note counts: two on fix/parser-crash beside its bookmark, three on the working copy, none elsewhere.
+- Steps: Agents leave notes on the working copy and on fix/parser-crash.
+
+### `notes-overview`
+
+- Window: 1440x620, light
+- State: A conflicted revision's diff in a short window: the scrollbar's overview strip with accent marks for three notes and conflict-coloured marks for each conflict, the first conflict in view.
+- Steps: Agents leave notes on the conflicted revision; select it; press ] twice.
+
+### `notes-view`
+
+- Window: 1440x900, light
+- State: The Notes view filtered to Waiting on you: notes on two changes grouped under their ids and titles, where each is, its author and last message; the author filter, one row selected, Resolve and Delete in the bar.
+- Steps: Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, pick Waiting on you, select a row.

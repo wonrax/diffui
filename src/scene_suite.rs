@@ -3090,7 +3090,158 @@ fn all() -> Vec<Scene> {
         .settings(THREE_PLUGINS),
     );
 
+    t.group("Review notes");
+    t.add(s(
+        "notes-diff",
+        "The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line.",
+        "Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view.",
+        |c| {
+            let (line, _, _) = working_copy_notes(c);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(line)));
+        },
+    ));
+    t.add(s(
+        "notes-reply",
+        "A line note in the diff with the reply field open under it, two lines typed, Cancel and Reply with their keys.",
+        "Press Reply on the line note and type.",
+        |c| {
+            let (line, _, _) = working_copy_notes(c);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(line.clone())));
+            c.act(Action::Notes(crate::notes::NotesMsg::StartReply(line)));
+            c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                "Hold the usage change until --samples parses:\nthe help shouldn't promise a flag that errors.".to_owned(),
+            )));
+        },
+    ));
+    t.add(s(
+        "notes-log-count",
+        "The revision list with open note counts: two on fix/parser-crash beside its bookmark, three on the working copy, none elsewhere.",
+        "Agents leave notes on the working copy and on fix/parser-crash.",
+        |c| {
+            working_copy_notes(c);
+            let parser = c.commit_of("fix/parser-crash");
+            for text in ["Returns `None` on empty input instead of panicking.", "No test for a file of only newlines."] {
+                crate::notes::scenarios::add(&c.repo, &["--as", "claude", "-r", &parser, text]);
+            }
+            wait_notes(c, 5);
+        },
+    ));
+    t.add(
+        s(
+            "notes-overview",
+            "A conflicted revision's diff in a short window: the scrollbar's overview strip with accent marks for three notes and conflict-coloured marks for each conflict, the first conflict in view.",
+            "Agents leave notes on the conflicted revision; select it; press ] twice.",
+            |c| {
+                let commit = c.commit_of("conflicted");
+                let repo = c.repo.clone();
+                let main = line_in(&repo, &commit, "src/main.rs", "fn main");
+                crate::notes::scenarios::add(&repo, &["--as", "claude", "-r", &commit, "Both sides changed the defaults; I kept neither yet."]);
+                crate::notes::scenarios::add(&repo, &["--as", "claude", "-r", &commit, "--file", "src/main.rs", "--line", &main.to_string(), "The usage line is in conflict below."]);
+                crate::notes::scenarios::add(&repo, &["--as", "codex", "-r", &commit, "--file", "src/config.rs", "Pick 8 samples: laptops have the fast path now."]);
+                c.select("conflicted");
+                wait_notes(c, 3);
+                c.key("]");
+                c.key("]");
+            },
+        )
+        .size(1440.0, 620.0),
+    );
+    t.add(s(
+        "notes-view",
+        "The Notes view filtered to Waiting on you: notes on two changes grouped under their ids and titles, where each is, its author and last message; the author filter, one row selected, Resolve and Delete in the bar.",
+        "Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, pick Waiting on you, select a row.",
+        |c| {
+            let (line, file, _) = working_copy_notes(c);
+            let parser = c.commit_of("fix/parser-crash");
+            let resolved = crate::notes::scenarios::add(&c.repo, &["--as", "codex", "-r", &parser, "--file", "src/parser/mod.rs", "--line", "2", "`lines().next()` returns `None` for empty input."]);
+            crate::notes::scenarios::add(&c.repo, &["--as", "codex", "-r", &parser, "Kept the signature so callers don't change."]);
+            crate::notes::scenarios::notes(&c.repo, &["resolve", &resolved]);
+            wait_notes(c, 5);
+            let _ = line;
+            c.act(Action::SetMainView(MainView::Notes));
+            c.act(Action::Notes(crate::notes::NotesMsg::Filter(
+                crate::notes::app::Filter::WaitingOnYou,
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::Select(file)));
+        },
+    ));
+
     t.scenes
+}
+
+/// The 1-based line of `path` holding `needle`, in `revision` of `repo`.
+fn line_in(repo: &Path, revision: &str, path: &str, needle: &str) -> usize {
+    let notes = diffui_core::notes::NotesRepo::open(repo, true).expect("the repo");
+    let commit = notes.resolve(revision).expect("the revision")[0]
+        .commit_id
+        .clone();
+    let text = notes
+        .read(&commit, path, diffui_core::notes::Side::New)
+        .unwrap_or_else(|| panic!("no {path}"));
+    text.lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no {needle} in {path}"))
+        + 1
+}
+
+/// Waits until the active tab holds `count` notes, located.
+fn wait_notes(c: &mut Ctx, count: usize) {
+    c.h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == count
+    });
+    c.settle();
+}
+
+/// Three notes on the working copy, as agents leave them: a line note the
+/// user answered and the agent answered back, a file note and a change note.
+/// Their ids: line, file, change.
+fn working_copy_notes(c: &mut Ctx) -> (String, String, String) {
+    use crate::notes::scenarios::{add, notes, user_reply};
+    let repo = c.repo.clone();
+    let line = line_in(&repo, "@", "src/main.rs", "[--samples N]");
+    let line = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "--file",
+            "src/main.rs",
+            "--line",
+            &line.to_string(),
+            "Documented **--samples** in the usage line; parsing it lands in the next change.\n\nThe old usage is still in `docs/guide.md`; I left it, since that page is versioned.",
+        ],
+    );
+    let file = add(
+        &repo,
+        &[
+            "--as",
+            "codex",
+            "--file",
+            "src/renderer/frame_loop.rs",
+            "Dropped step 45: nothing reads its output since the pipeline rework.",
+        ],
+    );
+    let change = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "Split the release notes out of the README so the pipeline rework has its own entry.",
+        ],
+    );
+    user_reply(&repo, &line, "Does anything parse the usage line?");
+    notes(
+        &repo,
+        &[
+            "reply",
+            &line,
+            "--as",
+            "claude",
+            "Only `scripts/ci-check.sh`, which matches on `usage:`; it still does.",
+        ],
+    );
+    wait_notes(c, 3);
+    (line, file, change)
 }
 
 /// A forge plugin that asks for a bit of everything.
