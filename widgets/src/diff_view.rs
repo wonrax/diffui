@@ -248,6 +248,21 @@ pub fn header_block_height(
         + HEADER_VERTICAL_PADDING * 2.0
 }
 
+/// How tall a diff of `files` files, `hunks` hunk strips and `rows` rows
+/// draws with wrapping off: what a view sized to its content takes.
+pub fn unwrapped_height(
+    typography: CodeTypography,
+    font: Font,
+    files: usize,
+    hunks: usize,
+    rows: usize,
+) -> f32 {
+    let metrics = layout::LayoutMetrics::new(typography, 3, font, false);
+    files as f32 * metrics.file_header_height
+        + hunks as f32 * metrics.hunk_header_height
+        + rows as f32 * metrics.row_height
+}
+
 /// What a press on a [`HeaderField`]'s link or button asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderAction {
@@ -438,9 +453,10 @@ pub struct AddButton {
     pub look: crate::ui::Look,
 }
 
-/// Rows `from..=to` of one hunk washed in the accent: lines picked for a
-/// note (`strong`, with a bar at the gutter's edge) or the lines an open note
-/// is about.
+/// Rows `from..=to` of one hunk marked by an accent bar at the gutter's
+/// edge: lines picked for a note (`strong`, washed in the selection colour
+/// too) or the lines an open note is about (the bar alone, so their own add
+/// or remove colour stays).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Highlight {
     pub from: LineAt,

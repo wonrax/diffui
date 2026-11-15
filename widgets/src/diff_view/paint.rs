@@ -2538,18 +2538,12 @@ impl View<'_> {
                 let Some(strong) = hit else {
                     continue;
                 };
-                let wash = if strong {
-                    palette.selection
-                } else {
-                    Color {
-                        a: palette.selection.a * 0.5,
-                        ..palette.selection
-                    }
-                };
-                plan.rect(bounds.x, row.y, bounds.width, row.height, wash);
+                // Lines being picked are washed; an open note's lines keep
+                // their own add or remove colour and show only the bar.
                 if strong {
-                    plan.rect(bounds.x, row.y, PICK_BAR_WIDTH, row.height, palette.accent);
+                    plan.rect(bounds.x, row.y, bounds.width, row.height, palette.selection);
                 }
+                plan.rect(bounds.x, row.y, PICK_BAR_WIDTH, row.height, palette.accent);
             }
         }
         if let Some(split) = &split {

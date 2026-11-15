@@ -9,11 +9,11 @@ use gpui_kit::{AnyElement, App, ElementId, SharedString, Window, canvas, div, px
 use super::app::{Filter, Note, NotesMsg};
 use super::inline::{age, lines_label, plain_line};
 use super::locate::Place;
-use super::store::{Role, Side};
+use super::store::Role;
 use crate::diff_view::CheckState;
 use crate::history_panel::{
-    DETAIL_EDGE, DETAIL_TITLE_SIZE, caption_on_line, fill_on_line, header_bar, list_column,
-    list_row, mono_on_line, note, two_line,
+    DETAIL_EDGE, caption_on_line, fill_on_line, header_bar, list_column, list_row, mono_on_line,
+    note, two_line,
 };
 use crate::revision_list::{
     AGE_TEXT_SIZE, CAPTION_TEXT_SIZE, REVISION_ROW_HEIGHT, ROW_CARD_INSET_Y, SMALL_TEXT_SIZE,
@@ -67,6 +67,25 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
 
 fn id(name: &str, part: &str) -> ElementId {
     ElementId::Name(SharedString::from(format!("notes-view-{name}-{part}")))
+}
+
+/// The detail column's widest: a comfortable measure of body text, past
+/// which a wide window only lengthens its lines.
+const DETAIL_MAX_WIDTH: f32 = 760.0;
+
+/// A change's title as the log shows it: `(no description set)` in the
+/// log's colour for a change without one.
+fn change_title(note: &Note, theme: theme::ThemeSpec) -> (String, Color) {
+    let title = note
+        .located
+        .now
+        .as_ref()
+        .map_or(note.thread.title(), |now| now.title.as_str());
+    if title.is_empty() {
+        ("(no description set)".to_owned(), theme.note_text)
+    } else {
+        (title.to_owned(), theme.text)
+    }
 }
 
 fn short(change: &str) -> &str {
@@ -249,16 +268,7 @@ pub(crate) fn build_notes_sidebar(
 fn group_header(note: &Note, ui: &Diffui, look: Look) -> AnyElement {
     let Look { theme, font, .. } = look;
     let thread = &note.thread;
-    let title = note
-        .located
-        .now
-        .as_ref()
-        .map_or(thread.title(), |now| now.title.as_str());
-    let (title, ink) = if title.is_empty() {
-        ("No description", theme.subtle_text)
-    } else {
-        (title, theme.muted_text)
-    };
+    let (title, ink) = change_title(note, theme);
     let mut line = vec![mono_on_line(
         short(thread.change_id()).to_owned(),
         theme.change_id,
@@ -268,7 +278,7 @@ fn group_header(note: &Note, ui: &Diffui, look: Look) -> AnyElement {
         line.push(ui::tag("Abandoned", theme.subtle_text, ui::TagSize::Small, font).aligned());
     }
     line.push(fill_on_line(
-        typography::line(title.to_owned(), font, CAPTION_TEXT_SIZE, ink).text_ellipsis(),
+        typography::line(title, font, CAPTION_TEXT_SIZE, ink).text_ellipsis(),
         font,
         CAPTION_TEXT_SIZE,
     ));
@@ -282,10 +292,12 @@ fn group_header(note: &Note, ui: &Diffui, look: Look) -> AnyElement {
         .into_any_element()
 }
 
-/// Where a note is, for its row and its header: `path:12–18` in mono, the
-/// file's path, or "Whole change" in prose.
+/// Where a note is, for its row and its header: `path:12–18`, or the file's
+/// path, in mono at the size the rows give ids and paths; "Whole change" in
+/// prose at `size`.
 fn location(note: &Note, look: Look, size: f32, ink: Color) -> Aligned {
     let Look { font, mono, .. } = look;
+    let path_size = CAPTION_TEXT_SIZE;
     match &note.thread.anchor {
         None => Aligned::text(
             typography::line("Whole change", font, size, ink).text_ellipsis(),
@@ -301,9 +313,9 @@ fn location(note: &Note, look: Look, size: f32, ink: Color) -> Aligned {
                 (_, None) => anchor.path.clone(),
             };
             Aligned::text(
-                typography::line(text, mono, size, ink).text_ellipsis(),
+                typography::line(text, mono, path_size, ink).text_ellipsis(),
                 mono,
-                size,
+                path_size,
             )
         }
     }
@@ -494,67 +506,15 @@ fn empty(title: &'static str, detail: &'static str, look: Look) -> AnyElement {
         .into_any_element()
 }
 
-/// A thread in context, as History shows an operation: a header with its
-/// change, author and time and its actions, the lines it's on as the diff
-/// draws them, then the thread itself.
+/// A thread in context, as History shows an operation: a header naming
+/// where it sits (its change's id and description, as the log draws them,
+/// and its location), the lines it's on as the diff draws them, then the
+/// thread itself. Who wrote it and when is on the card.
 fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyElement {
-    let Look { theme, .. } = look;
+    let Look { theme, font, .. } = look;
     let thread = &note.thread;
     let on = sender(cx);
-    let title_font = theme::emphasis_font(look.font, Weight::SEMIBOLD);
-    let title = note
-        .located
-        .now
-        .as_ref()
-        .map_or(thread.title(), |now| now.title.as_str());
-    let title = if title.is_empty() {
-        "No description"
-    } else {
-        title
-    };
-    let first = thread.messages.first();
-    let mut badges = Vec::new();
-    if thread.resolved.is_some() {
-        badges.push(meta_line::Badge {
-            label: "resolved",
-            color: theme.subtle_text,
-        });
-    }
-    if note.located.outdated() {
-        badges.push(meta_line::Badge {
-            label: "outdated",
-            color: theme.note_text,
-        });
-    }
-    let meta = meta_line::view(
-        meta_line::Meta {
-            ids: vec![meta_line::Id::plain(
-                short(thread.change_id()),
-                theme.change_id,
-            )],
-            badges,
-            who: first.map(|message| {
-                (
-                    match message.role {
-                        Role::User => "You".to_owned(),
-                        Role::Agent => message.author.clone(),
-                    },
-                    None,
-                )
-            }),
-            when: first.map(|message| {
-                (
-                    Some(message.at as i64 * 1000),
-                    age(message.at, super::store::now()),
-                )
-            }),
-            operation: None,
-        },
-        ui,
-        look,
-        window,
-        cx,
-    );
+    let (title, ink) = change_title(note, theme);
     let open = look
         .button("notes-view-open", "Open in diff")
         .compact()
@@ -562,8 +522,33 @@ fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx
         .disabled(note.located.archived())
         .tip("Show the note in its change's diff")
         .on_click(click(&on, NotesMsg::Open(thread.id.clone())));
+    let mut change = vec![
+        meta_line::id_text(
+            meta_line::Id::plain(short(thread.change_id()), theme.change_id),
+            ui,
+        ),
+        fill_on_line(
+            typography::line(title, font, SMALL_TEXT_SIZE, ink).text_ellipsis(),
+            font,
+            SMALL_TEXT_SIZE,
+        ),
+    ];
+    if note.located.archived() {
+        change.insert(
+            1,
+            ui::tag("Abandoned", theme.subtle_text, ui::TagSize::Small, font).aligned(),
+        );
+    }
+    let mut place = vec![location(note, look, SMALL_TEXT_SIZE, theme.muted_text).shrink()];
+    if thread.resolved.is_some() {
+        place.push(ui::tag("Resolved", theme.subtle_text, ui::TagSize::Small, font).aligned());
+    }
+    if note.located.outdated() {
+        place.push(ui::tag("Outdated", theme.note_text, ui::TagSize::Small, font).aligned());
+    }
     let mut block = div()
         .w_full()
+        .max_w(px(DETAIL_MAX_WIDTH))
         .flex()
         .flex_col()
         .gap(px(space::MD))
@@ -578,25 +563,14 @@ fn detail(note: &Note, ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx
                 .items_center()
                 .gap(px(space::SM))
                 .child(
-                    div().flex_1().min_w_0().child(typography::centered(
-                        typography::line(
-                            title.to_owned(),
-                            title_font,
-                            DETAIL_TITLE_SIZE,
-                            theme.text,
-                        )
-                        .text_ellipsis(),
-                        title_font,
-                        DETAIL_TITLE_SIZE,
-                    )),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(typography::baseline_row(change, space::SM).min_w_0()),
                 )
                 .child(open),
         )
-        .child(meta)
-        .child(typography::baseline_row(
-            [location(note, look, text_size::BODY, theme.muted_text)],
-            0.0,
-        ));
+        .child(typography::baseline_row(place, space::SM).min_w_0());
     if let Some(excerpt) = excerpt(note, ui, look, window, cx) {
         block = block.child(excerpt);
     }
@@ -618,20 +592,36 @@ fn excerpt(
 ) -> Option<AnyElement> {
     let Look { theme, .. } = look;
     let anchor = note.thread.anchor.as_ref()?;
-    let lines = anchor.lines.as_ref()?;
+    // Only a note on lines has an excerpt.
+    anchor.lines.as_ref()?;
     let tab = ui.active();
     if tab.notes.view.excerpt.is_empty() {
         return None;
     }
-    let row_height = (ui.config.code_type.size * ui.config.code_type.line_height).round();
-    let height = lines.text.len() as f32 * row_height + 2.0 * space::LG;
+    let view = &tab.notes.view;
+    let rows: usize = view.excerpt.iter().map(|hunk| hunk.lines.len()).sum();
+    // The well's hairline edges sit inside its box.
+    let height = crate::diff_view::unwrapped_height(
+        ui.config.code_type,
+        look.mono,
+        1,
+        view.excerpt.len(),
+        rows,
+    ) + 2.0 * theme::HAIRLINE;
+    let (status, additions, deletions) = view
+        .excerpt_file
+        .as_ref()
+        .map_or((diffui_core::DiffFileStatus::Modified, 0, 0), |file| {
+            (file.status, file.additions, file.deletions)
+        });
+    let status_color = theme::file_status_color(status, theme);
     let file = crate::diff_view::DiffFileView {
         title: anchor.path.clone(),
-        status: diffui_core::DiffFileStatus::Modified,
-        status_color: theme.muted_text,
-        status_fill: theme::TRANSPARENT,
-        additions: 0,
-        deletions: 0,
+        status,
+        status_color,
+        status_fill: theme::chip_background(status_color),
+        additions,
+        deletions,
         tag: None,
         note: None,
     };
@@ -647,23 +637,15 @@ fn excerpt(
         ui.config.code_type,
         ui.config.multi_click_ms,
     )
-    .plain(true)
-    .wrap(ui.diff_wrap)
+    .ui_font(look.font)
+    .wrap(false)
     .content_version(ui.document_version)
     .layout_version(ui.document_version);
-    let side = match lines.side {
-        Side::New => None,
-        Side::Old => Some("Before the change"),
-    };
     Some(
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(space::XS))
-            .children(side.map(|side| {
-                typography::line(side, look.font, text_size::CAPTION, theme.subtle_text)
-            }))
             .child(
                 div()
                     .w_full()

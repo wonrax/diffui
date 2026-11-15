@@ -1011,7 +1011,7 @@ const RUN_CHEVRON: f32 = 12.0;
 /// the commit bar's in the Diff view.
 pub(crate) const DETAIL_EDGE: f32 = crate::diff_view::HEADER_HORIZONTAL_PADDING;
 /// The op detail's title.
-pub(crate) const DETAIL_TITLE_SIZE: f32 = 18.0;
+const DETAIL_TITLE_SIZE: f32 = 18.0;
 
 fn ref_side_label(side: &[CommitBrief]) -> String {
     match side {

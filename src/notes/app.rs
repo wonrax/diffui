@@ -215,6 +215,9 @@ pub(crate) struct ViewState {
     pub(crate) thread: Option<String>,
     /// Its anchored lines, as the diff view's excerpt reads them.
     pub(crate) excerpt: Vec<diffui_core::DiffHunkView>,
+    /// The excerpt's file as the diff has it: its status and counts, once
+    /// read.
+    pub(crate) excerpt_file: Option<diffui_core::DiffFile>,
 }
 
 /// The store watch: dropped with the tab.
@@ -670,10 +673,11 @@ impl Diffui {
         Self::run_async(
             async move { receive.await.ok() },
             cx,
-            move |this, loaded, _| {
+            move |this, loaded, cx| {
                 let Some(state) = this.tab_mut(tab) else {
                     return;
                 };
+                let mut reread_excerpt = false;
                 state.notes.loading = false;
                 match loaded {
                     Some((threads, Ok(located))) => {
@@ -693,6 +697,8 @@ impl Diffui {
                         }
                         state.notes.notes = Rc::new(notes);
                         state.notes.view.excerpt = state.notes.excerpt_of();
+                        state.notes.view.excerpt_file = None;
+                        reread_excerpt = true;
                         state.notes.located_at = operation;
                     }
                     Some((_, Err(error))) => {
@@ -700,6 +706,12 @@ impl Diffui {
                         state.notes.located_at = operation;
                     }
                     None => {}
+                }
+                if reread_excerpt
+                    && this.is_active(tab)
+                    && this.active().notes.view.thread.is_some()
+                {
+                    this.refresh_excerpt(cx);
                 }
             },
         );
@@ -881,7 +893,7 @@ impl Diffui {
             }
             NotesMsg::SelectThread(id) => {
                 self.active_mut().notes.view.thread = Some(id);
-                self.refresh_excerpt();
+                self.refresh_excerpt(cx);
             }
             NotesMsg::FilterNamed(name) => {
                 let view = &mut self.active_mut().notes.view;
@@ -921,11 +933,79 @@ impl Diffui {
         }
     }
 
-    /// Recompute the Notes view's excerpt for its thread as it is now.
-    pub(crate) fn refresh_excerpt(&mut self) {
+    /// Recompute the Notes view's excerpt for its thread: its lines at once,
+    /// then, read off the UI thread, the file's diff around them: both sides'
+    /// numbers, the add and remove colours and word emphasis, and three rows
+    /// of context either side.
+    pub(crate) fn refresh_excerpt(&mut self, cx: &mut Cx) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
         let notes = &mut self.active_mut().notes;
         notes.view.excerpt = notes.excerpt_of();
+        notes.view.excerpt_file = None;
         self.document_version = self.document_version.wrapping_add(1);
+        let state = self.active();
+        let Some(note) = state
+            .notes
+            .view
+            .thread
+            .as_deref()
+            .and_then(|id| state.notes.get(id))
+            .cloned()
+        else {
+            return;
+        };
+        let (Some(now), Some(anchor), Some(root)) = (
+            note.located.now.clone(),
+            note.thread.anchor.clone(),
+            state
+                .repository
+                .as_ref()
+                .map(|repository| repository.root.clone()),
+        ) else {
+            return;
+        };
+        let Place::Lines { start, end } = note.located.place else {
+            return;
+        };
+        let Some(side) = anchor.lines.as_ref().map(|lines| lines.side) else {
+            return;
+        };
+        let (send, receive) = futures::channel::oneshot::channel();
+        let path = anchor.path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("notes-excerpt".to_owned())
+            .spawn(move || {
+                let file = diffui_core::notes::NotesRepo::open(&root, false)
+                    .ok()
+                    .and_then(|repo| repo.file_diff(&now.commit_id, &path));
+                let _ = send.send(file);
+            });
+        if spawned.is_err() {
+            return;
+        }
+        let id = note.thread.id.clone();
+        Self::run_async(
+            async move { receive.await.ok().flatten() },
+            cx,
+            move |this, file, _| {
+                let Some(file) = file else {
+                    return;
+                };
+                let Some(state) = this.tab_mut(tab) else {
+                    return;
+                };
+                if state.notes.view.thread.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                if let Some(hunk) = excerpt_hunk(&file, side, start, end) {
+                    state.notes.view.excerpt = vec![hunk];
+                    state.notes.view.excerpt_file = Some(file);
+                    this.document_version = this.document_version.wrapping_add(1);
+                }
+            },
+        );
     }
 
     /// The Notes view's filter menu: the filters its head leaves out, and the
@@ -1212,6 +1292,56 @@ fn picked_lines(tab: &TabState, from: LineAt, to: LineAt) -> Option<super::store
         side,
         start,
         text: rows.iter().map(|line| line.content.clone()).collect(),
+    })
+}
+
+/// The rows of `file`'s diff around lines `start..=end` of `side`: the hunk
+/// holding them, cut to three rows of context either side.
+fn excerpt_hunk(
+    file: &diffui_core::DiffFile,
+    side: Side,
+    start: usize,
+    end: usize,
+) -> Option<diffui_core::DiffHunkView> {
+    const CONTEXT: usize = 3;
+    let number = |row: &diffui_core::DiffLine| match side {
+        Side::New if row.kind != DiffLineKind::Deletion => row.new_line,
+        Side::Old if row.kind != DiffLineKind::Addition => row.old_line,
+        _ => None,
+    };
+    file.hunks.iter().find_map(|hunk| {
+        let first = hunk
+            .lines
+            .iter()
+            .position(|row| number(row) == Some(start))?;
+        let last = hunk
+            .lines
+            .iter()
+            .rposition(|row| number(row) == Some(end))?;
+        // A replaced line shows with what it replaced: the removed run in
+        // front of the anchored added lines belongs to them.
+        let mut first = first;
+        while first > 0 && hunk.lines[first - 1].kind == DiffLineKind::Deletion && side == Side::New
+        {
+            first -= 1;
+        }
+        let from = first.saturating_sub(CONTEXT);
+        let to = (last + CONTEXT + 1).min(hunk.lines.len());
+        let lines: Vec<diffui_core::DiffLine> = hunk.lines[from..to].to_vec();
+        let range = |pick: fn(&diffui_core::DiffLine) -> Option<usize>| {
+            let numbers: Vec<usize> = lines.iter().filter_map(pick).collect();
+            match (numbers.first(), numbers.last()) {
+                (Some(&a), Some(&b)) => a..b + 1,
+                _ => 0..0,
+            }
+        };
+        Some(diffui_core::DiffHunkView {
+            header: diffui_core::format_hunk_header(
+                &range(|row| row.old_line),
+                &range(|row| row.new_line),
+            ),
+            lines,
+        })
     })
 }
 

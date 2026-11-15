@@ -527,6 +527,8 @@ impl Card {
                         .cursor_pointer()
                         .on_click(self.send(NotesMsg::Toggle(thread.id.clone())));
                 }
+                // A reply starts a step down, past a hairline: a header sits
+                // tight on its body, messages stand apart.
                 div()
                     .flex()
                     .flex_col()
@@ -534,6 +536,12 @@ impl Card {
                     .w_full()
                     .px(px(theme::space::MD_LG))
                     .pt(px(theme::space::MD))
+                    .when(index > 0, |block| {
+                        block
+                            .mt(px(theme::space::MD))
+                            .border_t_1()
+                            .border_color(theme.border)
+                    })
                     .child(head)
                     .child(body)
                     .into_any_element()

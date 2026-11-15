@@ -144,6 +144,44 @@ impl NotesRepo {
         })
     }
 
+    /// `path`'s diff in the commit `commit_id` against its parents, as the
+    /// diff pane draws it (word emphasis included), or `None` when the commit
+    /// doesn't touch it.
+    pub fn file_diff(&self, commit_id: &str, path: &str) -> Option<crate::model::DiffFile> {
+        let repository = crate::repository::Repository {
+            root: self.root().to_owned(),
+            vcs: crate::repository::Vcs::Jj,
+            scope: self.root().to_owned(),
+        };
+        self.runtime.block_on(async {
+            let sides = jj::DiffSides::resolve(
+                &self.repo,
+                self.workspace.workspace_name(),
+                self.root(),
+                &crate::model::RevisionSelection::Commit(commit_id.to_owned()),
+                &crate::model::DiffBase::Parents,
+            )
+            .await
+            .ok()?;
+            let expand = [path.to_owned()];
+            let options = jj::DiffOptions {
+                limits: Default::default(),
+                expand: &expand,
+                only: Some(path),
+            };
+            let document = jj::diff_jj(
+                &self.repo,
+                &sides,
+                &repository,
+                &options,
+                &crate::repo::CancelFlag::default(),
+            )
+            .await
+            .ok()?;
+            document.files.into_iter().find(|file| file.path == path)
+        })
+    }
+
     async fn commit(&self, id: &CommitId) -> Result<Commit> {
         self.repo
             .store()

@@ -1057,3 +1057,77 @@ fn the_file_header_note_button_starts_a_file_note_and_counts_them() {
     h.settle();
     assert!(h.read(|ui| ui.active().note_reply().is_some()));
 }
+
+#[test]
+fn the_notes_view_shows_a_threads_lines_as_the_diff_draws_them() {
+    let repo = scratch_repo("excerpt");
+    std::fs::write(
+        repo.join("a.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+    )
+    .unwrap();
+    jj(&repo, &["status"]);
+    jj(&repo, &["new", "-m", "Change five"]);
+    std::fs::write(
+        repo.join("a.txt"),
+        "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\n",
+    )
+    .unwrap();
+    jj(&repo, &["status"]);
+    let id = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "--file",
+            "a.txt",
+            "--line",
+            "5",
+            "Shouting.",
+        ],
+    );
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 1
+    });
+    h.perform(Action::SetMainView(crate::MainView::Notes));
+    h.perform(Action::Notes(NotesMsg::SelectThread(id)));
+    h.wait_until("the excerpt", |ui| {
+        ui.active().notes.view.excerpt_file.is_some()
+    });
+    let rows = h.read(|ui| {
+        ui.active().notes.view.excerpt[0]
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.kind,
+                    line.old_line,
+                    line.new_line,
+                    line.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    use diffui_core::DiffLineKind::{Addition, Context, Deletion};
+    // The changed line both ways, three rows of context either side, both
+    // sides' numbers.
+    assert_eq!(rows.first().map(|row| row.3.as_str()), Some("two"));
+    assert_eq!(rows.last().map(|row| row.3.as_str()), Some("eight"));
+    assert!(
+        rows.contains(&(Deletion, Some(5), None, "five".to_owned())),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(Addition, None, Some(5), "FIVE".to_owned())),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(Context, Some(4), Some(4), "four".to_owned())),
+        "{rows:?}"
+    );
+    h.frames();
+    let open = h.bounds("notes-view-open");
+    assert!(open.size.height > gpui_kit::px(10.0));
+}
