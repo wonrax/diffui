@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, ElementId, SharedString, Window, div, px};
 
@@ -19,7 +20,7 @@ use crate::{Action, Cx, Diffui, icons, typography};
 
 /// A card's inner padding: around its messages, its footer and its
 /// composer.
-const CARD_PAD: f32 = theme::space::LG;
+pub(crate) const CARD_PAD: f32 = theme::space::LG;
 
 /// The reply field's id: one reply is written at a time.
 pub(crate) const REPLY_FIELD: &str = "note-reply-field";
@@ -343,6 +344,7 @@ impl Card {
         let hovered_id = thread.id.clone();
         let mut card = div()
             .id(id(&thread.id, "card"))
+            .test_support()
             .on_hover(move |on: &bool, window, cx| {
                 hover(&NotesMsg::Hover(hovered_id.clone(), *on), window, cx);
             })
@@ -457,6 +459,7 @@ impl Card {
         }
         div()
             .id(id(&thread.id, "folded"))
+            .test_support()
             .w_full()
             .min_w_0()
             .px(px(CARD_PAD))
@@ -530,23 +533,26 @@ impl Card {
                         .cursor_pointer()
                         .on_click(self.send(NotesMsg::Toggle(thread.id.clone())));
                 }
-                // A reply starts a step down, past a hairline: a header sits
-                // tight on its body, messages stand apart.
+                // Every message carries the card's padding on both sides of
+                // its text, whatever follows it (a reply past a hairline, the
+                // footer, the composer); a header sits tight on its body.
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(theme::space::XS))
                     .w_full()
-                    .px(px(CARD_PAD))
-                    .pt(px(CARD_PAD))
+                    .p(px(CARD_PAD))
                     .when(index > 0, |block| {
-                        block
-                            .mt(px(CARD_PAD))
-                            .border_t_1()
-                            .border_color(theme.border)
+                        block.border_t_1().border_color(theme.border)
                     })
                     .child(head)
-                    .child(body)
+                    .child(
+                        div()
+                            .id(id(&thread.id, &format!("body-{index}")))
+                            .test_support()
+                            .w_full()
+                            .child(body),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -610,7 +616,10 @@ impl Card {
         } else {
             "Waiting on you".to_owned()
         };
+        // The last message's own padding is the room above it.
         let mut row = div()
+            .id(id(&thread.id, "footer"))
+            .test_support()
             .flex()
             .flex_row()
             .items_center()
@@ -618,8 +627,7 @@ impl Card {
             .w_full()
             .min_w_0()
             .px(px(CARD_PAD))
-            .pt(px(theme::space::MD))
-            .pb(px(theme::space::MD_LG))
+            .pb(px(CARD_PAD))
             .child(div().flex_1().min_w_0().child(typography::centered(
                 typography::line(hint, font, text_size::CAPTION, theme.subtle_text).text_ellipsis(),
                 font,
@@ -782,6 +790,8 @@ fn reply_field(
         .child(cancel)
         .child(send);
     div()
+        .id("note-composer")
+        .test_support()
         .w_full()
         .flex()
         .flex_col()

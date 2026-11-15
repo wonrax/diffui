@@ -48,6 +48,7 @@ impl Render for Stage {
                 deletions: 2,
                 tag: None,
                 note: None,
+                section: false,
             })
             .collect();
         let props = DiffProps::new(

@@ -1135,6 +1135,18 @@ fn the_notes_view_shows_a_threads_lines_as_the_diff_draws_them() {
         rows.contains(&(Context, Some(4), Some(4), "four".to_owned())),
         "{rows:?}"
     );
+    // Only the anchored line carries the open note's mark: not the context,
+    // not the line it replaced.
+    let marked = h.read(|ui| {
+        let view = &ui.active().notes.view;
+        let mark = crate::notes::view::focused_highlight(view).expect("a mark");
+        assert!(!mark.strong);
+        view.stack[0].hunks[0].lines[mark.from.line..=mark.to.line]
+            .iter()
+            .map(|line| (line.kind, line.new_line))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(marked, [(Addition, Some(5))]);
     h.frames();
     let open = h.bounds("notes-view-open");
     assert!(open.size.height > gpui_kit::px(10.0));
@@ -1329,6 +1341,87 @@ fn the_notes_groups_stand_apart_and_count_in_the_age_column() {
         (gap - crate::theme::space::LG).abs() < 1.0,
         "a section's gap between groups: {gap}"
     );
+}
+
+/// The last message keeps the card's padding under its text in every state
+/// a card has: before the footer, before the composer, resolved (Reopen in
+/// the footer), and in the Notes view's stack as in the diff. Folded, the
+/// one line keeps its own padding to the card's edge.
+#[test]
+fn the_last_message_keeps_the_cards_padding_in_every_state() {
+    let (repo, [_, a2, b1, _]) = stacked_repo("card-padding");
+    let pad = super::inline::CARD_PAD;
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 4
+    });
+    let x = |p: gpui_kit::Pixels| f32::from(p);
+    let named = |thread: &str, part: &str| {
+        gpui_kit::ElementId::Name(format!("note-{thread}-{part}").into())
+    };
+    let near = |a: f32, b: f32| (a - b).abs() < 1.5;
+    // The gap under the last message's text, to what follows it, and from
+    // that to the card's bottom.
+    let check = |h: &mut Harness, thread: &str, last: usize, what: &str, after: &str| {
+        h.settle();
+        h.frames();
+        let body = h.bounds(named(thread, &format!("body-{last}")));
+        let next = if after == "composer" {
+            h.bounds("note-composer")
+        } else {
+            h.bounds(named(thread, after))
+        };
+        let card = h.bounds(named(thread, "card"));
+        assert!(
+            near(x(next.top()) - x(body.bottom()), pad),
+            "{what}: {body:?} then {next:?}"
+        );
+        assert!(
+            near(x(card.bottom()), x(next.bottom())) && x(next.bottom()) <= x(card.bottom()) + 0.5,
+            "{what}: {next:?} in {card:?}"
+        );
+    };
+
+    // In the diff: one message, then the footer.
+    h.perform(Action::Notes(NotesMsg::Toggle(a2.clone())));
+    check(&mut h, &a2, 0, "diff, footer", "footer");
+    // Two messages (the user's reply last), then the footer.
+    h.perform(Action::Notes(NotesMsg::Toggle(b1.clone())));
+    check(&mut h, &b1, 1, "diff, reply then footer", "footer");
+    // Replying: the composer follows the last message.
+    h.perform(Action::Notes(NotesMsg::StartReply(a2.clone())));
+    check(&mut h, &a2, 0, "diff, composer", "composer");
+    h.perform(Action::Notes(NotesMsg::CancelReply));
+    // Resolved, opened: Reopen in the footer.
+    h.perform(Action::Notes(NotesMsg::Resolve(vec![a2.clone()])));
+    h.settle();
+    if !h.read(|ui| ui.active().notes.expanded.contains(&a2)) {
+        h.perform(Action::Notes(NotesMsg::Toggle(a2.clone())));
+    }
+    check(&mut h, &a2, 0, "diff, resolved", "footer");
+    // Folded: its line keeps its padding to the card's edge.
+    h.perform(Action::Notes(NotesMsg::Toggle(a2.clone())));
+    h.settle();
+    h.frames();
+    let folded = h.bounds(named(&a2, "folded"));
+    let card = h.bounds(named(&a2, "card"));
+    assert!(
+        near(x(card.bottom()), x(folded.bottom())),
+        "{folded:?} {card:?}"
+    );
+    assert!(x(folded.size.height) >= 2.0 * crate::theme::space::MD_LG + 10.0);
+
+    // The Notes view's stack: the same card.
+    h.perform(Action::SetMainView(crate::MainView::Notes));
+    h.perform(Action::Notes(NotesMsg::Filter(Filter::WaitingOnAgent)));
+    h.perform(Action::Notes(NotesMsg::SelectThread(b1.clone())));
+    h.wait_until("the excerpt", |ui| {
+        ui.active().notes.view.stack.iter().all(|item| item.loaded)
+    });
+    check(&mut h, &b1, 1, "stack, footer", "footer");
+    h.perform(Action::Notes(NotesMsg::StartReply(b1.clone())));
+    check(&mut h, &b1, 1, "stack, composer", "composer");
 }
 
 /// The Notes pane head's filter fills its track, the segments tiling it

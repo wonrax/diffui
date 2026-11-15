@@ -127,6 +127,10 @@ pub struct DiffFileView {
     /// One line standing in for the file's rows (a mode-only change, an empty
     /// file, a binary, a file held back for size).
     pub note: Option<FileNote>,
+    /// A section of the document that isn't a file (a change's own notes):
+    /// its header is `title` in prose, as a section label, with no status
+    /// badge and no fold.
+    pub section: bool,
 }
 
 /// One muted line in place of a file's rows: an icon, the text in runs (a run
@@ -667,6 +671,9 @@ pub struct DiffProps {
     reveal: Option<(DocSpot, u64)>,
     /// A reveal puts its spot at the top rather than centring it.
     reveal_at_top: bool,
+    /// Room after the last row, so whatever ends the document (a card)
+    /// doesn't sit on the view's bottom edge.
+    end_space: f32,
     /// The "+" on the hovered line that starts a note.
     add_button: Option<AddButton>,
     /// Rows washed in the accent.
@@ -729,6 +736,7 @@ impl DiffProps {
             overview: None,
             reveal: None,
             reveal_at_top: false,
+            end_space: 0.0,
             add_button: None,
             highlights: Vec::new(),
             note_buttons: None,
@@ -946,6 +954,12 @@ impl DiffProps {
     /// rather than centring it: for a document read spot by spot.
     pub fn reveal_at_top(mut self) -> Self {
         self.reveal_at_top = true;
+        self
+    }
+
+    /// Leave `space` after the document's last row.
+    pub fn end_space(mut self, space: f32) -> Self {
+        self.end_space = space;
         self
     }
 

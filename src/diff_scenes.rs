@@ -591,6 +591,7 @@ fn plain_document_with_blame() {
                 deletions: 0,
                 tag: None,
                 note: None,
+                section: false,
             }],
             DocSource::new(cx.entity(), first_file),
             0,

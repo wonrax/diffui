@@ -1879,16 +1879,18 @@ impl View<'_> {
                 bounds,
             );
         };
-        icon_button(
-            plan,
-            layout.fold,
-            if folded {
-                icons::CHEVRON_RIGHT
-            } else {
-                icons::CHEVRON_DOWN
-            },
-            control_hovered(FileControl::Fold),
-        );
+        if !file.section {
+            icon_button(
+                plan,
+                layout.fold,
+                if folded {
+                    icons::CHEVRON_RIGHT
+                } else {
+                    icons::CHEVRON_DOWN
+                },
+                control_hovered(FileControl::Fold),
+            );
+        }
         if let Some(rect) = layout.check {
             let state = self
                 .props
@@ -1903,17 +1905,20 @@ impl View<'_> {
                 self.draw_check(plan, rect, state, bounds);
             }
         }
-        plan.status_badge(
-            &status_badge::StatusBadge {
-                letter: file.status.short_label(),
-                ink: file.status_color,
-            },
-            self.props.font,
-            layout.badge,
-            bounds,
-        );
-
-        self.draw_file_path(plan, file, &layout, bounds);
+        if file.section {
+            self.draw_section_title(plan, file, &layout, bounds);
+        } else {
+            plan.status_badge(
+                &status_badge::StatusBadge {
+                    letter: file.status.short_label(),
+                    ink: file.status_color,
+                },
+                self.props.font,
+                layout.badge,
+                bounds,
+            );
+            self.draw_file_path(plan, file, &layout, bounds);
+        }
 
         let meta_size = self.meta_size();
         let meta_line = TextBox::new(self.props.font, meta_size, metrics.row_height);
@@ -1963,6 +1968,38 @@ impl View<'_> {
                 control_hovered(FileControl::More),
             );
         }
+    }
+
+    /// A section's header title: prose as a section label is (the UI font,
+    /// semibold, body size, muted), on the header's baseline, ellipsised.
+    fn draw_section_title(
+        &self,
+        plan: &mut Plan,
+        file: &super::DiffFileView,
+        layout: &FileHeaderLayout,
+        bounds: Rectangle,
+    ) {
+        let font = theme::emphasis_font(self.props.ui_font, theme::Weight::SEMIBOLD);
+        let size = theme::text_size::BODY;
+        let height = self.metrics.row_height;
+        let available = (layout.title_right - layout.title_x).max(1.0);
+        let clip = Rectangle {
+            x: layout.title_x,
+            width: available,
+            ..bounds
+        };
+        let title = ellipsis::cut_end(&file.title, available, size, font);
+        let top = layout.baseline - TextBox::new(font, size, height).baseline();
+        plan.line(
+            &title,
+            font,
+            size,
+            layout.title_x,
+            top,
+            height,
+            self.props.palette.text_muted,
+            clip,
+        );
     }
 
     /// A file header's path: the directory in the muted colour, the name in the text

@@ -1705,7 +1705,7 @@ impl<'a> View<'a> {
         }
         drop(heights);
         index.file_tops.push(y);
-        index.total_height = y;
+        index.total_height = y + props.end_space;
         index.key = key;
     }
 
@@ -2429,8 +2429,20 @@ impl<'a> View<'a> {
             .baseline();
 
         let mut x = bounds.x + FILE_HEADER_PAD_LEFT;
-        let fold = control(x, FILE_CONTROL_SIZE);
-        x += FILE_CONTROL_SIZE + FILE_HEADER_GAP;
+        // A section folds nothing and has no status: nothing before its title.
+        let nothing = Rectangle {
+            x,
+            y,
+            width: 0.0,
+            height: 0.0,
+        };
+        let fold = if view.section {
+            nothing
+        } else {
+            let fold = control(x, FILE_CONTROL_SIZE);
+            x += FILE_CONTROL_SIZE + FILE_HEADER_GAP;
+            fold
+        };
         let check = self
             .props
             .marks
@@ -2448,8 +2460,13 @@ impl<'a> View<'a> {
             self.props.typography.size,
             self.metrics.row_height,
         );
-        let badge = crate::status_badge::rect(x, path_line.center_for_baseline(baseline));
-        x += badge.width + FILE_HEADER_GAP;
+        let badge = if view.section {
+            nothing
+        } else {
+            let badge = crate::status_badge::rect(x, path_line.center_for_baseline(baseline));
+            x += badge.width + FILE_HEADER_GAP;
+            badge
+        };
         let title_x = x;
 
         let mut right = bounds.x + bounds.width - FILE_HEADER_PAD_RIGHT;

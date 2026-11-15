@@ -565,6 +565,7 @@ fn source_code(
         deletions: 0,
         tag: None,
         note: None,
+        section: false,
     }];
     let revision_key = format!(
         "source:{}:{}",

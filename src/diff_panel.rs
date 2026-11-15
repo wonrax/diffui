@@ -473,6 +473,7 @@ pub(crate) fn file_views(files: &[diffui_core::DiffFile], theme: ThemeSpec) -> V
                 deletions: file.deletions,
                 tag: count_tag(file).map(str::to_owned),
                 note: file_note(file),
+                section: false,
             }
         })
         .collect()

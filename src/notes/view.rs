@@ -337,6 +337,30 @@ pub(crate) fn build_notes_sidebar(
 /// id styled as an id, its description (or the log's no-description words)
 /// in the section label's weight, ellipsised, and its open notes' count at
 /// the end. Its text starts where its rows' does.
+/// The thread in focus in the stack: its anchored rows marked as an open
+/// note's are in the diff, the excerpt's context left alone.
+pub(crate) fn focused_highlight(
+    view: &super::app::ViewState,
+) -> Option<crate::diff_view::Highlight> {
+    let file = view
+        .thread
+        .as_deref()
+        .and_then(|id| view.stack.iter().position(|item| item.id == id))?;
+    let item = &view.stack[file];
+    let end = item.hunks.first()?.lines.len().checked_sub(1)?;
+    let (first, last) = item.anchored?;
+    let at = |line: usize| crate::diff_view::LineAt {
+        file,
+        hunk: 0,
+        line: line.min(end),
+    };
+    Some(crate::diff_view::Highlight {
+        from: at(first),
+        to: at(last),
+        strong: false,
+    })
+}
+
 /// The break between two changes' groups: History's section spacing with a
 /// hairline across the list in its middle.
 fn group_break(theme: theme::ThemeSpec) -> AnyElement {
@@ -771,6 +795,8 @@ fn stack(notes: &[&Note], ui: &Diffui, look: Look, window: &mut Window, cx: &mut
                 // The header names it ("Whole change", the file); the card
                 // under it is the body.
                 note: None,
+                // The change's own notes are a section, not a file.
+                section: item.title == "Whole change",
             }
         })
         .collect();
@@ -793,28 +819,7 @@ fn stack(notes: &[&Note], ui: &Diffui, look: Look, window: &mut Window, cx: &mut
         })
         .collect();
     // The thread in focus: its rows marked as an open note's are.
-    let focused: Vec<crate::diff_view::Highlight> = view
-        .thread
-        .as_deref()
-        .and_then(|id| view.stack.iter().position(|item| item.id == id))
-        .and_then(|file| {
-            let rows = view.stack[file].hunks.first()?.lines.len();
-            (rows > 0).then(|| crate::diff_view::Highlight {
-                from: crate::diff_view::LineAt {
-                    file,
-                    hunk: 0,
-                    line: 0,
-                },
-                to: crate::diff_view::LineAt {
-                    file,
-                    hunk: 0,
-                    line: rows - 1,
-                },
-                strong: false,
-            })
-        })
-        .into_iter()
-        .collect();
+    let focused = focused_highlight(view).into_iter().collect();
     let selected = view
         .thread
         .as_deref()
@@ -846,6 +851,9 @@ fn stack(notes: &[&Note], ui: &Diffui, look: Look, window: &mut Window, cx: &mut
     .on_selected_file_changed(Diffui::listen(cx, |this, index: &usize, _, cx| {
         this.perform(Action::Notes(NotesMsg::StackScrolled(*index)), cx);
     }));
+    // The last card keeps the room History's detail leaves after its last
+    // item.
+    props = props.end_space(space::LG);
     if let Some((spot, token)) = view.reveal {
         props = props.reveal(spot, token).reveal_at_top();
     }

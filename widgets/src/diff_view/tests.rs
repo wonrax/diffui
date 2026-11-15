@@ -133,6 +133,7 @@ fn test_props(files: usize) -> DiffProps {
                 deletions: 1,
                 tag: None,
                 note: None,
+                section: false,
             })
             .collect(),
         DocSource::empty(),
@@ -1761,4 +1762,50 @@ fn the_add_button_is_centred_on_its_row() {
             "line 1 wraps"
         );
     }
+}
+
+/// A section's header (a change's own notes): its title starts where a
+/// file's fold would, with no fold to press and no badge.
+#[test]
+fn a_section_header_has_no_fold_and_no_badge() {
+    let mut props = test_props(2);
+    props.files[1].section = true;
+    props.files[1].title = "Whole change".to_owned();
+    let hunks = vec![Vec::new(), Vec::new()];
+    let view = view_of(&props, &hunks);
+    let bounds = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 600.0,
+        height: 400.0,
+    };
+    let file = view.file_header_layout(0, 0.0, bounds).unwrap();
+    let section = view.file_header_layout(1, 0.0, bounds).unwrap();
+    assert!(file.fold.width > 0.0 && file.badge.width > 0.0);
+    assert_eq!(section.fold.width, 0.0);
+    assert_eq!(section.badge.width, 0.0);
+    assert_eq!(section.title_x, file.fold.x);
+    assert!(section.title_x < file.title_x);
+}
+
+/// `end_space` leaves its room after whatever ends the document (its last
+/// row, or an inset laid under it), and moves nothing before.
+#[test]
+fn the_end_space_follows_the_documents_last_row() {
+    let hunks = test_hunks();
+    let width = 800.0;
+    let plain_props = test_props(hunks.len());
+    let plain = TestCaches::default();
+    view_of(&plain_props, &hunks).ensure_height_index(&plain.index, &plain.geometry, width);
+    let plain = plain.index.borrow();
+
+    let props = test_props(hunks.len()).end_space(12.0);
+    let cells = TestCaches::default();
+    view_of(&props, &hunks).ensure_height_index(&cells.index, &cells.geometry, width);
+    let index = cells.index.borrow();
+    assert_eq!(index.row_tops, plain.row_tops);
+    assert_eq!(index.file_tops, plain.file_tops);
+    let content_end = *index.file_tops.last().unwrap();
+    assert_eq!(content_end, plain.total_height);
+    assert_eq!(index.total_height - content_end, 12.0);
 }

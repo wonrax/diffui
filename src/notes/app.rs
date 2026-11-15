@@ -261,6 +261,9 @@ pub(crate) struct StackItem {
     pub(crate) hunks: Vec<diffui_core::DiffHunkView>,
     /// The file's real diff has replaced the anchored lines.
     pub(crate) loaded: bool,
+    /// The excerpt's rows the thread is on, first and last: the rest is
+    /// context.
+    pub(crate) anchored: Option<(usize, usize)>,
 }
 
 /// The store watch: dropped with the tab.
@@ -1104,9 +1107,16 @@ impl Diffui {
                         })
                         .clone();
                     if let Some(file) = file
-                        && let Some(hunk) = excerpt_hunk(&file, side, start, end)
+                        && let Some((hunk, anchored)) = excerpt_hunk(&file, side, start, end)
                     {
-                        read.push((id, file.status, file.additions, file.deletions, hunk));
+                        read.push((
+                            id,
+                            file.status,
+                            file.additions,
+                            file.deletions,
+                            hunk,
+                            anchored,
+                        ));
                     }
                 }
                 let _ = send.send(read);
@@ -1122,12 +1132,13 @@ impl Diffui {
                     return;
                 };
                 let view = &mut state.notes.view;
-                for (id, status, additions, deletions, hunk) in read {
+                for (id, status, additions, deletions, hunk, anchored) in read {
                     if let Some(item) = view.stack.iter_mut().find(|item| item.id == id) {
                         item.status = status;
                         item.additions = additions;
                         item.deletions = deletions;
                         item.hunks = vec![hunk];
+                        item.anchored = Some(anchored);
                         item.loaded = true;
                     }
                 }
@@ -1496,6 +1507,11 @@ fn fallback_item(note: &Note) -> StackItem {
             }]
         })
         .unwrap_or_default();
+    // Only the anchored lines show until the diff reads: all of them.
+    let anchored = hunks
+        .first()
+        .and_then(|hunk: &diffui_core::DiffHunkView| hunk.lines.len().checked_sub(1))
+        .map(|last| (0, last));
     StackItem {
         id: note.thread.id.clone(),
         title: anchor.map_or_else(|| "Whole change".to_owned(), |anchor| anchor.path.clone()),
@@ -1504,17 +1520,19 @@ fn fallback_item(note: &Note) -> StackItem {
         deletions: 0,
         hunks,
         loaded: false,
+        anchored,
     }
 }
 
 /// The rows of `file`'s diff around lines `start..=end` of `side`: the hunk
-/// holding them, cut to three rows of context either side.
-fn excerpt_hunk(
+/// holding them, cut to three rows of context either side, and which of the
+/// excerpt's rows are those lines.
+pub(crate) fn excerpt_hunk(
     file: &diffui_core::DiffFile,
     side: Side,
     start: usize,
     end: usize,
-) -> Option<diffui_core::DiffHunkView> {
+) -> Option<(diffui_core::DiffHunkView, (usize, usize))> {
     const CONTEXT: usize = 3;
     let number = |row: &diffui_core::DiffLine| match side {
         Side::New if row.kind != DiffLineKind::Deletion => row.new_line,
@@ -1530,8 +1548,9 @@ fn excerpt_hunk(
             .lines
             .iter()
             .rposition(|row| number(row) == Some(end))?;
+        let anchored_first = first;
         // A replaced line shows with what it replaced: the removed run in
-        // front of the anchored added lines belongs to them.
+        // front of the anchored added lines comes along, unmarked.
         let mut first = first;
         while first > 0 && hunk.lines[first - 1].kind == DiffLineKind::Deletion && side == Side::New
         {
@@ -1547,13 +1566,16 @@ fn excerpt_hunk(
                 _ => 0..0,
             }
         };
-        Some(diffui_core::DiffHunkView {
-            header: diffui_core::format_hunk_header(
-                &range(|row| row.old_line),
-                &range(|row| row.new_line),
-            ),
-            lines,
-        })
+        Some((
+            diffui_core::DiffHunkView {
+                header: diffui_core::format_hunk_header(
+                    &range(|row| row.old_line),
+                    &range(|row| row.new_line),
+                ),
+                lines,
+            },
+            (anchored_first - from, last - from),
+        ))
     })
 }
 
