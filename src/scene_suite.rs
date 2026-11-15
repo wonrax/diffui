@@ -3261,8 +3261,109 @@ fn all() -> Vec<Scene> {
             c.act(Action::Notes(crate::notes::NotesMsg::Open(outdated)));
         },
     ));
+    t.add(s(
+        "notes-pr-comments",
+        "fix/changelog-note's diff, its pull request #42 badged: under CHANGELOG.txt's added line an agent's note open, then a GitHub review thread open with its reply, tagged GitHub, its footer saying it's from GitHub, read-only, with Open on GitHub and no Reply or Resolve; at the file's header an outdated GitHub thread folded to its first comment.",
+        "Badge the pull requests; an agent leaves a note on the line; GitHub's threads read for #42; select fix/changelog-note; open the note and the thread.",
+        pr_comments_beside_a_note,
+    ));
 
     t.scenes
+}
+
+/// A pull request's review threads in a revision's diff, beside an agent's
+/// note on the same line.
+fn pr_comments_beside_a_note(c: &mut Ctx) {
+    use diffui_core::forge::{ForgeRemote, ReviewComment, ReviewThread};
+    use diffui_core::notes::Side;
+    forge_badges(c);
+    let repo = c.repo.clone();
+    let needle = "rc35: this line collides";
+    let line = line_in(&repo, "fix/changelog-note", "CHANGELOG.txt", needle);
+    let note = crate::notes::scenarios::add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "-r",
+            "fix/changelog-note",
+            "--file",
+            "CHANGELOG.txt",
+            "--line",
+            &line.to_string(),
+            "Kept trunk's wording above this line; it only records the release candidate.",
+        ],
+    );
+    wait_notes(c, 1);
+    let url = "https://github.com/acme/render-toolkit/pull/42#discussion_r";
+    let at = |iso: &str| diffui_core::history::parse_timestamp_millis(iso);
+    let comment = |author: &str, body: &str, iso: &str| ReviewComment {
+        author: author.to_owned(),
+        body: body.to_owned(),
+        created_millis: at(iso),
+    };
+    let threads = vec![
+        ReviewThread {
+            path: "CHANGELOG.txt".to_owned(),
+            side: Side::New,
+            line: Some(line),
+            start_line: None,
+            original_line: Some(line),
+            text: vec![needle.to_owned() + " with what trunk wrote here"],
+            outdated: false,
+            resolved: false,
+            url: format!("{url}1"),
+            comments: vec![
+                comment(
+                    "mika",
+                    "Should this name the **breaking change** too?",
+                    "2026-11-14T09:30:00Z",
+                ),
+                comment(
+                    "bob",
+                    "It's in the release notes; this file only lists candidates.",
+                    "2026-11-14T10:05:00Z",
+                ),
+            ],
+        },
+        ReviewThread {
+            path: "CHANGELOG.txt".to_owned(),
+            side: Side::New,
+            line: None,
+            start_line: None,
+            original_line: Some(line),
+            text: vec!["rc35: collides with trunk".to_owned()],
+            outdated: true,
+            resolved: false,
+            url: format!("{url}2"),
+            comments: vec![comment("mika", "Typo: collides.", "2026-11-13T16:00:00Z")],
+        },
+    ];
+    c.h.act(move |ui, _| {
+        let github = crate::plugins::bundled_kind("github");
+        let pr = ForgeRemote::new(github, "github.com", "acme", "render-toolkit").pull_request(42);
+        let state = ui.active_mut();
+        state
+            .forge
+            .comments
+            .insert(pr, crate::notes::forge::fetched(threads));
+    });
+    let commit = c.h.read(|ui| {
+        ui.active()
+            .forge
+            .of("fix/changelog-note")
+            .unwrap()
+            .target
+            .clone()
+    });
+    c.act(Action::SelectRevision(
+        diffui_core::RevisionSelection::Commit(commit),
+    ));
+    c.settle();
+    c.act(Action::Notes(crate::notes::NotesMsg::Toggle(note)));
+    c.act(Action::Notes(crate::notes::NotesMsg::Toggle(format!(
+        "{url}1"
+    ))));
 }
 
 /// Hovers the pointer down the diff's text until a line shows its "+".

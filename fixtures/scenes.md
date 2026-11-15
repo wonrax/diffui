@@ -1632,3 +1632,9 @@ section of `assets/agent/SKILL.md`). New in the port.
 - Window: 1440x900, light
 - State: Thread cards in the diff: a resolved change note folded and dimmed with its Resolved tag, an outdated line note open at its file's header with its Outdated tag and the lines it lost, a folded line note with its reply count.
 - Steps: Leave the working copy's notes; resolve the change note; an agent's note on lines the change no longer has; open it.
+
+### `notes-pr-comments`
+
+- Window: 1440x900, light
+- State: fix/changelog-note's diff, its pull request #42 badged: under CHANGELOG.txt's added line an agent's note open, then a GitHub review thread open with its reply, tagged GitHub, its footer saying it's from GitHub, read-only, with Open on GitHub and no Reply or Resolve; at the file's header an outdated GitHub thread folded to its first comment.
+- Steps: Badge the pull requests; an agent leaves a note on the line; GitHub's threads read for #42; select fix/changelog-note; open the note and the thread.
