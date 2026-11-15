@@ -101,7 +101,18 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
             None => "on the whole change".to_owned(),
             Some(anchor) => match &anchor.lines {
                 None => anchor.path.clone(),
-                Some(lines) => lines_label(&anchor.path, lines.start, lines.end(), lines.side),
+                Some(lines) => {
+                    let range = if lines.start == lines.end() {
+                        format!("Line {}", lines.start)
+                    } else {
+                        format!("Lines {}\u{2013}{}", lines.start, lines.end())
+                    };
+                    let side = match lines.side {
+                        super::store::Side::New => "",
+                        super::store::Side::Old => ", before the change",
+                    };
+                    format!("{range} of {}{side}", anchor.path)
+                }
             },
         };
         let card = Rc::new(NewCard {
@@ -127,13 +138,40 @@ pub(crate) fn decorate(ui: &Diffui, look: Look, mut props: DiffProps, cx: &mut C
     }
     if shown_change(tab).is_some() {
         let start = on.clone();
+        let pick = on.clone();
         props = props.add_button(crate::diff_view::AddButton {
             on_press: Rc::new(move |press, window, cx| {
                 start(&NotesMsg::StartNote(NoteTarget::Line(*press)), window, cx);
             }),
+            on_pick: Rc::new(move |range, window, cx| {
+                pick(&NotesMsg::Picking(*range), window, cx);
+            }),
             tip: "Add a note",
             look,
         });
+        let files = &tab.session.document.files;
+        let counts = (0..files.len())
+            .map(|index| super::app::file_note_count(ui, index))
+            .collect();
+        let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+        let start = on.clone();
+        props = props.note_buttons(crate::diff_view::NoteButtons {
+            counts,
+            on_press: Rc::new(move |index: &usize, window, cx| {
+                if let Some(path) = paths.get(*index) {
+                    start(
+                        &NotesMsg::StartNote(NoteTarget::File(path.clone())),
+                        window,
+                        cx,
+                    );
+                }
+            }),
+            look,
+        });
+        let highlights = super::app::highlights(tab);
+        if !highlights.is_empty() {
+            props = props.highlights(highlights);
+        }
     }
     let Look { theme, .. } = look;
     let spots = spots(tab);
@@ -242,8 +280,13 @@ impl Card {
         let Look { theme, .. } = self.look;
         let thread = &self.note.thread;
         let resolved = thread.resolved.is_some();
+        let hover = self.on.clone();
+        let hovered_id = thread.id.clone();
         let mut card = div()
             .id(id(&thread.id, "card"))
+            .on_hover(move |on: &bool, window, cx| {
+                hover(&NotesMsg::Hover(hovered_id.clone(), *on), window, cx);
+            })
             .flex()
             .flex_col()
             .w_full()

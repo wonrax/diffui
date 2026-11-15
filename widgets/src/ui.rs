@@ -88,7 +88,7 @@ const SMALL_ICON_SIZE: f32 = 12.0;
 /// How much of a disabled button's label and icon shows.
 const DISABLED_OPACITY: f32 = 0.45;
 /// Gap between a leading icon and its label.
-const ICON_GAP: f32 = 6.0;
+pub const ICON_GAP: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {

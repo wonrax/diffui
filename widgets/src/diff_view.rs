@@ -430,8 +430,38 @@ impl Ord for DocSpot {
 #[derive(Clone)]
 pub struct AddButton {
     pub on_press: Callback<LinePress>,
+    /// The rows a drag from the "+" covers as it goes, first and last;
+    /// `None` when it ends.
+    pub on_pick: Callback<Option<(LineAt, LineAt)>>,
     /// Its hover label.
     pub tip: &'static str,
+    pub look: crate::ui::Look,
+}
+
+/// Rows `from..=to` of one hunk washed in the accent: lines picked for a
+/// note (`strong`, with a bar at the gutter's edge) or the lines an open note
+/// is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Highlight {
+    pub from: LineAt,
+    pub to: LineAt,
+    pub strong: bool,
+}
+
+impl Highlight {
+    /// Whether it covers `line` of `(file, hunk)`.
+    fn covers(&self, file: usize, hunk: usize, line: usize) -> bool {
+        (self.from.file, self.from.hunk) == (file, hunk)
+            && (self.from.line..=self.to.line).contains(&line)
+    }
+}
+
+/// A note button in each file header: its files' open note counts (shown
+/// beside the icon when there are any), and where a press goes.
+#[derive(Clone)]
+pub struct NoteButtons {
+    pub counts: Vec<usize>,
+    pub on_press: Callback<usize>,
     pub look: crate::ui::Look,
 }
 
@@ -621,6 +651,10 @@ pub struct DiffProps {
     reveal: Option<(DocSpot, u64)>,
     /// The "+" on the hovered line that starts a note.
     add_button: Option<AddButton>,
+    /// Rows washed in the accent.
+    highlights: Vec<Highlight>,
+    /// The note button of each file header.
+    note_buttons: Option<NoteButtons>,
 }
 
 impl DiffProps {
@@ -677,6 +711,8 @@ impl DiffProps {
             overview: None,
             reveal: None,
             add_button: None,
+            highlights: Vec::new(),
+            note_buttons: None,
         }
     }
 
@@ -871,6 +907,19 @@ impl DiffProps {
     /// or a shift-click, fires again with `extend` for the far end.
     pub fn add_button(mut self, button: AddButton) -> Self {
         self.add_button = Some(button);
+        self
+    }
+
+    /// Wash these rows in the accent (see [`Highlight`]).
+    pub fn highlights(mut self, highlights: Vec<Highlight>) -> Self {
+        self.highlights = highlights;
+        self
+    }
+
+    /// Put a note button, with the file's count, at the right of each file
+    /// header, before its other tools.
+    pub fn note_buttons(mut self, buttons: NoteButtons) -> Self {
+        self.note_buttons = Some(buttons);
         self
     }
 

@@ -2516,6 +2516,42 @@ impl View<'_> {
                 }
             }
         }
+        // Lines picked for a note, or an open note's: the selection's wash over
+        // the row's own tint, and a picked range's bar at the gutter's edge.
+        if !props.highlights.is_empty() {
+            for row in &visible_rows {
+                let lines = match row.pair {
+                    Some((left, right)) => [left, right],
+                    None => [row.line_index as u32, row.line_index as u32],
+                };
+                let hit = props
+                    .highlights
+                    .iter()
+                    .filter(|highlight| {
+                        lines.iter().any(|&line| {
+                            line != NO_LINE
+                                && highlight.covers(row.file_index, row.hunk_index, line as usize)
+                        })
+                    })
+                    .map(|highlight| highlight.strong)
+                    .reduce(|a, b| a || b);
+                let Some(strong) = hit else {
+                    continue;
+                };
+                let wash = if strong {
+                    palette.selection
+                } else {
+                    Color {
+                        a: palette.selection.a * 0.5,
+                        ..palette.selection
+                    }
+                };
+                plan.rect(bounds.x, row.y, bounds.width, row.height, wash);
+                if strong {
+                    plan.rect(bounds.x, row.y, PICK_BAR_WIDTH, row.height, palette.accent);
+                }
+            }
+        }
         if let Some(split) = &split {
             self.split_row_tints(plan, &visible_rows, split, bounds);
         }

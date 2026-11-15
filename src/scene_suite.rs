@@ -3103,6 +3103,44 @@ fn all() -> Vec<Scene> {
         },
     ));
     t.add(s(
+        "notes-compose-range",
+        "A note being started on three lines of main.rs: the rows washed in the accent with a bar at the gutter's edge, the composer under them naming Lines 12-14 of src/main.rs, and each file header's note button, with a count where the file has notes.",
+        "Leave the working copy's notes; press the + on a line of main.rs and shift-press the one two lines down; type.",
+        |c| {
+            working_copy_notes(c);
+            let rows = c.h.read(|ui| {
+                let files = &ui.active().session.document.files;
+                let file = files.iter().position(|file| file.path == "src/main.rs")?;
+                files[file].hunks.iter().enumerate().find_map(|(hunk, view)| {
+                    let line = view
+                        .lines
+                        .iter()
+                        .position(|line| line.content.contains("[--samples N]"))?;
+                    (line + 2 < view.lines.len())
+                        .then_some((crate::diff_view::LineAt { file, hunk, line }, line + 2))
+                })
+            });
+            let (first, last) = rows.expect("main.rs's usage line in the diff");
+            let press = |line, extend| crate::diff_view::LinePress {
+                line,
+                extend,
+                one_side: false,
+            };
+            c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(press(first, false)),
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(press(
+                    crate::diff_view::LineAt { line: last, ..first },
+                    true,
+                )),
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                "Keep --samples out of the usage until it parses.".to_owned(),
+            )));
+        },
+    ));
+    t.add(s(
         "notes-reply",
         "A line note in the diff with the reply field open under it, two lines typed, Cancel and Reply with their keys.",
         "Press Reply on the line note and type.",

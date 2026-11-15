@@ -1648,6 +1648,7 @@ fn the_add_button_sits_on_the_hovered_line_over_its_gutter() {
     let hunks = test_hunks();
     let props = test_props(hunks.len()).add_button(AddButton {
         on_press: Rc::new(|_, _, _| {}),
+        on_pick: Rc::new(|_, _, _| {}),
         tip: "Add a note",
         look: crate::ui::Look::new(
             crate::theme::ResolvedTheme::Light.spec(),
@@ -1692,4 +1693,72 @@ fn the_add_button_sits_on_the_hovered_line_over_its_gutter() {
         view_of(&without, &hunks).add_line_at(&index, 0.0, bounds, Point::new(4.0, y)),
         None
     );
+}
+
+/// The "+" is centred on its row's first visual line, the row box, not on a
+/// baseline: on a wrapped line, and under other sizes and line heights.
+#[test]
+fn the_add_button_is_centred_on_its_row() {
+    let hunks = test_hunks();
+    for typography in [
+        CodeTypography {
+            size: 13.0,
+            ..CodeTypography::default()
+        },
+        CodeTypography {
+            size: 16.0,
+            line_height: 2.2,
+            ..CodeTypography::default()
+        },
+        CodeTypography {
+            size: 10.0,
+            line_height: 1.4,
+            ..CodeTypography::default()
+        },
+    ] {
+        let mut props = test_props(hunks.len()).add_button(AddButton {
+            on_press: Rc::new(|_, _, _| {}),
+            on_pick: Rc::new(|_, _, _| {}),
+            tip: "Add a note",
+            look: crate::ui::Look::new(
+                crate::theme::ResolvedTheme::Light.spec(),
+                Font::MONOSPACE,
+                Font::MONOSPACE,
+            ),
+        });
+        props.typography = typography;
+        let view = view_of(&props, &hunks);
+        let cells = TestCaches::default();
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 40.0,
+            width: 400.0,
+            height: 2000.0,
+        };
+        view.ensure_height_index(&cells.index, &cells.geometry, bounds.width);
+        let index = cells.index.borrow();
+        // Line 1 of file 0 is 500 characters: it wraps.
+        for line in [0, 1] {
+            let at = LineAt {
+                file: 0,
+                hunk: 0,
+                line,
+            };
+            let row = index.row_of_line(0, 0, line).unwrap();
+            let rect = view
+                .add_button_rect(&index, 10.0, bounds, (at, None))
+                .unwrap();
+            let row_top = bounds.y + index.row_tops[row] - 10.0;
+            let row_centre = row_top + view.metrics.row_height / 2.0;
+            assert!(
+                (rect.y + rect.height / 2.0 - row_centre).abs() < 1e-3,
+                "{typography:?} line {line}: {rect:?} vs row at {row_top}"
+            );
+            assert_eq!(rect.height, crate::ui::Size::Small.height());
+        }
+        assert!(
+            index.row_heights[1] > view.metrics.row_height * 1.5,
+            "line 1 wraps"
+        );
+    }
 }

@@ -1573,6 +1573,12 @@ section of `assets/agent/SKILL.md`). New in the port.
 - State: The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line. The pointer rests on a line, which shows its + in the gutter.
 - Steps: Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view; hover a line of the diff.
 
+### `notes-compose-range`
+
+- Window: 1440x900, light
+- State: A note being started on three lines of main.rs: the rows washed in the accent with a bar at the gutter's edge, the composer under them naming Lines 12-14 of src/main.rs, and each file header's note button, with a count where the file has notes.
+- Steps: Leave the working copy's notes; press the + on a line of main.rs and shift-press the one two lines down; type.
+
 ### `notes-reply`
 
 - Window: 1440x900, light

@@ -26,6 +26,10 @@ pub(crate) enum NotesMsg {
     StartNote(NoteTarget),
     /// Copy these threads as Markdown.
     Copy(Vec<String>),
+    /// The rows a drag from the "+" covers so far; `None` when it ends.
+    Picking(Option<(LineAt, LineAt)>),
+    /// The pointer is on this thread's card, or left it.
+    Hover(String, bool),
     /// Copy the open notes on the change on screen, or all of them.
     CopyChange {
         resolved: bool,
@@ -209,6 +213,10 @@ pub(crate) struct TabNotes {
     pub(crate) reveal: Option<(DocSpot, u64)>,
     /// A thread to scroll to once its change's diff is on screen.
     pending_open: Option<String>,
+    /// The rows a drag from the "+" covers, while it goes on.
+    pub(crate) picking: Option<(LineAt, LineAt)>,
+    /// The thread whose card the pointer is on.
+    pub(crate) hovered: Option<String>,
     pub(crate) view: ViewState,
     /// Markdown of each message, parsed once per load.
     pub(crate) parsed: std::collections::HashMap<(String, usize), Rc<Vec<crate::markdown::Block>>>,
@@ -331,6 +339,72 @@ pub(crate) fn reply_on_screen(tab: &TabState, reply: &NoteReply) -> bool {
             .any(|(_, note)| note.thread.id == *id),
         ReplyTo::New(note) => shown_change(tab) == Some(note.change.change_id.as_str()),
     }
+}
+
+/// The rows of the diff on screen `note`'s lines are on, first and last.
+fn rows_of(tab: &TabState, note: &Note) -> Option<(LineAt, LineAt)> {
+    let DocSpot::Line(last) = spot_of(tab, note)? else {
+        return None;
+    };
+    let (Place::Lines { start, .. }, Some(lines)) = (
+        &note.located.place,
+        note.thread
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.lines.as_ref()),
+    ) else {
+        return None;
+    };
+    let hunk = &tab.session.document.files[last.file].hunks[last.hunk];
+    let first = hunk.lines.iter().position(|row| {
+        let number = match lines.side {
+            Side::New if row.kind != DiffLineKind::Deletion => row.new_line,
+            Side::Old if row.kind != DiffLineKind::Addition => row.old_line,
+            _ => None,
+        };
+        number == Some(*start)
+    })?;
+    Some((
+        LineAt {
+            line: first,
+            ..last
+        },
+        last,
+    ))
+}
+
+/// The rows the diff washes in the accent: the range a drag from the "+"
+/// covers and the note being written (strong); the lines of the threads
+/// opened or under the pointer (soft). Folded threads wash nothing.
+pub(crate) fn highlights(tab: &TabState) -> Vec<crate::diff_view::Highlight> {
+    use crate::diff_view::Highlight;
+    let mut out = Vec::new();
+    let composing = tab.note_reply().and_then(|reply| match &reply.to {
+        ReplyTo::New(note) => note.rows,
+        ReplyTo::Thread(_) => None,
+    });
+    for (from, to) in tab.notes.picking.into_iter().chain(composing) {
+        out.push(Highlight {
+            from,
+            to,
+            strong: true,
+        });
+    }
+    let replying = tab.note_reply().and_then(NoteReply::thread);
+    for (_, note) in diff_notes(tab) {
+        let id = note.thread.id.as_str();
+        let shown = tab.notes.expanded.contains(id)
+            || tab.notes.hovered.as_deref() == Some(id)
+            || replying == Some(id);
+        if let Some((from, to)) = rows_of(tab, note).filter(|_| shown) {
+            out.push(Highlight {
+                from,
+                to,
+                strong: false,
+            });
+        }
+    }
+    out
 }
 
 /// What a spot of the diff is, for next/previous and the overview strip.
@@ -640,6 +714,15 @@ impl Diffui {
                 crate::input::focus(super::inline::REPLY_FIELD, cx);
             }
             NotesMsg::StartNote(target) => self.start_note(target, cx),
+            NotesMsg::Picking(range) => self.active_mut().notes.picking = range,
+            NotesMsg::Hover(id, on) => {
+                let hovered = &mut self.active_mut().notes.hovered;
+                if on {
+                    *hovered = Some(id);
+                } else if hovered.as_deref() == Some(id.as_str()) {
+                    *hovered = None;
+                }
+            }
             NotesMsg::Copy(ids) => self.copy_notes(&ids, cx),
             NotesMsg::CopyChange { resolved } => {
                 let tab = self.active();
@@ -835,6 +918,8 @@ impl Diffui {
                 }
             }
         };
+        // Its field shows under the spot: in view.
+        self.reveal_spot(new.spot);
         let draft = self
             .active()
             .note_reply()

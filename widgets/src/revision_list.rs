@@ -866,6 +866,13 @@ impl RevisionListProps {
 
 /// A file's counts, each side only when it counts
 /// something, with its colour.
+/// The line-box top that puts a file row's counts (`+2 −2`, and a badge's
+/// count) on the name's baseline: one baseline for every piece of text.
+fn count_top(font: Font, name_baseline: f32) -> f32 {
+    let line_height = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER;
+    name_baseline - TextBox::new(font, CAPTION_TEXT_SIZE, line_height).baseline()
+}
+
 /// Between a badge's icon and its count.
 const BADGE_ICON_GAP: f32 = 3.0;
 
@@ -2752,12 +2759,12 @@ impl RevisionList {
             let parts = changes_stats(file);
             let mut right = columns.stats_right;
             let line_height = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER;
-            let stats = TextBox::new(style.primary_font, CAPTION_TEXT_SIZE, line_height);
+            let stats_top = count_top(style.primary_font, name_baseline);
             for (text, color) in parts.iter().rev() {
                 typography::paint_line(
                     text,
                     right,
-                    name_baseline - stats.baseline(),
+                    stats_top,
                     CAPTION_TEXT_SIZE,
                     line_height,
                     style.primary_font,
@@ -2777,13 +2784,13 @@ impl RevisionList {
                         - crate::measure::line_width(tag, FILE_TAG_SIZE, style.mono_font)
                         - FILE_STAT_GAP;
                 }
-                let icon_box = TextBox::new(icons::ICON_FONT, CAPTION_TEXT_SIZE, line_height);
                 for (icon, count, color) in file.badges.iter().rev() {
                     let count = count.to_string();
+                    // On the counts' baseline, in their font and size.
                     typography::paint_line(
                         &count,
                         right,
-                        name_baseline - stats.baseline(),
+                        stats_top,
                         CAPTION_TEXT_SIZE,
                         line_height,
                         style.primary_font,
@@ -2795,20 +2802,19 @@ impl RevisionList {
                     right -=
                         crate::measure::line_width(&count, CAPTION_TEXT_SIZE, style.primary_font)
                             + BADGE_ICON_GAP;
-                    typography::paint_line(
+                    // An icon centres on the row, not on a baseline.
+                    let icon_width =
+                        crate::measure::line_width(icon, CAPTION_TEXT_SIZE, icons::ICON_FONT);
+                    paint_glyph(
                         icon,
-                        right,
-                        name_baseline - icon_box.baseline(),
+                        right - icon_width / 2.0,
+                        row_mid_y,
                         CAPTION_TEXT_SIZE,
-                        line_height,
-                        icons::ICON_FONT,
                         *color,
-                        TextAlign::Right,
                         window,
                         cx,
                     );
-                    right -= crate::measure::line_width(icon, CAPTION_TEXT_SIZE, icons::ICON_FONT)
-                        + FILE_STAT_GAP;
+                    right -= icon_width + FILE_STAT_GAP;
                 }
             }
             if parts.is_empty()
@@ -3606,6 +3612,19 @@ impl Element for ListElement {
 
 #[cfg(test)]
 mod tests {
+
+    /// A badge's count and the `+2 −2` beside it sit on one baseline: both
+    /// are laid from the line top `count_top` gives, in one font and size.
+    #[test]
+    fn a_badge_count_shares_the_counts_baseline() {
+        let font = Font::MONOSPACE;
+        let name_baseline = 117.5;
+        let line_height = CAPTION_TEXT_SIZE * LINE_HEIGHT_MULTIPLIER;
+        let baseline =
+            |top: f32| top + TextBox::new(font, CAPTION_TEXT_SIZE, line_height).baseline();
+        assert!((baseline(count_top(font, name_baseline)) - name_baseline).abs() < 1e-3);
+    }
+
     use super::*;
 
     // Three commits with the middle one (index 1) expanded over 2 file rows,

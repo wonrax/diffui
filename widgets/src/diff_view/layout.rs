@@ -61,9 +61,11 @@ pub(super) const HEADER_BUTTON_SIZE: f32 = 20.0;
 const HEADER_DESCRIPTION_INDENT: f32 = 0.0;
 pub(super) const HEADER_EDIT_WIDTH: f32 = 66.0;
 pub(super) const HEADER_EDIT_HEIGHT: f32 = 26.0;
-/// The "+" that starts a note: its side, and its gap from the gutter's
-/// right edge.
-pub(super) const ADD_BUTTON_SIZE: f32 = 18.0;
+/// The "+" that starts a note is kit's small icon button: its side is that
+/// size's height. And its gap from the gutter's right edge.
+pub(super) fn add_button_size() -> f32 {
+    crate::ui::Size::Small.height()
+}
 const ADD_BUTTON_INSET: f32 = 2.0;
 /// Side of a change-selection checkbox.
 pub(super) const CHECK_SIZE: f32 = 14.0;
@@ -117,6 +119,8 @@ pub(super) struct FileHeaderLayout {
     pub(super) stats: Vec<(String, f32, StatKind)>,
     pub(super) browse: Option<Rectangle>,
     pub(super) more: Option<Rectangle>,
+    /// The note button, overlaid with the app's own button.
+    pub(super) note: Option<Rectangle>,
 }
 
 /// Sizes derived from the caller's typography, so the diff view stays visually
@@ -248,6 +252,22 @@ fn char_advance(font: Font, size: f32) -> f32 {
         .entry((font, size.to_bits()))
         // "M" is a stable choice: it dominates hinting noise at small sizes.
         .or_insert_with(|| measure::line_width("M", size, font))
+}
+
+/// A file header's note button: square, or wide enough for its count.
+pub(super) fn note_button_width(count: usize, font: Font) -> f32 {
+    use crate::ui::Size;
+    if count == 0 {
+        return Size::Small.height();
+    }
+    // Kit's small labelled button: its insets, its icon, the gap and the
+    // count in its label's weight.
+    let label = crate::theme::emphasis_font(font, crate::theme::Weight::MEDIUM);
+    (2.0 * Size::Small.pad_x()
+        + Size::Small.icon_size()
+        + crate::ui::ICON_GAP
+        + measure::line_width(&count.to_string(), Size::Small.text_size(), label))
+    .ceil()
 }
 
 /// The shape of [`HeightIndex::key`].
@@ -2441,7 +2461,21 @@ impl<'a> View<'a> {
             right -= FILE_CONTROL_SIZE + if more.is_some() { 2.0 } else { 0.0 };
             control(right, FILE_CONTROL_SIZE)
         });
-        if browse.is_some() || more.is_some() {
+        let note = self.props.note_buttons.as_ref().map(|buttons| {
+            let count = buttons.counts.get(file).copied().unwrap_or(0);
+            let width = note_button_width(count, buttons.look.font);
+            right -= width
+                + if browse.is_some() || more.is_some() {
+                    2.0
+                } else {
+                    0.0
+                };
+            Rectangle {
+                width,
+                ..control(right, crate::ui::Size::Small.height())
+            }
+        });
+        if browse.is_some() || more.is_some() || note.is_some() {
             right -= FILE_HEADER_META_GAP;
         }
         let meta = |text: &str| measure::line_width(text, self.meta_size(), self.props.font);
@@ -2506,6 +2540,7 @@ impl<'a> View<'a> {
             stats: placed_stats,
             browse,
             more,
+            note,
         })
     }
 
@@ -2742,7 +2777,8 @@ impl<'a> View<'a> {
     }
 
     /// Where the "+" of `at` (in split column `side`) sits in the window: over
-    /// the right end of its line numbers, on the row's first line.
+    /// the right end of its line numbers, centred on the row's first visual
+    /// line (the row box a code line takes, whatever wraps below it).
     pub(super) fn add_button_rect(
         &self,
         index: &HeightIndex,
@@ -2759,11 +2795,11 @@ impl<'a> View<'a> {
             Some(SplitSide::Left) => self.split_layout(bounds.width).gutter_width,
             None => self.metrics.gutter_width,
         };
-        let size = ADD_BUTTON_SIZE;
+        let size = add_button_size();
         Some(Rectangle {
             x: bounds.x + gutter_right - size - ADD_BUTTON_INSET,
             y: bounds.y + index.row_tops[row] - vertical_offset
-                + ((self.metrics.row_height - size) / 2.0).max(0.0),
+                + (self.metrics.row_height - size) / 2.0,
             width: size,
             height: size,
         })

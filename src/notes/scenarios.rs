@@ -905,3 +905,141 @@ fn the_cursor_line_takes_a_note_from_the_keyboard() {
     h.settle();
     assert!(new_note_lines(&mut h).is_some_and(|(_, text)| text.len() == 1));
 }
+
+/// The rows the diff washes, as (first line, last line, strong).
+fn washed(h: &mut Harness) -> Vec<(usize, usize, bool)> {
+    h.read(|ui| {
+        super::app::highlights(ui.active())
+            .into_iter()
+            .map(|highlight| (highlight.from.line, highlight.to.line, highlight.strong))
+            .collect()
+    })
+}
+
+#[test]
+fn picked_lines_are_washed_while_dragging_composing_and_reading() {
+    let repo = scratch_repo("wash");
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the diff and notes", |ui| {
+        ui.active().notes.settled() && !ui.active().session.document.files.is_empty()
+    });
+    h.frames();
+    let x = h.read(|ui| ui.left_pane_width() + ui.files_pane_width()) + 300.0;
+    let mut rows = Vec::new();
+    let mut y = 60.0;
+    while y < 780.0 {
+        h.hover_point(crate::harness::at(x, y));
+        h.frames();
+        if let Some(button) = add_button(&mut h)
+            && rows
+                .last()
+                .is_none_or(|(_, last): &(f32, gpui_kit::Bounds<gpui_kit::Pixels>)| {
+                    last.origin.y != button.origin.y
+                })
+        {
+            rows.push((y, button));
+        }
+        y += 4.0;
+    }
+    assert_eq!(rows.len(), 3);
+    assert!(washed(&mut h).is_empty());
+
+    // Mid-drag: the range so far, strong.
+    h.hover_point(crate::harness::at(x, rows[0].0));
+    h.frames();
+    let plus = add_button(&mut h).expect("the first line's +");
+    h.pointer_down(plus.center(), gpui_kit::MouseButton::Left);
+    h.pointer_move(
+        crate::harness::at(x, rows[2].0),
+        Some(gpui_kit::MouseButton::Left),
+    );
+    h.settle();
+    assert_eq!(washed(&mut h), [(0, 2, true)]);
+    h.pointer_up(
+        crate::harness::at(x, rows[2].0),
+        gpui_kit::MouseButton::Left,
+    );
+    h.settle();
+    // Composing: still washed; the composer names the range.
+    assert_eq!(washed(&mut h), [(0, 2, true)]);
+    // Canceled: gone.
+    h.press("escape");
+    assert!(washed(&mut h).is_empty());
+
+    // A shift-click extends the range being written.
+    let press = |line, extend| crate::diff_view::LinePress {
+        line,
+        extend,
+        one_side: false,
+    };
+    let at = |line| crate::diff_view::LineAt {
+        file: 0,
+        hunk: 0,
+        line,
+    };
+    h.perform(Action::Notes(NotesMsg::StartNote(super::NoteTarget::Line(
+        press(at(1), false),
+    ))));
+    assert_eq!(washed(&mut h), [(1, 1, true)]);
+    h.perform(Action::Notes(NotesMsg::StartNote(super::NoteTarget::Line(
+        press(at(2), true),
+    ))));
+    assert_eq!(washed(&mut h), [(1, 2, true)]);
+    h.perform(Action::Notes(NotesMsg::ReplyEdited("Here.".to_owned())));
+    h.perform(Action::Notes(NotesMsg::SendReply));
+    h.wait_until("the note", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 1
+    });
+    // A folded thread washes nothing; opened or hovered, its lines softly.
+    assert!(washed(&mut h).is_empty());
+    let id = h.read(|ui| ui.active().notes.notes[0].thread.id.clone());
+    h.perform(Action::Notes(NotesMsg::Toggle(id.clone())));
+    assert_eq!(washed(&mut h), [(1, 2, false)]);
+    h.perform(Action::Notes(NotesMsg::Toggle(id.clone())));
+    h.perform(Action::Notes(NotesMsg::Hover(id.clone(), true)));
+    assert_eq!(washed(&mut h), [(1, 2, false)]);
+    h.perform(Action::Notes(NotesMsg::Hover(id, false)));
+    assert!(washed(&mut h).is_empty());
+}
+
+#[test]
+fn the_file_header_note_button_starts_a_file_note_and_counts_them() {
+    let repo = scratch_repo("header-note");
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the diff and notes", |ui| {
+        ui.active().notes.settled() && !ui.active().session.document.files.is_empty()
+    });
+    h.frames();
+    let button = gpui_kit::ElementId::NamedInteger("diff-file-note".into(), 0);
+    let narrow = h.bounds(button.clone());
+    assert_eq!(narrow.size.width, narrow.size.height, "an icon alone");
+    h.click_point(narrow.center());
+    h.settle();
+    let anchor = h.read(|ui| {
+        let reply = ui.active().note_reply()?;
+        let super::app::ReplyTo::New(note) = &reply.to else {
+            return None;
+        };
+        note.anchor.clone()
+    });
+    let anchor = anchor.expect("a file note being written");
+    assert_eq!(
+        (anchor.path.as_str(), anchor.lines.is_none()),
+        ("a.txt", true)
+    );
+    h.press("escape");
+    // With notes on the file, the button counts them and still starts one.
+    add(&repo, &["--as", "claude", "--file", "a.txt", "One."]);
+    h.wait_until("the note", |ui| ui.active().notes.notes.len() == 1);
+    h.frames();
+    let wide = h.bounds(button.clone());
+    assert!(
+        wide.size.width > wide.size.height,
+        "the count shows: {wide:?}"
+    );
+    h.click_point(wide.center());
+    h.settle();
+    assert!(h.read(|ui| ui.active().note_reply().is_some()));
+}

@@ -983,6 +983,9 @@ impl State {
                 && line != reached
             {
                 self.add_drag = Some((from, line));
+                if let Some(button) = &view.props.add_button {
+                    send(out, &Some(button.on_pick.clone()), Some(span(from, line)));
+                }
                 return true;
             }
             return false;
@@ -1302,6 +1305,7 @@ impl DiffElement {
         };
         let entity = self.view.clone();
         let on_press = button.on_press.clone();
+        let on_pick = button.on_pick.clone();
         let theme = button.look.theme;
         use gpui_kit::prelude::*;
         let mut element = InteractiveElement::id(gpui_kit::div(), "diff-add-note")
@@ -1322,6 +1326,7 @@ impl DiffElement {
                         view.state.add_drag = Some((line, line));
                         cx.notify();
                     });
+                    on_pick(&Some((line, line)), window, cx);
                 }
             })
             .child(
@@ -1353,7 +1358,135 @@ impl DiffElement {
             );
         });
         frame.add = Some(element);
+        if let Some((text, at)) = self.drag_label(bounds, cx) {
+            let mut label = crate::ui::tooltip_card(text, button.look).into_any_element();
+            label.layout_as_root(
+                gpui_kit::size(
+                    gpui_kit::AvailableSpace::MinContent,
+                    gpui_kit::AvailableSpace::MinContent,
+                ),
+                window,
+                cx,
+            );
+            window.with_content_mask(Some(clip), |window| {
+                label.prepaint_at(
+                    gpui_kit::point(gpui_kit::px(at.x), gpui_kit::px(at.y)),
+                    window,
+                    cx,
+                );
+            });
+            frame.add_label = Some(label);
+        }
     }
+
+    /// While a drag from the "+" goes on: "Lines 12–18" (or "Line 12"), and
+    /// where it shows, beside the "+" of the line the drag has reached.
+    fn drag_label(&self, bounds: Bounds<Pixels>, cx: &App) -> Option<(String, Point)> {
+        let view = self.view.read(cx);
+        let props = view.props.as_ref()?;
+        let (from, to) = view.state.add_drag?;
+        let side = view.state.hovered_add.and_then(|(_, side)| side);
+        let at = View::read(props, cx);
+        let index = view.state.height_index.borrow();
+        let rect =
+            at.add_button_rect(&index, view.state.painted_offset, bounds.into(), (to, side))?;
+        let (first, last) = span(from, to);
+        let number = |line: LineAt| {
+            let row = at.line(line.file, line.hunk, line.line)?;
+            match row.kind {
+                super::DiffLineKind::Deletion => row.old_line,
+                _ => row.new_line.or(row.old_line),
+            }
+        };
+        let (a, b) = (number(first)?, number(last)?);
+        let text = if a == b {
+            format!("Line {a}")
+        } else {
+            format!("Lines {}\u{2013}{}", a.min(b), a.max(b))
+        };
+        Some((text, Point::new(rect.x + rect.width + 6.0, rect.y)))
+    }
+
+    /// Prepaints each visible file header's note button: kit's icon button,
+    /// with the file's note count beside the icon when it has notes.
+    fn place_note_buttons(
+        &self,
+        frame: &mut Frame,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        use gpui_kit::prelude::*;
+        let (buttons, placed) = {
+            let view = self.view.read(cx);
+            let Some(props) = &view.props else {
+                return;
+            };
+            let Some(buttons) = &props.note_buttons else {
+                return;
+            };
+            let at = View::read(props, cx);
+            let index = view.state.height_index.borrow();
+            let rect: Rectangle = bounds.into();
+            let placed: Vec<(usize, Rectangle)> = at
+                .visible_file_header_positions(&index, rect, view.state.painted_offset)
+                .into_iter()
+                .filter_map(|(file, y)| Some((file, at.file_header_layout(file, y, rect)?.note?)))
+                .collect();
+            (buttons.clone(), placed)
+        };
+        let theme = buttons.look.theme;
+        let clip = gpui_kit::ContentMask { bounds };
+        for (file, rect) in placed {
+            let count = buttons.counts.get(file).copied().unwrap_or(0);
+            let on_press = buttons.on_press.clone();
+            let id = gpui_kit::ElementId::NamedInteger("diff-file-note".into(), file as u64);
+            let button = if count == 0 {
+                buttons
+                    .look
+                    .icon_button(id, crate::icons::MESSAGE_SQUARE, theme.muted_text)
+            } else {
+                buttons
+                    .look
+                    .button(id, count.to_string())
+                    .icon(crate::icons::MESSAGE_SQUARE, theme.accent)
+                    .ghost()
+            };
+            let mut element = InteractiveElement::id(
+                gpui_kit::div(),
+                gpui_kit::ElementId::NamedInteger("diff-file-note-wrap".into(), file as u64),
+            )
+            .block_mouse_except_scroll()
+            .child(
+                button
+                    .small()
+                    .tip("Add a note on this file")
+                    .on_click(move |_, window, cx| on_press(&file, window, cx)),
+            )
+            .into_any_element();
+            element.layout_as_root(
+                gpui_kit::size(
+                    gpui_kit::AvailableSpace::Definite(gpui_kit::px(rect.width)),
+                    gpui_kit::AvailableSpace::Definite(gpui_kit::px(rect.height)),
+                ),
+                window,
+                cx,
+            );
+            window.with_content_mask(Some(clip), |window| {
+                element.prepaint_at(
+                    gpui_kit::point(gpui_kit::px(rect.x), gpui_kit::px(rect.y)),
+                    window,
+                    cx,
+                );
+            });
+            frame.note_buttons.push(element);
+        }
+    }
+}
+
+/// `a` and `b` as a range of one hunk, first first.
+fn span(a: LineAt, b: LineAt) -> (LineAt, LineAt) {
+    (a.min(b), a.max(b))
 }
 
 /// `inset`'s element, laid out at `width`, and its height.
@@ -1395,6 +1528,10 @@ pub(super) struct Frame {
     inset_clip: Bounds<Pixels>,
     /// The "+" on the hovered line, prepainted.
     add: Option<gpui_kit::AnyElement>,
+    /// The range a drag from the "+" covers, beside it.
+    add_label: Option<gpui_kit::AnyElement>,
+    /// The file headers' note buttons.
+    note_buttons: Vec<gpui_kit::AnyElement>,
 }
 
 impl DiffView {
@@ -1491,6 +1628,8 @@ impl DiffView {
             insets: Vec::new(),
             inset_clip: Bounds::default(),
             add: None,
+            add_label: None,
+            note_buttons: Vec::new(),
         }
     }
 
@@ -1570,6 +1709,7 @@ impl Element for DiffElement {
         });
         self.place_insets(&mut frame, &mut built, bounds, window, cx);
         self.place_add_button(&mut frame, bounds, window, cx);
+        self.place_note_buttons(&mut frame, bounds, window, cx);
         frame
     }
 
@@ -1604,7 +1744,19 @@ impl Element for DiffElement {
             let clip = gpui_kit::ContentMask {
                 bounds: frame.inset_clip,
             };
-            window.with_content_mask(Some(clip), |window| add.paint(window, cx));
+            window.with_content_mask(Some(clip), |window| {
+                add.paint(window, cx);
+                if let Some(label) = &mut frame.add_label {
+                    label.paint(window, cx);
+                }
+            });
+        }
+        if !frame.note_buttons.is_empty() {
+            window.with_content_mask(Some(gpui_kit::ContentMask { bounds }), |window| {
+                for button in &mut frame.note_buttons {
+                    button.paint(window, cx);
+                }
+            });
         }
         window.set_cursor_style(frame.cursor, &frame.hitbox);
         if frame.animating {
@@ -1679,6 +1831,7 @@ impl Element for DiffElement {
             DiffView::handle(&entity, window, cx, |view, state, out| {
                 if let Some((from, to)) = state.add_drag.take() {
                     if let Some(button) = &view.props.add_button {
+                        send(out, &Some(button.on_pick.clone()), None);
                         let press = |line, extend| LinePress {
                             line,
                             extend,
