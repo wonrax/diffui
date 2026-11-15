@@ -199,6 +199,9 @@ pub(crate) enum Action {
     /// A change-selection or conflict-resolution intent (see
     /// [`crate::changes`]).
     Changes(crate::changes::ChangesMsg),
+    /// Review notes: reply, resolve, step through, the Notes view (see
+    /// [`crate::notes`]).
+    Notes(crate::notes::NotesMsg),
 
     // ── History ─────────────────────────────────────────────────────────
     /// Op log, evolog, file history, annotate — see [`crate::history_panel`].

@@ -105,6 +105,10 @@ struct Running {
     output: Output,
     /// The provider plugin, for its errors' wording.
     provider: Option<String>,
+    /// Who the run's notes are from: the provider's name.
+    author: String,
+    /// The revision it ran on.
+    target: Option<diffui_core::RevisionSelection>,
     cut: bool,
     /// Everything it wrote to stdout so far.
     text: String,
@@ -455,7 +459,7 @@ impl Diffui {
             args,
             cancel.clone(),
         );
-        if launch.output == Output::Panel {
+        if launch.output.is_panel() {
             run.heading = Some(match &provider {
                 Some((_, name)) => format!("{label} \u{b7} {name}"),
                 None => label.clone(),
@@ -465,7 +469,7 @@ impl Diffui {
         if let Some(log) = self.activity_log_for(tab) {
             log.set_command(activity, Some(shown));
         }
-        if launch.output == Output::Panel {
+        if launch.output.is_panel() {
             if launch.cut {
                 self.cli_output(tab, job, &[cut_note()]);
             }
@@ -478,6 +482,13 @@ impl Diffui {
             label,
             program,
             output: launch.output,
+            author: match &provider {
+                Some((_, name)) => name.clone(),
+                None => self
+                    .ai_provider()
+                    .map_or_else(|_| "AI review".to_owned(), |it| it.name().to_owned()),
+            },
+            target: crate::commands::target_revision(self, &launch.arg),
             provider: provider.map(|(id, _)| id),
             cut: launch.cut,
             text: String::new(),
@@ -800,7 +811,7 @@ impl Diffui {
             }
             return;
         }
-        if cut && output != Output::Panel {
+        if cut && !output.is_panel() {
             self.push_info_toast(
                 format!("{label}: the diff was cut"),
                 &format!("It went with its first {} KB only.", DIFF_LIMIT / 1024),
@@ -825,6 +836,10 @@ impl Diffui {
             | Output::Bookmark
             | Output::Panel
             | Output::None => {}
+            Output::Notes => {
+                let author = running.author.clone();
+                self.file_review(tab, running.target.clone(), author, &text, cx);
+            }
         }
     }
 

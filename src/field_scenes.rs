@@ -8,7 +8,7 @@ use crate::MainView;
 use crate::harness::{Harness, at, fixture_repo};
 
 /// Blank toolbar, past the last button on the left: not a list, not the diff.
-const BLANK_TOOLBAR: (f32, f32) = (900.0, 53.0);
+const BLANK_TOOLBAR: (f32, f32) = (1040.0, 53.0);
 /// Inside the revset box.
 const IN_REVSET_BOX: (f32, f32) = (100.0, 97.0);
 /// Over the palette's results.

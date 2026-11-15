@@ -127,6 +127,7 @@ fn changed_file_row(
         check: None,
         tag: file.and_then(count_tag).map(str::to_owned),
         struck,
+        badges: Vec::new(),
     }
 }
 
@@ -386,6 +387,9 @@ fn file_tree(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
         let ui = this.read(cx);
         let row = &tree_rows[display];
         let mut view = changed_file_row(row, &ui.active().session.document.files, theme, &lanes);
+        if let FileTreeRow::File { file_index, .. } = row {
+            view.badges = crate::notes::app::file_badges(ui, *file_index, theme);
+        }
         view.check = match row {
             FileTreeRow::File { file_index, .. } => {
                 crate::changes::tree_check(ui, Some(*file_index), None)
@@ -907,6 +911,9 @@ fn diff_props(
     }
     if let Some(find) = find_overlay(ui, look, cx) {
         props = props.with_find(find);
+    }
+    if range.is_none() {
+        props = crate::notes::inline::decorate(ui, look, props, cx);
     }
     props
 }

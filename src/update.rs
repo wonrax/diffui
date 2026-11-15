@@ -1249,6 +1249,7 @@ impl Diffui {
             Action::CommandLine(action) => self.on_command_line_action(action, cx),
             Action::RebaseOntoTrunk(sources) => self.rebase_onto_trunk(sources),
             Action::Changes(message) => self.on_changes(message, cx),
+            Action::Notes(message) => self.on_notes(message, cx),
             Action::History(action) => self.perform_history(action, cx),
             Action::RevealLogFile => {
                 crate::logging::reveal_log_file();
@@ -2657,6 +2658,7 @@ impl Diffui {
                 self.open_source_browser(revision, jump)
             }
             MainView::History => self.enter_history_view(cx),
+            MainView::Notes => self.active_mut().main_view = MainView::Notes,
         }
     }
 
@@ -2703,6 +2705,19 @@ impl Diffui {
         };
         if stale {
             self.active_mut().pop_mode(ModeKind::Description);
+        }
+        // A reply's field is under its thread in the diff, or nowhere.
+        let stale = {
+            let tab = self.active();
+            tab.note_reply().is_some_and(|reply| {
+                tab.main_view != MainView::Diff
+                    || !crate::notes::app::diff_notes(tab)
+                        .iter()
+                        .any(|(_, note)| note.thread.id == reply.id)
+            })
+        };
+        if stale {
+            self.active_mut().pop_mode(ModeKind::NoteReply);
         }
     }
 
@@ -3784,7 +3799,7 @@ impl Diffui {
     }
 
     /// Show `selection`, revealing its row once its diff lands.
-    fn jump_to_selection(&mut self, selection: RevisionSelection) {
+    pub(crate) fn jump_to_selection(&mut self, selection: RevisionSelection) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };

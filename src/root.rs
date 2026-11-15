@@ -319,6 +319,7 @@ impl Diffui {
         self.sync_media(cx);
         self.sync_forge(cx);
         self.sync_plugins(cx);
+        self.sync_notes(cx);
         // Chokepoint: if the active tab coalesced a refresh while busy and it's
         // now idle, run it. A no-op when nothing's pending (the common case).
         if let Some(tab) = self.active_tab_id() {
@@ -811,6 +812,7 @@ fn left_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
         MainView::Diff => sidebar::build_sidebar(ui, look, window, cx),
         MainView::Source => source_panel::build_source_sidebar(ui, look, window, cx),
         MainView::History => history_panel::build_history_sidebar(ui, look, window, cx),
+        MainView::Notes => sidebar::build_sidebar(ui, look, window, cx),
     }
 }
 
@@ -830,6 +832,7 @@ fn main_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> AnyEl
         MainView::Diff => diff_panel::build_diff_panel(ui, look, window, cx),
         MainView::Source => source_panel::build_source_panel(ui, look, window, cx),
         MainView::History => history_panel::build_history_panel(ui, look, window, cx),
+        MainView::Notes => crate::notes::view::build_notes_panel(ui, look, window, cx),
     }
 }
 

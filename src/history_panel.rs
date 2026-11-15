@@ -847,7 +847,7 @@ pub(crate) fn current_file(ui: &Diffui) -> Option<(RevisionSelection, String)> {
                 .path
                 .clone(),
         )),
-        MainView::History => None,
+        MainView::History | MainView::Notes => None,
     }
 }
 

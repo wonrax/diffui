@@ -644,6 +644,8 @@ pub(crate) enum MainView {
     Source,
     /// The operation log or a revision's evolog (jj only).
     History,
+    /// Every review note in the repository (jj only).
+    Notes,
 }
 
 /// One loaded file in the source browser: the synthesized all-context
@@ -851,6 +853,8 @@ pub(crate) struct TabState {
     pub(crate) forge: forge::TabForge,
     /// What this tab last told plugins.
     pub(crate) plugins: plugins::TabPlugins,
+    /// Review notes on this repository (see [`notes`]).
+    pub(crate) notes: notes::TabNotes,
 }
 
 impl TabState {
@@ -902,6 +906,7 @@ impl TabState {
             preview_debounce: Default::default(),
             forge: Default::default(),
             plugins: Default::default(),
+            notes: Default::default(),
         }
     }
 
@@ -952,7 +957,7 @@ impl TabState {
                 .as_ref()
                 .map(|view| std::slice::from_ref(&view.file))
                 .unwrap_or(&[]),
-            MainView::History => &[],
+            MainView::History | MainView::Notes => &[],
         }
     }
 }

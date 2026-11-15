@@ -218,6 +218,11 @@ fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
         }
     };
     let ghost = slot.preview.is_some_and(|row| row.role.is_ghost());
+    let notes = if ghost {
+        0
+    } else {
+        tab.notes.open_on_change(slot.commit.change_id())
+    };
     let commit_id = slot.commit.commit_id();
     let bookmarks = slot.commit.bookmarks();
     let mut view = build_revision_row(
@@ -262,6 +267,23 @@ fn revision_row_at(ui: &Diffui, look: Look, row: usize) -> RevisionRowView {
     // Tags trail the bookmarks, so the rail's `+N` overflow sheds them first.
     if !ghost && let Some(tags) = tab.session.bookmarks.tags.get(commit_id) {
         view.bookmark_chips.extend(tag_chips_for(tags, look));
+    }
+    // Open review notes, beside any conflict chip; a click lists them.
+    if notes > 0 {
+        let noun = if notes == 1 { "note" } else { "notes" };
+        view.status_chips.push(Chip {
+            label: notes.to_string(),
+            font: config.ui_font,
+            background: crate::theme::chip_background(theme.accent),
+            text_color: theme.accent,
+            border_color: None,
+            border_dashed: false,
+            icon: Some(crate::icons::MESSAGE_SQUARE),
+            icon_color: None,
+            suffix: None,
+            marks: Vec::new(),
+            tip: Some(format!("{notes} open review {noun}: click to list them")),
+        });
     }
     view
 }
@@ -1093,6 +1115,7 @@ pub(crate) mod scenes {
                 }),
                 tag: None,
                 struck: false,
+                badges: Vec::new(),
             });
             let (selected, checked, menus) = (seen.clone(), seen.clone(), seen.clone());
             let props = RevisionListProps::new(0, Some((0, 8)), style)

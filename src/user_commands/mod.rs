@@ -91,10 +91,19 @@ pub(crate) enum Output {
     Bookmark,
     /// The output panel, opened as it starts: text to read.
     Panel,
+    /// The output panel as it streams, then its findings filed as review
+    /// notes on the revision (see [`crate::notes::review`]); the panel stays
+    /// when there are none.
+    Notes,
     None,
 }
 
 impl Output {
+    /// Streams into the output panel.
+    pub(crate) fn is_panel(self) -> bool {
+        matches!(self, Output::Panel | Output::Notes)
+    }
+
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "activity" => Output::Activity,
@@ -105,6 +114,7 @@ impl Output {
             "pr" => Output::PullRequest,
             "bookmark" => Output::Bookmark,
             "panel" => Output::Panel,
+            "notes" => Output::Notes,
             "none" => Output::None,
             _ => return None,
         })

@@ -304,6 +304,7 @@ fn source_file_row(
         check: None,
         tag: None,
         struck: false,
+        badges: Vec::new(),
     }
 }
 

@@ -78,6 +78,12 @@ pub const CHECK: &str = "\u{e06c}"; // check
 pub const PENCIL: &str = "\u{e1f9}"; // pencil
 /// What runs an AI provider: a button or a menu row that sends the diff.
 pub const SPARKLES: &str = "\u{e412}"; // sparkles
+pub const MESSAGE_SQUARE: &str = "\u{e117}"; // message-square
+pub const MESSAGES: &str = "\u{e40d}"; // messages-square
+pub const REPLY: &str = "\u{e22a}"; // reply
+pub const EYE: &str = "\u{e0ba}"; // eye
+pub const EYE_OFF: &str = "\u{e0bb}"; // eye-off
+pub const TRASH: &str = "\u{e18e}"; // trash-2
 pub const FOLDER: &str = "\u{e0d7}"; // folder
 pub const BOOKMARK: &str = "\u{e060}"; // bookmark
 pub const CIRCLE: &str = "\u{e076}"; // circle

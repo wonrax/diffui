@@ -130,6 +130,8 @@ modes! {
         Draft(DraftUi; op_draft, op_draft_mut) => Draft,
         /// Line-select mode: the diff's changed lines are pickable one by one.
         Lines(crate::changes::LineSelect; line_select) => Lines,
+        /// A reply to a review note being written under its thread.
+        NoteReply(crate::notes::NoteReply; note_reply, note_reply_mut) => NoteReply,
     }
 }
 
@@ -143,7 +145,10 @@ impl TabMode {
     /// — the opposite of what the visible layering says.
     fn layer(&self) -> u8 {
         match self {
-            TabMode::Description(_) | TabMode::Draft(_) | TabMode::Lines(_) => 0,
+            TabMode::Description(_)
+            | TabMode::Draft(_)
+            | TabMode::Lines(_)
+            | TabMode::NoteReply(_) => 0,
             TabMode::Find(_) => 1,
         }
     }

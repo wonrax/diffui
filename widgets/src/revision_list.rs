@@ -315,6 +315,9 @@ pub struct FileRowView {
     pub tag: Option<String>,
     /// The name is struck through (a deleted file).
     pub struck: bool,
+    /// Counts drawn ahead of the file's changes, each an icon and a number
+    /// in one colour: its open review notes, its conflicts.
+    pub badges: Vec<(&'static str, usize, Color)>,
 }
 
 /// What a flat row index maps to: a commit (by index) or a file row under the
@@ -395,9 +398,9 @@ pub struct RevisionListProps {
     /// row's selection key, its card's rectangle in window coordinates (what
     /// anchors a native highlight) and the cursor.
     on_context_menu: Option<Callback<(RowSelectionKey, Rectangle, Point)>>,
-    /// A click on a bookmark chip that has a tip: the row's key, the chip's
-    /// index in its row's `bookmark_chips` and its rectangle in window
-    /// coordinates (what a menu anchors to).
+    /// A click on a chip that has a tip: the row's key, the chip's index in
+    /// its row's `bookmark_chips` (a status chip's runs on past them) and its
+    /// rectangle in window coordinates (what a menu anchors to).
     on_chip_click: Option<Callback<(RowSelectionKey, usize, Rectangle)>>,
     /// Right-click on a file row: the row's *display* index into the file tree
     /// (like `on_select_file`), its rect, and the cursor.
@@ -596,7 +599,7 @@ impl RevisionListProps {
         self
     }
 
-    /// Register a click handler for the bookmark chips that have a tip (see
+    /// Register a click handler for the chips that have a tip (see
     /// [`Chip::tip`]). Such a click doesn't select the row.
     pub fn on_chip_click(
         mut self,
@@ -810,6 +813,38 @@ impl RevisionListProps {
     /// The width of a file row's counts, or of the
     /// tag standing in for them.
     fn changes_stats_width(&self, file: &FileRowView) -> f32 {
+        let notes = self.notes_width(file);
+        let stats = self.counts_width(file);
+        if notes > 0.0 && stats > 0.0 {
+            notes + FILE_STAT_GAP + stats
+        } else {
+            notes + stats
+        }
+    }
+
+    /// The badges' icons and numbers, or zero without any.
+    fn notes_width(&self, file: &FileRowView) -> f32 {
+        file.badges
+            .iter()
+            .map(|(icon, count, _)| {
+                crate::measure::line_width(icon, CAPTION_TEXT_SIZE, icons::ICON_FONT)
+                    + BADGE_ICON_GAP
+                    + crate::measure::line_width(
+                        &count.to_string(),
+                        CAPTION_TEXT_SIZE,
+                        self.style.primary_font,
+                    )
+            })
+            .map(|width| width + FILE_STAT_GAP)
+            .sum::<f32>()
+            - if file.badges.is_empty() {
+                0.0
+            } else {
+                FILE_STAT_GAP
+            }
+    }
+
+    fn counts_width(&self, file: &FileRowView) -> f32 {
         if file.chevron.is_some() {
             return 0.0;
         }
@@ -831,6 +866,9 @@ impl RevisionListProps {
 
 /// A file's counts, each side only when it counts
 /// something, with its colour.
+/// Between a badge's icon and its count.
+const BADGE_ICON_GAP: f32 = 3.0;
+
 fn changes_stats(file: &FileRowView) -> Vec<(String, Color)> {
     let mut parts = Vec::with_capacity(2);
     if file.additions > 0 {
@@ -1063,7 +1101,8 @@ pub struct RevisionList {
 /// A chip with a tip, as the last paint placed it.
 struct PaintedChip {
     key: RowSelectionKey,
-    /// Its index in the row's `bookmark_chips`.
+    /// Its index in the row's `bookmark_chips`, then on into its
+    /// `status_chips`.
     chip: usize,
     bounds: Rectangle,
     tip: String,
@@ -2414,9 +2453,25 @@ impl RevisionList {
             chip::paint(&overflow_chip, widths, chip_x, center, window, cx);
             chip_x += layout.overflow_width + chip_gap;
         }
-        for (c, width) in rev.status_chips.iter().zip(&status_widths) {
+        for (index, (c, width)) in rev.status_chips.iter().zip(&status_widths).enumerate() {
             let center = chip::center_for_baseline(c, meta_baseline);
             chip::paint(c, widths, chip_x, center, window, cx);
+            if let Some(tip) = &c.tip
+                && !rev.inert
+            {
+                let height = chip::height();
+                self.painted_chips.borrow_mut().push(PaintedChip {
+                    key: rev.selection_key.clone(),
+                    chip: rev.bookmark_chips.len() + index,
+                    bounds: Rectangle {
+                        x: chip_x,
+                        y: (center - height / 2.0).round(),
+                        width: *width,
+                        height,
+                    },
+                    tip: tip.clone(),
+                });
+            }
             chip_x += width + chip_gap;
         }
 
@@ -2713,6 +2768,48 @@ impl RevisionList {
                 );
                 right -= crate::measure::line_width(text, CAPTION_TEXT_SIZE, style.primary_font)
                     + FILE_STAT_GAP;
+            }
+            if !file.badges.is_empty() {
+                if parts.is_empty()
+                    && let Some(tag) = &file.tag
+                {
+                    right = columns.stats_right
+                        - crate::measure::line_width(tag, FILE_TAG_SIZE, style.mono_font)
+                        - FILE_STAT_GAP;
+                }
+                let icon_box = TextBox::new(icons::ICON_FONT, CAPTION_TEXT_SIZE, line_height);
+                for (icon, count, color) in file.badges.iter().rev() {
+                    let count = count.to_string();
+                    typography::paint_line(
+                        &count,
+                        right,
+                        name_baseline - stats.baseline(),
+                        CAPTION_TEXT_SIZE,
+                        line_height,
+                        style.primary_font,
+                        *color,
+                        TextAlign::Right,
+                        window,
+                        cx,
+                    );
+                    right -=
+                        crate::measure::line_width(&count, CAPTION_TEXT_SIZE, style.primary_font)
+                            + BADGE_ICON_GAP;
+                    typography::paint_line(
+                        icon,
+                        right,
+                        name_baseline - icon_box.baseline(),
+                        CAPTION_TEXT_SIZE,
+                        line_height,
+                        icons::ICON_FONT,
+                        *color,
+                        TextAlign::Right,
+                        window,
+                        cx,
+                    );
+                    right -= crate::measure::line_width(icon, CAPTION_TEXT_SIZE, icons::ICON_FONT)
+                        + FILE_STAT_GAP;
+                }
             }
             if parts.is_empty()
                 && let Some(tag) = &file.tag

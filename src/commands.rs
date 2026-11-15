@@ -93,6 +93,8 @@ contexts! {
     StackSubmit = "submit-stack",
     /// The dialog that asks whether a plugin may run.
     PluginPermission = "plugin-permission",
+    /// A reply to a review note.
+    NoteReply = "note-reply",
 }
 
 impl Context {
@@ -2668,6 +2670,96 @@ pub(crate) static REGISTRY: &[Command] = &[
             crate::conflicts::command_region(ui, &arg, diffui_core::ConflictPick::Base(0))
         },
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.next",
+        label: "Next note or conflict",
+        hint: "Scroll to the next open review note or conflict in the diff",
+        contexts: &[Context::Base],
+        chords: &["]"],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only in the diff view",
+            )?;
+            require(
+                !crate::notes::app::spots(ui.active()).is_empty(),
+                "No open note or conflict in this diff",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::Step(1))),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.previous",
+        label: "Previous note or conflict",
+        hint: "Scroll to the previous open review note or conflict in the diff",
+        contexts: &[Context::Base],
+        chords: &["["],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only in the diff view",
+            )?;
+            require(
+                !crate::notes::app::spots(ui.active()).is_empty(),
+                "No open note or conflict in this diff",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::Step(-1))),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.notes",
+        label: "Show review notes",
+        hint: "Every note agents left in this repository, to filter and clean up",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+            require(
+                ui.active().main_view != MainView::Notes,
+                "Already showing the notes",
+            )
+        },
+        build: |_ui, _arg| Some(Action::SetMainView(MainView::Notes)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.toggle-resolved",
+        label: "Show or hide resolved notes",
+        hint: "Resolved review notes stay in the diff, folded, or leave it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| require(crate::notes::app::available(ui), reason::NOT_JJ),
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::ToggleResolved)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.reply.send",
+        label: "Send reply",
+        hint: "Post the reply under its note",
+        contexts: &[Context::NoteReply],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::SendReply)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "notes.reply.cancel",
+        label: "Cancel reply",
+        hint: "Close the reply field, dropping the draft",
+        contexts: &[Context::NoteReply],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::CancelReply)),
+        palette: PaletteScope::Hidden,
     },
     Command {
         id: "conflict.region.next",

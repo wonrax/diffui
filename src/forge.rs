@@ -533,6 +533,19 @@ impl Diffui {
         cx: &mut Cx,
     ) {
         let selection = crate::selection_from_key(key);
+        let row = self.active().session.commits.find(&selection);
+        // Past the bookmarks' chips, the one status chip that takes clicks:
+        // the review notes' count.
+        if let Some(change) = row
+            .filter(|row| index >= row.bookmarks().len())
+            .map(|row| row.change_id().to_owned())
+            .filter(|change| self.active().notes.open_on_change(change) > 0)
+        {
+            return self.perform(
+                crate::Action::Notes(crate::notes::NotesMsg::ShowChange(change)),
+                cx,
+            );
+        }
         let label = self
             .active()
             .session

@@ -1,14 +1,74 @@
 ---
 name: diffui
-description: Drive the diffui app (a GUI for jj and git) from the terminal with `diffui ctl`, add commands to it with `[[commands]]` rows in its config.toml, and write plugins for it with `diffui plugin`. Use when the user runs diffui and wants you to show them something in it, run a jj command where they can watch it, teach it a new command or shortcut, or support a forge it doesn't know.
+description: Drive the diffui app (a GUI for jj and git) from the terminal with `diffui ctl`, leave review notes on your changes and read the user's replies with `diffui notes`, add commands to it with `[[commands]]` rows in its config.toml, and write plugins for it with `diffui plugin`. Use when the user reviews your jj changes in diffui, when the user runs diffui and wants you to show them something in it, run a jj command where they can watch it, teach it a new command or shortcut, or support a forge it doesn't know.
 ---
 
 # diffui
 
 diffui is a desktop app for reviewing and rewriting history in jj (and git)
-repositories. You can drive the running app with `diffui ctl`, add commands
+repositories. You can leave the user review notes on your changes with
+`diffui notes` (see "Review notes"), drive the running app with `diffui ctl`, add commands
 to it by writing `[[commands]]` rows in its `config.toml`, and give it code
 of your own as a plugin (see "Writing a plugin").
+
+## Review notes
+
+When you change code in a jj repository the user reviews in diffui, leave
+notes on your changes: the user reads them inline in the diff, beside the
+lines they're about, and replies where something should change. `diffui
+notes` works whether diffui is open or not; an open app shows new notes and
+replies at once.
+
+**What deserves a note.** What the user can't see in the diff: a design
+decision and the alternative you didn't take, a trade-off, something you're
+unsure of, a spot that needs their eyes (a lock order, a migration, a
+behaviour change), a follow-up you left out on purpose. Not a narration of
+the diff: "added a function" is noise. A few good notes beat many. A note
+the user doesn't reply to is fine; there is nothing to approve.
+
+**Where.** A note is on a change (`-r`, default `@`), and optionally on one
+of its files (`--file`), and optionally on lines of it as the change has them
+(`--line 40` or `--line 40-52`; add `--old` for lines the change removed).
+Notes follow the change through amends and rebases: they're anchored to its
+change id and the text of the lines, not to a commit. When those lines are
+rewritten, the note stays on its file, marked outdated.
+
+**The loop.**
+
+1. Finish the change, then leave notes:
+   `diffui notes add --as <you> --file src/lib.rs --line 40-52 "Took the lock before the read so a writer can't slip in between; costs one extra lock per call."`
+   Use `-` as the text to read Markdown from stdin (a heredoc). Pass the same
+   `--as` name every time (your tool's name, or a session name when several
+   of you work in one repository) so the user can tell you apart.
+2. Wait for replies, in the background while the user reviews:
+   `diffui notes wait` sleeps until the user replies to one of your notes,
+   then prints the notes waiting on you and exits 0; it returns at once when
+   some already are. It exits 124 after `--timeout` (default `30m`; `0`
+   waits forever). Add `-r <revset>` to wait on some changes only, `--new` to
+   ignore replies already waiting, `--json` for the threads as JSON.
+3. For each reply, change the code (amend the change; the notes follow),
+   then answer under the note: `diffui notes reply <id> --as <you> "Done:
+   switched to an IndexMap."`, with `--resolve` when nothing is left to do.
+   Reply without resolving when you have a question back. `diffui notes
+   resolve <id>…` resolves without a word.
+4. Wait again until the user is done.
+
+| Verb | Does |
+|---|---|
+| `diffui notes add [-r REV] [--file PATH [--line N[-M]] [--old]] --as NAME TEXT` | Leave a note; prints it with its id. |
+| `diffui notes reply ID --as NAME [--resolve] TEXT` | Answer under a note. |
+| `diffui notes resolve ID…` / `diffui notes reopen ID…` | Resolve, or open again. |
+| `diffui notes list [-r REVSET] [--waiting] [--resolved] [--by NAME]` | Notes grouped by change, newest activity first: open ones, or with `--resolved` all; `--waiting` only those the user replied to. |
+| `diffui notes show ID` | One note and its replies. |
+| `diffui notes wait [-r REVSET] [--timeout 30m] [--new]` | Block until the user replies (see above). |
+| `diffui notes delete ID…` | Delete notes. |
+| `diffui notes prune [--resolved] [--archived] [-r REVSET] [--dry-run]` | Delete in bulk: resolved notes, archived ones (their change was abandoned), or every note on some changes. |
+
+Every verb takes `--repo <path>` (default: the current directory) and
+`--json`. In the output a note's status is `open` (no reply), `replied` (the
+user answered: your turn) or `resolved`; `outdated` means its lines are gone
+from the change, `archived` that the change was abandoned. The user's
+messages have the role `user`.
 
 ## `diffui ctl`
 
@@ -126,7 +186,7 @@ Optional fields:
 | Field | Meaning |
 |---|---|
 | `stdin = "<template>"` | Text fed to the program's standard input (`exec` and `agent` only). |
-| `output = "…"` | Where the program's standard output (an agent's reply) goes (`exec` and `agent` only): `activity` (default; the activity row and its output panel), `toast` (its first line once it exits), `clipboard`, `description` (written into the description editor as it arrives, opening it on the revision; undoable), `pr` (the pull request dialog's title, the first line, and body, as it arrives, opening the dialog for the revision), `bookmark` (the bookmark name prompt, its first line made a name such as `fix-parser-crash`, opening the prompt at the revision), `panel` (the output panel, opened as it starts, for text to read: rendered as Markdown, with a Rendered | Raw toggle), `open-url` (its first line, an `http(s)` link, opened in the browser) or `none`. A failure puts back what a field held. |
+| `output = "…"` | Where the program's standard output (an agent's reply) goes (`exec` and `agent` only): `activity` (default; the activity row and its output panel), `toast` (its first line once it exits), `clipboard`, `description` (written into the description editor as it arrives, opening it on the revision; undoable), `pr` (the pull request dialog's title, the first line, and body, as it arrives, opening the dialog for the revision), `bookmark` (the bookmark name prompt, its first line made a name such as `fix-parser-crash`, opening the prompt at the revision), `panel` (the output panel, opened as it starts, for text to read: rendered as Markdown, with a Rendered | Raw toggle), `notes` (the panel as it streams, then each list item that starts with a location such as `` `src/lib.rs:40-52` `` filed as a review note on that line of the revision, from the provider; the panel stays when no item cites a line), `open-url` (its first line, an `http(s)` link, opened in the browser) or `none`. A failure puts back what a field held. |
 | `confirm = "<template>"` | Ask before running; the text is the question. Can't use `{diff}` or `{recent_descriptions}`. |
 | `override = true` | Replace the built-in or shipped command with the same `id`. Without it, a row taking an existing id is left out. |
 | `timeout = 300` | Seconds the program may run before it's stopped (default 300). |
@@ -259,8 +319,10 @@ same id and `override = true`.
 - `ai.bookmark-name` ("Suggest bookmark name", also the new bookmark
   prompt's Suggest button): the revision's description and diff,
   `output = "bookmark"`.
-- `ai.explain` ("Explain this change") and `ai.review` ("Review this
-  change"): the revision's description and diff, `output = "panel"`.
+- `ai.explain` ("Explain this change"): the revision's description and
+  diff, `output = "panel"`.
+- `ai.review` ("Review this change"): the same, `output = "notes"`: each
+  finding that cites a line becomes a review note from the provider.
 
 ### AI providers
 

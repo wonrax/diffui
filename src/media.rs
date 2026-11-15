@@ -130,7 +130,7 @@ pub(crate) fn shows_svg_preview(ui: &Diffui) -> bool {
             .history
             .diff_document()
             .is_some_and(|(document, _)| has_svg_preview(document)),
-        crate::MainView::Source => false,
+        crate::MainView::Source | crate::MainView::Notes => false,
     }
 }
 

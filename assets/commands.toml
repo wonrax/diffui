@@ -84,9 +84,11 @@ group = "Revisions"
 when = "ai && revision.selected"
 menu = ["revision", "palette"]
 agent = """Review the change you are given (its description, then its diff). \
-List likely bugs, risky spots and missing cases, the most serious first, \
-each with its file and line and why it matters. Leave out style. If nothing \
-stands out, say so in one line. Markdown, a list."""
+List likely bugs, risky spots and missing cases, the most serious first. \
+Write each as one Markdown list item that starts with its file and line in \
+the new version in backticks, then a colon and why it matters, like this: \
+- `src/lib.rs:40-52`: the lock is taken twice. Leave out style. If nothing \
+stands out, say so in one line, not a list."""
 stdin = """{description}
 {diff}"""
-output = "panel"
+output = "notes"

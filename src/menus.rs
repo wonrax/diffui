@@ -831,7 +831,7 @@ impl Diffui {
                     None => (None, false),
                 }
             }
-            MainView::History => (None, false),
+            MainView::History | MainView::Notes => (None, false),
         };
         let Some(path) = path else {
             return Vec::new();
