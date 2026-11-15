@@ -1638,3 +1638,29 @@ section of `assets/agent/SKILL.md`). New in the port.
 - Window: 1440x900, light
 - State: fix/changelog-note's diff, its pull request #42 badged: under CHANGELOG.txt's added line an agent's note open, then a GitHub review thread open with its reply, tagged GitHub, its footer saying it's from GitHub, read-only, with Open on GitHub and no Reply or Resolve; at the file's header an outdated GitHub thread folded to its first comment.
 - Steps: Badge the pull requests; an agent leaves a note on the line; GitHub's threads read for #42; select fix/changelog-note; open the note and the thread.
+
+## Review layout
+
+### `review-pr-all`
+
+- Window: 1440x900, light
+- State: A pull request tab on all changes: the commits panel with the 'All changes' item selected over three numbered commits (title, age, short id, author, +/-); the header with the title, the pull request's number and state, author and branches, then its description rendered as Markdown (a heading, a list, code, a link).
+- Steps: Open acme/render-toolkit#41.
+
+### `review-pr-all-narrow`
+
+- Window: 1000x760, light
+- State: review-pr-all in a narrow window: rows, header facts and the bar's line cut to fit, nothing overlapping.
+- Steps: Open acme/render-toolkit#41 in a 1000 px window.
+
+### `review-pr-step`
+
+- Window: 1440x900, light
+- State: The same pull request with its second commit selected: the bar reads 'All changes / Commit 2 of 3' with previous and next, the header the commit's title, author, date and id, the diff and files that commit's alone.
+- Steps: Open acme/render-toolkit#41, select its second commit.
+
+### `review-jj-header`
+
+- Window: 1440x900, light
+- State: A jj revision's header in the same layout: the title, the fields, then the message's body as written, with the Rendered/Raw toggle in the bar.
+- Steps: Select the 'rework the pipeline' revision.

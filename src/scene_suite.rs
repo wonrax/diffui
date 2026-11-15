@@ -3268,7 +3268,62 @@ fn all() -> Vec<Scene> {
         pr_comments_beside_a_note,
     ));
 
+    t.group("Review layout");
+    t.add(
+        s(
+            "review-pr-all",
+            "A pull request tab on all changes: the commits panel with the 'All changes' item selected over three numbered commits (title, age, short id, author, +/-); the header with the title, the pull request's number and state, author and branches, then its description rendered as Markdown (a heading, a list, code, a link).",
+            "Open acme/render-toolkit#41.",
+            pull_request_tab,
+        )
+        .no_repo(),
+    );
+    t.add(
+        s(
+            "review-pr-all-narrow",
+            "review-pr-all in a narrow window: rows, header facts and the bar's line cut to fit, nothing overlapping.",
+            "Open acme/render-toolkit#41 in a 1000 px window.",
+            pull_request_tab,
+        )
+        .no_repo()
+        .size(1000.0, 760.0),
+    );
+    t.add(
+        s(
+            "review-pr-step",
+            "The same pull request with its second commit selected: the bar reads 'All changes / Commit 2 of 3' with previous and next, the header the commit's title, author, date and id, the diff and files that commit's alone.",
+            "Open acme/render-toolkit#41, select its second commit.",
+            |c| {
+                pull_request_tab(c);
+                c.act(Action::Review(crate::review::ReviewAction::Scope(
+                    crate::review::Scope::Step(1),
+                )));
+                c.h.wait_until("the commit's diff", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && ui.active().session.document.files.len() == 1
+                });
+                c.settle();
+            },
+        )
+        .no_repo(),
+    );
+    t.add(s(
+        "review-jj-header",
+        "A jj revision's header in the same layout: the title, the fields, then the message's body as written, with the Rendered/Raw toggle in the bar.",
+        "Select the 'rework the pipeline' revision.",
+        |c| {
+            c.select("kitchen-sink");
+        },
+    ));
+
     t.scenes
+}
+
+/// A pull request open in a tab of its own, through the bundled GitHub
+/// plugin and the harness's fake `gh`.
+fn pull_request_tab(c: &mut Ctx) {
+    crate::review::scenarios::answer_pull_request(crate::review::scenarios::BODY, 3);
+    crate::review::scenarios::open_pull_request(&mut c.h);
 }
 
 /// A pull request's review threads in a revision's diff, beside an agent's
