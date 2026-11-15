@@ -151,9 +151,13 @@ pub(crate) fn build_toolbar(
         // say *what* is being browsed.
         actions = actions.child(browsed_revision_label(ui, look, is_jj));
     } else {
-        actions = actions
-            .child(refresh_button(ui, look, cx))
-            .child(fetch_split_button(look, window, cx));
+        let source = ui.active_actions();
+        if source.refresh {
+            actions = actions.child(refresh_button(ui, look, cx));
+        }
+        if source.fetch {
+            actions = actions.child(fetch_split_button(look, window, cx));
+        }
         // Plain `jj git push` (tracked bookmarks that moved), behind a
         // confirmation listing what goes out.
         if is_jj
@@ -258,11 +262,13 @@ pub(crate) fn build_toolbar(
         .overflow_hidden()
         .child(actions)
         .child(div().flex_1().min_w_0())
-        .child(
-            div()
-                .flex_none()
-                .child(activity::activity_indicator(ui, look, window, cx)),
-        )
+        .when(shows_activity(ui), |bar| {
+            bar.child(
+                div()
+                    .flex_none()
+                    .child(activity::activity_indicator(ui, look, window, cx)),
+            )
+        })
         .child(toggles);
 
     div()
@@ -280,6 +286,17 @@ pub(crate) fn build_toolbar(
                 .child(activity::activity_progress_line(ui, look, window, cx)),
         )
         .into_any_element()
+}
+
+/// Whether the activity indicator shows. Idle, it reads "Up to date", a
+/// repository's sync status; a source with no remotes shows it only while
+/// something runs or has failed, or its popover is open.
+fn shows_activity(ui: &Diffui) -> bool {
+    let activities = &ui.active().activities;
+    ui.active_actions().fetch
+        || activities.first_running_visible().is_some()
+        || activities.failed_count() > 0
+        || ui.activity_popover_open()
 }
 
 /// The Diff ↔ Source view switcher, a [`segmented`] control. Deliberately *not*

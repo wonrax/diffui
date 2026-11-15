@@ -1136,6 +1136,12 @@ impl Diffui {
                     return;
                 };
                 if !self.active().session.capabilities.graph {
+                    // A source without a graph (a pull request, a patch file,
+                    // a compare) is read again, when it can be.
+                    if self.active_actions().refresh {
+                        let effects = self.active_mut().session.reload();
+                        self.run_effects(tab, effects);
+                    }
                     return;
                 }
                 // A manual refresh is a full reload: the user may have run an

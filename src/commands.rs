@@ -614,7 +614,14 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["cmd+r"],
         mac_chords: &[],
-        enabled: can_read_graph,
+        enabled: |ui, _arg| {
+            require(
+                ui.tabs
+                    .get(ui.active)
+                    .is_some_and(|tab| tab.actions().refresh),
+                "Nothing to read again in this tab",
+            )
+        },
         build: |_ui, _arg| Some(Action::Refresh),
         palette: PaletteScope::Root,
     },

@@ -75,7 +75,47 @@ impl Tab {
     }
 }
 
+/// What a tab's source can be asked for from the toolbar, besides its diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Actions {
+    /// Refresh reads the source again.
+    pub(crate) refresh: bool,
+    /// Fetch, its menu and the sync status: a repository's remotes.
+    pub(crate) fetch: bool,
+}
+
+impl Tab {
+    /// What this tab's source can do. A pull request, a compare and a
+    /// patch file can be read again; a patch from stdin or the clipboard
+    /// can't. Only a repository has remotes.
+    pub(crate) fn actions(&self) -> Actions {
+        use diffui_core::patch::{DiffInput, PatchOrigin};
+        let refresh = match &self.source {
+            TabSource::Repo { .. } | TabSource::ForgePr(_) => true,
+            TabSource::Diff(DiffInput::Compare { .. })
+            | TabSource::Diff(DiffInput::Patch(PatchOrigin::File(_))) => true,
+            TabSource::Diff(DiffInput::Patch(_)) => false,
+        };
+        Actions {
+            refresh,
+            fetch: matches!(self.source, TabSource::Repo { .. }),
+        }
+    }
+}
+
 impl Diffui {
+    /// The active tab's source's actions; a repository's when no tab is
+    /// open.
+    pub(crate) fn active_actions(&self) -> Actions {
+        self.tabs.get(self.active).map_or(
+            Actions {
+                refresh: true,
+                fetch: true,
+            },
+            Tab::actions,
+        )
+    }
+
     /// The active tab's steps; a graph's when no tab is open.
     pub(crate) fn active_steps(&self) -> Steps {
         self.tabs.get(self.active).map_or(Steps::Graph, Tab::steps)

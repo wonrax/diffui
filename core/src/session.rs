@@ -476,6 +476,15 @@ impl Session {
         effects
     }
 
+    /// Read a source without a graph again: its outline, then the diff on
+    /// screen. Nothing parked from before is reused.
+    pub fn reload(&mut self) -> Vec<Effect> {
+        self.pr_diffs.clear();
+        let mut effects = self.load_graph(false);
+        effects.extend(self.load_diff(self.selected_revision.clone()));
+        effects
+    }
+
     /// Start a diff load for `revision`, superseding any switch already in
     /// flight.
     ///

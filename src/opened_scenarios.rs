@@ -643,3 +643,55 @@ fn a_named_compare_refreshes_and_its_notes_follow_their_lines() {
         )
     });
 }
+
+/// The toolbar offers what each source can do: Refresh reads a patch
+/// file or a compare again, not stdin or the clipboard; only a repository
+/// fetches or shows its sync status.
+#[test]
+fn refresh_reads_a_patch_file_again_and_nothing_fetches() {
+    let mut h = Harness::open(None);
+    let dir = scratch("refresh-patch");
+    let file = dir.join("fix.patch");
+    std::fs::copy(fixture("format-patch.patch"), &file).unwrap();
+    h.act(|ui, cx| ui.open_diff(DiffInput::Patch(PatchOrigin::File(file.clone())), cx));
+    h.wait_until("the patch", loaded);
+    let actions = h.read(|ui| ui.active_actions());
+    assert_eq!(
+        (actions.refresh, actions.fetch),
+        (true, false),
+        "a patch file reads again"
+    );
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, text.replace("Shout beta", "Whisper beta")).unwrap();
+    h.perform(Action::Refresh);
+    h.wait_until("the patch read again", |ui| {
+        let theme = ui.resolved_theme().spec();
+        crate::commit_info::header(ui, ui.look(theme))
+            .and_then(|header| header.title)
+            .as_deref()
+            == Some("Whisper beta and add delta")
+    });
+
+    h.act(|ui, cx| ui.ctl_patch(None, Some(text), cx))
+        .expect("opens");
+    h.wait_until("the piped patch", loaded);
+    let actions = h.read(|ui| ui.active_actions());
+    assert_eq!(
+        (actions.refresh, actions.fetch),
+        (false, false),
+        "stdin can't"
+    );
+    assert!(
+        h.read(|ui| {
+            ui.registry
+                .iter()
+                .find(|command| command.id.as_str() == "repo.refresh")
+                .is_some_and(|command| {
+                    command
+                        .enabled(ui, &crate::commands::CommandArg::None)
+                        .is_err()
+                })
+        }),
+        "nor can its command"
+    );
+}
