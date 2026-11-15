@@ -3316,6 +3316,102 @@ fn all() -> Vec<Scene> {
         },
     ));
 
+    t.group("Patches and comparisons");
+    t.add(
+        s(
+            "patch-email",
+            "A git format-patch email open as a tab of its own: no steps panel; the header with its subject, author, date and commit, the patch file's path, then its message as written; list.txt's hunk without the mail's signature; a note on the added delta line, and under the toolbar the quiet strip saying the tab's notes aren't saved, with Copy.",
+            "Open core/tests/fixtures/patches/format-patch.patch; leave a note on its last line.",
+            |c| {
+                let patch = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("core/tests/fixtures/patches/format-patch.patch");
+                c.h.act(|ui, cx| {
+                    ui.open_diff(
+                        diffui_core::patch::DiffInput::Patch(
+                            diffui_core::patch::PatchOrigin::File(patch),
+                        ),
+                        cx,
+                    )
+                });
+                c.h.wait_until("the patch", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && !ui.active().session.document.files.is_empty()
+                });
+                c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                    crate::notes::NoteTarget::Line(crate::diff_view::LinePress {
+                        line: crate::diff_view::LineAt {
+                            file: 0,
+                            hunk: 0,
+                            line: 4,
+                        },
+                        extend: false,
+                        one_side: false,
+                    }),
+                )));
+                c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                    "Why add delta here rather than at the top?".to_owned(),
+                )));
+                c.act(Action::Notes(crate::notes::NotesMsg::SendReply));
+                c.h.wait_until("the note", |ui| !ui.active().notes.notes.is_empty());
+                // Its toast says it once; the strip is what stays.
+                c.h.act(|ui, _| ui.toasts.clear());
+            },
+        )
+        .no_repo(),
+    );
+    t.add(
+        s(
+            "compare-folders",
+            "Two folders compared, as jj's diff tool: no steps panel; under the toolbar the strip saying jj is waiting for this comparison, with Done; the header titled old → new with the Left and Right paths as fields; the files changed, added and deleted between them.",
+            "Make two folders; compare them as `jj diff --tool diffui` would.",
+            |c| {
+                let root = crate::harness::scratch_home().join("compare-scene");
+                let _ = std::fs::remove_dir_all(&root);
+                let (left, right) = (root.join("old"), root.join("new"));
+                for (dir, files) in [
+                    (
+                        &left,
+                        &[
+                            ("README.md", "# Parser\n\nRun make.\n"),
+                            ("src/parse.rs", "fn parse(line: &str) -> i32 {\n    if line.is_empty() {\n        return -1;\n    }\n    0\n}\n"),
+                            ("notes/old.txt", "to do\n"),
+                        ][..],
+                    ),
+                    (
+                        &right,
+                        &[
+                            ("README.md", "# Parser\n\nRun make, then make check.\n"),
+                            ("src/parse.rs", "fn parse(line: &str) -> i32 {\n    if line.trim().is_empty() {\n        return -1;\n    }\n    0\n}\n"),
+                            ("src/lexer.rs", "pub fn tokens(line: &str) -> Vec<&str> {\n    line.split_whitespace().collect()\n}\n"),
+                        ][..],
+                    ),
+                ] {
+                    for (path, text) in files {
+                        let path = dir.join(path);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, text).unwrap();
+                    }
+                }
+                // No one answers: the scene keeps the tab open.
+                let (reply, _answer) = futures::channel::oneshot::channel();
+                c.h.act(|ui, cx| {
+                    ui.ctl_compare(
+                        left.display().to_string(),
+                        right.display().to_string(),
+                        Some("jj".to_owned()),
+                        reply,
+                        cx,
+                    )
+                });
+                c.h.wait_until("the comparison", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && !ui.active().session.document.files.is_empty()
+                });
+            },
+        )
+        .no_repo(),
+    );
+
     t.scenes
 }
 

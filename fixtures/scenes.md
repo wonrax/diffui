@@ -1664,3 +1664,17 @@ section of `assets/agent/SKILL.md`). New in the port.
 - Window: 1440x900, light
 - State: A jj revision's header in the same layout: the title, the fields, then the message's body as written, with the Rendered/Raw toggle in the bar.
 - Steps: Select the 'rework the pipeline' revision.
+
+## Patches and comparisons
+
+### `patch-email`
+
+- Window: 1440x900, light
+- State: A git format-patch email open as a tab of its own: no steps panel; the header with its subject, author, date and commit, the patch file's path, then its message as written; list.txt's hunk without the mail's signature; a note on the added delta line, and under the toolbar the quiet strip saying the tab's notes aren't saved, with Copy.
+- Steps: Open core/tests/fixtures/patches/format-patch.patch; leave a note on its last line.
+
+### `compare-folders`
+
+- Window: 1440x900, light
+- State: Two folders compared, as jj's diff tool: no steps panel; under the toolbar the strip saying jj is waiting for this comparison, with Done; the header titled old → new with the Left and Right paths as fields; the files changed, added and deleted between them.
+- Steps: Make two folders; compare them as `jj diff --tool diffui` would.
