@@ -60,6 +60,9 @@ enum Verb {
     /// The plugins: the bundled ones and those in the plugins folder, and
     /// whether each is allowed
     List,
+    /// Print diffui.d.ts: the manifest reference, the runtime's rules and
+    /// the whole API, as `init` writes it
+    Types,
     /// Copy a bundled plugin into the plugins folder to edit; the copy
     /// replaces it
     Eject {
@@ -114,6 +117,7 @@ fn plugin_main() -> i32 {
             }
         }
         Verb::List => Ok(list()),
+        Verb::Types => Ok(diffui_plugins::TYPES.to_owned()),
         Verb::Eject { id } => match plugins_dir() {
             Some(folder) => super::bundled::eject(&id, &folder),
             None => Err("no home directory to put the plugins folder in".to_owned()),
