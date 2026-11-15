@@ -42,7 +42,8 @@ As git's (~/.gitconfig):
 
   then: git difftool --dir-diff --tool diffui";
 
-/// The rest of the main `--help`: patches, then the diff tool.
+/// The rest of the main `--help`: patches, the diff tool, then the agent
+/// guide.
 pub(crate) const AFTER_HELP: &str = "\
 Patches: `diffui -` reads a diff from stdin; `diffui fix.patch` opens a \
 patch file (any unified diff, or git format-patch emails). A path opens as a \
@@ -51,7 +52,11 @@ repository holds and it reads as a diff; every other path opens its \
 repository. With diffui already running, the patch opens as a tab there.
 
 `diffui diff LEFT RIGHT` compares two files or two folders (see `diffui diff \
---help` for the jj and git diff tool config).";
+--help` for the jj and git diff tool config).
+
+For agents and scripts: `diffui skill` prints a guide to `diffui notes` \
+(review notes), `diffui ctl` (drive the running app), `diffui plugin` and \
+`diffui jj`.";
 
 /// Whether `path`, named on the command line, is a patch rather than a
 /// repository: `-` is stdin; a file ending in `.patch`, `.diff`, `.mbox`
