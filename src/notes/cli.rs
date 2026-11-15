@@ -32,8 +32,8 @@ change. A note nobody replies to is fine.
 The loop: `add` notes on what the user should know, `wait` until the user
 replies, fix the code, then `reply` (with `--resolve` when it's done).
 
-Works whether diffui is open or not. See `diffui skill` for when to leave
-notes.";
+Works whether diffui is open or not. See `diffui skill notes` for when to
+leave notes.";
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "diffui notes", about = ABOUT, long_about = LONG_ABOUT)]
@@ -176,6 +176,12 @@ enum Verb {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// The CLI's definition, for the guide's test.
+#[cfg(test)]
+pub(crate) fn cli() -> clap::Command {
+    <NotesCli as clap::CommandFactory>::command()
 }
 
 /// `diffui notes …`: the exit code, or `None` when the command line isn't one.

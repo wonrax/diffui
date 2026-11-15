@@ -26,11 +26,17 @@ pub(crate) fn client_main() -> Option<i32> {
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "diffui plugin",
-    about = "Write and check diffui plugins (see `diffui skill`)"
+    about = "Write and check diffui plugins (see `diffui skill plugin`)"
 )]
 struct PluginCli {
     #[command(subcommand)]
     verb: Verb,
+}
+
+/// The CLI's definition, for the guide's test.
+#[cfg(test)]
+pub(crate) fn cli() -> clap::Command {
+    <PluginCli as clap::CommandFactory>::command()
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -213,7 +219,7 @@ fn manifest_text(id: &str, main: &str, forge: Option<&str>) -> String {
          id = \"{id}.hello\"\n\
          label = \"{name}: say hello\"\n\
          menu = [\"palette\", \"revision\"]   # palette | revision | bookmark | file\n\
-         # when = \"repo.kind == 'jj'\"      # a when-clause; see `diffui skill`\n\
+         # when = \"repo.kind == 'jj'\"      # a when-clause; see `diffui skill commands`\n\
          # keys = [\"cmd+shift+h\"]\n"
     );
     text

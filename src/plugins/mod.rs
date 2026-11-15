@@ -26,7 +26,7 @@ mod api;
 #[cfg(test)]
 mod auth_scenarios;
 mod bundled;
-mod cli;
+pub(crate) mod cli;
 mod events;
 mod forge;
 #[cfg(test)]

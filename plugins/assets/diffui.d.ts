@@ -29,7 +29,7 @@
  *     [[commands]]                     # then main.js must call commands.register with this id
  *     id = "forgejo.open-in-browser"   # always "<plugin id>.<name>"
  *     label = "Open pull request in browser"
- *     when = "bookmark.pr"             # a when-clause; see `diffui skill`
+ *     when = "bookmark.pr"             # a when-clause; see `diffui skill commands`
  *     menu = ["bookmark", "palette"]   # palette | revision | bookmark | file
  *     keys = ["cmd+shift+o"]
  *
@@ -37,7 +37,7 @@
  *     host = { type = "string", default = "codeberg.org", label = "Host" }
  *
  * A setting's `type` is "string", "boolean", "number", "enum", "path" or "secret", and Settings draws a control
- * for each (Settings → Plugins → the plugin's gear):
+ * for each (Settings → Plugins → the plugin's pencil):
  *
  *     auth = { type = "enum", values = ["auto", "cli", "token"], default = "auto", label = "Sign in with", per_host = true }
  *     program = { type = "path", default = "gh", label = "The gh program" }   # a field with Browse; says when it isn't there

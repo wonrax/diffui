@@ -638,13 +638,15 @@ fn an_ai_review_without_findings_stays_in_the_panel() {
 
 #[test]
 fn the_skill_teaches_every_notes_verb() {
-    for verb in [
-        "add", "reply", "resolve", "reopen", "list", "show", "wait", "export", "delete", "prune",
-    ] {
-        assert!(
-            crate::ctl::SKILL.contains(&format!("`diffui notes {verb}")),
-            "{verb}"
-        );
+    let guide = crate::ctl::topic("notes").expect("the notes topic");
+    let verbs: Vec<String> = super::cli::cli()
+        .get_subcommands()
+        .map(|verb| verb.get_name().to_owned())
+        .filter(|verb| verb != "help")
+        .collect();
+    assert!(verbs.len() >= 10, "{verbs:?}");
+    for verb in verbs {
+        assert!(guide.contains(&format!("`diffui notes {verb}")), "{verb}");
     }
 }
 

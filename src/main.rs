@@ -217,7 +217,8 @@ fn main() {
     if let Some(code) = diffui_core::cli::passthrough::jj_main() {
         std::process::exit(code.into());
     }
-    // `diffui ctl …` talks to the running app; `diffui skill` prints its guide.
+    // `diffui ctl …` talks to the running app; `diffui skill` prints its guide,
+    // which names every subcommand here (see `ctl::tests`).
     if let Some(code) = ctl::client_main() {
         std::process::exit(code);
     }

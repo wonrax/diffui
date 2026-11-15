@@ -374,7 +374,8 @@ fn documented(first: &str) -> String {
         .collect();
     assert!(!lines.is_empty(), "--help has no {first}");
     for line in &lines {
-        assert!(crate::ctl::SKILL.contains(line), "SKILL.md lacks {line}");
+        let guide = crate::ctl::topic("patches").expect("the patches topic");
+        assert!(guide.contains(line), "patches.md lacks {line}");
     }
     lines.join("\n") + "\n"
 }

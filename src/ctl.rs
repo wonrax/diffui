@@ -8,7 +8,9 @@
 //! returns, or `"ok": false` and an `"error"`.
 //!
 //! `diffui ctl <verb> …` is the client; `--json` prints the answer as it
-//! came. `diffui skill` prints the agent guide (`assets/agent/SKILL.md`).
+//! came. `diffui skill` prints the agent guide's index
+//! (`assets/agent/SKILL.md`), and `diffui skill <topic>` one of its
+//! references (`assets/agent/<topic>.md`).
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -22,8 +24,35 @@ use crate::app_files::{AppDir, app_file, write_atomic};
 use crate::commands::CommandArg;
 use crate::{Cx, Diffui, TabId};
 
-/// The agent guide `diffui skill` prints.
+/// The agent guide's index, which `diffui skill` prints.
 pub(crate) const SKILL: &str = include_str!("../assets/agent/SKILL.md");
+
+/// The guide's references, which `diffui skill <topic>` prints. The index
+/// names each one and says when to read it.
+pub(crate) const TOPICS: &[(&str, &str)] = &[
+    ("notes", include_str!("../assets/agent/notes.md")),
+    ("ctl", include_str!("../assets/agent/ctl.md")),
+    (
+        "pull-requests",
+        include_str!("../assets/agent/pull-requests.md"),
+    ),
+    ("commands", include_str!("../assets/agent/commands.md")),
+    ("ai", include_str!("../assets/agent/ai.md")),
+    ("plugin", include_str!("../assets/agent/plugin.md")),
+    (
+        "forge-plugin",
+        include_str!("../assets/agent/forge-plugin.md"),
+    ),
+    ("patches", include_str!("../assets/agent/patches.md")),
+];
+
+/// One reference by its topic's name.
+pub(crate) fn topic(name: &str) -> Option<&'static str> {
+    TOPICS
+        .iter()
+        .find(|(topic, _)| *topic == name)
+        .map(|(_, text)| *text)
+}
 
 /// One request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,7 +61,7 @@ pub(crate) enum Request {
     /// The open repositories, the active one, its selected revision and
     /// revset, and its latest activity.
     State,
-    /// Open a repository (or a GitHub PR reference) as a tab.
+    /// Open a repository (or a pull request's link or reference) as a tab.
     Open { path: String },
     /// Show the revision `revset` names, the way `jj show` would.
     Select {
@@ -59,8 +88,7 @@ pub(crate) enum Request {
     },
     /// Show a toast.
     Toast { text: String },
-    /// Read config.toml's keys and commands again, and start the plugins
-    /// afresh.
+    /// Read config.toml again, and start the plugins afresh.
     Reload,
     /// Every plugin found, with its state, what it registered and the end
     /// of its log.
@@ -439,18 +467,54 @@ pub(crate) fn client_main() -> Option<i32> {
     let mut args = std::env::args_os().skip(1);
     match args.next()?.to_str()? {
         "skill" => {
-            print!("{SKILL}");
-            Some(0)
+            let args: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
+            let (code, out) = skill_main(&args);
+            if code == 0 {
+                print!("{out}");
+            } else {
+                eprint!("{out}");
+            }
+            Some(code)
         }
         "ctl" => Some(ctl_main()),
         _ => None,
     }
 }
 
+/// `diffui skill [topic]`: the exit code and what to print (to stderr when
+/// the code isn't 0).
+fn skill_main(args: &[String]) -> (i32, String) {
+    let names = || {
+        TOPICS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match args {
+        [] => (0, SKILL.to_owned()),
+        [flag] if flag == "-h" || flag == "--help" => (
+            0,
+            format!(
+                "Usage: diffui skill [TOPIC]\n\nPrints the agent guide's index, or one topic: {}\n",
+                names()
+            ),
+        ),
+        [name] => match topic(name) {
+            Some(text) => (0, text.to_owned()),
+            None => (
+                2,
+                format!("diffui skill: no topic {name:?}; topics: {}\n", names()),
+            ),
+        },
+        _ => (2, format!("diffui skill: name one topic: {}\n", names())),
+    }
+}
+
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "diffui ctl",
-    about = "Drive the running diffui (see `diffui skill`)"
+    about = "Drive the running diffui (see `diffui skill ctl`)"
 )]
 struct CtlCli {
     /// Print the app's answer as JSON.
@@ -468,7 +532,7 @@ struct CtlCli {
 enum Verb {
     /// Open repositories, the active one, its selection, revset and activity.
     State,
-    /// Open a repository (or a GitHub PR reference) as a tab.
+    /// Open a repository (or a pull request's link or reference) as a tab.
     Open { path: String },
     /// Show the revision a revset names.
     Select { revset: String },
@@ -483,7 +547,7 @@ enum Verb {
     },
     /// Show a toast.
     Toast { text: String },
-    /// Read config.toml's keys and commands again, and reload the plugins.
+    /// Read config.toml again, and reload the plugins.
     Reload,
     /// Every plugin, its state and why it failed if it did.
     Plugins,
@@ -667,31 +731,101 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"verb":"nope"}"#).is_err());
     }
 
-    /// The guide names every when-clause key and template variable the app
-    /// has, so an agent reading it isn't missing one.
+    /// The text of a topic, which must exist.
+    fn guide(name: &str) -> &'static str {
+        topic(name).unwrap_or_else(|| panic!("no topic {name}"))
+    }
+
+    /// Every verb a CLI's clap definition has, `help` aside.
+    fn verbs(cli: &clap::Command) -> Vec<String> {
+        cli.get_subcommands()
+            .map(|verb| verb.get_name().to_owned())
+            .filter(|verb| verb != "help")
+            .collect()
+    }
+
+    /// The index names every topic the way an agent asks for it, and every
+    /// subcommand the binary answers to; `diffui skill` prints it, a topic
+    /// prints that topic, and anything else fails with the list.
     #[test]
-    fn the_skill_names_every_key_and_variable() {
-        for key in crate::when::KEYS {
-            assert!(SKILL.contains(&format!("`{}`", key.name)), "{}", key.name);
+    fn the_index_names_every_topic_and_subcommand() {
+        for (name, text) in TOPICS {
+            assert!(SKILL.contains(&format!("`diffui skill {name}`")), "{name}");
+            assert!(text.starts_with("# "), "{name} has no heading");
         }
-        for (name, _) in crate::user_commands::VARS {
-            assert!(SKILL.contains(&format!("`{{{name}}}`")), "{name}");
+        // Each is a `client_main` in `main`: add a new one here.
+        for subcommand in ["skill", "ctl", "notes", "plugin", "diff", "jj"] {
+            assert!(
+                SKILL.contains(&format!("`diffui {subcommand}")),
+                "{subcommand}"
+            );
         }
-        for verb in [
-            "state", "open", "select", "commands", "run", "jj", "toast", "reload", "plugins",
-        ] {
-            assert!(SKILL.contains(&format!("`diffui ctl {verb}")), "{verb}");
+        let jj = diffui_core::cli::passthrough::JJ_VERSION;
+        assert!(SKILL.contains(&format!("links ({jj})")), "the jj version");
+        assert_eq!(skill_main(&[]), (0, SKILL.to_owned()));
+        assert_eq!(skill_main(&["notes".to_owned()]).1, guide("notes"));
+        let (code, said) = skill_main(&["nope".to_owned()]);
+        assert_eq!(code, 2);
+        assert!(said.contains("forge-plugin"), "{said}");
+        assert_eq!(skill_main(&["ctl".to_owned(), "ai".to_owned()]).0, 2);
+    }
+
+    /// The ctl reference names every verb `diffui ctl` has.
+    #[test]
+    fn the_ctl_topic_names_every_verb() {
+        use clap::CommandFactory as _;
+        let ctl = guide("ctl");
+        for verb in verbs(&CtlCli::command()) {
+            assert!(ctl.contains(&format!("`diffui ctl {verb}")), "{verb}");
         }
     }
 
-    /// The guide's plugin section names what a plugin author can reach: the
-    /// CLI's verbs, every import, event, forge method and read-only jj
-    /// command, and the reference plugin as it is shipped.
+    /// The commands reference names every when-clause key and template
+    /// variable the app has, and every command diffui ships as a row.
     #[test]
-    fn the_skill_names_the_whole_plugin_surface() {
+    fn the_commands_topic_names_every_key_variable_and_shipped_command() {
+        let commands = guide("commands");
+        for key in crate::when::KEYS {
+            assert!(
+                commands.contains(&format!("`{}`", key.name)),
+                "{}",
+                key.name
+            );
+        }
+        for (name, _) in crate::user_commands::VARS {
+            assert!(commands.contains(&format!("`{{{name}}}`")), "{name}");
+        }
+        let (shipped, problems) = crate::user_commands::parse_commands(
+            Path::new("commands.toml"),
+            crate::user_commands::SHIPPED,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!shipped.is_empty());
+        for command in shipped {
+            assert!(
+                commands.contains(&format!("`{}`", command.id)),
+                "{}",
+                command.id
+            );
+        }
+    }
+
+    /// The plugin references name what a plugin author can reach: the CLI's
+    /// verbs, every import, event, forge and AI method, and the reference
+    /// plugin as it is shipped. The d.ts is the contract they point at.
+    #[test]
+    fn the_plugin_topics_name_the_whole_plugin_surface() {
         use diffui_plugins::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS};
-        for verb in ["init", "check", "list", "eject"] {
-            assert!(SKILL.contains(&format!("`diffui plugin {verb}")), "{verb}");
+        let plugin = guide("plugin");
+        let forge = guide("forge-plugin");
+        for verb in verbs(&crate::plugins::cli::cli()) {
+            assert!(
+                SKILL.contains(&format!("`diffui plugin {verb}"))
+                    || TOPICS
+                        .iter()
+                        .any(|(_, text)| text.contains(&format!("`diffui plugin {verb}"))),
+                "{verb}"
+            );
         }
         for import in [
             "commands",
@@ -708,7 +842,7 @@ mod tests {
             "ai",
             "AiError",
         ] {
-            assert!(SKILL.contains(&format!("| `{import}` |")), "{import}");
+            assert!(plugin.contains(&format!("| `{import}` |")), "{import}");
             assert!(
                 diffui_plugins::TYPES.contains(&format!("export const {import}:"))
                     || diffui_plugins::TYPES.contains(&format!("export function {import}("))
@@ -716,12 +850,14 @@ mod tests {
                 "{import} isn't in diffui.d.ts"
             );
         }
-        for name in EVENT_NAMES.iter().chain(&FORGE_METHODS).chain(&AI_METHODS) {
-            assert!(SKILL.contains(&format!("`{name}`")), "{name}");
+        for name in EVENT_NAMES.iter().chain(&AI_METHODS) {
+            assert!(plugin.contains(&format!("`{name}`")), "{name}");
+        }
+        for name in FORGE_METHODS {
+            assert!(forge.contains(&format!("`{name}`")), "{name}");
         }
         for command in crate::plugins::READ_ONLY {
             let command = format!("`{}`", command.join(" "));
-            assert!(SKILL.contains(&command), "{command}");
             assert!(
                 diffui_plugins::TYPES.contains(&command),
                 "{command} in diffui.d.ts"
@@ -735,7 +871,7 @@ mod tests {
             "ui.clipboard.write",
             "ui.status.set",
         ] {
-            assert!(SKILL.contains(slot), "{slot}");
+            assert!(plugin.contains(slot), "{slot}");
         }
         for file in ["plugin.toml", "main.js"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -743,7 +879,7 @@ mod tests {
                 .join(file);
             let text = std::fs::read_to_string(&path).expect("the reference plugin");
             assert!(
-                SKILL.contains(text.trim_end()),
+                forge.contains(text.trim_end()),
                 "{file} isn't in the guide as shipped"
             );
         }
