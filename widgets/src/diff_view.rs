@@ -230,6 +230,10 @@ pub enum HeaderLine {
     /// A field of the commit info grid: a selectable value in colour runs,
     /// with badges, a link and buttons around it.
     Rich(Box<HeaderField>),
+    /// Where the [`Inset`]s at [`DocSpot::Header`] go, as tall as they
+    /// measure: the app's own elements inside the header (a description
+    /// rendered as Markdown). A header without one leaves them out.
+    Inset,
 }
 
 /// Height a header-only diff view needs to show `header` whole.
@@ -246,6 +250,8 @@ pub fn header_block_height(
         .map(|line| match line {
             HeaderLine::Spacer(height) => *height,
             HeaderLine::Title { .. } => HEADER_TITLE_ROW_HEIGHT,
+            // A header-only view lays no insets.
+            HeaderLine::Inset => 0.0,
             _ => row_height,
         })
         .sum::<f32>()
@@ -412,20 +418,24 @@ pub struct AnnotationGutter {
 }
 
 /// A place in the document, for what the app lays into it ([`Inset`]) and
-/// marks on the scrollbar ([`Mark`]): above the first file, under a file's
-/// header, or under one line.
+/// marks on the scrollbar ([`Mark`]): inside the header (at its
+/// [`HeaderLine::Inset`]), above the first file, under a file's header, or
+/// under one line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DocSpot {
+    Header,
     Top,
     File(usize),
     Line(LineAt),
 }
 
 impl DocSpot {
-    /// Document order: the top, then each file's header and its lines.
+    /// Document order: the header, the top, then each file's header and its
+    /// lines.
     fn order(self) -> (usize, usize, usize, usize) {
         match self {
-            Self::Top => (0, 0, 0, 0),
+            Self::Header => (0, 0, 0, 0),
+            Self::Top => (0, 1, 0, 0),
             Self::File(file) => (file + 1, 0, 0, 0),
             Self::Line(at) => (at.file + 1, 1, at.hunk, at.line),
         }
@@ -915,8 +925,10 @@ impl DiffProps {
         self
     }
 
-    /// Lay the app's blocks into the document (see [`Inset`]).
-    pub fn insets(mut self, mut insets: Vec<Inset>) -> Self {
+    /// Lay the app's blocks into the document (see [`Inset`]), beside any
+    /// laid already.
+    pub fn insets(mut self, insets: Vec<Inset>) -> Self {
+        let mut insets = [std::mem::take(&mut self.insets), insets].concat();
         insets.sort_by_key(|inset| inset.at);
         self.inset_heights = std::cell::RefCell::new(vec![0.0; insets.len()]);
         self.insets = insets;

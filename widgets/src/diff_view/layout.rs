@@ -410,6 +410,19 @@ impl HeightIndex {
     ) -> Option<(f32, f32)> {
         use super::DocSpot;
         let (top, height) = match spot {
+            // The header's insets carry their own tops.
+            DocSpot::Header => (
+                self.insets
+                    .iter()
+                    .find(|(slot, ..)| {
+                        props
+                            .insets
+                            .get(*slot)
+                            .is_some_and(|inset| inset.at == spot)
+                    })
+                    .map(|(_, top, _)| *top)?,
+                0.0,
+            ),
             DocSpot::Top => (0.0, 0.0),
             DocSpot::File(file) => (*self.file_tops.get(file)?, 0.0),
             DocSpot::Line(at) => match self.row_of_line(at.file, at.hunk, at.line) {
@@ -1255,8 +1268,28 @@ impl<'a> View<'a> {
         match line {
             HeaderLine::Spacer(height) => *height,
             HeaderLine::Title { .. } => super::HEADER_TITLE_ROW_HEIGHT,
+            HeaderLine::Inset => {
+                let heights = self.props.inset_heights.borrow();
+                self.props
+                    .insets
+                    .iter()
+                    .zip(heights.iter())
+                    .filter(|(inset, _)| inset.at == super::DocSpot::Header)
+                    .map(|(_, height)| *height)
+                    .sum()
+            }
             _ => self.metrics.row_height,
         }
+    }
+
+    /// Where the header's insets start, when it has a place for them.
+    fn header_inset_top(&self) -> Option<f32> {
+        let line = self
+            .props
+            .header
+            .iter()
+            .position(|line| matches!(line, HeaderLine::Inset))?;
+        Some(self.header_line_top(line))
     }
 
     /// Header row at a content-space y coordinate, accounting for variable-height
@@ -1591,6 +1624,9 @@ impl<'a> View<'a> {
                 .peekable(),
         };
         let lay = &mut insets;
+        if let Some(mut top) = self.header_inset_top() {
+            lay.lay(&mut index, super::DocSpot::Header, &mut top);
+        }
         lay.lay(&mut index, super::DocSpot::Top, &mut y);
         for (file_index, hunks) in self.hunks.iter().enumerate() {
             index.file_tops.push(y);

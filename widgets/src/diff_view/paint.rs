@@ -1547,7 +1547,7 @@ impl View<'_> {
                         clip,
                     );
                 }
-                HeaderLine::Blank | HeaderLine::Spacer(_) => {}
+                HeaderLine::Blank | HeaderLine::Spacer(_) | HeaderLine::Inset => {}
             }
             y += self.header_line_height(line);
         }
