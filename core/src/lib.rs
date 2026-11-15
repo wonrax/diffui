@@ -22,6 +22,7 @@ pub mod model;
 pub mod mutations;
 pub mod notes;
 pub mod partial;
+pub mod patch;
 pub mod plan;
 pub mod preview_graph;
 pub mod process;

@@ -273,6 +273,12 @@ pub fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
         .map(|time| time.timestamp_millis())
 }
 
+/// `millis` as a signature timestamp (`%Y-%m-%d %H:%M:%S %z`), in UTC.
+pub fn timestamp_from_millis(millis: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S %z").to_string())
+}
+
 /// A signature timestamp for people, in the offset it was made in:
 /// `Oct 19, 2026, 15:48`. `None` when it doesn't parse.
 pub fn human_timestamp(timestamp: &str) -> Option<String> {

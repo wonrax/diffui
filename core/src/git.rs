@@ -12,10 +12,10 @@ use tokio::process::Command;
 use crate::FetchTarget;
 use crate::diff_parse::{DiffStreamParser, parse_unified_diff};
 use crate::graph::assign_lanes;
-use crate::jj::large_diff::{self, DiffLimits, RowBudget};
+use crate::jj::large_diff::{DiffLimits, RowBudget};
 use crate::model::{
-    CommitSummary, DiffDocument, DiffFile, DiffHunkView, ParentBrief, RevisionDetails,
-    RevisionSelection, SignatureInfo, StreamRow,
+    CommitSummary, DiffDocument, DiffFile, ParentBrief, RevisionDetails, RevisionSelection,
+    SignatureInfo, StreamRow,
 };
 use crate::repository::{Repository, RepositorySnapshot};
 use crate::source_browse::{SourceEntry, SourceEntryStatus};
@@ -80,17 +80,7 @@ fn parse_capped(output: &str, limits: DiffLimits, expand: &[String]) -> DiffDocu
     let mut budget = RowBudget::new(limits);
     let mut files = Vec::new();
     let mut keep = |mut file: DiffFile| {
-        let changed = file.additions + file.deletions;
-        if changed > 0
-            && !expand.contains(&file.path)
-            && let Err(reason) = budget.admit(changed)
-        {
-            file.hunks = vec![DiffHunkView {
-                header: large_diff::collapsed_header(reason, changed),
-                lines: Vec::new(),
-            }];
-            file.collapsed = Some(reason);
-        }
+        budget.cap(&mut file, expand);
         files.push(file);
     };
     let mut parser = DiffStreamParser::default();

@@ -728,4 +728,7 @@ pub enum OpenSpec {
     Local { root: PathBuf, scope: PathBuf },
     /// A pull (or merge) request on a forge, streamed through its provider.
     ForgePr(crate::forge::ForgePr),
+    /// A patch, or two folders or files compared: a diff with no
+    /// repository behind it.
+    Diff(crate::patch::DiffInput),
 }

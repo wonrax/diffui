@@ -109,6 +109,23 @@ impl RowBudget {
         Ok(())
     }
 
+    /// Collapse a parsed `file` (rows already built) when it doesn't fit,
+    /// keeping its counts; charge it when it does. One the user expanded is
+    /// left whole.
+    pub fn cap(&mut self, file: &mut crate::model::DiffFile, expand: &[String]) {
+        let changed = file.additions + file.deletions;
+        if changed > 0
+            && !expand.contains(&file.path)
+            && let Err(reason) = self.admit(changed)
+        {
+            file.hunks = vec![crate::model::DiffHunkView {
+                header: collapsed_header(reason, changed),
+                lines: Vec::new(),
+            }];
+            file.collapsed = Some(reason);
+        }
+    }
+
     /// Whether a file changing `changed` lines would get rows, charging
     /// nothing.
     pub fn fits(&self, changed: usize) -> bool {

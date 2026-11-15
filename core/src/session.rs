@@ -1087,6 +1087,12 @@ impl Session {
                 }),
                 Effect::Activity(Activity::Note(message)),
             ],
+            // A source with no graph to snapshot (a compare of folders) has
+            // only its diff to load again.
+            Payload::RepositoryChanged if !self.capabilities.graph => {
+                self.pr_diffs.clear();
+                self.load_diff(self.selected_revision.clone())
+            }
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::DiffResolved {

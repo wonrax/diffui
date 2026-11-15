@@ -17,6 +17,7 @@
 //! the last tab closing take the actor with it.
 
 pub(crate) mod cancel;
+mod diff_actor;
 mod git_actor;
 mod jj_actor;
 mod pr_actor;
@@ -308,6 +309,7 @@ pub fn repo_id(spec: &OpenSpec) -> RepoId {
     match spec {
         OpenSpec::Local { root, .. } => RepoId(root.to_string_lossy().into_owned()),
         OpenSpec::ForgePr(pr) => RepoId(pr.key()),
+        OpenSpec::Diff(input) => RepoId(input.key()),
     }
 }
 
@@ -329,7 +331,7 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             fetch: true,
             ..Capabilities::default()
         },
-        OpenSpec::ForgePr(_) => Capabilities::default(),
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) => Capabilities::default(),
     }
 }
 
@@ -389,9 +391,9 @@ pub fn open_with(
             vcs: if is_jj(root) { Vcs::Jj } else { Vcs::Git },
             scope: scope.clone(),
         },
-        // A PR has no local checkout; the placeholder keeps `RepoHandle` one
-        // shape across every kind of source.
-        OpenSpec::ForgePr(_) => Repository {
+        // A PR or a patch has no local checkout; the placeholder keeps
+        // `RepoHandle` one shape across every kind of source.
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) => Repository {
             root: PathBuf::new(),
             vcs: Vcs::Git,
             scope: PathBuf::new(),
@@ -423,6 +425,7 @@ pub fn open_with(
             let provider = forges.provider(pr.kind);
             pr_actor::spawn(id, pr, provider, cmd_rx, event_tx)
         }
+        OpenSpec::Diff(input) => diff_actor::spawn(id, input, cmd_rx, cmd_tx.clone(), event_tx),
     }
 
     RepoEvents {

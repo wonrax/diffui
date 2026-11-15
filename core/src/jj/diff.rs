@@ -461,66 +461,7 @@ pub(crate) async fn diff_trees_with_copies(
             file.deletions = deletions;
             file.collapsed = Some(reason);
         } else {
-            let hunks = large_diff::hunks(
-                before_bytes,
-                after_bytes,
-                crate::partial::HUNK_CONTEXT,
-                budget.limits(),
-            );
-            for hunk in hunks {
-                let mut rows = Vec::new();
-                let mut old_line = hunk.left_line_range.start + 1;
-                let mut new_line = hunk.right_line_range.start + 1;
-                for (line_type, tokens) in hunk.lines {
-                    let (content, raw_emphasis) = diff_tokens_to_line(tokens);
-                    match line_type {
-                        DiffLineType::Context => {
-                            rows.push(DiffLine {
-                                kind: DiffLineKind::Context,
-                                old_line: Some(old_line),
-                                new_line: Some(new_line),
-                                content,
-                                syntax: Vec::new(),
-                                emphasis: Vec::new(),
-                            });
-                            old_line += 1;
-                            new_line += 1;
-                        }
-                        DiffLineType::Removed => {
-                            file.deletions += 1;
-                            let emphasis =
-                                crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
-                            rows.push(DiffLine {
-                                kind: DiffLineKind::Deletion,
-                                old_line: Some(old_line),
-                                new_line: None,
-                                content,
-                                syntax: Vec::new(),
-                                emphasis,
-                            });
-                            old_line += 1;
-                        }
-                        DiffLineType::Added => {
-                            file.additions += 1;
-                            let emphasis =
-                                crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
-                            rows.push(DiffLine {
-                                kind: DiffLineKind::Addition,
-                                old_line: None,
-                                new_line: Some(new_line),
-                                content,
-                                syntax: Vec::new(),
-                                emphasis,
-                            });
-                            new_line += 1;
-                        }
-                    }
-                }
-                file.hunks.push(DiffHunkView {
-                    header: format_hunk_header(&hunk.left_line_range, &hunk.right_line_range),
-                    lines: rows,
-                });
-            }
+            text_hunks(&mut file, before_bytes, after_bytes, budget.limits());
             if surely_fits {
                 // Within the bound `surely_fits` checked, so this admits.
                 let _ = budget.admit(file.additions + file.deletions);
@@ -932,6 +873,70 @@ pub(super) fn conflict_marker_char(line: &str) -> Option<u8> {
     match bytes.get(run) {
         None | Some(b' ') => Some(first),
         _ => None,
+    }
+}
+
+/// `file`'s hunks between the texts `before` and `after`, refined word by
+/// word within `limits`, its counts added up. What a tree diff and a
+/// folder compare both build a text file's rows with.
+pub(crate) fn text_hunks(
+    file: &mut DiffFile,
+    before: &[u8],
+    after: &[u8],
+    limits: large_diff::DiffLimits,
+) {
+    let hunks = large_diff::hunks(before, after, crate::partial::HUNK_CONTEXT, limits);
+    for hunk in hunks {
+        let mut rows = Vec::new();
+        let mut old_line = hunk.left_line_range.start + 1;
+        let mut new_line = hunk.right_line_range.start + 1;
+        for (line_type, tokens) in hunk.lines {
+            let (content, raw_emphasis) = diff_tokens_to_line(tokens);
+            match line_type {
+                DiffLineType::Context => {
+                    rows.push(DiffLine {
+                        kind: DiffLineKind::Context,
+                        old_line: Some(old_line),
+                        new_line: Some(new_line),
+                        content,
+                        syntax: Vec::new(),
+                        emphasis: Vec::new(),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                }
+                DiffLineType::Removed => {
+                    file.deletions += 1;
+                    let emphasis = crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
+                    rows.push(DiffLine {
+                        kind: DiffLineKind::Deletion,
+                        old_line: Some(old_line),
+                        new_line: None,
+                        content,
+                        syntax: Vec::new(),
+                        emphasis,
+                    });
+                    old_line += 1;
+                }
+                DiffLineType::Added => {
+                    file.additions += 1;
+                    let emphasis = crate::diff_parse::finish_line_emphasis(&content, raw_emphasis);
+                    rows.push(DiffLine {
+                        kind: DiffLineKind::Addition,
+                        old_line: None,
+                        new_line: Some(new_line),
+                        content,
+                        syntax: Vec::new(),
+                        emphasis,
+                    });
+                    new_line += 1;
+                }
+            }
+        }
+        file.hunks.push(DiffHunkView {
+            header: format_hunk_header(&hunk.left_line_range, &hunk.right_line_range),
+            lines: rows,
+        });
     }
 }
 

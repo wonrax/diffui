@@ -1304,6 +1304,18 @@ pub struct Outline {
 #[derive(Debug, Clone)]
 pub enum Subject {
     PullRequest(crate::forge::PrInfo),
+    /// A patch, or a series of them (each a step), read from `origin`.
+    Patch {
+        /// Where it came from: a path, "stdin", "Clipboard".
+        origin: String,
+        /// A series' cover letter, or a single patch's email.
+        mail: Option<crate::patch::Mail>,
+    },
+    /// Two files or two folders, compared.
+    Compare {
+        left: std::path::PathBuf,
+        right: std::path::PathBuf,
+    },
 }
 
 /// One of the ordered pieces an [`Outline`] is made of.
