@@ -372,7 +372,8 @@ fn the_open_app_shows_notes_live_and_replies_into_the_store() {
     ));
     assert!(reply.size.height > gpui_kit::px(10.0), "{reply:?}");
     assert_eq!(reply.origin.y, resolve.origin.y);
-    assert!(reply.right() <= resolve.left());
+    // Resolve, then Reply: the primary last.
+    assert!(resolve.right() <= reply.left());
     // The log row and the file row count it.
     let change = h.read(|ui| super::app::shown_change(ui.active()).unwrap().to_owned());
     assert_eq!(h.read(|ui| ui.active().notes.open_on_change(&change)), 1);
@@ -1267,6 +1268,67 @@ fn the_list_follows_the_stack_and_j_and_k_step_through_it() {
     h.frames();
     h.settle();
     assert_eq!(focused(&mut h), Some(a2));
+}
+
+/// Two changes' groups in the Notes list: a break between them, and each
+/// header's count in the column its rows' ages end in.
+#[test]
+fn the_notes_groups_stand_apart_and_count_in_the_age_column() {
+    let (repo, [whole, ..]) = stacked_repo("groups");
+    jj(&repo, &["new"]);
+    let later = add(&repo, &["--as", "claude", "On the next change."]);
+    let mut h = Harness::open(Some(&repo));
+    h.wait_for_graph();
+    h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == 5
+    });
+    h.perform(Action::SetMainView(crate::MainView::Notes));
+    h.settle();
+    h.frames();
+    // Each group: its change, its first thread, how many rows.
+    let groups: Vec<(String, String, usize)> = h.read(|ui| {
+        let mut groups: Vec<(String, String, usize)> = Vec::new();
+        for note in crate::notes::view::listed(ui.active()) {
+            let change = note.thread.change_id();
+            match groups.last_mut() {
+                Some(group) if group.0 == change => group.2 += 1,
+                _ => groups.push((change.to_owned(), note.thread.id.clone(), 1)),
+            }
+        }
+        groups
+    });
+    assert_eq!(groups.len(), 2, "two groups");
+    let firsts: Vec<&String> = groups.iter().map(|group| &group.1).collect();
+    assert!(firsts.contains(&&later) && firsts.contains(&&whole));
+    let changes: Vec<&String> = groups.iter().map(|group| &group.0).collect();
+    let x = |p: gpui_kit::Pixels| f32::from(p);
+    for (change, thread, _) in &groups {
+        let count = h.bounds(gpui_kit::ElementId::Name(
+            format!("notes-view-{change}-count").into(),
+        ));
+        let age = h.bounds(gpui_kit::ElementId::Name(
+            format!("notes-view-{thread}-age").into(),
+        ));
+        assert!(
+            (x(count.right()) - x(age.right())).abs() < 1.0,
+            "{count:?} {age:?}"
+        );
+    }
+    // The second header sits a section's gap below the first group's last row.
+    let first_header = h.bounds(gpui_kit::ElementId::Name(
+        format!("notes-view-{}-group", changes[0]).into(),
+    ));
+    let second_header = h.bounds(gpui_kit::ElementId::Name(
+        format!("notes-view-{}-group", changes[1]).into(),
+    ));
+    let first_rows = groups[0].2 as f32;
+    let gap = x(second_header.top())
+        - x(first_header.bottom())
+        - first_rows * crate::revision_list::REVISION_ROW_HEIGHT;
+    assert!(
+        (gap - crate::theme::space::LG).abs() < 1.0,
+        "a section's gap between groups: {gap}"
+    );
 }
 
 /// The Notes pane head's filter fills its track, the segments tiling it

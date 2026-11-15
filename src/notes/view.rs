@@ -68,6 +68,15 @@ pub(crate) fn listed(tab: &TabState) -> Vec<&Note> {
     keyed.into_iter().map(|(_, note)| note).collect()
 }
 
+/// A row's checkbox, and the slot it keeps at the row's end (its gap
+/// before it): a group header keeps the same slot, so its count lines up
+/// with its rows' ages.
+const CHECK_SIDE: f32 = 14.0;
+const CHECK_SLOT: f32 = space::SM + CHECK_SIDE;
+/// Between one change's group and the next: History's section spacing, a
+/// hairline in its middle.
+const GROUP_GAP: f32 = space::LG;
+
 fn id(name: &str, part: &str) -> ElementId {
     ElementId::Name(SharedString::from(format!("notes-view-{name}-{part}")))
 }
@@ -172,11 +181,9 @@ pub(crate) fn build_notes_sidebar(
         .flex()
         .flex_col()
         .bg(theme.panel_background)
-        .child(
-            header_bar(head, false, theme)
-                .border_b_1()
-                .border_color(theme.border),
-        );
+        // No rule under the head: the list fades under it once scrolled,
+        // as History's does.
+        .child(header_bar(head, false, theme));
 
     // What the head's control doesn't say: a filter from the menu, an
     // author, a change. Each clears with its own ✕.
@@ -257,6 +264,10 @@ pub(crate) fn build_notes_sidebar(
     for note in &listed {
         let thread = &note.thread;
         if change != Some(thread.change_id()) {
+            if change.is_some() {
+                list = list.child(group_break(theme));
+                y += GROUP_GAP;
+            }
             change = Some(thread.change_id());
             groups.push((y, note));
             list = list.child(group_header(note, &listed, ui, look, &on));
@@ -286,15 +297,37 @@ pub(crate) fn build_notes_sidebar(
             .relative()
             .flex_1()
             .min_h_0()
-            .child(ui::scrollable_with("notes-view-list", &handle, list))
+            .child(ui::scroll_list(
+                "notes-view-list",
+                &handle,
+                ui::ScrollList {
+                    fade: Some(theme.panel_background),
+                    ..Default::default()
+                },
+                list,
+            ))
+            // The pinned header stands where the list's top is, so the fade
+            // the list casts once scrolled hangs under it instead.
             .children(pinned.map(|note| {
                 div()
                     .absolute()
                     .top_0()
                     .left_0()
                     .right(px(crate::scrollbar::GUTTER))
-                    .bg(theme.panel_background)
-                    .child(group_header(note, &listed, ui, look, &on))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .bg(theme.panel_background)
+                            .child(group_header(note, &listed, ui, look, &on)),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(theme::list::TOP_FADE))
+                            .child(ui::top_fade(theme.panel_background)),
+                    )
             })),
     )
     .into_any_element()
@@ -304,6 +337,20 @@ pub(crate) fn build_notes_sidebar(
 /// id styled as an id, its description (or the log's no-description words)
 /// in the section label's weight, ellipsised, and its open notes' count at
 /// the end. Its text starts where its rows' does.
+/// The break between two changes' groups: History's section spacing with a
+/// hairline across the list in its middle.
+fn group_break(theme: theme::ThemeSpec) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(GROUP_GAP))
+        .flex_none()
+        .flex()
+        .items_center()
+        .px(px(crate::revision_list::ROW_CARD_INSET_X))
+        .child(div().w_full().h(px(1.0)).bg(theme.border))
+        .into_any_element()
+}
+
 fn group_header(note: &Note, listed: &[&Note], ui: &Diffui, look: Look, on: &Send) -> AnyElement {
     let Look { theme, font, mono } = look;
     let thread = &note.thread;
@@ -344,7 +391,15 @@ fn group_header(note: &Note, listed: &[&Note], ui: &Diffui, look: Look, on: &Sen
     ));
     if open > 0 {
         line.push(Aligned::text(
-            typography::line(open.to_string(), font, text_size::BODY, theme.subtle_text),
+            div()
+                .id(id(thread.change_id(), "count"))
+                .test_support()
+                .child(typography::line(
+                    open.to_string(),
+                    font,
+                    text_size::BODY,
+                    theme.subtle_text,
+                )),
             font,
             text_size::BODY,
         ));
@@ -352,6 +407,7 @@ fn group_header(note: &Note, listed: &[&Note], ui: &Diffui, look: Look, on: &Sen
     let _ = ui;
     div()
         .id(id(thread.change_id(), "group"))
+        .test_support()
         .cursor_pointer()
         .on_click(click(
             on,
@@ -365,9 +421,7 @@ fn group_header(note: &Note, listed: &[&Note], ui: &Diffui, look: Look, on: &Sen
         .justify_end()
         .pb(px(space::XS))
         .pl(px(ROW_CONTENT_LEFT))
-        .pr(px(crate::revision_list::ROW_CARD_INSET_X
-            + theme::list::PAD_END
-            - crate::revision_list::ROW_CARD_INSET_X))
+        .pr(px(theme::list::PAD_END + CHECK_SLOT))
         .bg(theme.panel_background)
         .child(typography::baseline_row(line, space::SM).min_w_0())
         .into_any_element()
@@ -433,12 +487,15 @@ fn row(
             SMALL_TEXT_SIZE,
         ),
         Aligned::text(
-            typography::line(
-                latest.map_or(String::new(), |message| age(message.at, now)),
-                font,
-                AGE_TEXT_SIZE,
-                theme.subtle_text,
-            ),
+            div()
+                .id(id(&thread.id, "age"))
+                .test_support()
+                .child(typography::line(
+                    latest.map_or(String::new(), |message| age(message.at, now)),
+                    font,
+                    AGE_TEXT_SIZE,
+                    theme.subtle_text,
+                )),
             font,
             AGE_TEXT_SIZE,
         ),
@@ -475,7 +532,7 @@ fn row(
     let check = div()
         .id(id(&thread.id, "check"))
         .flex_none()
-        .ml(px(space::SM))
+        .ml(px(CHECK_SLOT - CHECK_SIDE))
         .on_click(toggle)
         .child(checkbox(
             if picked {
@@ -668,8 +725,6 @@ fn stack_header(note: &Note, shown: usize, ui: &Diffui, look: Look, cx: &mut Cx)
         .px(px(DETAIL_EDGE))
         .pt(px(space::LG))
         .pb(px(space::MD))
-        .border_b_1()
-        .border_color(theme.border)
         .child(
             div()
                 .w_full()
@@ -967,9 +1022,8 @@ fn action_bar(ui: &Diffui, look: Look, cx: &mut Cx) -> AnyElement {
 /// The change-selection checkbox, as the diff and the file list draw it.
 fn checkbox(state: CheckState, look: Look) -> AnyElement {
     let Look { theme, .. } = look;
-    const SIDE: f32 = 14.0;
     div()
-        .size(px(SIDE))
+        .size(px(CHECK_SIDE))
         .flex_none()
         .child(
             canvas(

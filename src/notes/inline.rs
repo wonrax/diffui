@@ -614,7 +614,7 @@ impl Card {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(theme::space::XS))
+            .gap(px(theme::space::SM))
             .w_full()
             .min_w_0()
             .px(px(CARD_PAD))
@@ -632,28 +632,30 @@ impl Card {
                     .tip("Copy as Markdown")
                     .on_click(self.send(NotesMsg::Copy(vec![thread.id.clone()]))),
             );
-        if thread.resolved.is_none() {
-            row = row.child(
-                self.look
-                    .button(id(&thread.id, "reply"), "Reply")
-                    .ghost()
-                    .small()
-                    .on_click(self.send(NotesMsg::StartReply(thread.id.clone()))),
-            );
-        }
+        // The thread's two actions filled, so they read at a glance: Resolve
+        // (or Reopen) raised, Reply the primary, last as primaries sit.
         let (label, message) = if thread.resolved.is_some() {
             ("Reopen", NotesMsg::Reopen(vec![thread.id.clone()]))
         } else {
             ("Resolve", NotesMsg::Resolve(vec![thread.id.clone()]))
         };
-        row.child(
+        row = row.child(
             self.look
                 .button(id(&thread.id, "resolve"), label)
-                .ghost()
+                .raised()
                 .small()
                 .on_click(self.send(message)),
-        )
-        .into_any_element()
+        );
+        if thread.resolved.is_none() {
+            row = row.child(
+                self.look
+                    .button(id(&thread.id, "reply"), "Reply")
+                    .primary()
+                    .small()
+                    .on_click(self.send(NotesMsg::StartReply(thread.id.clone()))),
+            );
+        }
+        row.into_any_element()
     }
 }
 
