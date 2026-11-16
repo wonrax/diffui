@@ -69,18 +69,11 @@ pub(crate) struct KeyDef {
 /// Every key a clause can name.
 pub(crate) static KEYS: &[KeyDef] = &[
     KeyDef {
-        // "jj", "git" or "pr" (a pull-request tab)
+        // what the active tab is: "jj", "git", "pr", "patch" or "compare"
         name: "repo.kind",
-        read: |ui, _| match &ui.active().repository {
-            Some(repository) => Value::Text(
-                match repository.vcs {
-                    crate::repository::Vcs::Jj => "jj",
-                    crate::repository::Vcs::Git => "git",
-                }
-                .to_owned(),
-            ),
-            None if ui.tabs.is_empty() => Value::Missing,
-            None => Value::Text("pr".to_owned()),
+        read: |ui, _| match ui.tabs.get(ui.active) {
+            Some(tab) => Value::Text(tab.source.kind().to_owned()),
+            None => Value::Missing,
         },
     },
     KeyDef {

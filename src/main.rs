@@ -1044,6 +1044,20 @@ pub(crate) enum TabSource {
     Diff(diffui_core::patch::DiffInput),
 }
 
+impl TabSource {
+    /// What the tab is, as `ctl state` and the `repo.kind` when-key name
+    /// it: "jj", "git", "pr", "patch" or "compare".
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Repo { vcs: Vcs::Jj, .. } => "jj",
+            Self::Repo { .. } => "git",
+            Self::ForgePr(_) => "pr",
+            Self::Diff(diffui_core::patch::DiffInput::Patch(_)) => "patch",
+            Self::Diff(diffui_core::patch::DiffInput::Compare { .. }) => "compare",
+        }
+    }
+}
+
 /// One open tab: its identity + display metadata, plus the per-tab state it
 /// owns outright — active or not.
 #[derive(Debug)]

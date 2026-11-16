@@ -9,7 +9,7 @@ bring it forward; otherwise the active tab).
 | Verb | Does |
 |---|---|
 | `diffui ctl state` | Open tabs (tab, root, name, kind `jj`/`git`/`pr`/`patch`/`compare`, which is active), the selected revision (change id, commit id, first line, bookmarks, whether it's `@`), the log's revset, and the active tab's ten latest activity rows (label, status, result, equivalent command). |
-| `diffui ctl open <path>` | Open a repository, or a pull request (`https://github.com/o/r/pull/12`, `o/r#12`, a GitLab `https://host/group/name/-/merge_requests/7` or `group/name!7`), as a tab. Answers with `state`. A patch file opens with `diffui <file>` instead (`diffui skill patches`). |
+| `diffui ctl open <path>` | Open a repository, or a pull request (`https://github.com/o/r/pull/12`, `o/r#12`, a GitLab `https://host/group/name/-/merge_requests/7` or `group/name!7`), as a tab. A patch file opens as a patch, by the same rule as `diffui <file>` (`diffui skill patches`). Answers with `state`. |
 | `diffui ctl select <revset>` | Show the revision `<revset>` names, as `jj show` would. |
 | `diffui ctl commands` | Every command id, its label, whether it was declared in config (`declared`), and whether it can run now (`available`, with `reason` when not). |
 | `diffui ctl run <id>` | Run a command by id, as its key would, on the selected revision (select one first). Fails with the reason when it can't run now. |

@@ -267,6 +267,31 @@ fn a_second_diffui_hands_its_patch_to_the_running_app() {
     assert_eq!(header(&mut h).title.as_deref(), Some("Count the bugs"));
 }
 
+#[test]
+fn ctl_open_takes_a_patch_file_and_when_clauses_see_the_tab_kind() {
+    let mut h = Harness::open(None);
+    let (reply, answer) = futures::channel::oneshot::channel();
+    let request = Request::Open {
+        path: fixture("format-patch.patch").display().to_string(),
+    };
+    h.act(|ui, cx| ui.on_ctl_request(request, reply, cx));
+    assert_eq!(
+        futures::executor::block_on(answer).expect("an answer")["ok"],
+        true
+    );
+    h.wait_until("the patch", loaded);
+    assert_eq!(h.read(kind), "patch");
+    h.read(|ui| {
+        use crate::when::Keys as _;
+        let arg = crate::commands::CommandArg::None;
+        let keys = crate::when::AppKeys { ui, arg: &arg };
+        assert_eq!(
+            keys.get("repo.kind"),
+            crate::when::Value::Text("patch".to_owned())
+        );
+    });
+}
+
 /// Kills the tool's process if the test fails before it ends, so no
 /// process outlives the run.
 struct Reaped(Child);

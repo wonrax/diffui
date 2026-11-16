@@ -113,7 +113,7 @@ a key that doesn't exist reads as false and `reload` reports it.
 
 | Key | Value |
 |---|---|
-| `repo.kind` | `"jj"`, `"git"` or `"pr"` (a pull-request tab) |
+| `repo.kind` | what the active tab is: `"jj"`, `"git"`, `"pr"`, `"patch"` or `"compare"` |
 | `repo.mutate` | the repository can be rewritten (jj) |
 | `repo.forge` | `"github"`, `"gitlab"` or a forge plugin's id: the forge one of the repository's remotes is on |
 | `ai` | an AI provider is picked (or found automatically) and set up |

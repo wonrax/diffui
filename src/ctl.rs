@@ -61,7 +61,8 @@ pub(crate) enum Request {
     /// The open repositories, the active one, its selected revision and
     /// revset, and its latest activity.
     State,
-    /// Open a repository (or a pull request's link or reference) as a tab.
+    /// Open a repository, a patch file, or a pull request's link or
+    /// reference as a tab.
     Open { path: String },
     /// Show the revision `revset` names, the way `jj show` would.
     Select {
@@ -239,7 +240,14 @@ impl Diffui {
         let answer = match request {
             Request::State => Ok(self.ctl_state()),
             Request::Open { path } => {
-                self.open_repository(&path, cx);
+                // A patch file opens as a patch, by the rule the command line
+                // uses; `-` means nothing here, since the app has no stdin.
+                match crate::opened::patch_origin(std::path::Path::new(&path)) {
+                    Some(origin) if path != "-" => {
+                        self.open_diff(diffui_core::patch::DiffInput::Patch(origin), cx);
+                    }
+                    _ => self.open_repository(&path, cx),
+                }
                 Ok(self.ctl_state())
             }
             Request::Toast { text } => {
@@ -310,15 +318,7 @@ impl Diffui {
                 json!({
                     "tab": tab.id.0,
                     "root": state.repository.as_ref().map(|repository| repository.root.display().to_string()),
-                    "kind": match &tab.source {
-                        crate::TabSource::Repo { vcs: crate::Vcs::Jj, .. } => "jj",
-                        crate::TabSource::Repo { .. } => "git",
-                        crate::TabSource::ForgePr(_) => "pr",
-                        crate::TabSource::Diff(diffui_core::patch::DiffInput::Patch(_)) => "patch",
-                        crate::TabSource::Diff(diffui_core::patch::DiffInput::Compare { .. }) => {
-                            "compare"
-                        }
-                    },
+                    "kind": tab.source.kind(),
                     "name": tab.name,
                     "active": self.is_active(tab.id),
                 })
@@ -532,7 +532,8 @@ struct CtlCli {
 enum Verb {
     /// Open repositories, the active one, its selection, revset and activity.
     State,
-    /// Open a repository (or a pull request's link or reference) as a tab.
+    /// Open a repository, a patch file, or a pull request's link or
+    /// reference as a tab.
     Open { path: String },
     /// Show the revision a revset names.
     Select { revset: String },
