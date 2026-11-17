@@ -915,6 +915,8 @@ fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl Into
         .saturating_duration_since(opened_at)
         .as_secs_f32();
     let pulse = 0.5 + 0.5 * (elapsed * GLOW_PULSE_SPEED).sin();
+    // Overall opacity, 0.45..1.0 like the macOS layer's opacity animation.
+    let opacity = 0.45 + 0.55 * pulse;
     let accent = theme.accent;
     let radius = crate::theme::list::radius(rect.height);
     div()
@@ -928,23 +930,25 @@ fn glow_card(theme: ThemeSpec, rect: Rectangle, opened_at: Instant) -> impl Into
         .child(crate::squircle::background(
             crate::squircle::Fill::new(crate::squircle::Corners::all(radius))
                 .background(Color {
-                    a: 0.10 + 0.14 * pulse,
+                    a: 0.22 * opacity,
                     ..accent
                 })
                 .border(
                     1.5,
                     Color {
-                        a: 0.55 + 0.45 * pulse,
+                        a: opacity,
                         ..accent
                     },
                 ),
             0.0,
         ))
-        // A soft accent halo: the "glow" half of the effect, pulsing with the
-        // border.
+        // A soft accent halo: the "glow" half of the effect. Unlike a
+        // CoreAnimation shadow, which follows the layer's alpha and so stays faint
+        // under the translucent fill, this one paints a solid blurred rect under
+        // the whole row, so it has to stay faint to keep the row readable.
         .shadow(vec![BoxShadow {
             color: Hsla::from(Color {
-                a: 0.5 + 0.4 * pulse,
+                a: 0.25 * opacity,
                 ..accent
             }),
             offset: point(px(0.0), px(0.0)),
