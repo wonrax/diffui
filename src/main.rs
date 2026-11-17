@@ -100,8 +100,8 @@ pub(crate) use diffui_core::{
 // were modules of this crate.
 pub(crate) use diffui_widgets::{
     chip, chrome, diff_view, ellipsis, geometry, graph_view, hunk_actions, icons, input, keys,
-    markdown, measure, prose, resize_handle, revision_list, scrollbar, squircle, theme, typography,
-    ui,
+    markdown, measure, prose, resize_handle, revision_list, scrollbar, squircle, system_fonts,
+    theme, typography, ui,
 };
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It

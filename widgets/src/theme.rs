@@ -42,8 +42,10 @@ pub struct Font {
 impl Font {
     /// The platform UI font.
     pub const DEFAULT: Self = Self::new(".SystemUIFont");
-    /// The platform's monospaced font.
-    pub const MONOSPACE: Self = Self::new(if cfg!(windows) { "Consolas" } else { "Menlo" });
+    /// The platform's monospaced font. Its family stands for the one
+    /// [`crate::system_fonts::monospace`] picks; [`Self::resolved_family`]
+    /// names it.
+    pub const MONOSPACE: Self = Self::new(MONOSPACE_FAMILY);
 
     pub const fn new(family: &'static str) -> Self {
         Self {
@@ -52,13 +54,24 @@ impl Font {
         }
     }
 
+    /// The installed family this font draws with.
+    pub fn resolved_family(self) -> &'static str {
+        if self.family == MONOSPACE_FAMILY {
+            crate::system_fonts::monospace().family
+        } else {
+            self.family
+        }
+    }
+
     pub fn gpui(self) -> gpui_kit::Font {
         gpui_kit::Font {
             weight: self.weight,
-            ..gpui_kit::font(self.family)
+            ..gpui_kit::font(self.resolved_family())
         }
     }
 }
+
+const MONOSPACE_FAMILY: &str = ".Monospace";
 
 /// `base` at `weight`. CoreText resolves weights of the system font too.
 pub fn emphasis_font(base: Font, weight: Weight) -> Font {

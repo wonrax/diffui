@@ -307,7 +307,7 @@ fn paragraph(id: &str, text: &Inlines, look: MarkdownLook, on_link: &OnLink) -> 
                 ..Default::default()
             },
             Span::Code => {
-                monospace.push((range.clone(), mono.family.into()));
+                monospace.push((range.clone(), mono.resolved_family().into()));
                 HighlightStyle {
                     background_color: Some(code_fill(theme).into()),
                     ..Default::default()

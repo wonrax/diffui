@@ -175,6 +175,8 @@ pub(crate) fn reveal_path(path: &Path) {
 fn font_label(font: Font) -> String {
     if font == Font::DEFAULT {
         "System font".to_owned()
+    } else if font == Font::MONOSPACE {
+        format!("System monospace ({})", font.resolved_family())
     } else {
         font.family.to_owned()
     }

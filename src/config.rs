@@ -16,14 +16,15 @@
 //!                          Falls back to the system default when unset.
 //!   mono_font            — family used for code/IDs.
 //!                          Falls back to the platform's default monospace
-//!                          family.
+//!                          family (see `system_fonts`).
 //!   multi_click_ms       — max ms between clicks to count as a multi-click in
 //!                          the diff view. Defaults to 350.
 //!   theme                — color theme: System | Light | Dark | Contrast.
 //!                          `System` follows the OS appearance. Defaults to
 //!                          System.
 //!   code_font_size       — px size of the code surfaces (diff view, source
-//!                          browser, description editor). Defaults to 12.
+//!                          browser, description editor). Defaults to the
+//!                          platform's (see `system_fonts`).
 //!   code_line_height     — row height of the diff/source grid as a multiple
 //!                          of `code_font_size`. Defaults to 1.85.
 //!   code_baseline_offset — px nudge of code text within its row; positive
@@ -206,7 +207,7 @@ impl AppConfig {
                 size: raw
                     .code_font_size
                     .map(|size| clamp(size, CODE_FONT_SIZE))
-                    .unwrap_or(defaults.size),
+                    .unwrap_or_else(|| crate::system_fonts::monospace().size),
                 line_height: raw
                     .code_line_height
                     .map(|factor| clamp(factor, CODE_LINE_HEIGHT))
