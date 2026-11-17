@@ -118,6 +118,7 @@ pub const TERMINAL: &str = "\u{e181}"; // terminal
 pub const LIST_CHECKS: &str = "\u{e1d0}"; // list-checks
 pub const PANEL_LEFT: &str = "\u{e12a}"; // panel-left
 pub const ELLIPSIS: &str = "\u{e0b6}"; // ellipsis
+pub const MENU: &str = "\u{e115}"; // menu
 pub const SCISSORS: &str = "\u{e14e}"; // scissors
 pub const MOVE: &str = "\u{e121}"; // move
 pub const ARROW_DOWN_TO_LINE: &str = "\u{e455}"; // arrow-down-to-line

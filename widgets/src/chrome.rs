@@ -23,6 +23,10 @@
 //!     Aero Snap, Snap Layouts on the maximize button, the double-click zoom
 //!     and the system menu, none of which a hand-rolled drag would.
 //!
+//! macOS fills its global menu bar from the command registry; everywhere else
+//! the same menus open from a ☰ button at the strip's leading edge (see
+//! [`app_menu_button`]).
+//!
 //! Centralizing the policy here keeps `main` / `tab_bar` platform-agnostic, so
 //! extending to full custom chrome on Windows/Linux is a change in one place
 //! rather than `cfg!`s scattered across the UI.
@@ -74,6 +78,12 @@ pub fn trailing_inset() -> f32 {
     } else {
         0.0
     }
+}
+
+/// Whether the strip leads with a ☰ button holding the application menus:
+/// everywhere but macOS, whose menus live in the global menu bar.
+pub fn app_menu_button() -> bool {
+    !cfg!(target_os = "macos")
 }
 
 /// Platform spelling of the primary command modifier for UI hints — `⌘` on

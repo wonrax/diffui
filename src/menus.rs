@@ -1157,6 +1157,17 @@ impl Diffui {
             Some(gpui_kit::MouseButton::Left),
         )));
     }
+
+    /// The tab strip's ☰ ([`crate::chrome::app_menu_button`]): the
+    /// application menus, dropped below `anchor` like a toolbar dropdown.
+    pub(crate) fn on_open_app_menu(&mut self, anchor: Rectangle) {
+        self.pop_mode(ModeKind::ActivityPopover);
+        self.push_mode(Mode::Menu(menu::OverlayMenu::new(
+            crate::app_menu::overlay(self),
+            menu::AnchorSpec::Below(anchor),
+            Some(gpui_kit::MouseButton::Left),
+        )));
+    }
 }
 
 /// A glow tracing the revision or file row at `rect`.

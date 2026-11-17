@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, Div, FontFallbacks, MouseButton, MouseMoveEvent,
+    AnyElement, App, Bounds, Div, FontFallbacks, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Window, WindowControlArea, canvas, deferred, div, px,
 };
 
@@ -45,7 +45,7 @@ const TAB_TEXT_SIZE: f32 = text_size::BODY;
 /// strip's other controls.
 const TAB_HEIGHT: f32 = 28.0;
 
-/// Room around the tabs'  inside its clip, so the active tab's drop
+/// Room around the tabs' row inside its clip, so the active tab's drop
 /// shadow (1px down, 2px of blur) isn't cut off at the strip's bottom.
 const TAB_RING_ROOM: f32 = 4.0;
 
@@ -618,6 +618,9 @@ pub(crate) fn build_tab_bar(
         .h_full()
         .w_full()
         .when(inset > 0.0, |row| row.child(div().w(px(inset)).flex_none()))
+        .when(chrome::app_menu_button(), |row| {
+            row.child(app_menu_button(look, cx))
+        })
         // `+` stays with the tabs; the search field gives way to its floor, then
         // the tabs squeeze.
         .child(
@@ -921,6 +924,28 @@ fn add_button(look: Look, cx: &mut Cx) -> impl IntoElement {
         .flex_none()
         .child(icons::icon(icons::PLUS, 15.0, theme.muted_text))
         .on_click(Diffui::on_action(Action::OpenRepoDialog, cx))
+}
+
+/// The ☰ holding the application menus where there's no global menu bar to
+/// put them in. Opens on the press, as the toolbar's dropdowns do.
+fn app_menu_button(look: Look, cx: &mut Cx) -> impl IntoElement {
+    let Look { theme, .. } = look;
+    let (anchor, tracker) = crate::menu::anchor_tracker();
+    let open = Diffui::listen(cx, move |this, _: &MouseDownEvent, _, _| {
+        this.on_open_app_menu(anchor.get());
+    });
+    div()
+        .relative()
+        .flex_none()
+        .when(chrome::caption_buttons(), |wrapper| wrapper.occlude())
+        .child(tracker)
+        .child(
+            look.bare_button("app-menu")
+                .size(px(TAB_HEIGHT))
+                .p(px(0.0))
+                .child(icons::icon(icons::MENU, 15.0, theme.muted_text)),
+        )
+        .on_mouse_down(MouseButton::Left, open)
 }
 
 /// The window's minimize / maximize / close buttons, where we draw them
