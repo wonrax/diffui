@@ -8,10 +8,13 @@
 
 use crate::Cx;
 use crate::Diffui;
-use crate::commands::{CommandArg, CommandId};
+#[cfg(target_os = "macos")]
+use crate::commands::CommandArg;
+use crate::commands::CommandId;
 
 impl Diffui {
     /// A menu-bar pick: `tag` names the command through [`tag_of`].
+    #[cfg(target_os = "macos")]
     pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
         if let Some(id) = command_of(tag) {
             self.run_command(&id, CommandArg::None, cx)
@@ -100,6 +103,7 @@ fn tag_of(id: &str) -> u32 {
 }
 
 /// The command `tag` stands for.
+#[cfg(target_os = "macos")]
 fn command_of(tag: u32) -> Option<CommandId> {
     let tags = TAG_IDS
         .lock()

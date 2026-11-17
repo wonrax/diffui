@@ -12,6 +12,7 @@
 //! (`assets/agent/SKILL.md`), and `diffui skill <topic>` one of its
 //! references (`assets/agent/<topic>.md`).
 
+#[cfg(unix)]
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -20,7 +21,9 @@ use futures::channel::{mpsc, oneshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::app_files::{AppDir, app_file, write_atomic};
+#[cfg(unix)]
+use crate::app_files::write_atomic;
+use crate::app_files::{AppDir, app_file};
 use crate::commands::CommandArg;
 use crate::{Cx, Diffui, TabId};
 
@@ -606,13 +609,17 @@ fn ctl_main() -> i32 {
 }
 
 /// The running app's socket, when one answers there.
+#[cfg(unix)]
 pub(crate) fn running_socket() -> Option<PathBuf> {
     let socket = std::fs::read(socket_file()?).ok()?;
     let socket = PathBuf::from(String::from_utf8_lossy(&socket).into_owned());
-    #[cfg(unix)]
-    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-        return Some(socket);
-    }
+    std::os::unix::net::UnixStream::connect(&socket)
+        .is_ok()
+        .then_some(socket)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn running_socket() -> Option<PathBuf> {
     None
 }
 

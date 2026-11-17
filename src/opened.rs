@@ -6,6 +6,7 @@
 //! `ctl` socket. `diffui diff` then waits until that tab closes: jj and git
 //! delete the folders they compare once their tool exits.
 
+#[cfg(unix)]
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -449,6 +450,6 @@ fn waiting_command() -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "opened_scenarios.rs"]
 mod scenarios;

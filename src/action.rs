@@ -91,6 +91,7 @@ pub(crate) enum Action {
     /// Open the clipboard's text as a patch, in a tab of its own.
     OpenClipboardPatch,
     /// Pick a local working-copy directory with the native folder chooser.
+    #[cfg(target_os = "macos")]
     ChooseRepoFolder,
     /// Resolve the dialog's path and open it as a tab — or, with a folder
     /// suggestion highlighted, act on that row as a click would.

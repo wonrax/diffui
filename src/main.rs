@@ -7,7 +7,7 @@ use std::{
 mod action;
 mod activity;
 mod ai;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod ai_scenarios;
 mod app_files;
 mod app_menu;

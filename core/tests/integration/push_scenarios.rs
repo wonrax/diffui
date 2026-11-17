@@ -802,6 +802,7 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
 /// logs each call and prints a signature-shaped blob, or fails like a
 /// cancelled prompt. Returns the repo config that signs through it with
 /// `behavior`, plus `extra`, and the call log's path.
+#[cfg(unix)]
 fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -835,10 +836,12 @@ fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (Strin
 }
 
 /// How many times the signer ran.
+#[cfg(unix)]
 fn sign_calls(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
 }
 
+#[cfg(unix)]
 fn is_signed(root: &Path, commit_id: &str) -> bool {
     harness::block_on(async {
         let workspace = harness::load_workspace(root);
@@ -853,6 +856,7 @@ fn is_signed(root: &Path, commit_id: &str) -> bool {
 }
 
 /// Whether the commit at `refs/heads/<name>` on the remote carries a signature.
+#[cfg(unix)]
 fn remote_signed(remote: &Path, name: &str) -> bool {
     harness::run_git(
         remote,
@@ -863,6 +867,7 @@ fn remote_signed(remote: &Path, name: &str) -> bool {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_with_everything_signed_pushes_without_rewriting() {
     let (config, log) = signing_config("push-sign-all-signed", "own", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-all-signed", Some(&config)) else {
@@ -894,6 +899,7 @@ fn sign_on_push_with_everything_signed_pushes_without_rewriting() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_signs_unsigned_commits_then_pushes_them() {
     let (config, _log) = signing_config("push-sign-unsigned", "keep", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-unsigned", Some(&config)) else {
@@ -946,6 +952,7 @@ fn sign_on_push_signs_unsigned_commits_then_pushes_them() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_signs_before_a_move_and_push_and_a_change_push() {
     let (config, _log) = signing_config("push-sign-move", "keep", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-move", Some(&config)) else {
@@ -980,6 +987,7 @@ fn sign_on_push_signs_before_a_move_and_push_and_a_change_push() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_skips_immutable_commits_with_a_warning() {
     let (config, _log) = signing_config(
         "push-sign-immutable",
@@ -1025,6 +1033,7 @@ fn sign_on_push_skips_immutable_commits_with_a_warning() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
     let (config, log) = signing_config("push-sign-fails", "keep", true, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-fails", Some(&config)) else {

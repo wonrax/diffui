@@ -2,12 +2,17 @@
 //! local servers standing in for Anthropic and OpenAI and scripts standing in
 //! for `claude` and `codex`. Nothing here reaches a real API or program.
 
+#[cfg(unix)]
 use std::io::{BufReader, Write};
+#[cfg(unix)]
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use diffui_plugins::protocol::{AiCall, AiRequest, PluginCall};
@@ -15,9 +20,9 @@ use diffui_plugins::secrets::{self, FileStore, SecretStore};
 use diffui_plugins::{BUNDLED, PluginError};
 use serde_json::{Value, json};
 
-use crate::support::{
-    PATIENCE, Request, Response, Server, Setup, TestPlugin, read_request, scratch,
-};
+#[cfg(unix)]
+use crate::support::read_request;
+use crate::support::{PATIENCE, Request, Response, Server, Setup, TestPlugin, scratch};
 
 /// Keys in the shell would stand in for the stored ones.
 fn without_keys() {
@@ -379,10 +384,9 @@ fn openai_compatible_streams_and_needs_a_model() {
     assert_eq!(kind("long").0, "failed");
 }
 
-/// A stand-in program: keeps its arguments, stdin and directory beside
-/// itself, then runs `body`.
 /// A `stream_event` line with a text delta, as `claude -p --output-format
 /// stream-json --include-partial-messages` prints one.
+#[cfg(unix)]
 fn delta_line(text: &str) -> String {
     json!({
         "type": "stream_event",
@@ -392,6 +396,7 @@ fn delta_line(text: &str) -> String {
 }
 
 /// A script body printing `lines`, a line each.
+#[cfg(unix)]
 fn printing(lines: &[String]) -> String {
     lines
         .iter()
@@ -399,6 +404,9 @@ fn printing(lines: &[String]) -> String {
         .collect()
 }
 
+/// A stand-in program: keeps its arguments, stdin and directory beside
+/// itself, then runs `body`.
+#[cfg(unix)]
 fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
     let script = dir.join(name);
     std::fs::write(
@@ -413,6 +421,7 @@ fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 #[test]
+#[cfg(unix)]
 fn claude_code_and_codex_run_their_programs() {
     let dir = scratch("cli");
     let repo = dir.join("repo");
@@ -520,6 +529,7 @@ fn claude_code_and_codex_run_their_programs() {
 
 /// A server that sends one SSE event every `gap`, forever, and says when
 /// the connection went away.
+#[cfg(unix)]
 fn trickling_server(gap: Duration) -> (String, mpsc::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host = listener.local_addr().unwrap().to_string();
@@ -558,6 +568,7 @@ fn trickling_server(gap: Duration) -> (String, mpsc::Receiver<()>) {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_cancel_mid_stream_aborts_the_request_and_kills_the_program() {
     let (host, closed) = trickling_server(Duration::from_millis(50));
     let plugin = provider(
@@ -638,6 +649,7 @@ fn a_cancel_mid_stream_aborts_the_request_and_kills_the_program() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_old_claude_without_streaming_answers_in_plain_text() {
     let dir = scratch("old-claude");
     let program = fake_program(

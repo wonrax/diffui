@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::Cx;
+#[cfg(target_os = "macos")]
 use crate::commands::CommandId;
 use crate::prose::Prose;
 use diffui_core::forge::ForgeAbility;
@@ -986,8 +987,8 @@ impl Diffui {
     /// The system folder picker, then opening what was chosen. Its panel runs a
     /// modal loop like a menu's, so it runs outside any update for the same reason
     /// ([`Self::popup`]).
+    #[cfg(target_os = "macos")]
     pub(crate) fn choose_repo_folder(&mut self, cx: &mut Cx) {
-        #[cfg(target_os = "macos")]
         cx.spawn(async move |this, cx| {
             let chosen = macos_native::choose_repository_folder();
             let _ = this.update(cx, |this, cx| {
@@ -998,8 +999,6 @@ impl Diffui {
             });
         })
         .detach();
-        #[cfg(not(target_os = "macos"))]
-        let _ = cx;
     }
 
     /// macOS: pop the file context menu natively, glowing over the row, and
@@ -1027,7 +1026,7 @@ impl Diffui {
         display_index: usize,
         row_rect: Rectangle,
         cursor: Point,
-        cx: &mut Cx,
+        _cx: &mut Cx,
     ) {
         let tree = self.file_context_menu_tree(display_index);
         if tree.is_empty() {
@@ -1066,7 +1065,7 @@ impl Diffui {
         selection: RevisionSelection,
         row_rect: Rectangle,
         cursor: Point,
-        cx: &mut Cx,
+        _cx: &mut Cx,
     ) {
         let tree = self.revision_menu_tree(&selection);
         // Opened by the right button: its release is the one that opened the
@@ -1140,7 +1139,12 @@ impl Diffui {
     /// Non-macOS: open the overlay dropdown, anchored edge-to-edge below the
     /// trigger's rect.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn open_toolbar_menu(&mut self, which: ToolbarMenu, anchor: Rectangle, cx: &mut Cx) {
+    pub(crate) fn open_toolbar_menu(
+        &mut self,
+        which: ToolbarMenu,
+        anchor: Rectangle,
+        _cx: &mut Cx,
+    ) {
         let root = match which {
             ToolbarMenu::FetchBranches => self.fetch_menu_entries(),
             ToolbarMenu::RevsetPresets => self.revset_menu_entry_tree(),

@@ -17,16 +17,19 @@
 
 #[cfg(unix)]
 use std::io::IsTerminal;
+#[cfg(any(unix, test))]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// What launchd hands a GUI app. A `PATH` made only of these is the default,
 /// not a choice.
+#[cfg(any(unix, test))]
 const SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Brackets the shell's answer, so whatever its rc files print around it
 /// (greetings, prompts, update nags) can be told apart from the value.
+#[cfg(any(unix, test))]
 const MARKER: &str = "__DIFFUI_PATH__";
 
 /// How long a login shell gets to start. A slow `.zshrc` beyond this costs the
@@ -102,6 +105,7 @@ pub(crate) fn repair_path() -> Option<String> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn looks_minimal(path: &str) -> bool {
     path.split(':')
         .filter(|entry| !entry.is_empty())
@@ -111,6 +115,7 @@ fn looks_minimal(path: &str) -> bool {
 /// Where Homebrew (Apple silicon and Intel), nix (single-user, nix-darwin,
 /// home-manager, the daemon's default profile) and per-user tool installs put
 /// their binaries.
+#[cfg(unix)]
 fn fallback_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin"]
         .iter()
@@ -173,6 +178,7 @@ fn login_shell_path(shell: &str) -> Result<String, String> {
     parse_marked(&output).ok_or_else(|| "no PATH in its output".to_owned())
 }
 
+#[cfg(any(unix, test))]
 fn parse_marked(output: &str) -> Option<String> {
     let (_, rest) = output.split_once(MARKER)?;
     let (path, _) = rest.split_once(MARKER)?;
@@ -182,6 +188,7 @@ fn parse_marked(output: &str) -> Option<String> {
 
 /// `primary` (the shell's answer) first, then what we started with, then the
 /// fallback dirs; each entry once, in first-seen order.
+#[cfg(any(unix, test))]
 fn merge_paths(primary: Option<&str>, current: &str, fallback: Vec<PathBuf>) -> String {
     let mut seen: Vec<String> = Vec::new();
     let entries = primary

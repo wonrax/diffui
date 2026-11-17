@@ -34,7 +34,7 @@ struct PluginCli {
 }
 
 /// The CLI's definition, for the guide's test.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cli() -> clap::Command {
     <PluginCli as clap::CommandFactory>::command()
 }

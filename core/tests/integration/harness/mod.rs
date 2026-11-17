@@ -237,6 +237,7 @@ impl TestRepo {
 
     /// The first event `pick` accepts, parked ones first; everything else
     /// seen on the way is parked. Gives up after ten seconds.
+    #[cfg(unix)]
     pub fn wait_for(&mut self, pick: impl Fn(&Payload) -> bool) -> Payload {
         if let Some(i) = self.parked.iter().position(|e| pick(&e.payload)) {
             return self.parked.remove(i).payload;

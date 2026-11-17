@@ -29,7 +29,7 @@ mod bundled;
 pub(crate) mod cli;
 mod events;
 mod forge;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod forge_scenarios;
 #[cfg(test)]
 pub(crate) mod github_scenarios;
@@ -60,7 +60,7 @@ pub(crate) use events::TabPlugins;
 #[cfg(test)]
 pub(crate) use forge::bundled_kind;
 pub(crate) use page::{PageAction, PluginPage, page_overlay};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use query::READ_ONLY;
 #[cfg(test)]
 pub(crate) use scenarios::PluginDir;

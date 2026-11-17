@@ -343,6 +343,7 @@ fn the_strips_controls_do_what_they_say() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn the_fetch_caret_pops_its_menu() {
     use crate::menus::tests::{SCRIPT, Script};
     let mut h = open_fixture();

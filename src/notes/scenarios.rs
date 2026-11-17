@@ -555,6 +555,7 @@ fn next_and_previous_step_through_notes_and_conflicts_across_files() {
 }
 
 /// A stand-in AI provider (`[ai] command`) that prints `reply`.
+#[cfg(unix)]
 fn fake_reviewer(reply: &str) -> PathBuf {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let dir = scratch_home().join("repos");
@@ -573,6 +574,7 @@ fn fake_reviewer(reply: &str) -> PathBuf {
     script
 }
 
+#[cfg(unix)]
 fn review(reply: &str) -> (Harness, PathBuf) {
     let repo = scratch_repo("review");
     let script = fake_reviewer(reply);
@@ -595,6 +597,7 @@ fn review(reply: &str) -> (Harness, PathBuf) {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_ai_review_lands_as_notes_on_the_lines_it_cites() {
     let (mut h, repo) =
         review("- `a.txt:2`: two is suspicious.\n- `a.txt:40`: past the end.\n- No tests.");
@@ -622,6 +625,7 @@ fn an_ai_review_lands_as_notes_on_the_lines_it_cites() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_ai_review_without_findings_stays_in_the_panel() {
     let (mut h, repo) = review("Nothing stands out.");
     h.wait_until("the run to end", |ui| {

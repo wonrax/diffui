@@ -475,6 +475,7 @@ fn a_failure_midway_stops_and_a_retry_picks_up_where_it_stopped() {
 /// through the chosen provider (a stand-in `claude`) and fills that row
 /// alone.
 #[test]
+#[cfg(unix)]
 fn generate_fills_a_row_through_the_provider() {
     let fake = FakeCli::new(
         "stack-generate",

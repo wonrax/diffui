@@ -1186,7 +1186,7 @@ pub(crate) fn open_repo_card(
         .text_size(px(text_size::BODY_LG));
     let status = ui.open_repo_status();
 
-    let mut band = div()
+    let band = div()
         .flex()
         .flex_row()
         .items_center()
@@ -1198,14 +1198,12 @@ pub(crate) fn open_repo_card(
         .child(kind_box(status.as_ref(), theme))
         .child(div().flex_1().min_w_0().child(field));
     #[cfg(target_os = "macos")]
-    {
-        band = band.child(
-            look.button("open-repo-folder", "Browse\u{2026}")
-                .compact()
-                .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx))
-                .tip("Choose a folder in Finder"),
-        );
-    }
+    let band = band.child(
+        look.button("open-repo-folder", "Browse\u{2026}")
+            .compact()
+            .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx))
+            .tip("Choose a folder in Finder"),
+    );
 
     let mut body = theme::surface(div(), theme::Elevation::Modal, theme)
         .w(px(OPEN_DIALOG_WIDTH))

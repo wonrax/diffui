@@ -1033,6 +1033,7 @@ impl Diffui {
                     self.pop_mode(ModeKind::OpenRepo);
                 }
             }
+            #[cfg(target_os = "macos")]
             Action::ChooseRepoFolder => self.choose_repo_folder(cx),
             Action::SubmitRepoDialog => {
                 let Some(dialog) = self.open_repo_dialog() else {

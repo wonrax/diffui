@@ -38,6 +38,7 @@ fn open(config: &str) -> (Harness, std::path::PathBuf) {
 /// A fake agent CLI: keeps what it was given on stdin beside itself and
 /// writes a description. Written after the harness opens, which clears its
 /// home.
+#[cfg(unix)]
 fn fake_agent(name: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = crate::harness::scratch_home().join("repos");
@@ -55,6 +56,7 @@ fn fake_agent(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg(unix)]
 fn generate_writes_the_agents_description_into_the_editor() {
     let script = fake_agent("fake-agent");
     let config = format!(

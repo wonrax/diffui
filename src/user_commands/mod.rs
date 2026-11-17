@@ -20,7 +20,7 @@ use std::time::Duration;
 
 pub(crate) use run::{Generation, RunId, Runs, jj as embedded_jj, jj_line};
 pub(crate) use spec::{SHIPPED, parse_commands};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use template::VARS;
 pub(crate) use template::Var;
 

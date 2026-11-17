@@ -10,9 +10,10 @@ use crate::harness;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use diffui_core::git::list_git_source_tree;
 use diffui_core::git::{
-    list_git_source_tree, load_git_commits, load_git_diff, load_git_file_diff,
-    load_git_repository_snapshot,
+    load_git_commits, load_git_diff, load_git_file_diff, load_git_repository_snapshot,
 };
 use diffui_core::{DiffCollapse, DiffFileStatus, DiffLineKind, Repository, RevisionSelection, Vcs};
 

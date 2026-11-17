@@ -284,6 +284,8 @@ struct Pending {
     reply: std::sync::mpsc::Sender<Option<String>>,
 }
 
+// Only the unix `imp` starts a server; elsewhere the fields go unread.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Server {
     exe: PathBuf,
     socket: PathBuf,

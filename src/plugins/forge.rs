@@ -753,7 +753,7 @@ impl Diffui {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod gitlab;
 
 #[cfg(test)]
@@ -906,6 +906,7 @@ pub(super) mod tests {
     /// The test forge plugin of `fixtures/plugins`, running as a forge would
     /// in the app, its program a copy of the fake CLI in a scratch directory
     /// (where the CLI notes the pids of endless diffs).
+    #[cfg(unix)]
     pub(crate) struct TestForge {
         pub(crate) provider: ScriptForge,
         pub(crate) dir: std::path::PathBuf,
@@ -923,6 +924,7 @@ pub(super) mod tests {
     }
 
     /// A copy of the fake CLI, executable, in a fresh directory of its own.
+    #[cfg(unix)]
     pub(crate) fn install_cli(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(dir).expect("make the CLI's directory");
@@ -1029,6 +1031,7 @@ pub(super) mod tests {
         spawned(manifest, program, dir)
     }
 
+    #[cfg(unix)]
     fn test_forge(name: &str) -> TestForge {
         let dir = scratch_dir(name);
         let program = install_cli(&dir);
@@ -1040,6 +1043,7 @@ pub(super) mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn pr(forge: &TestForge, number: u64) -> ForgePr {
         let mut pr = forge
             .provider
@@ -1055,6 +1059,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_plugins_pull_request_tab_reads_its_header_commits_and_commit_diffs() {
         let forge = test_forge("tab");
         let provider = &forge.provider;
@@ -1085,6 +1090,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_plugins_diff_streams_file_by_file() {
         let forge = test_forge("stream");
         let started = std::time::Instant::now();
@@ -1108,6 +1114,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_cancel_stops_the_plugins_diff_and_its_program() {
         let forge = test_forge("cancel");
         let cancel = CancelFlag::default();
@@ -1140,6 +1147,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_plugins_typed_errors_read_like_the_built_in_forges() {
         let forge = test_forge("errors");
         let error = block_on(forge.provider.view(pr(&forge, 3))).unwrap_err();
@@ -1190,6 +1198,7 @@ pub(super) mod tests {
     /// for its peak memory.
     #[test]
     #[ignore = "a measurement, run by hand"]
+    #[cfg(unix)]
     fn measure_a_pull_requests_diff() {
         let lines: usize = std::env::var("MEASURE_LINES")
             .ok()

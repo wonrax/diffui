@@ -68,7 +68,7 @@ impl PluginPage {
     }
 
     /// The models the list offers, once they came.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn models(&self) -> Option<Vec<String>> {
         match self.models.as_ref()? {
             Some(Ok(models)) => Some(models.iter().map(|model| model.id.clone()).collect()),

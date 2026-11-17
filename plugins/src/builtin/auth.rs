@@ -260,6 +260,7 @@ mod tests {
     /// A stand-in for git that answers `credential fill` from its stdin and
     /// environment, so no real helper (or keychain) is asked.
     #[test]
+    #[cfg(unix)]
     fn git_is_asked_without_any_way_to_prompt() {
         let dir = std::env::temp_dir().join(format!("diffui-auth-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
