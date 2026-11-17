@@ -23,13 +23,22 @@ use crate::{Action, Cx, Diffui, FetchTarget, MainView, ToolbarMenu, activity, ic
 const CONTROL: ui::Size = ui::Size::Compact;
 
 /// The bar's own height, without the progress line and the rule under it.
-pub const HEIGHT: f32 = theme::control::COMPACT + 2.0 * theme::space::SM;
+/// The controls sit flush under the tab strip, whose margin below the tabs
+/// already spaces them, and keep the same gap down to the rule, the progress
+/// line counted in it.
+pub fn height() -> f32 {
+    theme::control::COMPACT + bottom_pad()
+}
+
+fn bottom_pad() -> f32 {
+    crate::tab_bar::edge_gap() - activity::PROGRESS_LINE_HEIGHT
+}
 
 /// Where the window chrome (tab strip, toolbar, progress line, rule) ends and
 /// the panels begin — what floating surfaces anchored under the toolbar hang
 /// from.
 pub fn chrome_bottom() -> f32 {
-    crate::tab_bar::height() + HEIGHT + activity::PROGRESS_LINE_HEIGHT + theme::HAIRLINE
+    crate::tab_bar::height() + height() + activity::PROGRESS_LINE_HEIGHT + theme::HAIRLINE
 }
 
 /// Where every modal surface (command palette, open-repo and confirm
@@ -253,7 +262,8 @@ pub(crate) fn build_toolbar(
         .items_center()
         .gap(px(theme::space::SM))
         .w_full()
-        .h(px(HEIGHT))
+        .h(px(height()))
+        .pb(px(bottom_pad()))
         .px(px(theme::space::MD))
         // The window's chrome, one section with the tab strip above.
         .bg(chrome_fill(theme))

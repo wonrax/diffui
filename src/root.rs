@@ -1100,7 +1100,7 @@ impl Diffui {
                 div()
                     .w_full()
                     .flex_none()
-                    .h(px(toolbar::HEIGHT + activity::PROGRESS_LINE_HEIGHT))
+                    .h(px(toolbar::height() + activity::PROGRESS_LINE_HEIGHT))
                     .child(embed(&panes.toolbar)),
             )
             .child(horizontal_divider(theme))

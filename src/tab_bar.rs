@@ -114,6 +114,12 @@ pub fn height() -> f32 {
 /// The strip's height where it sizes itself (no title bar to stand in for).
 const STRIP_HEIGHT: f32 = 38.0;
 
+/// The space between the tabs and the window's top edge: the chrome's one
+/// vertical gap, which the toolbar keeps under the tabs and above the panels.
+pub(crate) fn edge_gap() -> f32 {
+    (height() - TAB_HEIGHT) / 2.0
+}
+
 /// The slot a dragged tab belongs in, given `widths` in strip order, the
 /// dragged tab's current `index` with its slot starting at `slot`, and the
 /// position `x` its left edge has been dragged to.
@@ -1001,7 +1007,9 @@ pub(crate) fn caption_buttons(theme: ThemeSpec, window: &Window) -> AnyElement {
         .absolute()
         .top_0()
         .right_0()
-        .h(px(height()))
+        // Flush with the window's top edge, as Windows' own are, and ending
+        // with the tabs, so the toolbar keeps its gap under them too.
+        .h(px(height() - edge_gap()))
         .flex()
         .flex_row()
         .child(button(
