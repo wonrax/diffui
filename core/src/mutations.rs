@@ -10,7 +10,7 @@ use crate::partial::DiffSelection;
 use crate::resolve::ConflictResolution;
 
 /// Which commits a rebase moves, relative to the picked source revisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RebaseSourceMode {
     /// Only the picked revisions (`jj rebase -r`) — their descendants stay
     /// behind, re-parented across the hole.
@@ -31,7 +31,7 @@ pub enum RebaseSourceMode {
 
 /// Where moved (or duplicated) commits land relative to a target revision.
 /// Mirrors `jj rebase`'s `-d` / `-A` / `-B` and the combined `-A x -B y`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Destination {
     /// New children of the target (`jj rebase -d`); the target's existing
     /// children are unaffected.
@@ -65,7 +65,7 @@ impl Destination {
 }
 
 /// Where a squash folds its source into.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SquashTarget {
     /// The source's single parent (`jj squash` with no `--into`). Errors on a
     /// merge commit — an explicit destination is required there.
@@ -75,7 +75,7 @@ pub enum SquashTarget {
 
 /// A revision mutation. Targets are `RevisionSelection`s so the working-copy
 /// case (which has no stable change-id) stays representable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MutationOp {
     /// Create a new child commit of `parent` and move `@` onto it (`jj new`).
     New { parent: RevisionSelection },
@@ -269,7 +269,7 @@ impl MutationOp {
 }
 
 /// User-facing summary of a successful mutation — becomes the status message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MutationOutcome {
     pub message: String,
     /// Whether the mutation moved `@` (new/edit/abandon). Bookmark ops leave the
@@ -295,7 +295,7 @@ pub struct MutationOutcome {
 
 /// What a draft simulation produced — the op bar renders the kind-specific
 /// summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DraftSimulation {
     Rebase(RebasePreview),
     Merge(MergePreview),
@@ -305,7 +305,7 @@ pub enum DraftSimulation {
 }
 
 /// Predicted outcome of a squash draft (whole revisions or picked changes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SquashPreview {
     /// Whether the sources end up empty and abandoned.
     pub abandons_sources: bool,
@@ -315,7 +315,7 @@ pub struct SquashPreview {
 }
 
 /// Predicted outcome of a new-change or duplicate draft.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InsertPreview {
     /// Commits created.
     pub created: u32,
@@ -328,7 +328,7 @@ pub struct InsertPreview {
 
 /// Predicted outcome of a merge draft: which paths the merged tree would
 /// leave conflicted — see `jj::preview_merge`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergePreview {
     /// Repo-relative conflicted paths, capped — see `truncated`.
     pub conflicts: Vec<String>,
@@ -337,7 +337,7 @@ pub struct MergePreview {
 }
 
 /// Predicted outcome of a rebase draft — see `jj::preview_rebase`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RebasePreview {
     /// Commits in the moved set.
     pub moved: u32,

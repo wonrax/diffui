@@ -81,7 +81,7 @@ impl Drop for Harness {
 }
 
 /// A scene's window, unless it asks for another.
-const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
+pub(crate) const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
 /// How long a settle or a wait may take before the test fails.
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// A real-time beat between dispatcher pumps.
@@ -306,7 +306,7 @@ impl Harness {
         let dir = scratch_home().join(".config/diffui");
         std::fs::create_dir_all(&dir).expect("make the config directory");
         std::fs::write(dir.join("settings.toml"), settings).expect("write the settings");
-        Self::start(turn, repo, size)
+        Self::start(turn, repo, size, Vec::new())
     }
 
     /// [`Self::open_sized`] on a `HOME` with no saved session or recents, and
@@ -355,10 +355,22 @@ impl Harness {
         std::fs::write(dir.join("config.toml"), config).expect("write the config");
         std::fs::write(dir.join("settings.toml"), settings).expect("write the settings");
         prepare(home);
-        Self::start(turn, repo, size)
+        Self::start(turn, repo, size, Vec::new())
     }
 
-    fn start(turn: Turn, repo: Option<&Path>, (width, height): (f32, f32)) -> Self {
+    /// The app as a launch that finds `open_repos` in its saved session
+    /// (roots, or `host:root`), on the home as the harness before left it:
+    /// its config.toml included.
+    pub(crate) fn open_restoring(open_repos: Vec<String>) -> Self {
+        Self::start(turn(), None, DEFAULT_SIZE, open_repos)
+    }
+
+    fn start(
+        turn: Turn,
+        repo: Option<&Path>,
+        (width, height): (f32, f32),
+        open_repos: Vec<String>,
+    ) -> Self {
         let tokio = crate::spawn::runtime().enter();
         scratch_home();
         let mut cx = HeadlessAppContext::with_platform(
@@ -386,6 +398,7 @@ impl Harness {
         let saved = WindowState {
             width: Some(width),
             height: Some(height),
+            open_repos,
             ..WindowState::default()
         };
         let mut built = None;

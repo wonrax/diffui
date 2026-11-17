@@ -441,8 +441,8 @@ impl Diffui {
         let label = launch.label.clone();
         let Some(root) = self
             .tab(tab)
-            .and_then(|state| state.repository.as_ref())
-            .map(|repository| repository.root.clone())
+            .and_then(|state| state.local_root())
+            .map(std::path::Path::to_owned)
         else {
             self.push_error_toast(format!("{label} didn't run"), "No local repository here");
             return None;

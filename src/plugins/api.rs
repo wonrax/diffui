@@ -70,6 +70,9 @@ impl Diffui {
         let Some(repository) = state.repository.as_ref() else {
             return reply.stale();
         };
+        if state.remote.is_some() {
+            return reply.err("The repository is on another machine: a plugin can't read it");
+        }
         let root = repository.root.clone();
         let jj = repository.vcs == Vcs::Jj;
         // The reads below go through jj at the handle's operation.

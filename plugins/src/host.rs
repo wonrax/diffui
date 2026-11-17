@@ -129,6 +129,10 @@ pub struct Registration {
     /// `None` without a provider.
     #[serde(default)]
     pub ai: Option<Vec<String>>,
+    /// The transport's methods (of
+    /// [`crate::protocol::TRANSPORT_METHODS`]), or `None` without one.
+    #[serde(default)]
+    pub transport: Option<Vec<String>>,
     /// Event names with at least one listener; the rest need not be sent.
     pub events: Vec<String>,
 }

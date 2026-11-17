@@ -28,6 +28,9 @@ ureq = "3"
 # clock rather than by sleeping through it.
 tokio = { version = "1.44", features = ["test-util"] }
 diffui-core = { path = ".", features = ["fault-injection"] }
+# Walks the wire types' serde shapes without sample values, for the golden
+# file that says when the protocol version has to move.
+serde-reflection = "0.5"
 
 [dependencies]
 anyhow = "1.0"
@@ -41,7 +44,11 @@ jj-lib = "0.47"
 # Commit search (`commit_search`), shared with the palette. Already in the
 # tree through the app.
 nucleo-matcher = "0.3"
-tokio = { version = "1.44", features = ["fs", "io-util", "macros", "process", "time", "rt", "sync"] }
+# The wire a repository on another machine is driven over (`remote`). Both
+# already in the tree through jj-lib.
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["fs", "io-std", "io-util", "macros", "process", "time", "rt", "rt-multi-thread", "sync"] }
 # Structured logging for the repository actor: one span per command, so a
 # stuck or slow operation is attributable without an `eprintln!` trail.
 tracing = "0.1"

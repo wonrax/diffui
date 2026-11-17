@@ -1,6 +1,6 @@
 ---
 name: diffui
-description: Leave review notes on your jj changes in diffui and read the user's replies (`diffui notes`), drive the running diffui app from the terminal (`diffui ctl`), add commands and shortcuts to it, and write plugins for it. Use when the user reviews your jj changes in diffui, wants you to show them something in it or run a jj command they can watch, wants a diffui command, AI provider or forge set up, or asks for a diffui plugin. `diffui skill` prints this index; it says which `diffui skill <topic>` to read.
+description: Leave review notes on your jj changes in diffui and read the user's replies (`diffui notes`), drive the running diffui app from the terminal (`diffui ctl`), add commands and shortcuts to it, and write plugins for it. Use when the user reviews your jj changes in diffui, wants you to show them something in it or run a jj command they can watch, wants a diffui command, AI provider, forge or remote host set up, or asks for a diffui plugin. `diffui skill` prints this index; it says which `diffui skill <topic>` to read.
 ---
 
 # diffui
@@ -38,6 +38,9 @@ one topic or none.
   wins over Settings and locks its control. `settings.toml` beside it is what
   Settings rewrites whole: don't edit it. After editing config.toml or a
   plugin, run `diffui ctl reload` and fix every `path:line:col` it prints.
+- **A repository can be on another machine.** A tab opened as `host:/path`
+  is served by `diffui-serve` (or `diffui serve`) running there; what reads
+  or runs something in the working tree is off for it.
 - **`diffui jj <args>` is the jj CLI diffui links (0.47.1).** Use it when the
   `jj` on the `PATH` is a different version and refuses the repository.
 
@@ -56,4 +59,5 @@ topics don't repeat them.
 | `diffui skill ai` | The user asks which AI diffui's Generate and Review use, wants another provider or model, or an AI command is greyed out. |
 | `diffui skill plugin` | A `[[commands]]` row can't do the job (it needs logic, HTTP, events or a status item), you're writing or fixing a plugin, or one fails to load. |
 | `diffui skill forge-plugin` | diffui should show pull requests for a forge it doesn't know (Forgejo, Gitea, Bitbucket), or a forge plugin needs pull request tabs, review comments or sign-in. Read `plugin` first. |
+| `diffui skill remote` | The repository is on another machine (a server over ssh, WSL from Windows, a container): setting up a host in config.toml, where `diffui-serve` comes from, why a remote tab doesn't connect, or writing a transport plugin. |
 | `diffui skill patches` | You want to show the user a diff that isn't a jj change (a patch, `git diff` output, two files or folders), or make diffui jj's or git's diff tool. |

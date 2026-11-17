@@ -75,7 +75,9 @@ impl Diffui {
         let mut selection_moved = false;
         for tab in &mut self.tabs {
             let state = &mut tab.state;
-            if state.repository.is_none() {
+            // A plugin's reads are of this machine's disk: it hears nothing
+            // of a repository that isn't on it.
+            if state.repository.is_none() || state.remote.is_some() {
                 continue;
             }
             let seen = &mut state.plugins;

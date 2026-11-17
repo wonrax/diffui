@@ -589,6 +589,7 @@ fn build_diff_panel_body(ui: &Diffui, look: Look, window: &mut Window, cx: &mut 
     let range = crate::range::shown_range(ui);
     let compare = crate::compare::build_compare_banner(ui, look, window, cx);
     let mut panel = panel_column(theme)
+        .children(crate::remote::banners(ui, look, cx))
         .children(compare)
         .children(crate::opened::banners(ui, look, cx));
 

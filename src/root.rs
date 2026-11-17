@@ -53,6 +53,14 @@ pub(crate) struct Background {
     menu: Option<Task<()>>,
 }
 
+impl Background {
+    /// End the actors of `specs`: each one's loop is dropped, and the next
+    /// frame starts another for whatever tab still wants it.
+    pub(crate) fn restart(&mut self, specs: &[OpenSpec]) {
+        self.repos.retain(|spec, _| !specs.contains(spec));
+    }
+}
+
 impl std::fmt::Debug for Background {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Background")
@@ -343,10 +351,19 @@ impl Diffui {
         let specs: Vec<OpenSpec> = self.tabs.iter().map(|tab| tab.open_spec()).collect();
         self.background.repos.retain(|spec, _| specs.contains(spec));
         for spec in specs {
+            // The app holds a remote repository's link before its actor asks
+            // for it, so the connection is one it knows about.
+            if let OpenSpec::Remote { host, .. } = &spec
+                && !self.background.repos.contains_key(&spec)
+            {
+                self.host_link(host, cx);
+            }
             self.background
                 .repos
                 .entry(spec.clone())
-                .or_insert_with(|| repository_loop(spec, &self.forge.forges, cx));
+                .or_insert_with(|| {
+                    repository_loop(spec, &self.forge.forges, &self.remote.hosts, cx)
+                });
         }
 
         // While anything is in flight (a load, a diff switch, or any running
@@ -490,9 +507,14 @@ fn sync_ticker(
 /// One repository's actor and its event loop. The actor runs on its own thread
 /// and reports through a channel; this folds what it says into the app. Events
 /// that arrived together fold in one update, so a burst costs one reconcile.
-fn repository_loop(spec: OpenSpec, forges: &diffui_core::forge::Forges, cx: &mut Cx) -> Task<()> {
+fn repository_loop(
+    spec: OpenSpec,
+    forges: &diffui_core::forge::Forges,
+    hosts: &diffui_core::remote::Hosts,
+    cx: &mut Cx,
+) -> Task<()> {
     use futures::{FutureExt as _, StreamExt as _};
-    let mut events = diffui_core::repo::open(spec, forges);
+    let mut events = diffui_core::repo::open(spec, forges, hosts);
     cx.spawn(async move |this, cx| {
         while let Some(first) = events.next().await {
             let mut batch = vec![first];

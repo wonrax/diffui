@@ -51,9 +51,11 @@ impl<Id> Slot<Id> {
 /// were missing. It drops the per-slot target id the assigner tracks
 /// internally, so it's compact (one byte per lane, not a 32-byte commit id)
 /// and cheap to store for every commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaneFrame {
+    #[serde(with = "wire::kinds")]
     pub before: Vec<Option<GraphEdgeType>>,
+    #[serde(with = "wire::kinds")]
     pub after: Vec<Option<GraphEdgeType>>,
     pub node_lane: usize,
     pub merging_lanes: Vec<usize>,
@@ -276,6 +278,90 @@ fn allocate_lane<Id>(lanes: &mut Vec<Slot<Id>>, max_lanes: usize) -> usize {
         lanes.len() - 1
     } else {
         max_lanes - 1
+    }
+}
+
+/// jj-lib's edge types on the wire. They have no serde of their own, so a
+/// kind travels as one byte: 0 for no edge, then missing, direct, indirect.
+pub(crate) mod wire {
+    use jj_lib::graph::{GraphEdge, GraphEdgeType};
+
+    fn byte(kind: Option<GraphEdgeType>) -> u8 {
+        match kind {
+            None => 0,
+            Some(GraphEdgeType::Missing) => 1,
+            Some(GraphEdgeType::Direct) => 2,
+            Some(GraphEdgeType::Indirect) => 3,
+        }
+    }
+
+    fn kind<E: serde::de::Error>(byte: u8) -> Result<Option<GraphEdgeType>, E> {
+        Ok(match byte {
+            0 => None,
+            1 => Some(GraphEdgeType::Missing),
+            2 => Some(GraphEdgeType::Direct),
+            3 => Some(GraphEdgeType::Indirect),
+            other => return Err(E::custom(format!("no edge kind {other}"))),
+        })
+    }
+
+    /// A lane's edge kinds.
+    pub(crate) mod kinds {
+        use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+        use super::{GraphEdgeType, byte, kind};
+
+        pub(crate) fn serialize<S: Serializer>(
+            kinds: &[Option<GraphEdgeType>],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            kinds
+                .iter()
+                .map(|kind| byte(*kind))
+                .collect::<Vec<u8>>()
+                .serialize(serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<Option<GraphEdgeType>>, D::Error> {
+            Vec::<u8>::deserialize(deserializer)?
+                .into_iter()
+                .map(kind)
+                .collect()
+        }
+    }
+
+    /// A row's edges to the rows below it, each as `(target, kind)`. An edge
+    /// always has a kind, so here the byte starts at 0 for missing.
+    pub(crate) mod edges {
+        use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer};
+
+        use super::{GraphEdge, byte, kind};
+
+        pub(crate) fn serialize<S: Serializer>(
+            edges: &[GraphEdge<usize>],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            edges
+                .iter()
+                .map(|edge| (edge.target, byte(Some(edge.edge_type)) - 1))
+                .collect::<Vec<(usize, u8)>>()
+                .serialize(serializer)
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<GraphEdge<usize>>, D::Error> {
+            Vec::<(usize, u8)>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(target, byte)| {
+                    let edge_type = kind(byte.saturating_add(1))?
+                        .ok_or_else(|| serde::de::Error::custom("an edge needs a kind"))?;
+                    Ok(GraphEdge { target, edge_type })
+                })
+                .collect()
+        }
     }
 }
 

@@ -157,6 +157,7 @@ fn the_reference_plugin_lists_checks_creates_and_updates() {
                 "updatePullRequest".into()
             ]),
             ai: None,
+            transport: None,
             events: vec![],
         }
     );

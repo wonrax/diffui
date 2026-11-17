@@ -105,6 +105,16 @@ pub(crate) enum Action {
     OpenRepoPick(usize),
     /// Open a repository (or PR) by path/reference.
     OpenRepo(String),
+    /// Open a row of the recent list, by its key: a root here, or
+    /// `host:root`.
+    OpenRecent(String),
+    /// List the hosts in the open prompt, to pick the machine the path is
+    /// on (or put the folders back).
+    OpenRepoHosts,
+    /// Point the open prompt at a host; `None` is this machine.
+    OpenRepoHost(Option<String>),
+    /// Reach the active tab's host again after its connection was lost.
+    ReconnectHost,
     /// Remove one path from the persisted recent-repository list.
     RemoveRecentRepo(String),
     ClearRecentRepos,
@@ -244,6 +254,8 @@ pub(crate) enum Action {
     },
     /// The permission dialog's answer, and what Settings does to a plugin.
     Plugin(crate::plugins::PluginAction),
+    /// Settings' hosts: the list's field and a host's page.
+    Host(crate::host_page::HostAction),
     /// Settings → AI.
     Ai(crate::ai::AiAction),
     /// Stop the program writing into the description editor.

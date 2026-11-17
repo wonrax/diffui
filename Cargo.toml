@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["core", "widgets", "plugins"]
+members = ["core", "widgets", "plugins", "serve"]
 resolver = "3"
 
 [workspace.dependencies]

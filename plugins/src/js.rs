@@ -24,7 +24,7 @@ use crate::Limits;
 use crate::host::Registration;
 use crate::manifest::Manifest;
 use crate::memory::Capped;
-use crate::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS};
+use crate::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS, TRANSPORT_METHODS};
 use crate::typescript;
 
 /// The module a plugin imports, and the name its frames carry in a stack.
@@ -33,7 +33,7 @@ const HOST_SOURCE: &str = include_str!("js/diffui.js");
 
 /// What `import { … } from "diffui"` offers. A test holds this, the module
 /// and `assets/diffui.d.ts` to the same list.
-pub(crate) const EXPORTS: [&str; 13] = [
+pub(crate) const EXPORTS: [&str; 14] = [
     "AiError",
     "ForgeError",
     "ai",
@@ -46,6 +46,7 @@ pub(crate) const EXPORTS: [&str; 13] = [
     "forge",
     "http",
     "kv",
+    "transport",
     "ui",
 ];
 
@@ -260,6 +261,8 @@ impl Js {
             "forgeMethods": FORGE_METHODS,
             "ai": manifest.ai.is_some(),
             "aiMethods": AI_METHODS,
+            "transport": manifest.transport.is_some(),
+            "transportMethods": TRANSPORT_METHODS,
             "events": EVENT_NAMES,
         })
         .to_string();
@@ -584,7 +587,8 @@ impl Resolver for PluginResolver {
             return Err(Exception::throw_reference(
                 ctx,
                 &format!(
-                    "Cannot import \"{name}\" (from {base}). A plugin can import \"{HOST_MODULE}\" ({}) and its own files by relative path (\"./util.js\"). There is no Node, npm or require here.",
+                    // QuickJS keeps 255 bytes of this: the list has to fit.
+                    "Cannot import \"{name}\" (from {base}). A plugin imports \"{HOST_MODULE}\" ({}) and its own files (\"./util.js\"). No Node, npm or require here.",
                     EXPORTS.join(", ")
                 ),
             ));

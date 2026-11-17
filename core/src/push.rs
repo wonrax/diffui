@@ -8,7 +8,7 @@ use crate::model::RevisionSelection;
 /// What one push sends, mirroring `jj git push`'s target flags. Every target
 /// lands in the same transaction as the push itself, so a refused or failed
 /// push leaves no half-made local bookmark behind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PushTarget {
     /// `-b <name>`: the local bookmark as it stands. A bookmark that doesn't
     /// track this remote yet is created there (and tracked from then on); a
@@ -30,7 +30,7 @@ pub enum PushTarget {
 
 /// The CLI's escape hatches for the per-commit checks. Missing author or
 /// committer identity has none, so neither does this.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushAllow {
     /// `--allow-empty-description`
     pub empty_description: bool,
@@ -57,7 +57,7 @@ impl PushAllow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushRequest {
     pub remote: String,
     pub targets: Vec<PushTarget>,
@@ -69,7 +69,7 @@ pub struct PushRequest {
 }
 
 /// One reason `jj git push` refuses a commit it would publish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PushCheck {
     EmptyDescription,
     /// Author or committer has no name or email.
@@ -93,7 +93,7 @@ impl PushCheck {
 
 /// A commit the push would have made newly reachable on the remote, and why
 /// it may not be.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RejectedCommit {
     /// Short change id, as the graph shows it.
     pub change_id: String,
@@ -107,7 +107,7 @@ pub struct RejectedCommit {
 }
 
 /// Which way a push moves a bookmark on the remote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MoveKind {
     /// The remote doesn't have the bookmark yet.
     Add,
@@ -129,7 +129,7 @@ impl MoveKind {
 }
 
 /// One bookmark (or tag) a push would change on the remote.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BookmarkMove {
     pub bookmark: String,
     /// `bookmark` names a tag: a tracked tag the default push carries along.
@@ -170,7 +170,7 @@ impl BookmarkMove {
 /// Why a push stopped before anything reached the remote: commits jj's checks
 /// refuse, or — with no commits listed — a [`PushRequest::confirm`] asking for
 /// the go-ahead on `moves`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushRejection {
     pub remote: String,
     /// What the push would do, one move per bookmark: what the CLI prints

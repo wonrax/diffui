@@ -1873,6 +1873,66 @@ fn all() -> Vec<Scene> {
         )
         .dark(),
     );
+    t.add(
+        s(
+            "open-repo-hosts",
+            "The open prompt listing where to open: this machine, then the hosts with how each is reached. The band shows the host chip.",
+            "Launch with two `[hosts]` tables, cmd+O, click the host chip.",
+            |c| {
+                c.key("cmd+o");
+                c.act(Action::OpenRepoHosts);
+                c.key("down");
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "open-repo-on-host",
+            "The open prompt browsing a host: its name on the chip, a folder of that machine listed with the repository flagged.",
+            "As open-repo-hosts, pick the host, type the fixture's folder.",
+            |c| {
+                c.key("cmd+o");
+                c.act(Action::OpenRepoHost(Some("box".to_owned())));
+                let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+                c.h.act(|ui, cx| ui.open_repo_typed(format!("{dir}/"), cx));
+                c.h.wait_until("the host's folder listing", |ui| {
+                    ui.open_repo_dialog()
+                        .and_then(|dialog| dialog.suggestions())
+                        .is_some_and(|(_, rows)| !rows.is_empty())
+                });
+                c.key("down");
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "remote-tab",
+            "A repository on another machine in a tab beside a local one: the host before the name, in mono.",
+            "Launch with a `[hosts]` table, open the fixture on that host.",
+            open_on_host,
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "remote-connection-lost",
+            "The strip atop a remote tab's diff once its connection is gone, with Reconnect; the graph stays.",
+            "As remote-tab, then the host's server stops.",
+            |c| {
+                open_on_host(c);
+                crate::remote::in_process::stop();
+                c.h.wait_until("the tab to hear its link is gone", |ui| {
+                    ui.active()
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.lost.is_some())
+                });
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
     t.add(s(
         "shortcuts-sheet",
         "The keyboard-shortcut cheat sheet over the window.",
@@ -1935,6 +1995,55 @@ fn all() -> Vec<Scene> {
         )
         .config("theme = \"Light\"\nrefresh = \"Manual\"\ncode_font_size = 14\n")
         .settings("multi_click_ms = = 400\n"),
+    );
+
+    t.add(
+        s(
+            "settings-hosts",
+            "The settings dialog's Hosts group: a row per host with how it is reached and what runs there, then the field that adds one.",
+            "Launch with two `[hosts]` tables, press cmd+,.",
+            |c| {
+                c.key("cmd+,");
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "settings-host-page",
+            "A host's page: how it is reached with the transport's own settings, the Test row, and the server's command and environment. What config.toml sets is locked.",
+            "As settings-hosts, click the pencil on the ssh host's row.",
+            |c| {
+                c.key("cmd+,");
+                c.act(Action::Host(crate::host_page::HostAction::Open(
+                    "staging".to_owned(),
+                )));
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+
+    t.add(
+        s(
+            "settings-host-failed",
+            "A host's page after its server didn't start: why in red on the Connection row with Try again, and under it what was run and what that wrote.",
+            "Launch with a host whose command fails, open its page, click Connect.",
+            |c| {
+                use crate::host_page::HostAction;
+                c.key("cmd+,");
+                c.act(Action::Host(HostAction::Open("devbox".to_owned())));
+                c.act(Action::Host(HostAction::Connect));
+                c.h.wait_until("the start to fail", |ui| {
+                    matches!(
+                        ui.host_state(&diffui_core::remote::HostId("devbox".to_owned())),
+                        Some(crate::connections::HostState::Failed(_))
+                    )
+                });
+            },
+        )
+        .config(
+            "[hosts.devbox]\ncommand = [\"sh\", \"-c\", \"echo 'Warning: Permanently added devbox to the list of known hosts.' >&2; echo 'bash: line 1: exec: diffui-serve: not found' >&2; exit 127\"]\n",
+        ),
     );
 
     t.group("Credential prompt");
@@ -3758,6 +3867,25 @@ choices = ["staging", "staging-next", "release/1.0"]
 "#;
 
 /// The ids of `fixtures/scenes.md`, in order.
+/// Two hosts: `box`, whose server runs in this process, and one reached over
+/// the bundled ssh transport (never connected to here).
+const REMOTE_HOSTS: &str = "[hosts.box]\ncommand = [\"<in this process>\"]\n\n\
+                            [hosts.staging]\ntransport = \"ssh\"\n\
+                            destination = \"deploy@staging.acme.dev\"\n";
+
+/// Open the fixture again as a repository on `box`, and wait for its graph.
+fn open_on_host(c: &mut Ctx) {
+    let target = format!("box:{}", c.repo.display());
+    c.h.act(|ui, cx| ui.open_repository(&target, cx));
+    c.h.wait_until("the remote tab's graph", |ui| {
+        let state = ui.active();
+        state.remote.is_some()
+            && !state.session.commits.is_empty()
+            && matches!(state.session.status, crate::LoadStatus::Loaded)
+            && !state.session.diff_in_flight()
+    });
+}
+
 fn baseline_ids() -> Vec<String> {
     let md =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/scenes.md"))

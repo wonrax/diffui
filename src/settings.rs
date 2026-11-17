@@ -200,6 +200,9 @@ pub(crate) fn build_overlay(
     if ui.mode(ModeKind::Settings).is_none() {
         return div().into_any_element();
     }
+    if let Some(page) = crate::host_page::page_overlay(ui, look, _window, cx) {
+        return page;
+    }
     if let Some(page) = crate::plugins::page_overlay(ui, look, _window, cx) {
         return page;
     }
@@ -371,15 +374,21 @@ pub(crate) fn build_overlay(
     // Every AI row is a hinted row's height.
     let ai = crate::ai::settings_group(ui, look, cx);
     let ai_rows = ai.len();
+    let (hosts, hosts_height) = crate::host_page::settings_group(ui, look, _window, cx);
+    let host_rows = hosts.len();
     let groups = [
         ("Appearance", appearance),
         ("Code", code_rows),
         ("Behaviour", behaviour),
+        ("Hosts", hosts),
         ("AI", ai),
         ("Plugins", plugins),
     ];
     let count = groups.len() as f32;
-    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>() - plugin_rows - ai_rows;
+    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>()
+        - plugin_rows
+        - ai_rows
+        - host_rows;
     for (index, (title, rows)) in groups.into_iter().enumerate() {
         body = body.child(group(look, title, index > 0, rows));
     }
@@ -394,6 +403,8 @@ pub(crate) fn build_overlay(
         + hinted_rows * (HINT_ROW_HEIGHT - ROW_HEIGHT)
         + plugins_height
         + plugin_rows as f32 * theme::HAIRLINE
+        + hosts_height
+        + host_rows as f32 * theme::HAIRLINE
         + ai_rows as f32 * (HINT_ROW_HEIGHT + theme::HAIRLINE)
         + errors as f32 * BANNER_HEIGHT;
     let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)

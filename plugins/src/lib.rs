@@ -11,8 +11,8 @@
 //! - Repository reads, jj commands and UI slots are [`protocol::HostCall`]s,
 //!   forwarded to the app's [`Host`].
 //! - The app drives a plugin with [`protocol::PluginCall`]s through
-//!   [`Plugin::call`]: run a command, ask the forge or AI provider,
-//!   deliver an event.
+//!   [`Plugin::call`]: run a command, ask the forge, AI or transport
+//!   provider, deliver an event.
 //!
 //! Plugin code never runs on the caller's thread and nothing here blocks it:
 //! every result arrives through a callback or a [`Host`] method.
@@ -45,7 +45,7 @@ pub use js::{JsError, ThrownForgeError};
 pub use manifest::{
     API_VERSION, AiClaim, CommandDecl, ConfigField, ConfigKind, Diagnostic, FORGE_HOSTS,
     ForgeClaim, ForgeTerm, HOSTS, HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace,
-    PER_HOST, Permissions, SecretField,
+    PER_HOST, Permissions, SecretField, TransportClaim,
 };
 use protocol::PluginCall;
 
@@ -234,6 +234,7 @@ impl Plugin {
         let what = match &call {
             PluginCall::Forge { call, .. } => call.method(),
             PluginCall::Ai { call } => call.method(),
+            PluginCall::Transport { call } => call.method(),
             PluginCall::Command { .. } | PluginCall::Event { .. } => "the handler",
         };
         let typed = move |result: Result<serde_json::Value, PluginError>| {

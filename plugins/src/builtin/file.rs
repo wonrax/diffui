@@ -122,15 +122,25 @@ pub(crate) fn check_entry(entry: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// What `~` stands for: `HOME`, or on Windows, where nothing sets it, the
+/// profile folder.
+fn home(var: &dyn Fn(&str) -> Option<String>) -> String {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .find_map(|name| var(name).filter(|home| !home.is_empty()))
+        .unwrap_or_default()
+}
+
 /// The file `asked` names, when one of `allowed` (the manifest's entries)
 /// names it: by the entry as written or by the path it expands to here.
 pub(crate) fn resolve(asked: &str, allowed: &[String]) -> Result<String, HostError> {
     let var = |name: &str| std::env::var(name).ok();
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home(&var);
     for entry in allowed {
         let path = expand(entry, &var, &home).ok().flatten();
         if entry == asked {
-            return path.filter(|path| path.starts_with('/')).ok_or_else(|| {
+            let absolute = |path: &String| std::path::Path::new(path).is_absolute();
+            return path.filter(absolute).ok_or_else(|| {
                 HostError::new(
                     "NotFoundError",
                     format!("{entry} names no file here: a variable in it is not set"),
@@ -187,6 +197,28 @@ mod tests {
             },
             "/Users/me",
         )
+    }
+
+    #[test]
+    fn home_is_the_profile_folder_where_nothing_sets_home() {
+        let vars = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        assert_eq!(
+            home(&vars(&[("HOME", "/Users/me"), ("USERPROFILE", "C:\\x")])),
+            "/Users/me"
+        );
+        let windows = vars(&[("HOME", ""), ("USERPROFILE", "C:\\Users\\me")]);
+        assert_eq!(home(&windows), "C:\\Users\\me");
+        assert_eq!(
+            expand("~/.ssh/config", &windows, &home(&windows)).unwrap(),
+            Some("C:\\Users\\me/.ssh/config".to_owned())
+        );
+        assert_eq!(home(&vars(&[])), "");
     }
 
     #[test]

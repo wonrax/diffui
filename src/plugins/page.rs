@@ -141,7 +141,7 @@ pub(crate) enum PageAction {
 
 /// A field's id: the input widget's ids are static, so each distinct name
 /// is kept once for the life of the process.
-fn field_id(name: String) -> &'static str {
+pub(crate) fn field_id(name: String) -> &'static str {
     static IDS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut ids = IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(known) = ids.iter().find(|known| **known == name) {
@@ -298,6 +298,7 @@ impl Diffui {
                 if self.mode(ModeKind::Settings).is_none() {
                     self.open_settings();
                 }
+                self.close_host_page();
                 let stored = self.plugins.secrets.accounts().unwrap_or_default();
                 self.plugins.page = Some(PluginPage {
                     id: id.clone(),
@@ -843,8 +844,8 @@ impl Diffui {
     }
 }
 
-const CARD_WIDTH: f32 = 560.0;
-const FIELD_WIDTH: f32 = 240.0;
+pub(crate) const CARD_WIDTH: f32 = 560.0;
+pub(crate) const FIELD_WIDTH: f32 = 240.0;
 
 /// The page, in place of the Settings list, while one is open.
 pub(crate) fn page_overlay(
@@ -952,10 +953,10 @@ pub(crate) fn page_overlay(
     )
 }
 
-const ROW_HEIGHT: f32 = 44.0;
+pub(crate) const ROW_HEIGHT: f32 = 44.0;
 const HINT_ROW_HEIGHT: f32 = crate::settings::HINT_ROW_HEIGHT;
-const GROUP_HEAD: f32 = overlay_kit::GROUP_HEIGHT + theme::space::XL;
-const DIALOG_HEAD: f32 = 146.0;
+pub(crate) const GROUP_HEAD: f32 = overlay_kit::GROUP_HEIGHT + theme::space::XL;
+pub(crate) const DIALOG_HEAD: f32 = 146.0;
 const ROW_INSET: f32 = crate::settings::ROW_INSET;
 
 fn send(
@@ -966,7 +967,12 @@ fn send(
 }
 
 /// A titled card of rows split by inset hairlines, as Settings' groups.
-fn group(look: Look, title: &'static str, after: bool, rows: Vec<AnyElement>) -> AnyElement {
+pub(crate) fn group(
+    look: Look,
+    title: &'static str,
+    after: bool,
+    rows: Vec<AnyElement>,
+) -> AnyElement {
     let Look { theme, .. } = look;
     let count = rows.len();
     let mut card = div()
@@ -998,7 +1004,12 @@ fn group(look: Look, title: &'static str, after: bool, rows: Vec<AnyElement>) ->
 }
 
 /// A setting's name, a lock when config.toml sets it, and a line under it.
-fn label(look: Look, name: &str, locked: bool, under: Option<AnyElement>) -> gpui_kit::Div {
+pub(crate) fn label(
+    look: Look,
+    name: &str,
+    locked: bool,
+    under: Option<AnyElement>,
+) -> gpui_kit::Div {
     let Look { theme, font, .. } = look;
     let mut title = div()
         .flex()
@@ -1035,7 +1046,7 @@ fn label(look: Look, name: &str, locked: bool, under: Option<AnyElement>) -> gpu
         .children(under)
 }
 
-fn caption(look: Look, text: impl Into<String>, ink: theme::Color) -> AnyElement {
+pub(crate) fn caption(look: Look, text: impl Into<String>, ink: theme::Color) -> AnyElement {
     let Look { font, .. } = look;
     typography::line(text.into(), font, text_size::CAPTION, ink)
         .overflow_hidden()
@@ -1043,7 +1054,11 @@ fn caption(look: Look, text: impl Into<String>, ink: theme::Color) -> AnyElement
         .into_any_element()
 }
 
-fn row_shell(height: f32, label: impl IntoElement, control: impl IntoElement) -> AnyElement {
+pub(crate) fn row_shell(
+    height: f32,
+    label: impl IntoElement,
+    control: impl IntoElement,
+) -> AnyElement {
     div()
         .flex()
         .flex_row()

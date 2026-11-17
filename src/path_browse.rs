@@ -32,7 +32,15 @@ pub(crate) struct Query {
 }
 
 impl Query {
+    #[cfg(test)]
     pub(crate) fn parse(input: &str) -> Option<Self> {
+        Self::parse_on(input, false)
+    }
+
+    /// `input` as a path on this machine, or (`remote`) on another one. A
+    /// path over there keeps its `~`: only that machine knows its home, so
+    /// the folder is listed, and told apart, as typed.
+    pub(crate) fn parse_on(input: &str, remote: bool) -> Option<Self> {
         // A bare `~` lists home, as a shell completes it to `~/`.
         let input = if input == "~" { "~/" } else { input };
         if !input.starts_with('/') && !input.starts_with("~/") {
@@ -41,7 +49,11 @@ impl Query {
         let split = input.rfind('/')? + 1;
         let typed_dir = &input[..split];
         Some(Self {
-            dir: crate::expand_user_path(typed_dir),
+            dir: if remote {
+                PathBuf::from(typed_dir)
+            } else {
+                crate::expand_user_path(typed_dir)
+            },
             typed_dir: typed_dir.to_owned(),
             partial: input[split..].to_owned(),
         })
@@ -139,7 +151,7 @@ pub(crate) struct FoundRepo {
 /// it. Blocking (a few stats, a canonicalize), so callers run it off the UI
 /// thread.
 pub(crate) fn probe(input: String) -> Probe {
-    let query = Query::parse(&input);
+    let query = Query::parse_on(&input, false);
     let dir_exists = query.as_ref().is_some_and(|query| query.dir.is_dir());
     let target = crate::expand_user_path(&input);
     let repo = diffui_core::prepare_repository(&target)
@@ -183,6 +195,12 @@ pub(crate) enum Status {
     Missing { folder: String },
     /// Opening failed, for a reason only the open itself found.
     Failed(String),
+    /// The machine the path is on is being reached: the last thing its
+    /// transport's program said.
+    Connecting {
+        host: String,
+        detail: Option<String>,
+    },
 }
 
 /// Whether a recent repository is a jj or git one. Recents only record the
@@ -202,7 +220,12 @@ fn recent_kind(root: &str) -> Option<Vcs> {
 /// One row of the prompt's recent list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Recent {
+    /// What it is kept and opened by: a root here, or `host:root`.
     pub(crate) root: String,
+    /// The machine it is on, when it isn't this one.
+    pub(crate) host: Option<String>,
+    /// The root itself, on whichever machine.
+    pub(crate) path: String,
     pub(crate) vcs: Option<Vcs>,
     /// A tab has it open: picking it switches there.
     pub(crate) open: bool,
@@ -215,15 +238,19 @@ impl Diffui {
             .iter()
             .map(|root| {
                 let tab = self.tabs.iter().find_map(|tab| match &tab.source {
-                    TabSource::Repo { root: open, vcs } if open.to_str() == Some(root) => {
-                        Some(*vcs)
-                    }
+                    TabSource::Repo { vcs, .. } if tab.key().as_deref() == Some(root) => Some(*vcs),
                     _ => None,
                 });
+                // A recent on another machine is never looked at here.
+                let target = diffui_core::remote::RemoteTarget::parse(root)
+                    .filter(|_| !Path::new(root).exists());
+                let local = target.is_none();
                 Recent {
                     root: root.clone(),
-                    vcs: tab.or_else(|| recent_kind(root)),
+                    vcs: tab.or_else(|| local.then(|| recent_kind(root)).flatten()),
                     open: tab.is_some(),
+                    host: target.as_ref().map(|target| target.host.0.clone()),
+                    path: target.map_or_else(|| root.clone(), |target| target.path),
                 }
             })
             .collect()
@@ -235,6 +262,9 @@ impl Diffui {
         let Some(dialog) = self.open_repo_dialog() else {
             return 0;
         };
+        if dialog.picking_host {
+            return self.open_repo_host_rows().len() + 1;
+        }
         match dialog.suggestions() {
             Some((_, rows)) => rows.len(),
             None if dialog.path.trim().is_empty() => self.recent_repos.len(),
@@ -245,7 +275,7 @@ impl Diffui {
     /// The recent the arrows picked, while the recents show.
     pub(crate) fn open_repo_selected_recent(&self) -> Option<String> {
         let dialog = self.open_repo_dialog()?;
-        if !dialog.path.trim().is_empty() {
+        if dialog.picking_host || !dialog.path.trim().is_empty() {
             return None;
         }
         self.recent_repos.get(dialog.selected?).cloned()
@@ -253,8 +283,23 @@ impl Diffui {
 
     /// Enter on row `row`: a folder suggestion, or a recent.
     pub(crate) fn open_repo_pick_row(&mut self, row: usize, cx: &mut Cx) {
+        if self
+            .open_repo_dialog()
+            .is_some_and(|dialog| dialog.picking_host)
+        {
+            // Row 0 is this machine.
+            let host = row.checked_sub(1).and_then(|row| {
+                self.open_repo_host_rows()
+                    .get(row)
+                    .map(|host| host.name.clone())
+            });
+            if row == 0 || host.is_some() {
+                self.set_open_repo_host(host, cx);
+            }
+            return;
+        }
         match self.open_repo_selected_recent() {
-            Some(root) => self.open_repository(&root, cx),
+            Some(root) => self.open_recent(&root, cx),
             None => self.pick_open_repo_suggestion(row, cx),
         }
     }
@@ -263,7 +308,16 @@ impl Diffui {
     /// take the highlighted recent's path to browse from.
     pub(crate) fn open_repo_complete(&mut self, cx: &mut Cx) {
         if let Some(root) = self.open_repo_selected_recent() {
-            return self.browse_open_repo_path(crate::contract_user_path(&root), cx);
+            // A recent on another machine is browsed from there.
+            return match diffui_core::remote::RemoteTarget::parse(&root)
+                .filter(|_| !Path::new(&root).exists())
+            {
+                Some(target) => {
+                    self.set_open_repo_host(Some(target.host.0), cx);
+                    self.browse_open_repo_path(target.path, cx)
+                }
+                None => self.browse_open_repo_path(crate::contract_user_path(&root), cx),
+            };
         }
         let completed = self.open_repo_dialog().and_then(|dialog| {
             let (query, rows) = dialog.suggestions()?;
@@ -302,11 +356,30 @@ impl Diffui {
         else {
             return;
         };
-        if Query::parse(&input).is_none() {
+        let remote = self
+            .open_repo_dialog()
+            .and_then(|dialog| dialog.link.clone());
+        if Query::parse_on(&input, remote.is_some()).is_none() {
             return;
         }
         Self::run_async(
-            async move { tokio::task::spawn_blocking(move || probe(input)).await.ok() },
+            async move {
+                match remote {
+                    Some(link) => {
+                        let probed = link.probe(&input).await.ok()?;
+                        Some(Probe {
+                            input,
+                            dir_exists: probed.dir_exists,
+                            repo: probed.repository.map(|found| FoundRepo {
+                                root: PathBuf::from(found.root),
+                                vcs: found.vcs,
+                                at_root: found.at_root,
+                            }),
+                        })
+                    }
+                    None => tokio::task::spawn_blocking(move || probe(input)).await.ok(),
+                }
+            },
             cx,
             |this, probe, _| {
                 if let Some(probe) = probe
@@ -327,22 +400,45 @@ impl Diffui {
         if let Some(error) = &dialog.error {
             return Some(Status::Failed(error.clone()));
         }
+        if dialog.picking_host {
+            return None;
+        }
+        // A machine that isn't reached yet, or can't be, comes before
+        // anything about the path on it.
+        if let (Some(host), Some(link)) = (&dialog.host, &dialog.link) {
+            match &*link.state().borrow() {
+                diffui_core::remote::LinkState::Connecting { detail } => {
+                    return Some(Status::Connecting {
+                        host: host.0.clone(),
+                        detail: detail.clone(),
+                    });
+                }
+                diffui_core::remote::LinkState::Down(error) => {
+                    return Some(Status::Failed(error.to_string()));
+                }
+                diffui_core::remote::LinkState::Up(_) => {}
+            }
+        }
         let input = dialog.path.trim();
         if input.is_empty() {
             return None;
         }
-        if let Some(spec) = self.forge.forges.parse_pr(input) {
+        if dialog.host.is_none()
+            && let Some(spec) = self.forge.forges.parse_pr(input)
+        {
             return Some(Status::PullRequest(spec));
         }
-        let Some(query) = Query::parse(input) else {
+        let Some(query) = dialog.query() else {
             return Some(Status::Relative);
         };
         let probe = dialog.probe.as_ref()?;
         if let Some(repo) = &probe.repo {
-            let open = self
-                .tabs
-                .iter()
-                .any(|tab| tab.root() == Some(repo.root.as_path()));
+            let open = self.tabs.iter().any(|tab| match &dialog.host {
+                None => tab.root() == Some(repo.root.as_path()),
+                Some(host) => tab.remote_target().is_some_and(|target| {
+                    target.host == *host && Path::new(&target.path) == repo.root
+                }),
+            });
             let name = repo.root.file_name().map_or_else(
                 || repo.root.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -383,6 +479,32 @@ impl Diffui {
 pub(crate) struct Listing {
     pub(crate) dir: PathBuf,
     pub(crate) entries: Vec<Entry>,
+    /// The machine `dir` is on, when it isn't this one.
+    pub(crate) host: Option<diffui_core::remote::HostId>,
+}
+
+impl Listing {
+    /// What a host's server listed for `dir` (a path as typed), or nothing
+    /// for a folder it couldn't read.
+    pub(crate) fn remote(
+        host: diffui_core::remote::HostId,
+        dir: PathBuf,
+        listed: Vec<diffui_core::remote::DirEntry>,
+    ) -> Self {
+        Self {
+            dir,
+            host: Some(host),
+            entries: listed
+                .into_iter()
+                .map(|entry| Entry {
+                    folded: entry.name.to_lowercase(),
+                    name: entry.name,
+                    vcs: entry.vcs,
+                    canonical: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -423,7 +545,11 @@ pub(crate) fn list(dir: PathBuf) -> Listing {
         })
         .collect();
     entries.sort_by(|a, b| a.folded.cmp(&b.folded).then_with(|| a.name.cmp(&b.name)));
-    Listing { dir, entries }
+    Listing {
+        dir,
+        entries,
+        host: None,
+    }
 }
 
 /// The same markers `prepare_repository` looks for, jj first since a
@@ -490,6 +616,7 @@ mod tests {
     #[test]
     fn matching_is_a_case_insensitive_prefix_that_hides_dot_dirs() {
         let listing = Listing {
+            host: None,
             dir: PathBuf::from("/x"),
             entries: vec![
                 entry(".config"),
@@ -560,6 +687,7 @@ mod tests {
         let mut dialog = crate::OpenRepoDialog {
             path: "/x/di".to_owned(),
             listing: Some(Listing {
+                host: None,
                 dir: PathBuf::from("/x/"),
                 entries: vec![entry("diffui"), entry("docs")],
             }),

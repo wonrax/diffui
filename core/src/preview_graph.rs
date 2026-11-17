@@ -18,7 +18,7 @@ use crate::graph_layout::{GraphLayout, GraphLayoutBuilder};
 use crate::model::{CommitStore, CommitStoreBuilder, CommitSummary, RowView};
 
 /// What the operation does to a commit the post-op log shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PostOpRole {
     /// The same commit as before.
     Unchanged,
@@ -32,7 +32,7 @@ pub enum PostOpRole {
 }
 
 /// One row of the post-op log, in walk order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PostOpRow {
     /// Hex id of the pre-op commit this row continues: the commit itself when
     /// unchanged, its predecessor when rewritten or moved. `None` for
@@ -41,6 +41,7 @@ pub struct PostOpRow {
     pub role: PostOpRole,
     /// Edges to the rows below, by row index. Missing edges keep a target
     /// outside the row range so the lane assigner can tell them apart.
+    #[serde(with = "crate::graph::wire::edges")]
     pub edges: Vec<GraphEdge<usize>>,
     /// The post-op data, whenever the loaded row can't stand in for it
     /// (anything rewritten or created, a ref or `@` that moved, or a commit
@@ -52,7 +53,7 @@ pub struct PostOpRow {
 }
 
 /// The log revset walked over a draft's simulated result.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PostOpGraph {
     pub rows: Vec<PostOpRow>,
     /// Hex ids of pre-op commits the operation abandons outright: a squash

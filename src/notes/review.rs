@@ -177,8 +177,8 @@ impl Diffui {
         let findings = parse_findings(reply);
         let state = self.tab(tab);
         let root: Option<PathBuf> = state
-            .and_then(|state| state.repository.as_ref())
-            .map(|repository| repository.root.clone());
+            .and_then(|state| state.local_root())
+            .map(std::path::Path::to_owned);
         let store: Option<std::sync::Arc<dyn Source>> =
             state.and_then(|state| state.notes.source.clone());
         let (Some(revision), Some(root), Some(store), false) = (

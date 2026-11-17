@@ -261,6 +261,17 @@ fn the_data_types_have_the_fields_the_protocol_sends() {
     );
     assert_eq!(fields(Selection::default()), interface("Selection"));
     assert_eq!(fields(AiRequest::default()), interface("AiRequest"));
+    {
+        use diffui_plugins::protocol::{
+            FoundHost, Launch, Located, ServerCommand, TransportExit, TransportHost,
+        };
+        assert_eq!(fields(TransportHost::default()), interface("TransportHost"));
+        assert_eq!(fields(ServerCommand::default()), interface("ServerCommand"));
+        assert_eq!(fields(Launch::default()), interface("Launch"));
+        assert_eq!(fields(FoundHost::default()), interface("FoundHost"));
+        assert_eq!(fields(TransportExit::default()), interface("TransportExit"));
+        assert_eq!(fields(Located::default()), interface("Located"));
+    }
     assert_eq!(
         fields(AiModel {
             id: text(),

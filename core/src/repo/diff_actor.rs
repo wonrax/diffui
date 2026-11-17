@@ -704,6 +704,7 @@ mod tests {
                 right: dir.join("right"),
             }),
             &crate::forge::Forges::default(),
+            &crate::remote::Hosts::none(),
         );
         assert!(matches!(
             events.next().await.map(|event| event.payload),

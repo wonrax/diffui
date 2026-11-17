@@ -187,6 +187,9 @@ pub enum PluginCall {
     Forge { repo: RepoHandle, call: ForgeCall },
     /// Ask the registered AI provider. The reply is named on [`AiCall`].
     Ai { call: AiCall },
+    /// Ask the registered transport. The reply is named on
+    /// [`TransportCall`].
+    Transport { call: TransportCall },
     /// Deliver an event to its listeners. Fire and forget: the reply is
     /// `null` as soon as the listeners were called, and what they throw goes
     /// to the plugin's log.
@@ -277,6 +280,103 @@ impl AiCall {
 
 /// The provider methods a script can register: `complete` is required.
 pub const AI_METHODS: [&str; 3] = ["complete", "models", "account"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "camelCase")]
+pub enum TransportCall {
+    /// How to reach `host`'s server. Reply: [`Launch`], whose argv the
+    /// plugin's `[permissions] exec` must cover and whose environment
+    /// `[permissions] env` must list, as for `exec`.
+    Connect { host: TransportHost },
+    /// The hosts found on this machine. Reply: `Vec<`[`FoundHost`]`>`.
+    Hosts,
+    /// Why starting `host`'s server ended the way `exit` says, when the
+    /// transport can tell. Reply: `Option<String>`.
+    Explain {
+        host: TransportHost,
+        exit: TransportExit,
+    },
+    /// The host and the path on it that `path`, a path on this machine
+    /// under one of the manifest's `local_roots`, really is. Reply:
+    /// `Option<`[`Located`]`>`.
+    Locate { path: String },
+}
+
+impl TransportCall {
+    /// The provider method this calls, as the script names it.
+    pub fn method(&self) -> &'static str {
+        match self {
+            TransportCall::Connect { .. } => "connect",
+            TransportCall::Hosts => "hosts",
+            TransportCall::Explain { .. } => "explain",
+            TransportCall::Locate { .. } => "locate",
+        }
+    }
+}
+
+/// The transport methods a script can register: `connect` is required.
+pub const TRANSPORT_METHODS: [&str; 4] = ["connect", "hosts", "explain", "locate"];
+
+/// One host, as its transport is asked about it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TransportHost {
+    /// The name the user knows it by: its `[hosts.<name>]`, or the name the
+    /// transport's `hosts()` gave it.
+    pub name: String,
+    /// The transport's per-host settings for it, over their defaults.
+    pub options: serde_json::Map<String, serde_json::Value>,
+    /// The server to start on the host.
+    pub server: ServerCommand,
+}
+
+/// The command that is the server on the far side, with the environment it
+/// should run in. Words, not a shell line: a transport that goes through a
+/// shell quotes them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ServerCommand {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// The program on this machine whose stdin and stdout are the stream.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Launch {
+    pub argv: Vec<String>,
+    /// Environment for that program (not for the server).
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A host a transport found without being told: a WSL distribution, a
+/// `Host` in `~/.ssh/config`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FoundHost {
+    pub name: String,
+    /// Per-host settings that reach it, when the name alone doesn't say.
+    #[serde(default)]
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+/// How a transport's program ended before a server answered.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TransportExit {
+    /// `null` when a signal ended it or the app gave up waiting.
+    pub code: Option<i32>,
+    /// The end of what it wrote to stderr.
+    pub stderr: String,
+}
+
+/// A path on this machine, as the host and path it really is.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Located {
+    /// The host's name, as `hosts()` gives it.
+    pub host: String,
+    /// The path on that host.
+    pub path: String,
+    #[serde(default)]
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
 
 /// What an AI provider is asked to answer.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

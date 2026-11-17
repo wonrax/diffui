@@ -55,6 +55,9 @@ repository. With diffui already running, the patch opens as a tab there.
 `diffui diff LEFT RIGHT` compares two files or two folders (see `diffui diff \
 --help` for the jj and git diff tool config).
 
+`diffui HOST:/PATH` opens a repository on another machine, a host from \
+config.toml's [hosts] or one a transport finds (see `diffui skill remote`).
+
 For agents and scripts: `diffui skill` prints a guide to `diffui notes` \
 (review notes), `diffui ctl` (drive the running app), `diffui plugin` and \
 `diffui jj`.";

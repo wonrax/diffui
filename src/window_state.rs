@@ -131,12 +131,31 @@ impl RepoLayouts {
         state
     }
 
-    /// Record how `tab` is laid out now. PR tabs have no root to key it by.
+    /// A never-loaded tab for `repository` on `host`, laid out as the tab
+    /// saved under `key` was last left.
+    pub(crate) fn remote_tab_state(
+        &self,
+        key: &str,
+        repository: crate::Repository,
+        host: diffui_core::remote::HostId,
+    ) -> crate::TabState {
+        let revset = self
+            .revsets
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let mut state = crate::TabState::unloaded_remote(repository, host, revset);
+        state.history_panel_collapsed = self.history_panel_collapsed.get(key) == Some(&true);
+        state.files_panel_collapsed = self.files_panel_collapsed.get(key) == Some(&true);
+        state
+    }
+
+    /// Record how `tab` is laid out now. PR tabs have no key to file it
+    /// under.
     pub(crate) fn remember(&mut self, tab: &crate::Tab) {
-        let Some(root) = tab.root() else {
+        let Some(key) = tab.key() else {
             return;
         };
-        let key = root.to_string_lossy().into_owned();
         let state = &tab.state;
         if state.session.revset.is_empty() {
             self.revsets.remove(&key);

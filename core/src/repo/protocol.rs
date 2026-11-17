@@ -28,10 +28,13 @@ use crate::session::{RefreshMode, RefreshOrigin};
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
 /// Identity of an open repository: the workspace root for a local repository,
-/// the `owner/repo#number` reference for a GitHub pull request. One actor per
+/// the `owner/repo#number` reference for a GitHub pull request, `host:path`
+/// for a repository on another machine. One actor per
 /// id — see [`repo_id`](super::repo_id) for why this is per workspace rather
 /// than per `.jj/repo`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RepoId(pub String);
 
 impl fmt::Display for RepoId {
@@ -47,7 +50,19 @@ impl fmt::Display for RepoId {
 /// Unique process-wide, not per session: two sessions over different
 /// repositories would otherwise both be waiting on "job 3", and an event would
 /// have no way to say which one it answers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct JobId(pub u64);
 
 impl JobId {
@@ -63,7 +78,7 @@ impl JobId {
 /// replaces runtime downcasts to per-capability traits: a frontend reads the
 /// flags to grey out an action instead of dispatching it and catching
 /// [`RepoError::Unsupported`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities {
     /// Has a commit graph and a working copy to snapshot (jj, git).
     pub graph: bool,
@@ -87,7 +102,7 @@ pub struct Capabilities {
 /// the frontend needs to tell "the revset doesn't parse" (keep the graph, show
 /// the revset error) from "this commit is immutable" (offer the override) from
 /// "the walk died" (fail the tab), and prose can't be matched on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RepoError {
     /// The user's revset failed to parse or resolve.
     Revset(String),
@@ -117,6 +132,9 @@ pub enum RepoError {
     /// The actor panicked while running the command. It dropped whatever it
     /// had loaded and keeps serving, so the next command starts clean.
     Crashed(String),
+    /// The repository is on another machine and the connection to it is
+    /// gone. [`Payload::Disconnected`] says why, once, for the whole tab.
+    Disconnected,
 }
 
 impl fmt::Display for RepoError {
@@ -133,6 +151,7 @@ impl fmt::Display for RepoError {
             Self::UndoesPush { summary } => {
                 write!(f, "undoing \u{201c}{summary}\u{201d} undoes a push")
             }
+            Self::Disconnected => f.write_str("the connection to the repository's host was lost"),
             Self::Crashed(message) => write!(
                 f,
                 "This repository's worker crashed: {message}. See the log \
@@ -146,7 +165,7 @@ impl std::error::Error for RepoError {}
 
 /// What a preview simulates. Separate from [`MutationOp`] because a preview
 /// resolves the same inputs without ever writing an operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PreviewRequest {
     Rebase {
         mode: RebaseSourceMode,
@@ -181,7 +200,7 @@ pub enum PreviewRequest {
 /// Work asked of a repository. Every variant that does work carries a
 /// [`JobId`]; the actor answers each with exactly one terminal event
 /// (`Failed`, `Cancelled`, or the variant's own success).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Walk `revset` and stream the rows back as `Batch` events.
     LoadGraph {
@@ -386,7 +405,7 @@ impl Command {
 
 /// What a [`Command::Snapshot`] does with the disk. Only jj has a snapshot to
 /// take; git and pull requests read every variant as a plain refresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiskSync {
     /// Look without writing: whether the disk has edits `@` doesn't hold and
     /// whether the checkout is stale. No snapshot, no stale update.
@@ -401,7 +420,7 @@ pub enum DiskSync {
 }
 
 /// How the disk stands against `@`, as the last snapshot found it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiskState {
     /// The disk has edits `@` doesn't hold yet. Only a [`DiskSync::Check`]
     /// leaves any behind.
@@ -416,7 +435,7 @@ pub struct DiskState {
 }
 
 /// The tail of a graph walk: what only the completed walk knows.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GraphTail {
     /// `(row index, is_empty)` for the single-parent commits the walk resolved
     /// in its final pass. Merges and roots stay unknown (see
@@ -458,11 +477,13 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Payload {
     /// The actor is up. The only variant that isn't plain data: `handle` is a
     /// channel sender, which is how the in-process bootstrap works. Across a
-    /// process boundary this is where a connect handshake would go.
+    /// process boundary the connect handshake stands in for it (see
+    /// [`crate::remote`]), so it never goes on the wire.
+    #[serde(skip)]
     Ready {
         handle: super::RepoHandle,
         capabilities: Capabilities,
@@ -658,6 +679,21 @@ pub enum Payload {
     Cancelled {
         job: JobId,
     },
+    /// A repository on another machine is being reached: the last thing the
+    /// transport's program said, for something to show while it works. Made
+    /// on the app's side, so never on the wire.
+    #[serde(skip)]
+    Connecting {
+        detail: Option<String>,
+    },
+    /// The repository's host can't be reached, went away, or has no
+    /// repository at the path. Every job still out has been failed with
+    /// [`RepoError::Disconnected`], and every later one will be. Getting it
+    /// back is opening the repository again. Made on the app's side.
+    #[serde(skip)]
+    Disconnected {
+        error: crate::remote::ConnectError,
+    },
 }
 
 impl Payload {
@@ -697,7 +733,9 @@ impl Payload {
             | Self::WorkingCopyChanged
             | Self::RepositoryChanged
             | Self::StaleWorkingCopyRecovered
-            | Self::StaleWorkingCopy { .. } => None,
+            | Self::StaleWorkingCopy { .. }
+            | Self::Connecting { .. }
+            | Self::Disconnected { .. } => None,
         }
     }
 
@@ -717,6 +755,8 @@ impl Payload {
                 | Self::RepositoryChanged
                 | Self::StaleWorkingCopyRecovered
                 | Self::StaleWorkingCopy { .. }
+                | Self::Connecting { .. }
+                | Self::Disconnected { .. }
         )
     }
 }
@@ -731,4 +771,10 @@ pub enum OpenSpec {
     /// A patch, or two folders or files compared: a diff with no
     /// repository behind it.
     Diff(crate::patch::DiffInput),
+    /// The repository at or above `path` on another machine, served by the
+    /// `diffui-serve` there (see [`crate::remote`]).
+    Remote {
+        host: crate::remote::HostId,
+        path: String,
+    },
 }

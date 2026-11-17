@@ -31,7 +31,7 @@ use jj_lib::settings::UserSettings;
 use crate::model::RevisionSelection;
 
 /// How to resolve one conflicted path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictResolution {
     /// Take side `n` (0-based) of the conflict as the file's content —
     /// `jj resolve --tool :ours` is `Side(0)`, `:theirs` is `Side(1)`.
@@ -58,7 +58,7 @@ pub enum ConflictResolution {
 }
 
 /// A term of a conflict to take, 0-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictPick {
     Side(usize),
     Base(usize),
@@ -67,7 +67,7 @@ pub enum ConflictPick {
 /// One term of a conflict, labeled the way jj labels it in conflict markers
 /// (`nlqwxzwn 7dd24e73 "description"`), or `side #n` / `base #n` when the
 /// conflict carries no labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictTerm {
     pub label: String,
     /// The path doesn't exist on this term (one side deleted the file).
@@ -75,7 +75,7 @@ pub struct ConflictTerm {
 }
 
 /// A conflicted path in a revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictFile {
     pub path: String,
     /// The conflict's sides (jj's "adds"), in marker order: side 1 is what
@@ -128,7 +128,7 @@ pub fn hunk_conflict_region(hunk: &crate::model::DiffHunkView) -> Option<(usize,
 /// A prepared merge-tool run: the input files are written, the arguments
 /// interpolated. [`run`](Self::run) blocks until the tool exits, so call it
 /// off the UI thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeToolInvocation {
     /// The configured name (`vscode`, `meld`…), for messages.
     pub tool: String,

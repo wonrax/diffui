@@ -32,3 +32,38 @@ Run this before jj's first snapshot:
 ```powershell
 jj config set --repo working-copy.eol-conversion input-output
 ```
+
+## Repositories in WSL
+
+Open a repository that lives inside a WSL distribution through a host, not
+through its `\\wsl.localhost\…` path: jj on Windows would read every file
+over the network share, see none of the changes made inside, and rewrite
+line endings and executable bits. With a host, `diffui-serve` runs inside
+the distribution and does jj's work there.
+
+Build the server inside the distribution, from a checkout at the same commit
+as the app:
+
+```sh
+# With Nix:
+nix build .#diffui-serve          # ./result/bin/diffui-serve
+
+# Without: a C compiler, wabt (wasm2c) and SIMDe's headers, as for the app.
+cargo install --path serve        # ~/.cargo/bin/diffui-serve
+```
+
+Each distribution is offered as a host by its name (the chip in the open
+dialog, or `diffui Ubuntu:~/src/repo`). diffui starts
+`wsl.exe --distribution <name> --shell-type login` and looks for
+`diffui-serve` on the `PATH` a login shell gets there. Say where it is
+otherwise, in diffui's config.toml (`%XDG_CONFIG_HOME%\diffui\config.toml`,
+else `%HOME%\.config\diffui\config.toml`):
+
+```toml
+[hosts.Ubuntu]
+server = ["/home/me/src/diffui/result/bin/diffui-serve"]
+```
+
+`--shell-type` needs the WSL from the Microsoft Store (`wsl --update`).
+`diffui skill remote` has the rest: every host setting, and what a remote
+tab doesn't do.

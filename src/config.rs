@@ -177,6 +177,7 @@ impl AppConfig {
             settings_path,
             stored,
             plugins: tables.plugins,
+            hosts: tables.hosts,
             ai_provider: tables.ai.provider,
             config_error,
             settings_error,
@@ -375,6 +376,9 @@ pub struct ConfigFiles {
     stored: Scalars,
     /// What the user decided about each plugin, by id.
     pub(crate) plugins: PluginRecords,
+    /// `settings.toml`'s `[hosts.<name>]` tables: the hosts Settings made
+    /// or changed. config.toml's tables go over them, a key at a time.
+    pub(crate) hosts: HostTables,
     /// `settings.toml`'s `[ai] provider`: the AI provider Settings picked.
     pub(crate) ai_provider: Option<String>,
     /// Why `config.toml` was ignored, as `path:line:col: message`.
@@ -412,7 +416,13 @@ impl ConfigFiles {
         };
         let mut next = self.stored.clone();
         setting.store(&mut next);
-        save_settings(path, &next, &self.plugins, self.ai_provider.as_deref())?;
+        save_settings(
+            path,
+            &next,
+            &self.plugins,
+            self.ai_provider.as_deref(),
+            &self.hosts,
+        )?;
         self.stored = next;
         self.settings_error = None;
         Ok(())
@@ -428,7 +438,13 @@ impl ConfigFiles {
         let mut next = self.plugins.clone();
         next.insert(id.to_owned(), record);
         if let Some(path) = &self.settings_path {
-            save_settings(path, &self.stored, &next, self.ai_provider.as_deref())?;
+            save_settings(
+                path,
+                &self.stored,
+                &next,
+                self.ai_provider.as_deref(),
+                &self.hosts,
+            )?;
             self.settings_error = None;
         }
         self.plugins = next;
@@ -438,16 +454,55 @@ impl ConfigFiles {
     /// Save the AI provider Settings picked (`None`: automatic).
     pub(crate) fn write_ai_provider(&mut self, provider: Option<String>) -> Result<(), String> {
         if let Some(path) = &self.settings_path {
-            save_settings(path, &self.stored, &self.plugins, provider.as_deref())?;
+            save_settings(
+                path,
+                &self.stored,
+                &self.plugins,
+                provider.as_deref(),
+                &self.hosts,
+            )?;
             self.settings_error = None;
         }
         self.ai_provider = provider;
+        Ok(())
+    }
+
+    /// Save `settings.toml`'s `[hosts.<name>]` table; `None` takes it out.
+    pub(crate) fn write_host(
+        &mut self,
+        name: &str,
+        table: Option<toml::Table>,
+    ) -> Result<(), String> {
+        let mut next = self.hosts.clone();
+        match table {
+            Some(table) => {
+                next.insert(name.to_owned(), table);
+            }
+            None => {
+                next.remove(name);
+            }
+        }
+        if let Some(path) = &self.settings_path {
+            save_settings(
+                path,
+                &self.stored,
+                &self.plugins,
+                self.ai_provider.as_deref(),
+                &next,
+            )?;
+            self.settings_error = None;
+        }
+        self.hosts = next;
         Ok(())
     }
 }
 
 /// What `settings.toml` says about each plugin, by id.
 pub(crate) type PluginRecords = std::collections::BTreeMap<String, crate::plugins::Record>;
+
+/// `[hosts.<name>]` tables as written, by name. `crate::remote` reads them:
+/// config.toml's over settings.toml's.
+pub(crate) type HostTables = std::collections::BTreeMap<String, toml::Table>;
 
 /// What `settings.toml` says about each plugin, read on its own: for
 /// `diffui plugin list`, which has no app around it.
@@ -459,13 +514,16 @@ pub(crate) fn plugin_records() -> PluginRecords {
         .unwrap_or_default()
 }
 
-/// The tables of `settings.toml`: `[ai]` and each `[plugins.<id>]`.
+/// The tables of `settings.toml`: `[ai]`, each `[plugins.<id>]` and each
+/// `[hosts.<name>]`.
 #[derive(Default, Debug, Deserialize, Serialize)]
 struct StoredPlugins {
     #[serde(default, skip_serializing_if = "AiTable::is_empty")]
     ai: AiTable,
     #[serde(default, skip_serializing_if = "PluginRecords::is_empty")]
     plugins: PluginRecords,
+    #[serde(default, skip_serializing_if = "HostTables::is_empty")]
+    hosts: HostTables,
 }
 
 /// `[ai]`. Only config.toml's has a `command`.
@@ -483,23 +541,25 @@ impl AiTable {
     }
 }
 
-/// Write `settings.toml` whole: the settings, then the `[ai]` and plugin
-/// tables.
+/// Write `settings.toml` whole: the settings, then the `[ai]`, plugin and
+/// host tables.
 fn save_settings(
     path: &Path,
     scalars: &Scalars,
     plugins: &PluginRecords,
     ai_provider: Option<&str>,
+    hosts: &HostTables,
 ) -> Result<(), String> {
     let body = toml::to_string(scalars).map_err(|error| error.to_string())?;
     let mut text = format!("{SETTINGS_HEADER}{body}");
-    if !plugins.is_empty() || ai_provider.is_some() {
+    if !plugins.is_empty() || ai_provider.is_some() || !hosts.is_empty() {
         let tables = toml::to_string(&StoredPlugins {
             ai: AiTable {
                 command: None,
                 provider: ai_provider.map(str::to_owned),
             },
             plugins: plugins.clone(),
+            hosts: hosts.clone(),
         })
         .map_err(|error| error.to_string())?;
         text.push('\n');
@@ -600,6 +660,9 @@ struct FileOnly {
     /// `[plugins.<id>]`: each plugin's own settings, as written.
     #[serde(default)]
     plugins: std::collections::BTreeMap<String, toml::Table>,
+    /// `[hosts.<name>]`: the machines repositories are opened on.
+    #[serde(default)]
+    hosts: HostTables,
 }
 
 /// `[editor]`: the program a shipped command starts.
@@ -624,6 +687,8 @@ pub(crate) struct UserConfig {
     pub(crate) ai_provider: Option<String>,
     /// Each plugin's `[plugins.<id>]` table.
     pub(crate) plugins: std::collections::BTreeMap<String, toml::Table>,
+    /// Each `[hosts.<name>]` table (see `crate::remote`).
+    pub(crate) hosts: HostTables,
 }
 
 impl UserConfig {
@@ -640,6 +705,7 @@ impl UserConfig {
             ai: file_only.ai.command.filter(|argv| !argv.is_empty()),
             ai_provider: file_only.ai.provider,
             plugins: file_only.plugins,
+            hosts: file_only.hosts,
         }
     }
 
@@ -992,6 +1058,32 @@ mod tests {
         assert_eq!(config.code_type.line_height, 1.85);
         assert_eq!(config.locked, Locked::default());
         assert_eq!(files.settings_error, None);
+    }
+
+    #[test]
+    fn a_hosts_table_is_kept_across_other_writes_and_read_back() {
+        let dir = Dir::new("hosts", None, None);
+        let (_, mut files) = dir.load();
+        let table: toml::Table =
+            toml::from_str("transport = \"ssh\"\nport = 2222\nserver = [\"nix\", \"run\"]\n")
+                .unwrap();
+        files
+            .write_host("devbox", Some(table.clone()))
+            .expect("the host's write");
+        files.write(&Setting::MultiClickMs(500)).expect("a setting");
+        files
+            .write_ai_provider(Some("claude".to_owned()))
+            .expect("the provider");
+        let text = std::fs::read_to_string(dir.settings()).expect("settings.toml");
+        assert!(text.contains("[hosts.devbox]\n"), "{text}");
+        let (config, mut files) = dir.load();
+        assert_eq!(config.multi_click_ms, 500);
+        assert_eq!(files.hosts.get("devbox"), Some(&table));
+
+        files.write_host("devbox", None).expect("the removal");
+        let text = std::fs::read_to_string(dir.settings()).expect("settings.toml");
+        assert!(!text.contains("hosts"), "{text}");
+        assert!(dir.load().1.hosts.is_empty());
     }
 
     #[test]

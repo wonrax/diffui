@@ -119,6 +119,7 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 | `forge` | `forge.register(provider)`: a forge (`diffui skill forge-plugin`) |
 | `ForgeError` | `throw new ForgeError(kind, message, { host, what })` from a forge, so diffui says what to do (`gh auth login --hostname …`) |
 | `ai` | `ai.register(provider)` for a plugin with `[provides.ai]`: `complete` (called with a `request`, `{ prompt, input, system, model, cwd }`, and `{ signal }`) returns the reply as text or an (async) iterable of text pieces (required), `models` (the list Settings' model picker shows), `account` (what it runs as, `{ label }`, for its page) |
+| `transport` | `transport.register(provider)` for a plugin with `[provides.transport]`, which reaches repositories on other machines: see `diffui skill remote` |
 | `AiError` | `throw new AiError(kind, message)` from an AI provider: diffui adds what to do ("Add an API key in Settings → AI → Anthropic") |
 | `events` | `events.on(name, listener)` for `repoOpened`, `refsChanged`, `operationChanged` (the repository changed: a commit, a rebase, an undo; what a status item recomputes on), `selectionChanged`, `fetched`, `pushed`, `commandInvoked` |
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |

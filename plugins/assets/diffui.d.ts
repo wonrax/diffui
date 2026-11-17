@@ -97,6 +97,26 @@
  *     [permissions]
  *     http = ["{config.base_url}"]   # a "{config.<key>}" word reaches the host of the address that string setting holds
  *
+ * A transport reaches repositories on other machines (diffui bundles `ssh` and `wsl`). It never carries the
+ * data: it answers with the program to start on this machine, whose stdin and stdout become the stream to the
+ * `diffui-serve` on the other side, and diffui starts that program itself. So `ssh`, `wsl.exe`, `docker exec`
+ * or a bridge to anything else that ends in a byte stream are all transports:
+ *
+ *     [provides.transport]
+ *     local_roots = ['\\wsl.localhost\']   # optional: prefixes of paths on this machine that `locate` maps to a host
+ *
+ *     [permissions]
+ *     exec = [["{config.program}"]]   # what `connect` answers is held to this, like `exec`
+ *
+ *     [config.schema]
+ *     program = { type = "path", default = "ssh", label = "The ssh program" }
+ *     destination = { type = "string", label = "Destination", per_host = true }   # a host's own settings
+ *
+ * A host is a `[hosts.<name>]` table in config.toml (or one made in Settings → Hosts) with `transport = "<plugin
+ * id>"`. diffui reads `server` (the command that is diffui-serve over there, default `["diffui-serve"]`) and
+ * `env` (its environment) from it; every other key is one of the transport's `per_host` settings and reaches the
+ * script as `host.options`. A transport with `hosts()` also offers the machines it finds without any table.
+ *
  * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
  * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
  * may reach: `http.fetch` goes only there, and `auth.token(host)` answers only for a host listed there. A forge
@@ -122,8 +142,8 @@
  *   the plugin's folder: `npx -p typescript tsc --noEmit` (`-p jsconfig.json` for JavaScript). It finds the
  *   API's types because this file sits beside the module; without it there, `"diffui"` doesn't resolve.
  * - Plugins never draw. They answer questions (a forge or AI provider), run commands and fill the slots in `ui`.
- * - Call `commands.register`, `forge.register`, `ai.register` and `events.on` while the main module loads
- *   (top-level `await` is fine). Loading fails if a declared command or provider has no handler, or if anything
+ * - Call `commands.register`, `forge.register`, `ai.register`, `transport.register` and `events.on` while the
+ *   main module loads (top-level `await` is fine). Loading fails if a declared command or provider has no handler, or if anything
  *   throws.
  * - Every host function returns a promise. A refusal rejects with an `Error` whose `name` is "PermissionError";
  *   a timeout with "TimeoutError"; a cancelled call with "AbortError".
@@ -463,6 +483,83 @@ declare module "diffui" {
   }
 
   export type AiErrorKind = "missing-cli" | "auth" | "rate-limited" | "unreachable" | "failed";
+
+  /** Reaching other machines. Needs `[provides.transport]` in plugin.toml. */
+  export const transport: Transport;
+
+  export interface Transport {
+    /** Call once, while the main module loads. */
+    register(provider: TransportProvider): void;
+  }
+
+  export interface TransportProvider {
+    /**
+     * The program on this machine whose stdin and stdout are the stream to `host`'s server. diffui starts it;
+     * its argv must be covered by `[permissions] exec` and its `env` listed under `[permissions] env`. It has
+     * to end up running `host.server.argv` over there with `host.server.env` set, and pass bytes through
+     * untouched (no terminal: `ssh -T`).
+     *
+     * Throw to say the host can't be reached as configured (a setting is missing).
+     */
+    connect(host: TransportHost): Launch | Promise<Launch>;
+    /**
+     * The machines found here without a `[hosts]` table: WSL distributions, the `Host`s of `~/.ssh/config`.
+     * Asked when the open dialog or Settings lists hosts.
+     */
+    hosts?(): FoundHost[] | Promise<FoundHost[]>;
+    /**
+     * Why the program ended before a server answered, in a sentence the user can act on ("box has no
+     * diffui-serve on its PATH. …"), or nothing when the exit doesn't say. diffui shows the program's last
+     * stderr line otherwise.
+     */
+    explain?(host: TransportHost, exit: TransportExit): string | null | undefined;
+    /**
+     * The host and the path there that `path` is: a path on this machine under one of the manifest's
+     * `local_roots` (`\\wsl.localhost\Ubuntu\home\me\repo` is `/home/me/repo` on `Ubuntu`). Nothing when it isn't one.
+     */
+    locate?(path: string): Located | null | undefined;
+  }
+
+  export interface TransportHost {
+    /** The `[hosts.<name>]` it is configured under, or the name `hosts()` gave it. */
+    readonly name: string;
+    /** The transport's `per_host` settings for this host, over their defaults. */
+    readonly options: Readonly<Record<string, any>>;
+    /** The server to start over there. */
+    readonly server: ServerCommand;
+  }
+
+  /** A command as words, not a shell line: a transport that goes through a shell quotes each one. */
+  export interface ServerCommand {
+    readonly argv: readonly string[];
+    readonly env: Readonly<Record<string, string>>;
+  }
+
+  export interface Launch {
+    argv: string[];
+    /** Environment for the program started here, not for the server. */
+    env?: Record<string, string>;
+  }
+
+  export interface FoundHost {
+    name: string;
+    /** `per_host` settings that reach it, when the name alone doesn't say. */
+    options?: Record<string, any>;
+  }
+
+  export interface TransportExit {
+    /** `null` when a signal ended the program or diffui gave up waiting. */
+    readonly code: number | null;
+    /** The end of what it wrote to stderr. */
+    readonly stderr: string;
+  }
+
+  export interface Located {
+    /** The host's name, as `hosts()` gives it. */
+    host: string;
+    path: string;
+    options?: Record<string, any>;
+  }
 
   export interface PullRequest {
     number: number;

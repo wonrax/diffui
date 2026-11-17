@@ -12,6 +12,7 @@ const { send, utf8Encode, utf8Decode } = boot.native;
 const declaredCommands = new Set(boot.commands);
 const providesForge = boot.forge;
 const providesAi = boot.ai;
+const providesTransport = boot.transport;
 const eventNames = boot.events;
 
 const post = (message) => send(JSON.stringify(message));
@@ -517,6 +518,7 @@ const commandHandlers = new Map();
 const listeners = new Map();
 let forgeProvider = null;
 let aiProvider = null;
+let transportProvider = null;
 
 function whileLoading(what) {
   if (!loading) throw new Error(`${what} must run while the plugin loads (at the top level of its main module), not later`);
@@ -558,6 +560,18 @@ export const ai = freezeDeep({
       throw new TypeError("ai.register needs an object with at least a complete(request, { signal }) method");
     }
     aiProvider = provider;
+  },
+});
+
+export const transport = freezeDeep({
+  register(provider) {
+    whileLoading("transport.register");
+    if (!providesTransport) throw new Error("transport.register needs `[provides.transport]` in plugin.toml");
+    if (transportProvider) throw new Error("transport.register was called twice");
+    if (!provider || typeof provider.connect !== "function") {
+      throw new TypeError("transport.register needs an object with at least a connect(host) method");
+    }
+    transportProvider = provider;
   },
 });
 
@@ -939,6 +953,19 @@ async function askAi(id, request, signal) {
   }
 }
 
+async function askTransport(request) {
+  switch (request.method) {
+    case "connect":
+      return transportProvider.connect(freezeDeep(request.host));
+    case "hosts":
+      return transportProvider.hosts();
+    case "explain":
+      return transportProvider.explain(freezeDeep(request.host), freezeDeep(request.exit));
+    case "locate":
+      return transportProvider.locate(request.path);
+  }
+}
+
 /** The most parts one `call.part` hands over. */
 const PART_BATCH = 64;
 
@@ -1032,6 +1059,9 @@ async function answer(id, request) {
         }
         break;
       }
+      case "transport":
+        value = (await askTransport(request.call)) ?? null;
+        break;
       case "event":
         deliver(request.event);
         break;
@@ -1074,6 +1104,9 @@ boot.finishLoad = () => {
     commands: [...commandHandlers.keys()],
     forge: forgeProvider && boot.forgeMethods.filter((method) => typeof forgeProvider[method] === "function"),
     ai: aiProvider && boot.aiMethods.filter((method) => typeof aiProvider[method] === "function"),
+    transport:
+      transportProvider &&
+      boot.transportMethods.filter((method) => typeof transportProvider[method] === "function"),
     events: [...listeners.keys()],
   });
 };

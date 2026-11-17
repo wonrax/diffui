@@ -35,7 +35,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_BATCH: usize = 256;
 
 /// One jj CLI run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CliInvocation {
     /// An executable that runs jj-cli when started as `jj`: the app's own
     /// binary (`std::env::current_exe()`).
@@ -59,7 +59,7 @@ impl CliInvocation {
 }
 
 /// Which stream a line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CliStream {
     Stdout,
     Stderr,
@@ -67,7 +67,7 @@ pub enum CliStream {
 
 /// One line of CLI output, without its newline and with any ANSI styling
 /// removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CliLine {
     pub stream: CliStream,
     pub text: String,

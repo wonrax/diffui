@@ -77,7 +77,7 @@ impl std::hash::Hash for DiffInput {
 }
 
 /// An email's (or an `hg export`'s) header: who, when, and what it says.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Mail {
     /// The subject, its `[PATCH n/m]` tag taken off.
     pub subject: String,

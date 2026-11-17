@@ -49,7 +49,7 @@ impl LoadProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RevisionSelection {
     #[default]
     WorkingCopy,
@@ -72,7 +72,7 @@ impl RevisionSelection {
 
 /// What a revision's diff is taken against. The revision itself is the "to"
 /// side of every base but [`DiffBase::Range`]; this names the "from" side.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DiffBase {
     /// `jj diff -r X`: X against its (merged) parents.
     #[default]
@@ -137,7 +137,7 @@ impl DiffBase {
 /// `jj diff`'s revision arguments as typed, before anything resolved them.
 /// [`crate::Session::diff_revsets`] resolves them with jj's rules and shows
 /// the result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffRequest {
     /// `jj diff -r REVSET…`: several are their union, none means `@`. One
     /// commit is that commit's own diff; several are a [`DiffBase::Range`],
@@ -154,7 +154,7 @@ pub enum DiffRequest {
 
 /// The commits a range diff covers, carried on its [`DiffDocument`] so the
 /// view can label the range and tint its rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffRange {
     /// The revset as given.
     pub revset: String,
@@ -178,7 +178,7 @@ impl DiffRange {
     pub const COMMIT_LIMIT: usize = 10_000;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiffDocument {
     pub files: Vec<DiffFile>,
     pub total_additions: usize,
@@ -219,7 +219,7 @@ impl DiffDocument {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffFile {
     pub path: String,
     pub old_path: Option<String>,
@@ -241,7 +241,7 @@ pub struct DiffFile {
 }
 
 /// The two sides of a file whose diff isn't (only) text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobChange {
     pub kind: BlobKind,
     /// `None` where the file is absent: before an add, after a delete.
@@ -259,7 +259,7 @@ impl BlobChange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlobKind {
     /// Any binary the app can't render: shown as its sizes.
     Binary,
@@ -270,7 +270,7 @@ pub enum BlobKind {
 }
 
 /// One side of a [`BlobChange`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobSide {
     pub size: u64,
     /// Content identity (`<blob hash>:<size>`): keys decodes, so a reload or
@@ -283,7 +283,7 @@ pub struct BlobSide {
 }
 
 /// Why a file's diff came back without rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffCollapse {
     /// The file alone changes too many lines.
     LargeFile,
@@ -295,7 +295,7 @@ pub enum DiffCollapse {
 /// builder input — it's pushed into a [`CommitStore`], which keeps the data
 /// compactly (interned authors, an arena for ids/descriptions, packed flags)
 /// so a million-commit history fits in memory. Read it back via [`RowView`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitSummary {
     pub change_id: String,
     pub commit_id: String,
@@ -1072,7 +1072,7 @@ pub fn file_tree_rows(
     rows
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffFileStatus {
     Added,
     Deleted,
@@ -1113,7 +1113,7 @@ pub struct BackendOutput {
 /// these into its live `CommitStore` + `GraphLayout` per `Batch` event, so the
 /// sidebar paints after the first batch instead of waiting for the whole (up to
 /// ~1M-row) history to load.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamRow {
     pub summary: CommitSummary,
     pub frame: LaneFrame,
@@ -1136,7 +1136,7 @@ pub struct CommitsTail {
 /// bookmark at or behind `@`, its tracked upstream (if any), and how far `@`
 /// sits ahead/behind that upstream. `None` when the working copy has no local
 /// bookmark in its ancestry, or for backends without branch tracking (git).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BranchStatus {
     /// The nearest local bookmark at or behind `@`.
     pub branch: String,
@@ -1153,7 +1153,7 @@ pub struct BranchStatus {
 /// which commit each points at (to know which bookmarks sit on a right-clicked
 /// revision) and per-remote tracking state (to offer push vs. track). Computed
 /// once per load alongside [`BranchStatus`]; empty for git repos.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BookmarksInfo {
     pub bookmarks: Vec<BookmarkEntry>,
     /// `@`'s commit id (hex), so a working-copy right-click can resolve the
@@ -1178,7 +1178,7 @@ pub struct BookmarksInfo {
 
 /// A bookmark or tag a plain push would send, and how many commits its local
 /// target is ahead of the remote's copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushCandidate {
     pub name: String,
     pub tag: bool,
@@ -1207,7 +1207,7 @@ impl BookmarksInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BookmarkEntry {
     pub name: String,
     /// Commit ids (hex) the local bookmark points at. One entry normally;
@@ -1220,7 +1220,7 @@ pub struct BookmarkEntry {
     pub remotes: Vec<RemoteBookmarkRef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteBookmarkRef {
     pub remote: String,
     /// Commit id (hex) this remote ref points at.
@@ -1260,7 +1260,7 @@ impl BookmarkEntry {
 
 /// `jj show`-style summary of a single revision, used to render the header
 /// strip above the diff view.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RevisionDetails {
     pub commit_id: String,
     pub change_id: Option<String>,
@@ -1274,7 +1274,7 @@ pub struct RevisionDetails {
 }
 
 /// A parent named in [`RevisionDetails`]: enough to show and open it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParentBrief {
     pub commit_id: String,
     /// `None` on git, which has no change ids.
@@ -1284,7 +1284,7 @@ pub struct ParentBrief {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SignatureInfo {
     pub name: String,
     pub email: String,
@@ -1294,14 +1294,14 @@ pub struct SignatureInfo {
 /// What a source without a graph says about itself: what the whole is (its
 /// header), and the steps it's made of, oldest first. A pull request's
 /// commits; a patch series' patches.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Outline {
     pub subject: Subject,
     pub steps: Vec<Step>,
 }
 
 /// What an [`Outline`] is of.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Subject {
     PullRequest(crate::forge::PrInfo),
     /// A patch, or a series of them (each a step), read from `origin`.
@@ -1319,7 +1319,7 @@ pub enum Subject {
 }
 
 /// One of the ordered pieces an [`Outline`] is made of.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     /// What selects it: [`RevisionSelection::Commit`] of this id.
     pub id: String,
@@ -1336,7 +1336,7 @@ pub struct Step {
 
 // ---- Diff line model (moved here from the UI `diff_view` module) ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub old_line: Option<usize>,
@@ -1351,13 +1351,13 @@ pub struct DiffLine {
     pub emphasis: Vec<(usize, usize)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffHunkView {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffLineKind {
     Context,
     Addition,
@@ -1366,14 +1366,14 @@ pub enum DiffLineKind {
     Note,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyntaxSpan {
     pub start: usize,
     pub end: usize,
     pub kind: SyntaxKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SyntaxKind {
     Comment,
     String,

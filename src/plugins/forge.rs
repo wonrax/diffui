@@ -700,6 +700,8 @@ impl Diffui {
     /// Make the forges of the plugins that are running or loading the app's,
     /// in claiming order, and have every tab look at its remotes again.
     pub(super) fn refresh_script_forges(&mut self) {
+        // The same moments change which transports run.
+        self.refresh_hosts();
         let handles = self.plugins.forge_handles.clone();
         let mut ranked: Vec<(u8, Arc<dyn ForgeProvider>)> = self
             .plugins

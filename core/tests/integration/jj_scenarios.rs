@@ -42,6 +42,7 @@ async fn run_one(root: &Path, make: impl FnOnce(JobId) -> Command) -> Vec<Payloa
         // `harness::test_settings_for`.
         SettingsSource::Fixed(Box::new(harness::test_settings_for(root))),
         &diffui_core::forge::Forges::default(),
+        &diffui_core::remote::Hosts::none(),
     ));
     let handle = match events.next().await.map(|event| event.payload) {
         Some(Payload::Ready { handle, .. }) => handle,

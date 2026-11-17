@@ -412,10 +412,11 @@ impl Diffui {
         };
         let info = &state.session.bookmarks;
         let ranges = ranges_of(&rows, info, &remote_name);
+        // The stats are read by this machine's jj, in a checkout here.
         let root = state
             .repository
             .as_ref()
-            .filter(|repository| repository.vcs == crate::Vcs::Jj)
+            .filter(|repository| repository.vcs == crate::Vcs::Jj && state.remote.is_none())
             .map(|repository| repository.root.display().to_string());
         let details = state.session.capabilities.details;
         let heads: Vec<String> = rows.iter().map(|row| row.bookmark.clone()).collect();

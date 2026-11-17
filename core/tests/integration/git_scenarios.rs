@@ -305,6 +305,7 @@ fn the_git_actor_starts_and_forwards_its_watch() {
                 scope: PathBuf::new(),
             },
             &Default::default(),
+            &diffui_core::remote::Hosts::none(),
         ));
         assert!(matches!(
             events.next().await.unwrap().payload,

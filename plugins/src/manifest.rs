@@ -80,6 +80,8 @@ pub struct Manifest {
     pub forge: Option<ForgeClaim>,
     /// `[provides] ai`: the plugin is an AI provider.
     pub ai: Option<AiClaim>,
+    /// `[provides] transport`: the plugin reaches other machines.
+    pub transport: Option<TransportClaim>,
     pub commands: Vec<CommandDecl>,
     /// `[config.schema]`, by key.
     pub config: Vec<ConfigField>,
@@ -282,6 +284,22 @@ pub struct AiClaim {
     /// The string setting that names the model, which Settings fills from
     /// the provider's `models()`.
     pub model: Option<String>,
+}
+
+/// What a transport tells the app before its script runs.
+///
+/// A transport says how to start the program whose stdin and stdout are the
+/// stream to a machine's `diffui-serve`; the app starts it, so no byte goes
+/// through the script. A host of the transport is a `[hosts.<name>]` table
+/// in config.toml, and the transport's per-host settings (`per_host = true`
+/// in `[config.schema]`) are what such a table may hold beyond the app's own
+/// keys.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransportClaim {
+    /// Prefixes of paths on this machine that are really paths on one of
+    /// its hosts (`\\wsl.localhost\`), compared without case. A path
+    /// opened under one is put to the script's `locate`.
+    pub local_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -495,6 +513,14 @@ struct RawPermissions {
 struct RawProvides {
     forge: Option<RawForge>,
     ai: Option<RawAi>,
+    transport: Option<RawTransport>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTransport {
+    #[serde(default)]
+    local_roots: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1150,6 +1176,9 @@ impl Manifest {
             },
             forge,
             ai,
+            transport: raw.provides.transport.map(|transport| TransportClaim {
+                local_roots: transport.local_roots,
+            }),
             commands,
             config,
         })

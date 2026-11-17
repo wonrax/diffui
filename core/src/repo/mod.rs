@@ -22,6 +22,7 @@ mod git_actor;
 mod jj_actor;
 mod pr_actor;
 pub mod protocol;
+mod remote_actor;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -230,6 +231,20 @@ pub struct RepoHandle {
     repository: Repository,
     capabilities: Capabilities,
     tx: mpsc::UnboundedSender<Envelope>,
+    remote: Option<Arc<RemoteRepository>>,
+}
+
+/// What the app knows about a repository on another machine, from the
+/// server's answer to opening it.
+#[derive(Debug)]
+pub struct RemoteRepository {
+    pub host: crate::remote::HostId,
+    pub info: Arc<crate::remote::HostInfo>,
+    /// The root, kind and scope there, and what the app can't read from
+    /// here: jj's default revset and the git remotes.
+    pub opened: crate::remote::Opened,
+    /// Kept so the stream stays up while a tab holds the handle.
+    pub link: crate::remote::HostLink,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -250,8 +265,15 @@ impl RepoHandle {
         self.capabilities
     }
 
+    /// The repository's root, kind and scope. For one on another machine
+    /// ([`Self::remote`]) the root is a path *there*: nothing on this disk.
     pub fn repository(&self) -> &Repository {
         &self.repository
+    }
+
+    /// Where the repository is, when it isn't on this machine.
+    pub fn remote(&self) -> Option<&RemoteRepository> {
+        self.remote.as_deref()
     }
 
     /// The same actor, addressed with a different path scope. Two tabs can
@@ -310,6 +332,7 @@ pub fn repo_id(spec: &OpenSpec) -> RepoId {
         OpenSpec::Local { root, .. } => RepoId(root.to_string_lossy().into_owned()),
         OpenSpec::ForgePr(pr) => RepoId(pr.key()),
         OpenSpec::Diff(input) => RepoId(input.key()),
+        OpenSpec::Remote { host, path } => RepoId(format!("{host}:{path}")),
     }
 }
 
@@ -331,7 +354,10 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             fetch: true,
             ..Capabilities::default()
         },
-        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) => Capabilities::default(),
+        // A remote repository's come with the server's answer.
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) | OpenSpec::Remote { .. } => {
+            Capabilities::default()
+        }
     }
 }
 
@@ -368,9 +394,15 @@ impl std::fmt::Debug for SettingsSource {
 /// Spawn the actor for `spec` and return its event stream. The first event is
 /// [`Payload::Ready`], which carries the command sender — everything else the
 /// frontend needs travels as protocol data.
-/// A pull request is served by its forge's provider among `forges`.
-pub fn open(spec: OpenSpec, forges: &crate::forge::Forges) -> RepoEvents {
-    open_with(spec, SettingsSource::Layered, forges)
+/// A pull request is served by its forge's provider among `forges`, a
+/// repository on another machine over that host's link among `hosts`. Such a
+/// repository's `Ready` comes once its server has answered, not at once.
+pub fn open(
+    spec: OpenSpec,
+    forges: &crate::forge::Forges,
+    hosts: &crate::remote::Hosts,
+) -> RepoEvents {
+    open_with(spec, SettingsSource::Layered, forges, hosts)
 }
 
 /// [`open`], with the jj configuration named rather than discovered. Only a
@@ -379,11 +411,24 @@ pub fn open_with(
     spec: OpenSpec,
     settings: SettingsSource,
     forges: &crate::forge::Forges,
+    hosts: &crate::remote::Hosts,
 ) -> RepoEvents {
     let id = repo_id(&spec);
     let capabilities = capabilities_for(&spec);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+    let spec = match spec {
+        OpenSpec::Remote { host, path } => {
+            let link = hosts.link(&host);
+            remote_actor::spawn(id, link, path, cmd_rx, cmd_tx.clone(), event_tx);
+            return RepoEvents {
+                rx: event_rx,
+                shutdown: cmd_tx,
+            };
+        }
+        local => local,
+    };
 
     let repository = match &spec {
         OpenSpec::Local { root, scope } => Repository {
@@ -393,7 +438,7 @@ pub fn open_with(
         },
         // A PR or a patch has no local checkout; the placeholder keeps
         // `RepoHandle` one shape across every kind of source.
-        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) => Repository {
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) | OpenSpec::Remote { .. } => Repository {
             root: PathBuf::new(),
             vcs: Vcs::Git,
             scope: PathBuf::new(),
@@ -405,6 +450,7 @@ pub fn open_with(
         repository,
         capabilities,
         tx: cmd_tx.clone(),
+        remote: None,
     };
     let _ = event_tx.send(Event::new(
         id.clone(),
@@ -426,6 +472,7 @@ pub fn open_with(
             pr_actor::spawn(id, pr, provider, cmd_rx, event_tx)
         }
         OpenSpec::Diff(input) => diff_actor::spawn(id, input, cmd_rx, cmd_tx.clone(), event_tx),
+        OpenSpec::Remote { .. } => unreachable!("opened above"),
     }
 
     RepoEvents {

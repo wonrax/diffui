@@ -1,0 +1,23 @@
+# Repositories on machines reached with ssh. A host is a [hosts.<name>] table
+# in config.toml with transport = "ssh" (Settings → Hosts makes one), and the
+# Hosts of ~/.ssh/config are offered without one. diffui starts `ssh` and
+# talks to the diffui-serve it runs over there; nothing is copied to the
+# machine. Bundled with diffui; `diffui plugin eject ssh` copies it out to
+# edit.
+id = "ssh"
+name = "SSH"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+exec = [["{config.program}"]]
+read = ["~/.ssh/config"]
+
+[provides.transport]
+
+[config.schema]
+program = { type = "path", default = "ssh", label = "The ssh program" }
+destination = { type = "string", label = "Destination", hint = "user@host, or a Host from ~/.ssh/config. Empty uses the host's name.", per_host = true }
+port = { type = "number", label = "Port", per_host = true }
+login_shell = { type = "boolean", default = true, label = "Start the server from a login shell", hint = "So the PATH your shell's profile sets (cargo, nix) applies.", per_host = true }

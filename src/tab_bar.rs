@@ -160,6 +160,12 @@ fn drop_index(widths: &[f32], index: usize, slot: f32, x: f32) -> usize {
 /// shows.
 fn tab_tooltip(tab: &crate::Tab) -> String {
     let place = match &tab.source {
+        // A path on another machine, as it is written to open it.
+        crate::TabSource::Repo {
+            root,
+            host: Some(host),
+            ..
+        } => format!("{host}:{}", root.to_string_lossy()),
         crate::TabSource::Repo { root, .. } => crate::contract_user_path(&root.to_string_lossy()),
         crate::TabSource::ForgePr(spec) => spec.reference(),
         crate::TabSource::Diff(diffui_core::patch::DiffInput::Patch(origin)) => {
@@ -743,10 +749,10 @@ fn tab_widget(
     // outer row instead. The mono badge and the sans name share a baseline.
     let name_font = emphasis_font(font, Weight::MEDIUM);
     let mut spans = Vec::new();
-    if !tab.owner.is_empty() {
+    if let Some((prefix, host)) = tab_prefix(tab) {
         spans.push(
-            crate::ellipsis::Span::new(format!("{}/", tab.owner))
-                .font(font)
+            crate::ellipsis::Span::new(prefix)
+                .font(if host { look.mono } else { font })
                 .color(theme.subtle_text),
         );
     }
@@ -866,14 +872,34 @@ fn tab_widget(
     (body, tab_natural_width(ui, tab))
 }
 
+/// What comes before a tab's name, and whether it is a host: the folder
+/// the repository is in as `code/`, or the machine it is on as `box:`, the
+/// way it is typed to open it. A host is set in mono, as the place it is
+/// rather than part of a path.
+fn tab_prefix(tab: &crate::Tab) -> Option<(String, bool)> {
+    if tab.owner.is_empty() {
+        return None;
+    }
+    Some(match tab.state.remote {
+        Some(_) => (format!("{}:", tab.owner), true),
+        None => (format!("{}/", tab.owner), false),
+    })
+}
+
 /// A tab's width with nothing cut, so a short name doesn't get stretched to the
 /// squeezed tabs' floor.
 fn tab_natural_width(ui: &Diffui, tab: &crate::Tab) -> f32 {
     let name_font = emphasis_font(ui.config.ui_font, Weight::MEDIUM);
-    let owner = if tab.owner.is_empty() {
-        0.0
-    } else {
-        measure::line_width(&format!("{}/", tab.owner), TAB_TEXT_SIZE, ui.config.ui_font)
+    let owner = match tab_prefix(tab) {
+        None => 0.0,
+        Some((prefix, host)) => {
+            let font = if host {
+                ui.config.mono_font
+            } else {
+                ui.config.ui_font
+            };
+            measure::line_width(&prefix, TAB_TEXT_SIZE, font)
+        }
     };
     owner
         + measure::line_width(&tab.name, TAB_TEXT_SIZE, name_font)
@@ -1326,14 +1352,23 @@ pub(crate) fn open_repo_card(
         .gap(px(OPEN_GLYPH_GAP))
         .text_size(px(text_size::BODY_LG))
         .child(kind_box(status.as_ref(), theme))
+        // Only once there is another machine to pick: without hosts the
+        // prompt is about this one, and says nothing of it.
+        .when(
+            dialog.host.is_some() || !ui.open_repo_host_rows().is_empty(),
+            |band| band.child(host_chip(look, dialog, cx)),
+        )
         .child(div().flex_1().min_w_0().child(field));
+    // Finder shows this machine's folders, not a host's.
     #[cfg(target_os = "macos")]
-    let band = band.child(
-        look.button("open-repo-folder", "Browse\u{2026}")
-            .compact()
-            .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx))
-            .tip("Choose a folder in Finder"),
-    );
+    let band = band.when(dialog.host.is_none(), |band| {
+        band.child(
+            look.button("open-repo-folder", "Browse\u{2026}")
+                .compact()
+                .on_click(Diffui::on_action(Action::ChooseRepoFolder, cx))
+                .tip("Choose a folder in Finder"),
+        )
+    });
 
     let mut body = theme::surface(div(), theme::Elevation::Modal, theme)
         .w(px(OPEN_DIALOG_WIDTH))
@@ -1355,6 +1390,7 @@ pub(crate) fn open_repo_card(
 
     let path = dialog.path.trim();
     let list: Option<AnyElement> = match (&status, dialog.suggestions()) {
+        _ if dialog.picking_host => Some(hosts_section(ui, look, dialog, cx)),
         (Some(crate::path_browse::Status::PullRequest(spec)), _) => {
             Some(pull_request_card(look, spec).into_any_element())
         }
@@ -1505,7 +1541,166 @@ fn status_parts(
             vec![plain(error.clone())],
             None,
         ),
+        Status::Connecting { host, detail } => {
+            let mut runs = vec![plain("Connecting to "), code(host.clone())];
+            match detail {
+                // What the transport's program is saying: a build, a login.
+                Some(detail) => runs.push(plain(format!(": {detail}"))),
+                None => runs.push(plain("\u{2026}")),
+            }
+            (Tone::Muted, icons::REFRESH, runs, None)
+        }
     }
+}
+
+/// The machine the path is on, at the input band's start: a click lists the
+/// hosts to pick another.
+fn host_chip(look: Look, dialog: &crate::OpenRepoDialog, cx: &mut Cx) -> impl IntoElement {
+    let label = dialog
+        .host
+        .as_ref()
+        .map_or_else(|| "This machine".to_owned(), |host| host.0.clone());
+    look.button("open-repo-host", label)
+        .compact()
+        .on_click(Diffui::on_action(Action::OpenRepoHosts, cx))
+        .tip("Choose the machine the repository is on")
+}
+
+/// The machines a repository can be opened on: this one, then the hosts.
+fn hosts_section(
+    ui: &Diffui,
+    look: Look,
+    dialog: &crate::OpenRepoDialog,
+    cx: &mut Cx,
+) -> AnyElement {
+    let Look { theme, .. } = look;
+    let (font, mono) = (look.font, look.mono);
+    let name_font = emphasis_font(font, Weight::MEDIUM);
+    let hosts = ui.open_repo_host_rows();
+    let lead = |glyph: &'static str| {
+        Aligned::glyph(
+            div()
+                .w(px(OPEN_LEAD_BOX))
+                .flex()
+                .justify_center()
+                .child(icons::icon(glyph, ui::ICON_SIZE, theme.subtle_text)),
+            ui::ICON_SIZE,
+        )
+    };
+    let row =
+        |index: usize, text: gpui_kit::Div, current: bool, host: Option<String>, cx: &mut Cx| {
+            let selected = dialog.selected == Some(index);
+            let end = div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap(px(theme::space::MD))
+                .when(current, |end| {
+                    end.child(
+                        ui::tag("Current", theme.accent, ui::TagSize::Regular, name_font).view(),
+                    )
+                })
+                .when(selected, |end| end.child(row_hint("Browse", look)));
+            list_row(
+                ("open-repo-host-row", index).into(),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .gap(px(theme::space::MD))
+                    .child(text.flex_1().min_w_0())
+                    .child(end),
+                selected,
+                theme,
+            )
+            .on_click(Diffui::on_action(Action::OpenRepoHost(host), cx))
+        };
+    let mut list = div().flex().flex_col().w_full();
+    let here = typography::baseline_row(
+        [
+            lead(icons::FOLDER),
+            Aligned::gap(OPEN_GLYPH_GAP),
+            Aligned::text(
+                typography::line("This machine", name_font, text_size::BODY, theme.text),
+                name_font,
+                text_size::BODY,
+            ),
+        ],
+        0.0,
+    );
+    list = list.child(row(0, here, dialog.host.is_none(), None, cx));
+    for (index, host) in hosts.iter().enumerate() {
+        // A host that can't be reached as configured says why in place of
+        // how it is reached.
+        let how = match host.via.as_str() {
+            "" => String::new(),
+            "command" if host.configured => "custom command".to_owned(),
+            via => format!("over {via}"),
+        };
+        // Then how its connection stands, when the app has or tried one.
+        use crate::connections::HostState;
+        let state = ui.host_state(&diffui_core::remote::HostId(host.name.clone()));
+        let (note, ink) = match (&host.problem, &state) {
+            (Some(problem), _) => (problem.clone(), theme.removed_text),
+            (None, Some(HostState::Failed(why))) => (why.clone(), theme.removed_text),
+            (None, Some(state)) => {
+                let ink = match state {
+                    HostState::Up(_) => theme.added_text,
+                    _ => theme.muted_text,
+                };
+                let word = state.word().to_lowercase();
+                let note = if how.is_empty() {
+                    word
+                } else {
+                    format!("{how} \u{b7} {word}")
+                };
+                (note, ink)
+            }
+            (None, None) => (how, theme.subtle_text),
+        };
+        let text = typography::baseline_row(
+            [
+                lead(icons::TERMINAL),
+                Aligned::gap(OPEN_GLYPH_GAP),
+                // A host's name is what is typed and configured: mono, like
+                // an id.
+                Aligned::text(
+                    typography::line(host.name.clone(), mono, text_size::BODY, theme.text)
+                        .text_ellipsis(),
+                    mono,
+                    text_size::BODY,
+                )
+                .shrink(),
+                Aligned::gap(theme::space::MD),
+                Aligned::text(
+                    typography::line(note, font, text_size::CAPTION, ink)
+                        .overflow_hidden()
+                        .text_ellipsis(),
+                    font,
+                    text_size::CAPTION,
+                )
+                .fill(),
+            ],
+            0.0,
+        );
+        let current = dialog.host.as_ref().is_some_and(|open| open.0 == host.name);
+        list = list.child(row(index + 1, text, current, Some(host.name.clone()), cx));
+    }
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(section_head("Open on", look))
+        .child(list)
+        .when(hosts.is_empty(), |section| {
+            section.child(open_note(
+                "No hosts yet. Add one in Settings to open a repository on another machine.",
+                look,
+            ))
+        })
+        .into_any_element()
 }
 
 /// The square at the band's start: what kind of thing the input names. Green
@@ -1698,6 +1893,23 @@ fn open_repo_footer(
             look,
         )
     };
+    if dialog.picking_host {
+        // The list is of machines: nothing of the path's keys applies.
+        return strip
+            .children(bound(
+                &["repo.previous-folder", "repo.next-folder"],
+                "Select",
+            ))
+            .child(key_hint(
+                &[crate::keymap::key_label("enter")],
+                "Browse",
+                look,
+            ))
+            .child(end().child(footer_note(
+                "Hosts come from [hosts] in config.toml, ssh and WSL",
+                look,
+            )));
+    }
     if path.is_empty() {
         let remove = ui
             .keymap
@@ -1730,7 +1942,7 @@ fn open_repo_footer(
                     )),
             );
     }
-    let browsing = crate::path_browse::Query::parse(path).is_some()
+    let browsing = dialog.query().is_some()
         && !matches!(status, Some(crate::path_browse::Status::PullRequest(_)));
     if browsing {
         return strip
@@ -2163,15 +2375,21 @@ fn recent_repo_row(
 ) -> impl IntoElement {
     let Look { theme, .. } = look;
     let (font, mono) = (look.font, look.mono);
-    let root = std::path::Path::new(&recent.root);
+    let root = std::path::Path::new(&recent.path);
     let name = root.file_name().map_or_else(
-        || recent.root.clone(),
+        || recent.path.clone(),
         |name| name.to_string_lossy().into_owned(),
     );
     let parent = root
         .parent()
-        .map(|parent| crate::contract_user_path(&parent.to_string_lossy()))
+        .map(|parent| parent.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Where it is: the folder, on this machine with its home as `~`, on
+    // another as `host:folder`.
+    let parent = match &recent.host {
+        Some(host) => format!("{host}:{parent}"),
+        None => crate::contract_user_path(&parent),
+    };
     let name_font = emphasis_font(font, Weight::MEDIUM);
     let name_width = measure::line_width(&name, text_size::BODY, name_font);
     let end_width = if recent.open { 44.0 } else { 0.0 }
@@ -2260,7 +2478,10 @@ fn recent_repo_row(
         theme,
     )
     .group(group)
-    .on_click(Diffui::on_action(Action::OpenRepo(recent.root.clone()), cx))
+    .on_click(Diffui::on_action(
+        Action::OpenRecent(recent.root.clone()),
+        cx,
+    ))
 }
 
 #[cfg(test)]

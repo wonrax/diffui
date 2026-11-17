@@ -28,7 +28,7 @@ use crate::host::{
 };
 use crate::js::{Fault, Js, JsError, MainState, StartError, Turn};
 use crate::manifest::{HostPattern, JjAccess, Manifest};
-use crate::protocol::{AiCall, HostCall, PluginCall, RepoCall};
+use crate::protocol::{AiCall, HostCall, Launch, PluginCall, RepoCall, TransportCall};
 use crate::secrets::{self, SecretStore};
 use crate::{Limits, Options};
 
@@ -158,6 +158,9 @@ struct PendingCall {
     window: Duration,
     /// A streaming call's parts; each one moves the deadline.
     parts: Option<PartFn>,
+    /// The reply is a [`Launch`] the app will start: it is held to the
+    /// manifest's `exec` and `env` permissions first.
+    launch: bool,
 }
 
 type Job = Box<dyn FnOnce() -> Result<Value, HostError> + Send>;
@@ -463,6 +466,11 @@ impl Actor {
                 "plugin.toml provides ai but {main} never called ai.register"
             ));
         }
+        if self.manifest.transport.is_some() && registration.transport.is_none() {
+            return Err(format!(
+                "plugin.toml provides a transport but {main} never called transport.register"
+            ));
+        }
         Ok(registration)
     }
 
@@ -599,7 +607,29 @@ impl Actor {
             Phase::Ready { registration, .. } => registration,
         };
         let mut window = self.limits.forge_call;
+        let launch = matches!(
+            call,
+            PluginCall::Transport {
+                call: TransportCall::Connect { .. }
+            }
+        );
         let (what, deadline) = match &call {
+            PluginCall::Transport { call } => {
+                let method = call.method();
+                let registered = registration
+                    .transport
+                    .as_ref()
+                    .is_some_and(|methods| methods.iter().any(|m| m == method));
+                if !registered {
+                    return reply(Err(PluginError::NotRegistered(format!(
+                        "transport method {method}"
+                    ))));
+                }
+                (
+                    format!("transport.{method}"),
+                    Some(Instant::now() + self.limits.forge_call),
+                )
+            }
             PluginCall::Command { id, .. } => {
                 if !registration.commands.contains(id) {
                     return reply(Err(PluginError::NotRegistered(format!("command \"{id}\""))));
@@ -654,6 +684,7 @@ impl Actor {
                 deadline,
                 window,
                 parts,
+                launch,
             },
         );
         self.enter(&json!({ "t": "call", "id": id, "call": call }));
@@ -709,7 +740,13 @@ impl Actor {
                 let Some(call) = self.calls.remove(&id) else {
                     return;
                 };
-                if ok {
+                if ok && call.launch {
+                    let checked = self.check_launch(&value);
+                    if let Err(refused) = &checked {
+                        self.log(LogLevel::Error, format!("{}: {refused}", call.what));
+                    }
+                    (call.reply)(checked.map(|()| value));
+                } else if ok {
                     (call.reply)(Ok(value));
                 } else {
                     let error = error.unwrap_or_default();
@@ -735,6 +772,25 @@ impl Actor {
                 );
             }
         }
+    }
+
+    /// Hold the program a transport wants started to what `exec` would be
+    /// held to: the app starts it, but on the plugin's word.
+    fn check_launch(&self, value: &Value) -> Result<(), PluginError> {
+        let launch: Launch = serde_json::from_value(value.clone()).map_err(|error| {
+            PluginError::BadReply(format!(
+                "connect must give {{ argv: string[], env?: Record<string, string> }}: {error}"
+            ))
+        })?;
+        if launch.argv.is_empty() {
+            return Err(PluginError::BadReply(
+                "connect gave an empty argv".to_owned(),
+            ));
+        }
+        let env: Vec<(String, String)> = launch.env.into_iter().collect();
+        exec::check(&launch.argv, &self.exec)
+            .and_then(|()| exec::check_env(&env, &self.manifest.permissions.env))
+            .map_err(|refused| PluginError::BadReply(refused.message))
     }
 
     // Host calls.

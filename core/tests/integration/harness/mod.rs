@@ -141,6 +141,62 @@ pub fn commit_ids(root: &Path) -> Vec<String> {
     })
 }
 
+/// A host whose `diffui-serve` runs in this process: each launch starts a
+/// serve loop on one end of an in-memory pipe and hands the link the other.
+pub struct InProcessHost {
+    settings: SettingsSource,
+    servers: std::sync::Mutex<Vec<tokio::task::JoinHandle<std::io::Result<()>>>>,
+}
+
+impl InProcessHost {
+    pub fn new(settings: SettingsSource) -> Self {
+        Self {
+            settings,
+            servers: Default::default(),
+        }
+    }
+
+    /// End every server started so far, as a dropped connection would.
+    pub fn stop(&self) {
+        for server in self.servers.lock().unwrap().drain(..) {
+            server.abort();
+        }
+    }
+}
+
+impl diffui_core::remote::Connector for InProcessHost {
+    fn launch(
+        &self,
+        _host: &diffui_core::remote::HostId,
+    ) -> futures::future::BoxFuture<'static, Result<diffui_core::remote::Launch, String>> {
+        let (here, there) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(here);
+        let (input, output) = tokio::io::split(there);
+        let server = tokio::spawn(diffui_core::remote::serve::serve_with(
+            input,
+            output,
+            PathBuf::from("jj"),
+            self.settings.clone(),
+        ));
+        self.servers.lock().unwrap().push(server);
+        Box::pin(async move {
+            Ok(diffui_core::remote::Launch::Stream {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                name: "a server in this process".to_owned(),
+            })
+        })
+    }
+
+    fn explain(
+        &self,
+        _host: &diffui_core::remote::HostId,
+        _exit: &diffui_core::remote::Exit,
+    ) -> futures::future::BoxFuture<'static, Option<String>> {
+        Box::pin(async { None })
+    }
+}
+
 /// One open repository, driven synchronously.
 pub struct TestRepo {
     pub root: PathBuf,
@@ -168,6 +224,7 @@ impl TestRepo {
             },
             SettingsSource::Fixed(Box::new(test_settings_for(root))),
             &diffui_core::forge::Forges::default(),
+            &diffui_core::remote::Hosts::none(),
         ));
         let handle = runtime.block_on(async {
             match events.next().await.map(|event| event.payload) {
@@ -182,6 +239,48 @@ impl TestRepo {
             runtime,
             parked: Vec::new(),
         }
+    }
+
+    /// `root`, opened the way a repository on another machine is: through a
+    /// `diffui-serve` loop (here in this process, on two in-memory pipes)
+    /// and the relaying actor. Also the host, to end its server with.
+    pub fn remote(root: &Path) -> (Self, std::sync::Arc<InProcessHost>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let host = std::sync::Arc::new(InProcessHost::new(SettingsSource::Fixed(Box::new(
+            test_settings_for(root),
+        ))));
+        let hosts = diffui_core::remote::Hosts::new(host.clone());
+        let mut events = {
+            let _runtime = runtime.enter();
+            Box::pin(repo::open(
+                OpenSpec::Remote {
+                    host: diffui_core::remote::HostId("box".to_owned()),
+                    path: root.to_string_lossy().into_owned(),
+                },
+                &diffui_core::forge::Forges::default(),
+                &hosts,
+            ))
+        };
+        let handle = runtime.block_on(async {
+            loop {
+                match events.next().await.map(|event| event.payload) {
+                    Some(Payload::Connecting { .. }) => {}
+                    Some(Payload::Ready { handle, .. }) => break handle,
+                    other => panic!("expected the remote actor's Ready event, got {other:?}"),
+                }
+            }
+        });
+        let repo = Self {
+            root: root.to_owned(),
+            handle,
+            events,
+            runtime,
+            parked: Vec::new(),
+        };
+        (repo, host)
     }
 
     /// Send `command` and collect every event for its job up to and including
@@ -253,6 +352,31 @@ impl TestRepo {
                 .expect("the actor's event stream ended early");
             if pick(&event.payload) {
                 return event.payload;
+            }
+            self.parked.push(event);
+        }
+    }
+
+    /// [`Self::wait_for`], giving up after `patience` with `None`. The stream
+    /// ending counts as nothing more to see.
+    pub fn try_wait_for(
+        &mut self,
+        patience: std::time::Duration,
+        pick: impl Fn(&Payload) -> bool,
+    ) -> Option<Payload> {
+        if let Some(i) = self.parked.iter().position(|e| pick(&e.payload)) {
+            return Some(self.parked.remove(i).payload);
+        }
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            let events = &mut self.events;
+            let event = self
+                .runtime
+                .block_on(async { tokio::time::timeout(left, events.next()).await })
+                .ok()??;
+            if pick(&event.payload) {
+                return Some(event.payload);
             }
             self.parked.push(event);
         }

@@ -346,10 +346,13 @@ pub(crate) fn available(ui: &Diffui) -> bool {
 
 /// Whether the active tab has the Notes view: a jj repository's store.
 pub(crate) fn view_available(ui: &Diffui) -> bool {
-    ui.active()
-        .repository
-        .as_ref()
-        .is_some_and(|repository| repository.vcs == Vcs::Jj)
+    let tab = ui.active();
+    // The store is on this machine, filed by a repository's path here.
+    tab.remote.is_none()
+        && tab
+            .repository
+            .as_ref()
+            .is_some_and(|repository| repository.vcs == Vcs::Jj)
 }
 
 /// Whether the active tab's notes live in memory: a patch or a compare.
@@ -795,7 +798,7 @@ impl Diffui {
             let Some(root) = state
                 .repository
                 .as_ref()
-                .filter(|repository| repository.vcs == Vcs::Jj)
+                .filter(|repository| repository.vcs == Vcs::Jj && state.remote.is_none())
                 .map(|repository| repository.root.clone())
             else {
                 continue;
@@ -1230,10 +1233,7 @@ impl Diffui {
         let state = self.active();
         let notes: Vec<Note> = stack_notes(state).into_iter().cloned().collect();
         let stack: Vec<StackItem> = notes.iter().map(fallback_item).collect();
-        let root = state
-            .repository
-            .as_ref()
-            .map(|repository| repository.root.clone());
+        let root = state.local_root().map(std::path::Path::to_owned);
         let view = &mut self.active_mut().notes.view;
         view.stack = stack;
         view.stack_version = view.stack_version.wrapping_add(1);

@@ -27,6 +27,7 @@ pub mod plan;
 pub mod preview_graph;
 pub mod process;
 pub mod push;
+pub mod remote;
 pub mod repo;
 pub mod repository;
 pub mod resolve;
@@ -54,7 +55,7 @@ pub use push::{
 };
 pub use repo::{
     Capabilities, Command, DiskState, DiskSync, Event, JobId, OpenSpec, Payload, PreviewRequest,
-    RepoError, RepoHandle, RepoId, canonical_selection, rewritten_targets,
+    RemoteRepository, RepoError, RepoHandle, RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{
     FetchOutcome, FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository,

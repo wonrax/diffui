@@ -316,7 +316,12 @@ impl Diffui {
         else {
             return;
         };
-        let remotes = diffui_core::forge::remotes(&root);
+        // A repository on another machine has no git config to read here:
+        // its server read the remotes when it opened.
+        let remotes = match &state.remote {
+            Some(remote) => remote.remotes.clone(),
+            None => diffui_core::forge::remotes(&root),
+        };
         let home = forges.pick_remote(&remotes, None);
         state.forge.remotes = remotes.clone();
         state.forge.home = home.clone();

@@ -148,7 +148,7 @@ impl<T> Ord for Ranked<T> {
 
 /// A commit a history search found, with what a result row shows. Stands on
 /// its own: the commit may not be loaded into the graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitHit {
     pub change_id: String,
     pub commit_id: String,

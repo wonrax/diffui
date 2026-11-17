@@ -932,6 +932,30 @@ have no scene; see src/toolbar.rs and plugins/bundled/github for what differs.
 - State: open-repo-typed in dark.
 - Steps: As open-repo-typed, theme Dark.
 
+### `open-repo-hosts`
+
+- Window: 1440x900, light
+- State: The open prompt listing where to open: this machine, then the hosts with how each is reached. The band shows the host chip.
+- Steps: Launch with two `[hosts]` tables, cmd+O, click the host chip.
+
+### `open-repo-on-host`
+
+- Window: 1440x900, light
+- State: The open prompt browsing a host: its name on the chip, a folder of that machine listed with the repository flagged.
+- Steps: As open-repo-hosts, pick the host, type the fixture's folder.
+
+### `remote-tab`
+
+- Window: 1440x900, light
+- State: A repository on another machine in a tab beside a local one: the host before the name, in mono.
+- Steps: Launch with a `[hosts]` table, open the fixture on that host.
+
+### `remote-connection-lost`
+
+- Window: 1440x900, light
+- State: The strip atop a remote tab's diff once its connection is gone, with Reconnect; the graph stays.
+- Steps: As remote-tab, then the host's server stops.
+
 ### `shortcuts-sheet`
 
 - Window: 1440x900, light
@@ -971,6 +995,23 @@ have no scene; see src/toolbar.rs and plugins/bundled/github for what differs.
 - State: Rows config.toml sets are locked; a settings.toml that doesn't parse shows its banner.
 - Steps: Launch with config.toml setting theme, refresh and code_font_size, and a broken settings.toml; press cmd+,.
 
+### `settings-hosts`
+
+- Window: 1440x900, light
+- State: The settings dialog's Hosts group: a row per host with how it is reached and what runs there, then the field that adds one.
+- Steps: Launch with two `[hosts]` tables, press cmd+,.
+
+### `settings-host-page`
+
+- Window: 1440x900, light
+- State: A host's page: how it is reached with the transport's own settings, the Test row, and the server's command and environment. What config.toml sets is locked.
+- Steps: As settings-hosts, click the pencil on the ssh host's row.
+
+### `settings-host-failed`
+
+- Window: 1440x900, light
+- State: A host's page after its server didn't start: why in red on the Connection row with Try again, and under it what was run and what that wrote.
+- Steps: Launch with a host whose command fails, open its page, click Connect.
 
 ## Credential prompt
 

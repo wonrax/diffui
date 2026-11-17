@@ -64,7 +64,7 @@ pub const HIGHLIGHT_MAX_ROWS: usize = 10_000;
 /// writes nothing in the background, only noticing that the disk has edits
 /// `@` doesn't hold or that the checkout went stale, and leaves both to the
 /// refresh button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RefreshMode {
     #[default]
     Auto,
@@ -72,7 +72,7 @@ pub enum RefreshMode {
 }
 
 /// What triggered a repository refresh — decides how much we reload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RefreshOrigin {
     /// The filesystem watcher (a working-tree file edit). It ignores `.jj`/
     /// `.git`, so the change is always a working-copy tree edit — topology is
@@ -1133,6 +1133,9 @@ impl Session {
             | Payload::CliOutput { .. }
             | Payload::CliExited { .. }
             | Payload::CommitsFound { .. } => Vec::new(),
+            // A host's link coming up or going down is the frontend's to
+            // show; the jobs it took with it fail one by one.
+            Payload::Connecting { .. } | Payload::Disconnected { .. } => Vec::new(),
             Payload::RevsetResolved { job, result, .. } => self.on_span_checked(job, result),
         }
     }
@@ -1560,6 +1563,17 @@ impl Session {
         let owned_mutation = self.mutation_job == Some(job);
         let mut effects = self.clear_slot(job);
         self.loading_since = None;
+        if error == RepoError::Disconnected {
+            // The host went away under the job. What is on screen stays, and
+            // the frontend says so once for the tab rather than per job.
+            if owned_graph {
+                effects.push(Effect::Activity(Activity::LoadFinished {
+                    ok: false,
+                    detail: None,
+                }));
+            }
+            return effects;
+        }
         let message = error.to_string();
 
         if owned_graph {

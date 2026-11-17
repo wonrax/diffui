@@ -710,9 +710,22 @@ impl Diffui {
         let (true, Some(job)) = (owned, event.job()) else {
             return Some(event);
         };
-        let conflicts = &mut self.tab_mut(tab)?.changes.conflicts;
+        let state = self.tab_mut(tab)?;
+        let remote = state.remote.is_some();
+        let conflicts = &mut state.changes.conflicts;
         match event.payload {
-            Payload::ConflictInfoLoaded { files, .. } => {
+            Payload::ConflictInfoLoaded { mut files, .. } => {
+                if remote {
+                    // The tool's inputs would be written over there and the
+                    // tool started here.
+                    for file in &mut files {
+                        file.merge_tool_blocker = Some(
+                            "The repository is on another machine: resolve in the diff, \
+                             or with jj resolve there"
+                                .to_owned(),
+                        );
+                    }
+                }
                 if let Some((_, revision, document_id)) = conflicts.job.take() {
                     if std::mem::take(&mut conflicts.reveal_on_load) {
                         // Resolving rewrote a commit: the focus follows it to

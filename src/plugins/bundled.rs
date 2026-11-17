@@ -38,6 +38,9 @@ pub(crate) fn bundled() -> Vec<Bundled> {
 pub(crate) fn built_in() -> Vec<Bundled> {
     diffui_plugins::BUNDLED
         .iter()
+        // WSL exists on Windows only; elsewhere its plugin would run a
+        // script to find nothing.
+        .filter(|(id, _)| cfg!(windows) || *id != "wsl")
         .map(|(id, files)| Bundled {
             id: (*id).to_owned(),
             files: files

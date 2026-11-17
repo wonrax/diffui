@@ -23,6 +23,7 @@ mod commit_info;
 mod compare;
 mod config;
 mod conflicts;
+mod connections;
 mod credentials;
 mod ctl;
 mod diff_panel;
@@ -35,6 +36,7 @@ mod graph_preview;
 #[cfg(test)]
 mod harness;
 mod history_panel;
+mod host_page;
 mod jj_version;
 mod keymap;
 mod launch_env;
@@ -66,6 +68,9 @@ mod path_browse;
 mod plan;
 mod plugins;
 mod range;
+mod remote;
+#[cfg(all(test, unix))]
+mod remote_scenarios;
 mod review;
 mod revision_rows;
 mod revops;
@@ -216,6 +221,24 @@ fn main() {
     // `diffui jj …`, or a passthrough child started as `jj`: be the jj CLI.
     if let Some(code) = diffui_core::cli::passthrough::jj_main() {
         std::process::exit(code.into());
+    }
+    // `diffui serve`: be the far end of a repository on another machine,
+    // for a host whose `server` names the app itself rather than
+    // `diffui-serve`.
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        std::process::exit(match std::env::current_exe() {
+            Ok(exe) => {
+                if diffui_core::remote::serve::serve_stdio(exe) == std::process::ExitCode::SUCCESS {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(error) => {
+                eprintln!("diffui: can't find its own executable: {error}");
+                1
+            }
+        });
     }
     // `diffui ctl …` talks to the running app; `diffui skill` prints its guide,
     // which names every subcommand here (see `ctl::tests`).
@@ -477,6 +500,8 @@ pub(crate) struct Diffui {
     pub(crate) command_line_settle: spawn::Debounce,
     /// The window's regions as cached views, once it has a window.
     pub(crate) panes: Option<root::Panes>,
+    /// The hosts repositories are opened on, and the links to them.
+    pub(crate) remote: remote::Remote,
     /// The forges, and when to ask them again.
     pub(crate) forge: forge::ForgeUi,
     /// The plugins found in the plugins folder, and what runs of them.
@@ -872,6 +897,9 @@ pub(crate) struct TabState {
     pub(crate) forge: forge::TabForge,
     /// What this tab last told plugins.
     pub(crate) plugins: plugins::TabPlugins,
+    /// The connection to the repository's host, for a repository on another
+    /// machine.
+    pub(crate) remote: Option<remote::RemoteTab>,
     /// Review notes on this repository (see [`notes`]).
     pub(crate) notes: notes::TabNotes,
     /// The description the header shows whole, by its hash, after "Show
@@ -930,9 +958,38 @@ impl TabState {
             preview_debounce: Default::default(),
             forge: Default::default(),
             plugins: Default::default(),
+            remote: None,
             notes: Default::default(),
             description_whole: None,
             waiting: Default::default(),
+        }
+    }
+
+    /// A never-loaded tab for `repository` on `host`. Nothing of it is read
+    /// here: its default revset comes with the server's answer, and becomes
+    /// the tab's when no `revset` was saved for it.
+    pub(crate) fn unloaded_remote(
+        repository: Repository,
+        host: diffui_core::remote::HostId,
+        revset: Option<String>,
+    ) -> Self {
+        let wants_default_revset = revset.is_none();
+        let mut state = Self::unloaded(None, Some(revset.unwrap_or_default()));
+        state.repository = Some(repository);
+        state.remote = Some(remote::RemoteTab {
+            host,
+            wants_default_revset,
+            ..Default::default()
+        });
+        state
+    }
+
+    /// The repository's root on this disk: `None` when there is no
+    /// repository, or it is on another machine.
+    pub(crate) fn local_root(&self) -> Option<&Path> {
+        match (&self.repository, &self.remote) {
+            (Some(repository), None) => Some(&repository.root),
+            _ => None,
         }
     }
 
@@ -1030,14 +1087,20 @@ pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
-/// What a tab views: a local repository, or a pull (merge) request read
-/// through its forge's provider. Equality is identity — it's what de-duplicates opens.
+/// What a tab views: a repository, here or on another machine, or a pull
+/// (merge) request read through its forge's provider. Equality is identity —
+/// it's what de-duplicates opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TabSource {
     Repo {
         vcs: Vcs,
         /// Repository root, used to de-duplicate opens and key the watcher.
+        /// With a `host`, a path on that machine: nothing on this disk, and
+        /// never to be joined, canonicalized or looked at here.
         root: PathBuf,
+        /// The machine the repository is on, when it isn't this one (see
+        /// `crate::remote`).
+        host: Option<diffui_core::remote::HostId>,
     },
     ForgePr(diffui_core::forge::ForgePr),
     /// A patch, or two files or folders compared: no repository behind it.
@@ -1073,13 +1136,42 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
-    /// The local repository root, or `None` for a pull-request tab. Persistence
-    /// and the recent-repos list key off this, so PR tabs (session-only for
-    /// now) drop out of both naturally.
+    /// The repository's root on this disk: `None` for a pull request, a
+    /// patch, and a repository on another machine. Whatever reads or runs
+    /// something in the working tree goes through this.
     pub(crate) fn root(&self) -> Option<&Path> {
         match &self.source {
-            TabSource::Repo { root, .. } => Some(root),
-            TabSource::ForgePr(_) | TabSource::Diff(_) => None,
+            TabSource::Repo {
+                root, host: None, ..
+            } => Some(root),
+            TabSource::Repo { host: Some(_), .. } | TabSource::ForgePr(_) | TabSource::Diff(_) => {
+                None
+            }
+        }
+    }
+
+    /// Where a remote tab's repository is.
+    pub(crate) fn remote_target(&self) -> Option<diffui_core::remote::RemoteTarget> {
+        match &self.source {
+            TabSource::Repo {
+                root,
+                host: Some(host),
+                ..
+            } => Some(diffui_core::remote::RemoteTarget {
+                host: host.clone(),
+                path: root.to_string_lossy().into_owned(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// What the session, the recent list and the saved layouts know a
+    /// repository tab by: its root, or `host:root`. `None` for the tabs that
+    /// are session-only (a pull request, a patch).
+    pub(crate) fn key(&self) -> Option<String> {
+        match self.remote_target() {
+            Some(target) => Some(target.to_string()),
+            None => Some(self.root()?.to_string_lossy().into_owned()),
         }
     }
 
@@ -1087,6 +1179,14 @@ impl Tab {
     /// what the actor's events are attributed to.
     pub(crate) fn open_spec(&self) -> diffui_core::OpenSpec {
         match &self.source {
+            TabSource::Repo {
+                root,
+                host: Some(host),
+                ..
+            } => diffui_core::OpenSpec::Remote {
+                host: host.clone(),
+                path: root.to_string_lossy().into_owned(),
+            },
             TabSource::Repo { root, .. } => diffui_core::OpenSpec::Local {
                 root: root.clone(),
                 scope: self
@@ -1240,6 +1340,13 @@ pub(crate) struct OpenRepoDialog {
     /// What the typed path was found to be, for the status line. May lag the
     /// path for a beat; see [`path_browse::Probe`].
     pub(crate) probe: Option<path_browse::Probe>,
+    /// The machine the path is on, when it isn't this one.
+    pub(crate) host: Option<diffui_core::remote::HostId>,
+    /// The link to that machine, held while the prompt is open: its folder
+    /// listings share one connection, which the opened tab then takes over.
+    pub(crate) link: Option<diffui_core::remote::HostLink>,
+    /// The hosts are listed instead of folders, to pick where the path is.
+    pub(crate) picking_host: bool,
 }
 
 impl OpenRepoDialog {
@@ -1247,7 +1354,10 @@ impl OpenRepoDialog {
     /// browse (empty, a PR reference, relative) or no folder has been read
     /// yet, and the recents show instead.
     pub(crate) fn suggestions(&self) -> Option<(path_browse::Query, Vec<&path_browse::Entry>)> {
-        let query = path_browse::Query::parse(&self.path)?;
+        if self.picking_host {
+            return None;
+        }
+        let query = self.query()?;
         let listing = self.listing.as_ref()?;
         if listing.dir == query.dir {
             let matches = query.matches(listing);
@@ -1255,6 +1365,12 @@ impl OpenRepoDialog {
         }
         let listed = self.listed_query.as_ref()?;
         Some((listed.clone(), listed.matches(listing)))
+    }
+
+    /// The path, split where completion happens, as a path on the machine
+    /// being browsed.
+    pub(crate) fn query(&self) -> Option<path_browse::Query> {
+        path_browse::Query::parse_on(&self.path, self.host.is_some())
     }
 }
 

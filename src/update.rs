@@ -67,9 +67,20 @@ impl Diffui {
         // repository" error.
         enum BootTarget {
             Repo(Repository),
+            /// A repository on another machine, from the session: its root
+            /// as saved, opened without asking the host first.
+            Remote(diffui_core::remote::RemoteTarget),
             Pr(diffui_core::forge::ForgePr),
             Diff(diffui_core::patch::DiffInput),
         }
+        // `host:/path` is a repository on a host unless it is, improbably, a
+        // path here.
+        let remote_target = |text: &str| {
+            diffui_core::remote::RemoteTarget::parse(text).filter(|_| !Path::new(text).exists())
+        };
+        // Named on the command line: opened once the app is up, since where
+        // its root is has to be asked of the host.
+        let mut remote_opens = Vec::new();
         // A link can name a plugin's forge: its manifest says how its links
         // read, before any script runs.
         let boot_forges = plugins.forge_kinds();
@@ -83,7 +94,7 @@ impl Diffui {
         fn push_repo(targets: &mut Vec<BootTarget>, repository: Repository) {
             let duplicate = targets.iter().any(|target| match target {
                 BootTarget::Repo(open) => open.root == repository.root,
-                BootTarget::Pr(_) | BootTarget::Diff(_) => false,
+                BootTarget::Remote(_) | BootTarget::Pr(_) | BootTarget::Diff(_) => false,
             });
             if !duplicate {
                 targets.push(BootTarget::Repo(repository));
@@ -100,6 +111,10 @@ impl Diffui {
                     {
                         targets.push(BootTarget::Pr(spec));
                     }
+                    continue;
+                }
+                if let Some(target) = remote_target(&path.to_string_lossy()) {
+                    remote_opens.push(target);
                     continue;
                 }
                 // `-`, or a patch file (see `opened::patch_origin`).
@@ -120,7 +135,14 @@ impl Diffui {
             }
         } else {
             for path in &saved.open_repos {
-                if let Ok(repository) = prepare_repository(Path::new(path)) {
+                if let Some(target) = remote_target(path) {
+                    if !targets
+                        .iter()
+                        .any(|open| matches!(open, BootTarget::Remote(open) if *open == target))
+                    {
+                        targets.push(BootTarget::Remote(target));
+                    }
+                } else if let Ok(repository) = prepare_repository(Path::new(path)) {
                     push_repo(&mut targets, repository);
                 }
             }
@@ -143,6 +165,7 @@ impl Diffui {
             .and_then(|active| {
                 targets.iter().position(|target| match target {
                     BootTarget::Repo(repository) => repository.root.to_string_lossy() == active,
+                    BootTarget::Remote(target) => target.to_string() == active,
                     BootTarget::Pr(_) | BootTarget::Diff(_) => false,
                 })
             })
@@ -159,9 +182,30 @@ impl Diffui {
                     let source = TabSource::Repo {
                         vcs: repository.vcs,
                         root: repository.root.clone(),
+                        host: None,
                     };
                     let state = repo_layouts.tab_state(repository.clone());
                     (owner, name, source, state)
+                }
+                BootTarget::Remote(target) => {
+                    // The kind isn't saved: the server's answer corrects it.
+                    let repository = Repository {
+                        root: PathBuf::from(&target.path),
+                        vcs: Vcs::Jj,
+                        scope: PathBuf::new(),
+                    };
+                    let (_, name) = repo_label(&repository.root);
+                    let source = TabSource::Repo {
+                        vcs: repository.vcs,
+                        root: repository.root.clone(),
+                        host: Some(target.host.clone()),
+                    };
+                    let state = repo_layouts.remote_tab_state(
+                        &target.to_string(),
+                        repository,
+                        target.host.clone(),
+                    );
+                    (target.host.0.clone(), name, source, state)
                 }
                 BootTarget::Pr(spec) => (
                     spec.owner.clone(),
@@ -206,10 +250,11 @@ impl Diffui {
         // even after they're later closed. PR tabs aren't paths, so they stay out.
         let mut recent_repos = saved.recent_repos.clone();
         for target in targets.iter().rev() {
-            let BootTarget::Repo(repository) = target else {
-                continue;
+            let key = match target {
+                BootTarget::Repo(repository) => repository.root.to_string_lossy().into_owned(),
+                BootTarget::Remote(target) => target.to_string(),
+                BootTarget::Pr(_) | BootTarget::Diff(_) => continue,
             };
-            let key = repository.root.to_string_lossy().into_owned();
             recent_repos.retain(|root| root != &key);
             recent_repos.insert(0, key);
         }
@@ -271,6 +316,7 @@ impl Diffui {
             palette_query: Default::default(),
             command_line_settle: Default::default(),
             panes: None,
+            remote: Default::default(),
             forge: Default::default(),
             plugins,
             #[cfg(test)]
@@ -289,6 +335,12 @@ impl Diffui {
         // Kicks the streaming load for whatever the active tab is: a repo walk,
         // a PR stream, or nothing when no tab opened.
         app.ensure_active_loaded();
+        for problem in app.remote.problems.clone() {
+            app.push_error_toast("Host ignored".to_owned(), &problem);
+        }
+        for target in remote_opens {
+            app.open_remote(target, cx);
+        }
         app.ensure_welcome_prompt(cx);
         app
     }
@@ -324,6 +376,10 @@ impl Diffui {
                 state.handle = Some(handle.with_scope(scope));
                 state.session.repo = Some(event.repo.clone());
                 state.session.capabilities = capabilities;
+                if let Some(opened) = handle.remote().map(|remote| &remote.opened) {
+                    crate::remote::answered(&mut self.tabs[index], opened);
+                }
+                let state = &mut self.tabs[index].state;
                 // Before anything loads: the mode picks what a snapshot does,
                 // and the actor goes by jj's setting alone until told.
                 let effects = state.session.set_refresh_mode(self.config.refresh);
@@ -335,9 +391,13 @@ impl Diffui {
                     self.start_tab_load(id);
                 }
             }
-            if capabilities.mutate {
+            // The jj on this machine's PATH says nothing about another's.
+            if capabilities.mutate && handle.remote().is_none() {
                 crate::jj_version::check_once(cx);
             }
+            return;
+        }
+        if self.on_link_event(&event) {
             return;
         }
 
@@ -859,6 +919,7 @@ impl Diffui {
                 self.run_plugin_command(command, tab, arg)
             }
             Action::Plugin(action) => self.update_plugins(action, cx),
+            Action::Host(action) => self.update_host_page(action, cx),
             Action::Ai(action) => self.update_ai(action, cx),
             Action::StopGenerating => self.stop_generating(),
             Action::ReloadCommands => {
@@ -1060,6 +1121,18 @@ impl Diffui {
             Action::OpenRepoComplete => self.open_repo_complete(cx),
             Action::OpenRepoPick(row) => self.pick_open_repo_suggestion(row, cx),
             Action::OpenRepo(path) => self.open_repository(&path, cx),
+            Action::OpenRecent(key) => self.open_recent(&key, cx),
+            Action::OpenRepoHosts => {
+                // What a transport finds can have changed since it loaded.
+                self.refresh_found_hosts();
+                if let Some(dialog) = self.open_repo_dialog_mut() {
+                    dialog.picking_host = !dialog.picking_host;
+                    dialog.selected = None;
+                }
+                crate::input::focus(tab_bar::OPEN_REPO_INPUT_ID, cx)
+            }
+            Action::OpenRepoHost(host) => self.set_open_repo_host(host, cx),
+            Action::ReconnectHost => self.reconnect_host(),
             Action::RemoveRecentRepo(path) => {
                 self.recent_repos.retain(|recent| recent != &path);
                 self.mark_geometry_dirty();
@@ -1093,6 +1166,7 @@ impl Diffui {
             Action::CloseSettings => {
                 self.pop_mode(ModeKind::Settings);
                 self.plugins.page = None;
+                self.close_host_page();
             }
             Action::ConfirmAccept => {
                 let Some(Mode::Confirm(dialog)) = self.pop_mode(ModeKind::Confirm) else {
@@ -1387,12 +1461,16 @@ impl Diffui {
 
     pub(crate) fn on_open_repo_listed(&mut self, listing: crate::path_browse::Listing) {
         if let Some(dialog) = self.open_repo_dialog_mut() {
+            // A folder of the machine the prompt has since left.
+            if dialog.host != listing.host {
+                return;
+            }
             if dialog.listing_pending.as_ref() == Some(&listing.dir) {
                 dialog.listing_pending = None;
             }
             // A read for a folder the path has since left is
             // dropped, so the rows on screen stay up.
-            let query = crate::path_browse::Query::parse(&dialog.path);
+            let query = dialog.query();
             if let Some(query) = query.filter(|query| query.dir == listing.dir) {
                 dialog.listing = Some(listing);
                 dialog.listed_query = Some(query);
@@ -3492,7 +3570,12 @@ impl Diffui {
     /// going through the actor's tree, off the UI thread: a slow volume
     /// mustn't stall a frame.
     fn list_ignored_dir(&mut self, tab: TabId, dir: String, cx: &mut Cx) {
-        let Some(repository) = self.tab(tab).and_then(|target| target.repository.clone()) else {
+        // What jj ignores is only on the disk, and this reads the disk here.
+        let Some(repository) = self
+            .tab(tab)
+            .filter(|target| target.remote.is_none())
+            .and_then(|target| target.repository.clone())
+        else {
             return;
         };
         Self::run_async(
@@ -4028,7 +4111,9 @@ impl Diffui {
         let Some(target) = self.tab_mut(tab) else {
             return;
         };
-        if target.default_revset.is_none() {
+        // A repository on another machine got its default with the
+        // server's answer.
+        if target.default_revset.is_none() && target.remote.is_none() {
             target.default_revset = Some(
                 target
                     .repository
@@ -4295,7 +4380,9 @@ impl Diffui {
     /// (and nothing changes) when the file doesn't parse.
     pub(crate) fn reload_commands(&mut self) -> Result<Vec<String>, String> {
         self.user_config = crate::config::UserConfig::reload()?;
-        let problems = self.reload_plugins();
+        let mut problems = self.reload_plugins();
+        // The host tables were read again with the plugins.
+        problems.extend(self.remote.problems.iter().cloned());
         self.report_command_problems(&problems);
         Ok(problems)
     }
@@ -4739,7 +4826,11 @@ impl Diffui {
     /// Record `root` as the most-recently-opened repository (deduped, newest
     /// first, capped). Surfaced by the open dialog's quick-pick list.
     pub(crate) fn push_recent_repo(&mut self, root: &std::path::Path) {
-        let key = root.to_string_lossy().into_owned();
+        self.push_recent_key(root.to_string_lossy().into_owned());
+    }
+
+    /// [`Self::push_recent_repo`] by a tab's key: a root, or `host:root`.
+    pub(crate) fn push_recent_key(&mut self, key: String) {
         self.recent_repos.retain(|existing| existing != &key);
         self.recent_repos.insert(0, key);
         self.recent_repos.truncate(RECENT_REPOS_MAX);
@@ -4754,10 +4845,10 @@ impl Diffui {
         // Closed repositories are remembered as long as the recents offer them.
         layouts.retain(|root| {
             self.recent_repos.iter().any(|recent| recent == root)
-                || self.tabs.iter().any(|tab| {
-                    tab.root()
-                        .is_some_and(|open| open.to_string_lossy() == root)
-                })
+                || self
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.key().as_deref() == Some(root))
         });
         WindowState {
             width: Some(self.window_size.width),
@@ -4774,15 +4865,8 @@ impl Diffui {
             messages_rendered: Some(self.text_views.messages_rendered),
             // GitHub-PR tabs are session-only (no local root to restore from),
             // so they drop out of the persisted set here.
-            open_repos: self
-                .tabs
-                .iter()
-                .filter_map(|tab| Some(tab.root()?.to_string_lossy().into_owned()))
-                .collect(),
-            active_repo: self
-                .tabs
-                .get(self.active)
-                .and_then(|tab| Some(tab.root()?.to_string_lossy().into_owned())),
+            open_repos: self.tabs.iter().filter_map(Tab::key).collect(),
+            active_repo: self.tabs.get(self.active).and_then(Tab::key),
             revsets: layouts.revsets,
             history_panel_collapsed: layouts.history_panel_collapsed,
             files_panel_collapsed: layouts.files_panel_collapsed,

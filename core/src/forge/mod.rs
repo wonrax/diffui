@@ -202,7 +202,9 @@ impl ForgeRemote {
 }
 
 /// Where a pull request stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum PrState {
     #[default]
     Open,
@@ -304,7 +306,7 @@ impl UpdatePr {
 }
 
 /// A pull request's header, for its tab.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PrInfo {
     pub number: u64,
     pub title: String,

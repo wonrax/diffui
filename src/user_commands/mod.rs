@@ -213,7 +213,11 @@ impl UserCommand {
                     .is_some_and(|(path, root)| std::path::Path::new(root).join(path).exists());
                 crate::commands::require(on_disk, "Not in the working copy").map_err(Cow::Borrowed)
             }
-            Step::Exec(_) | Step::Agent(_) => Ok(()),
+            // Both start a program here, in a working tree that isn't.
+            Step::Exec(_) | Step::Agent(_) => {
+                crate::commands::require(ui.active().remote.is_none(), reason::REMOTE)
+                    .map_err(Cow::Borrowed)
+            }
         }
     }
 }

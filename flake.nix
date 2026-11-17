@@ -53,24 +53,63 @@
             hash = "sha256-z1/E2D58HdqxnRY94Jb3h/h+/mFQSQmqRpQ09h71Hi4=";
           };
 
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                base = baseNameOf path;
+              in
+              !builtins.elem base [
+                "target"
+                "result"
+                ".direnv"
+                ".jj"
+              ];
+          };
+
+          # The commit a build is made from, which `diffui-serve --version`
+          # reports and a host's `server` setting can pin with `{rev}`. Empty
+          # for a dirty tree: there is no commit to name.
+          rev = self.rev or "";
+
+          # The far end of a repository on another machine (see
+          # core/src/remote): the core alone, so it needs none of the GUI's
+          # libraries. `nix run .#diffui-serve` is a `server` setting that
+          # works on NixOS.
+          diffui-serve = pkgs.rustPlatform.buildRustPackage {
+            pname = "diffui-serve";
+            inherit version src;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            cargoBuildFlags = [
+              "-p"
+              "diffui-serve"
+            ];
+
+            buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
+
+            doCheck = false;
+
+            HIGHLIGHTS_WASM_PATH = highlightsWasm;
+            WABT_DIR = pkgs.wabt;
+            SIMDE_DIR = pkgs.simde;
+            DIFFUI_REV = rev;
+
+            meta = {
+              description = "The server end of diffui's remote repositories";
+              homepage = "https://github.com/wonrax/diffui";
+              mainProgram = "diffui-serve";
+              platforms = lib.platforms.unix;
+            };
+          };
+
           diffui = pkgs.rustPlatform.buildRustPackage {
             pname = "diffui";
-            inherit version;
-
-            src = lib.cleanSourceWith {
-              src = ./.;
-              filter =
-                path: type:
-                let
-                  base = baseNameOf path;
-                in
-                !builtins.elem base [
-                  "target"
-                  "result"
-                  ".direnv"
-                  ".jj"
-                ];
-            };
+            inherit version src;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -96,6 +135,7 @@
             HIGHLIGHTS_WASM_PATH = highlightsWasm;
             WABT_DIR = pkgs.wabt;
             SIMDE_DIR = pkgs.simde;
+            DIFFUI_REV = rev;
 
             # Linux: wrap for the runtime libs and install the XDG desktop entry
             # (+ icon) so launchers/app grids list it, not just the CLI. macOS:
@@ -228,11 +268,17 @@
           packages = {
             default = diffui;
             diffui = diffui;
+            diffui-serve = diffui-serve;
           };
 
           apps.default = {
             type = "app";
             program = "${diffui}/bin/diffui";
+          };
+
+          apps.diffui-serve = {
+            type = "app";
+            program = "${diffui-serve}/bin/diffui-serve";
           };
 
           devShells.default = pkgs.mkShell {
@@ -293,8 +339,7 @@
                   unset rustflags_var
                 fi
                 unset apple_ld
-              ''
-;
+              '';
           };
 
           formatter = pkgs.nixfmt;

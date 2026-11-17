@@ -505,10 +505,12 @@ impl Diffui {
             return JjCli::default();
         };
         if state.cmdline.cli.is_none() {
+            // The aliases are in jj's config beside the repository: one on
+            // another machine gets jj's own grammar.
             let cli = state
                 .repository
                 .as_ref()
-                .filter(|repository| repository.vcs == crate::Vcs::Jj)
+                .filter(|repository| repository.vcs == crate::Vcs::Jj && state.remote.is_none())
                 .map(|repository| JjCli::for_repo(&repository.root))
                 .unwrap_or_default();
             state.cmdline.cli = Some(cli);

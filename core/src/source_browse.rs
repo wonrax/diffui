@@ -20,7 +20,7 @@ use crate::repository::Repository;
 use crate::syntax;
 
 /// How a listed path relates to the revision's tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceEntryStatus {
     /// In the revision's tree.
     Tracked,
@@ -32,7 +32,7 @@ pub enum SourceEntryStatus {
 }
 
 /// One path in a revision's source listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceEntry {
     /// Repo-relative, `/`-separated.
     pub path: String,
@@ -61,7 +61,7 @@ impl SourceEntry {
 /// A file read for the source browser, ready to render: the content as a
 /// single all-context "diff" file (so a diff-oriented frontend can reuse its
 /// code view), plus what made it unreadable when `file` is empty.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceFileLoad {
     /// One hunk of context lines with `new_line` numbering and syntax spans
     /// applied. Empty hunks when the file is binary/oversized.

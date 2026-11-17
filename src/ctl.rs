@@ -47,6 +47,7 @@ pub(crate) const TOPICS: &[(&str, &str)] = &[
         include_str!("../assets/agent/forge-plugin.md"),
     ),
     ("patches", include_str!("../assets/agent/patches.md")),
+    ("remote", include_str!("../assets/agent/remote.md")),
 ];
 
 /// One reference by its topic's name.
@@ -299,8 +300,9 @@ impl Diffui {
             .tabs
             .iter()
             .filter_map(|tab| {
-                let root = &tab.state.repository.as_ref()?.root;
-                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                // A path names a repository on this machine only.
+                let root = tab.state.local_root()?;
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
                 wanted
                     .starts_with(&root)
                     .then_some((tab.id, root.as_os_str().len()))
@@ -321,6 +323,7 @@ impl Diffui {
                 json!({
                     "tab": tab.id.0,
                     "root": state.repository.as_ref().map(|repository| repository.root.display().to_string()),
+                    "host": state.remote.as_ref().map(|remote| remote.host.0.clone()),
                     "kind": tab.source.kind(),
                     "name": tab.name,
                     "active": self.is_active(tab.id),
@@ -762,7 +765,7 @@ mod tests {
             assert!(text.starts_with("# "), "{name} has no heading");
         }
         // Each is a `client_main` in `main`: add a new one here.
-        for subcommand in ["skill", "ctl", "notes", "plugin", "diff", "jj"] {
+        for subcommand in ["skill", "ctl", "notes", "plugin", "diff", "jj", "serve"] {
             assert!(
                 SKILL.contains(&format!("`diffui {subcommand}")),
                 "{subcommand}"
@@ -823,9 +826,13 @@ mod tests {
     /// plugin as it is shipped. The d.ts is the contract they point at.
     #[test]
     fn the_plugin_topics_name_the_whole_plugin_surface() {
-        use diffui_plugins::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS};
+        use diffui_plugins::protocol::{AI_METHODS, EVENT_NAMES, FORGE_METHODS, TRANSPORT_METHODS};
         let plugin = guide("plugin");
         let forge = guide("forge-plugin");
+        let remote = guide("remote");
+        for name in TRANSPORT_METHODS {
+            assert!(remote.contains(&format!("| `{name}` |")), "{name}");
+        }
         for verb in verbs(&crate::plugins::cli::cli()) {
             assert!(
                 SKILL.contains(&format!("`diffui plugin {verb}"))
@@ -849,6 +856,7 @@ mod tests {
             "ForgeError",
             "ai",
             "AiError",
+            "transport",
         ] {
             assert!(plugin.contains(&format!("| `{import}` |")), "{import}");
             assert!(

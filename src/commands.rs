@@ -270,6 +270,8 @@ pub(crate) mod reason {
     pub(crate) const NOT_JJ: Reason = "Needs a jj repository";
     pub(crate) const GONE: Reason = "Revision is no longer in the log";
     pub(crate) const NO_REPOSITORY: Reason = "No local repository in this tab";
+    /// For what reads or runs something in the working tree.
+    pub(crate) const REMOTE: Reason = "The repository is on another machine";
     pub(crate) const NO_FILE: Reason = "No file selected";
     pub(crate) const NO_REMOTES: Reason = "No git remotes";
     pub(crate) const NO_LOCAL_BOOKMARK: Reason = "No local bookmark here";
@@ -960,10 +962,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: |ui, _arg| require(ui.active().repository.is_some(), reason::NO_REPOSITORY),
         build: |ui, arg| {
             let path = arg.path()?;
-            let repository = ui.active().repository.as_ref()?;
-            Some(Action::Copy(
-                repository.root.join(path).display().to_string(),
-            ))
+            let tab = ui.active();
+            let repository = tab.repository.as_ref()?;
+            Some(Action::Copy(match tab.remote {
+                // A path over there, in its own spelling: never joined with
+                // this machine's separator.
+                Some(_) => format!(
+                    "{}/{path}",
+                    repository.root.to_string_lossy().trim_end_matches('/')
+                ),
+                None => repository.root.join(path).display().to_string(),
+            }))
         },
         palette: PaletteScope::Hidden,
     },

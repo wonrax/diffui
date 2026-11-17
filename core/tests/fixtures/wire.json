@@ -1,0 +1,4278 @@
+{
+  "protocol": 1,
+  "types": {
+    "BlobChange": {
+      "STRUCT": [
+        {
+          "kind": {
+            "TYPENAME": "BlobKind"
+          }
+        },
+        {
+          "before": {
+            "OPTION": {
+              "TYPENAME": "BlobSide"
+            }
+          }
+        },
+        {
+          "after": {
+            "OPTION": {
+              "TYPENAME": "BlobSide"
+            }
+          }
+        }
+      ]
+    },
+    "BlobKind": {
+      "ENUM": {
+        "0": {
+          "Binary": "UNIT"
+        },
+        "1": {
+          "Image": "UNIT"
+        },
+        "2": {
+          "Svg": "UNIT"
+        }
+      }
+    },
+    "BlobSide": {
+      "STRUCT": [
+        {
+          "size": "U64"
+        },
+        {
+          "id": "STR"
+        },
+        {
+          "dimensions": {
+            "OPTION": {
+              "TUPLEARRAY": {
+                "CONTENT": "U32",
+                "SIZE": 2
+              }
+            }
+          }
+        },
+        {
+          "bytes": {
+            "OPTION": {
+              "SEQ": "U8"
+            }
+          }
+        }
+      ]
+    },
+    "BookmarkEntry": {
+      "STRUCT": [
+        {
+          "name": "STR"
+        },
+        {
+          "local_targets": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "remotes": {
+            "SEQ": {
+              "TYPENAME": "RemoteBookmarkRef"
+            }
+          }
+        }
+      ]
+    },
+    "BookmarkMove": {
+      "STRUCT": [
+        {
+          "bookmark": "STR"
+        },
+        {
+          "tag": "BOOL"
+        },
+        {
+          "from": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "to": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "kind": {
+            "TYPENAME": "MoveKind"
+          }
+        },
+        {
+          "revisions": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "revision_count": "U64"
+        }
+      ]
+    },
+    "BookmarksInfo": {
+      "STRUCT": [
+        {
+          "bookmarks": {
+            "SEQ": {
+              "TYPENAME": "BookmarkEntry"
+            }
+          }
+        },
+        {
+          "working_copy_commit": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "remotes": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "git_push": {
+            "OPTION": {
+              "SEQ": "STR"
+            }
+          }
+        },
+        {
+          "tags": {
+            "MAP": {
+              "KEY": "STR",
+              "VALUE": {
+                "SEQ": "STR"
+              }
+            }
+          }
+        },
+        {
+          "trunk": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "tracked_push": {
+            "SEQ": {
+              "TYPENAME": "PushCandidate"
+            }
+          }
+        }
+      ]
+    },
+    "BranchStatus": {
+      "STRUCT": [
+        {
+          "branch": "STR"
+        },
+        {
+          "upstream": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "ahead": "U64"
+        },
+        {
+          "behind": "U64"
+        }
+      ]
+    },
+    "Capabilities": {
+      "STRUCT": [
+        {
+          "graph": "BOOL"
+        },
+        {
+          "mutate": "BOOL"
+        },
+        {
+          "fetch": "BOOL"
+        },
+        {
+          "browse": "BOOL"
+        },
+        {
+          "details": "BOOL"
+        },
+        {
+          "compare": "BOOL"
+        },
+        {
+          "range_diff": "BOOL"
+        }
+      ]
+    },
+    "ChangedCommit": {
+      "STRUCT": [
+        {
+          "kind": {
+            "TYPENAME": "CommitChangeKind"
+          }
+        },
+        {
+          "commit": {
+            "TYPENAME": "CommitBrief"
+          }
+        },
+        {
+          "predecessors": {
+            "SEQ": {
+              "TYPENAME": "CommitBrief"
+            }
+          }
+        },
+        {
+          "rebased": "BOOL"
+        }
+      ]
+    },
+    "CliInvocation": {
+      "STRUCT": [
+        {
+          "program": "STR"
+        },
+        {
+          "args": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "env": {
+            "SEQ": {
+              "TUPLEARRAY": {
+                "CONTENT": "STR",
+                "SIZE": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CliLine": {
+      "STRUCT": [
+        {
+          "stream": {
+            "TYPENAME": "CliStream"
+          }
+        },
+        {
+          "text": "STR"
+        }
+      ]
+    },
+    "CliStream": {
+      "ENUM": {
+        "0": {
+          "Stdout": "UNIT"
+        },
+        "1": {
+          "Stderr": "UNIT"
+        }
+      }
+    },
+    "Command": {
+      "ENUM": {
+        "0": {
+          "LoadGraph": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revset": "STR"
+              }
+            ]
+          }
+        },
+        "1": {
+          "LoadDiff": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "base": {
+                  "TYPENAME": "DiffBase"
+                }
+              },
+              {
+                "expand": {
+                  "SEQ": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Snapshot": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "origin": {
+                  "TYPENAME": "RefreshOrigin"
+                }
+              },
+              {
+                "disk": {
+                  "TYPENAME": "DiskSync"
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Mutate": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "op": {
+                  "TYPENAME": "MutationOp"
+                }
+              },
+              {
+                "allow_immutable": "BOOL"
+              },
+              {
+                "seen_op": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "seen_wc": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "Preview": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "draft": {
+                  "TYPENAME": "PreviewRequest"
+                }
+              },
+              {
+                "graph": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "seen_op": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "5": {
+          "Fetch": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "target": {
+                  "TYPENAME": "FetchTarget"
+                }
+              }
+            ]
+          }
+        },
+        "6": {
+          "RevisionDetails": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "7": {
+          "EmptyStatus": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "targets": {
+                  "SEQ": {
+                    "TUPLE": [
+                      "U64",
+                      "STR"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "8": {
+          "ListTree": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "9": {
+          "ReadFile": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "10": {
+          "FilePair": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "old_path": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "base": {
+                  "TYPENAME": "DiffBase"
+                }
+              }
+            ]
+          }
+        },
+        "11": {
+          "BookmarkCheck": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "name": "STR"
+              },
+              {
+                "to": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "seen_op": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "12": {
+          "ConflictInfo": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "13": {
+          "PrepareMergeTool": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "14": {
+          "ConflictText": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "15": {
+          "History": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "request": {
+                  "TYPENAME": "HistoryRequest"
+                }
+              }
+            ]
+          }
+        },
+        "16": {
+          "ExpandFile": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "base": {
+                  "TYPENAME": "DiffBase"
+                }
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "17": {
+          "ResolveRevset": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "query": {
+                  "TYPENAME": "RevsetQuery"
+                }
+              }
+            ]
+          }
+        },
+        "18": {
+          "ResolveDiff": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "request": {
+                  "TYPENAME": "DiffRequest"
+                }
+              }
+            ]
+          }
+        },
+        "19": {
+          "SearchCommits": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "needle": "STR"
+              },
+              {
+                "revset": "STR"
+              }
+            ]
+          }
+        },
+        "20": {
+          "RunCli": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "invocation": {
+                  "TYPENAME": "CliInvocation"
+                }
+              }
+            ]
+          }
+        },
+        "21": {
+          "SetRefreshMode": {
+            "STRUCT": [
+              {
+                "mode": {
+                  "TYPENAME": "RefreshMode"
+                }
+              }
+            ]
+          }
+        },
+        "22": {
+          "Cancel": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "CommitBrief": {
+      "STRUCT": [
+        {
+          "commit_id": "STR"
+        },
+        {
+          "change_id": "STR"
+        },
+        {
+          "summary": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "time_millis": "I64"
+        },
+        {
+          "empty": "BOOL"
+        },
+        {
+          "visible": "BOOL"
+        }
+      ]
+    },
+    "CommitChangeKind": {
+      "ENUM": {
+        "0": {
+          "Created": "UNIT"
+        },
+        "1": {
+          "Rewritten": "UNIT"
+        },
+        "2": {
+          "Abandoned": "UNIT"
+        }
+      }
+    },
+    "CommitHit": {
+      "STRUCT": [
+        {
+          "change_id": "STR"
+        },
+        {
+          "commit_id": "STR"
+        },
+        {
+          "shortest_change_id_len": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "change_offset": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "description": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "score": "U16"
+        },
+        {
+          "in_log": "BOOL"
+        }
+      ]
+    },
+    "CommitSummary": {
+      "STRUCT": [
+        {
+          "change_id": "STR"
+        },
+        {
+          "commit_id": "STR"
+        },
+        {
+          "shortest_change_id_len": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "description": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "author_timestamp": {
+            "OPTION": "I64"
+          }
+        },
+        {
+          "has_description": "BOOL"
+        },
+        {
+          "is_empty": {
+            "OPTION": "BOOL"
+          }
+        },
+        {
+          "has_conflict": "BOOL"
+        },
+        {
+          "is_divergent": "BOOL"
+        },
+        {
+          "is_hidden": "BOOL"
+        },
+        {
+          "change_offset": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "is_working_copy": "BOOL"
+        },
+        {
+          "is_immutable": "BOOL"
+        },
+        {
+          "on_trunk": "BOOL"
+        },
+        {
+          "bookmarks": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "parent_ids": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "ConflictFile": {
+      "STRUCT": [
+        {
+          "path": "STR"
+        },
+        {
+          "sides": {
+            "SEQ": {
+              "TYPENAME": "ConflictTerm"
+            }
+          }
+        },
+        {
+          "bases": {
+            "SEQ": {
+              "TYPENAME": "ConflictTerm"
+            }
+          }
+        },
+        {
+          "pickable": "BOOL"
+        },
+        {
+          "merge_tool_blocker": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "regions": "U64"
+        }
+      ]
+    },
+    "ConflictPick": {
+      "ENUM": {
+        "0": {
+          "Side": {
+            "NEWTYPE": "U64"
+          }
+        },
+        "1": {
+          "Base": {
+            "NEWTYPE": "U64"
+          }
+        }
+      }
+    },
+    "ConflictResolution": {
+      "ENUM": {
+        "0": {
+          "Side": {
+            "NEWTYPE": "U64"
+          }
+        },
+        "1": {
+          "Base": {
+            "NEWTYPE": "U64"
+          }
+        },
+        "2": {
+          "Content": {
+            "STRUCT": [
+              {
+                "content": {
+                  "SEQ": "U8"
+                }
+              },
+              {
+                "marker_len": {
+                  "OPTION": "U64"
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Region": {
+            "STRUCT": [
+              {
+                "region": "U64"
+              },
+              {
+                "regions": "U64"
+              },
+              {
+                "pick": {
+                  "TYPENAME": "ConflictPick"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "ConflictTerm": {
+      "STRUCT": [
+        {
+          "label": "STR"
+        },
+        {
+          "absent": "BOOL"
+        }
+      ]
+    },
+    "Destination": {
+      "ENUM": {
+        "0": {
+          "Onto": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "1": {
+          "After": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "2": {
+          "Before": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "3": {
+          "Between": {
+            "STRUCT": [
+              {
+                "parent": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "child": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "Trunk": "UNIT"
+        }
+      }
+    },
+    "DiffBase": {
+      "ENUM": {
+        "0": {
+          "Parents": "UNIT"
+        },
+        "1": {
+          "Revision": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "2": {
+          "Interdiff": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "3": {
+          "Range": {
+            "NEWTYPE": "STR"
+          }
+        }
+      }
+    },
+    "DiffCollapse": {
+      "ENUM": {
+        "0": {
+          "LargeFile": "UNIT"
+        },
+        "1": {
+          "OverBudget": "UNIT"
+        }
+      }
+    },
+    "DiffDocument": {
+      "STRUCT": [
+        {
+          "files": {
+            "SEQ": {
+              "TYPENAME": "DiffFile"
+            }
+          }
+        },
+        {
+          "total_additions": "U64"
+        },
+        {
+          "total_deletions": "U64"
+        },
+        {
+          "range": {
+            "OPTION": {
+              "TYPENAME": "DiffRange"
+            }
+          }
+        }
+      ]
+    },
+    "DiffFile": {
+      "STRUCT": [
+        {
+          "path": "STR"
+        },
+        {
+          "old_path": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "status": {
+            "TYPENAME": "DiffFileStatus"
+          }
+        },
+        {
+          "hunks": {
+            "SEQ": {
+              "TYPENAME": "DiffHunkView"
+            }
+          }
+        },
+        {
+          "additions": "U64"
+        },
+        {
+          "deletions": "U64"
+        },
+        {
+          "collapsed": {
+            "OPTION": {
+              "TYPENAME": "DiffCollapse"
+            }
+          }
+        },
+        {
+          "blob": {
+            "OPTION": {
+              "TYPENAME": "BlobChange"
+            }
+          }
+        },
+        {
+          "mode_change": {
+            "OPTION": {
+              "TUPLEARRAY": {
+                "CONTENT": "U32",
+                "SIZE": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "DiffFileStatus": {
+      "ENUM": {
+        "0": {
+          "Added": "UNIT"
+        },
+        "1": {
+          "Deleted": "UNIT"
+        },
+        "2": {
+          "Modified": "UNIT"
+        },
+        "3": {
+          "Renamed": "UNIT"
+        },
+        "4": {
+          "Conflicted": "UNIT"
+        }
+      }
+    },
+    "DiffHunkView": {
+      "STRUCT": [
+        {
+          "header": "STR"
+        },
+        {
+          "lines": {
+            "SEQ": {
+              "TYPENAME": "DiffLine"
+            }
+          }
+        }
+      ]
+    },
+    "DiffLine": {
+      "STRUCT": [
+        {
+          "kind": {
+            "TYPENAME": "DiffLineKind"
+          }
+        },
+        {
+          "old_line": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "new_line": {
+            "OPTION": "U64"
+          }
+        },
+        {
+          "content": "STR"
+        },
+        {
+          "syntax": {
+            "SEQ": {
+              "TYPENAME": "SyntaxSpan"
+            }
+          }
+        },
+        {
+          "emphasis": {
+            "SEQ": {
+              "TUPLEARRAY": {
+                "CONTENT": "U64",
+                "SIZE": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "DiffLineKind": {
+      "ENUM": {
+        "0": {
+          "Context": "UNIT"
+        },
+        "1": {
+          "Addition": "UNIT"
+        },
+        "2": {
+          "Deletion": "UNIT"
+        },
+        "3": {
+          "Conflict": "UNIT"
+        },
+        "4": {
+          "Note": "UNIT"
+        }
+      }
+    },
+    "DiffRange": {
+      "STRUCT": [
+        {
+          "revset": "STR"
+        },
+        {
+          "commits": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "count": "U64"
+        },
+        {
+          "heads": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "roots": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "base": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "includes_working_copy": "BOOL"
+        }
+      ]
+    },
+    "DiffRequest": {
+      "ENUM": {
+        "0": {
+          "Revisions": {
+            "NEWTYPE": {
+              "SEQ": "STR"
+            }
+          }
+        },
+        "1": {
+          "FromTo": {
+            "STRUCT": [
+              {
+                "from": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "to": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "interdiff": "BOOL"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "DiffSelection": {
+      "STRUCT": [
+        {
+          "files": {
+            "SEQ": {
+              "TYPENAME": "FileSelection"
+            }
+          }
+        }
+      ]
+    },
+    "DirEntry": {
+      "STRUCT": [
+        {
+          "name": "STR"
+        },
+        {
+          "vcs": {
+            "OPTION": {
+              "TYPENAME": "Vcs"
+            }
+          }
+        }
+      ]
+    },
+    "DiskState": {
+      "STRUCT": [
+        {
+          "edits": "BOOL"
+        },
+        {
+          "stale": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "stuck": "BOOL"
+        }
+      ]
+    },
+    "DiskSync": {
+      "ENUM": {
+        "0": {
+          "Check": "UNIT"
+        },
+        "1": {
+          "Fold": "UNIT"
+        },
+        "2": {
+          "Sync": "UNIT"
+        }
+      }
+    },
+    "Down": {
+      "ENUM": {
+        "0": {
+          "DirListed": {
+            "STRUCT": [
+              {
+                "request": "U64"
+              },
+              {
+                "entries": {
+                  "SEQ": {
+                    "TYPENAME": "DirEntry"
+                  }
+                }
+              },
+              {
+                "error": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "1": {
+          "Probed": {
+            "STRUCT": [
+              {
+                "request": "U64"
+              },
+              {
+                "probe": {
+                  "TYPENAME": "Probed"
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Opened": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              },
+              {
+                "repository": {
+                  "TYPENAME": "Opened"
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Refused": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              },
+              {
+                "message": "STR"
+              }
+            ]
+          }
+        },
+        "4": {
+          "Event": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              },
+              {
+                "payload": {
+                  "TYPENAME": "Payload"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "DraftSimulation": {
+      "ENUM": {
+        "0": {
+          "Rebase": {
+            "NEWTYPE": {
+              "TYPENAME": "RebasePreview"
+            }
+          }
+        },
+        "1": {
+          "Merge": {
+            "NEWTYPE": {
+              "TYPENAME": "MergePreview"
+            }
+          }
+        },
+        "2": {
+          "Squash": {
+            "NEWTYPE": {
+              "TYPENAME": "SquashPreview"
+            }
+          }
+        },
+        "3": {
+          "Insert": {
+            "NEWTYPE": {
+              "TYPENAME": "InsertPreview"
+            }
+          }
+        }
+      }
+    },
+    "EvologEntry": {
+      "STRUCT": [
+        {
+          "commit": {
+            "TYPENAME": "CommitBrief"
+          }
+        },
+        {
+          "operation": {
+            "OPTION": {
+              "TYPENAME": "OperationRef"
+            }
+          }
+        },
+        {
+          "predecessor_ids": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "FetchOutcome": {
+      "STRUCT": [
+        {
+          "remotes": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "output": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "warnings": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "changed": "BOOL"
+        }
+      ]
+    },
+    "FetchTarget": {
+      "ENUM": {
+        "0": {
+          "Default": "UNIT"
+        },
+        "1": {
+          "AllRemotes": "UNIT"
+        },
+        "2": {
+          "RemoteBranch": {
+            "STRUCT": [
+              {
+                "remote": "STR"
+              },
+              {
+                "branch": "STR"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "FileAnnotation": {
+      "STRUCT": [
+        {
+          "revision": {
+            "TYPENAME": "RevisionSelection"
+          }
+        },
+        {
+          "path": "STR"
+        },
+        {
+          "lines": {
+            "SEQ": "U32"
+          }
+        },
+        {
+          "origins": {
+            "SEQ": {
+              "TYPENAME": "CommitBrief"
+            }
+          }
+        },
+        {
+          "unique_prefix_lens": {
+            "SEQ": "U64"
+          }
+        }
+      ]
+    },
+    "FileSelection": {
+      "STRUCT": [
+        {
+          "path": "STR"
+        },
+        {
+          "hunks": {
+            "TYPENAME": "HunkPick"
+          }
+        }
+      ]
+    },
+    "FoundRepository": {
+      "STRUCT": [
+        {
+          "root": "STR"
+        },
+        {
+          "vcs": {
+            "TYPENAME": "Vcs"
+          }
+        },
+        {
+          "at_root": "BOOL"
+        },
+        {
+          "scope": "STR"
+        }
+      ]
+    },
+    "GraphTail": {
+      "STRUCT": [
+        {
+          "empty_updates": {
+            "SEQ": {
+              "TUPLE": [
+                "U64",
+                "BOOL"
+              ]
+            }
+          }
+        },
+        {
+          "branch_status": {
+            "OPTION": {
+              "TYPENAME": "BranchStatus"
+            }
+          }
+        },
+        {
+          "bookmarks": {
+            "TYPENAME": "BookmarksInfo"
+          }
+        },
+        {
+          "root_commit_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "op_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "symbols": {
+            "TYPENAME": "RevsetSymbols"
+          }
+        }
+      ]
+    },
+    "Hello": {
+      "STRUCT": [
+        {
+          "protocol": "U32"
+        },
+        {
+          "version": "STR"
+        },
+        {
+          "rev": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "host": {
+            "OPTION": {
+              "TYPENAME": "HostInfo"
+            }
+          }
+        }
+      ]
+    },
+    "HistoryDiffTarget": {
+      "ENUM": {
+        "0": {
+          "Commit": {
+            "STRUCT": [
+              {
+                "commit_id": "STR"
+              }
+            ]
+          }
+        },
+        "1": {
+          "InterDiff": {
+            "STRUCT": [
+              {
+                "from": {
+                  "SEQ": "STR"
+                }
+              },
+              {
+                "to": "STR"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "HistoryRequest": {
+      "ENUM": {
+        "0": {
+          "OpLog": {
+            "STRUCT": [
+              {
+                "limit": "U64"
+              }
+            ]
+          }
+        },
+        "1": {
+          "ShowOperation": {
+            "STRUCT": [
+              {
+                "operation_id": "STR"
+              }
+            ]
+          }
+        },
+        "2": {
+          "Evolog": {
+            "STRUCT": [
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Diff": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "HistoryDiffTarget"
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "Annotate": {
+            "STRUCT": [
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "HistoryResponse": {
+      "ENUM": {
+        "0": {
+          "OpLogDone": {
+            "STRUCT": [
+              {
+                "truncated": "BOOL"
+              }
+            ]
+          }
+        },
+        "1": {
+          "Operation": {
+            "NEWTYPE": {
+              "TYPENAME": "OperationChanges"
+            }
+          }
+        },
+        "2": {
+          "Evolog": {
+            "NEWTYPE": {
+              "SEQ": {
+                "TYPENAME": "EvologEntry"
+              }
+            }
+          }
+        },
+        "3": {
+          "Diff": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "HistoryDiffTarget"
+                }
+              },
+              {
+                "document": {
+                  "TYPENAME": "DiffDocument"
+                }
+              },
+              {
+                "details": {
+                  "OPTION": {
+                    "TYPENAME": "RevisionDetails"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "Annotation": {
+            "NEWTYPE": {
+              "TYPENAME": "FileAnnotation"
+            }
+          }
+        }
+      }
+    },
+    "HostInfo": {
+      "STRUCT": [
+        {
+          "os": "STR"
+        },
+        {
+          "home": {
+            "OPTION": "STR"
+          }
+        }
+      ]
+    },
+    "HunkPick": {
+      "ENUM": {
+        "0": {
+          "All": "UNIT"
+        },
+        "1": {
+          "Hunks": {
+            "NEWTYPE": {
+              "SEQ": {
+                "TYPENAME": "HunkRef"
+              }
+            }
+          }
+        }
+      }
+    },
+    "HunkRef": {
+      "STRUCT": [
+        {
+          "index": "U64"
+        },
+        {
+          "header": "STR"
+        },
+        {
+          "lines": {
+            "OPTION": {
+              "SEQ": {
+                "TYPENAME": "LineRef"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "InsertPreview": {
+      "STRUCT": [
+        {
+          "created": "U32"
+        },
+        {
+          "rebased": "U32"
+        },
+        {
+          "new_conflicts": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "JobId": {
+      "NEWTYPESTRUCT": "U64"
+    },
+    "LaneFrame": {
+      "STRUCT": [
+        {
+          "before": {
+            "SEQ": "U8"
+          }
+        },
+        {
+          "after": {
+            "SEQ": "U8"
+          }
+        },
+        {
+          "node_lane": "U64"
+        },
+        {
+          "merging_lanes": {
+            "SEQ": "U64"
+          }
+        },
+        {
+          "missing_parents": "U64"
+        }
+      ]
+    },
+    "LineRef": {
+      "ENUM": {
+        "0": {
+          "Removed": {
+            "NEWTYPE": "U64"
+          }
+        },
+        "1": {
+          "Added": {
+            "NEWTYPE": "U64"
+          }
+        }
+      }
+    },
+    "Mail": {
+      "STRUCT": [
+        {
+          "subject": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "date": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "millis": {
+            "OPTION": "I64"
+          }
+        },
+        {
+          "message": "STR"
+        },
+        {
+          "commit": {
+            "OPTION": "STR"
+          }
+        }
+      ]
+    },
+    "MergePreview": {
+      "STRUCT": [
+        {
+          "conflicts": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "truncated": "BOOL"
+        }
+      ]
+    },
+    "MergeToolInvocation": {
+      "STRUCT": [
+        {
+          "tool": "STR"
+        },
+        {
+          "program": "STR"
+        },
+        {
+          "args": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "dir": "STR"
+        },
+        {
+          "output": "STR"
+        },
+        {
+          "initial_output": {
+            "SEQ": "U8"
+          }
+        },
+        {
+          "conflict_exit_codes": {
+            "SEQ": "I32"
+          }
+        },
+        {
+          "marker_len": "U64"
+        },
+        {
+          "edits_markers": "BOOL"
+        },
+        {
+          "revision": {
+            "TYPENAME": "RevisionSelection"
+          }
+        },
+        {
+          "path": "STR"
+        }
+      ]
+    },
+    "MoveKind": {
+      "ENUM": {
+        "0": {
+          "Add": "UNIT"
+        },
+        "1": {
+          "Delete": "UNIT"
+        },
+        "2": {
+          "Forward": "UNIT"
+        },
+        "3": {
+          "Backward": "UNIT"
+        },
+        "4": {
+          "Sideways": "UNIT"
+        }
+      }
+    },
+    "MutationOp": {
+      "ENUM": {
+        "0": {
+          "New": {
+            "STRUCT": [
+              {
+                "parent": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "1": {
+          "Edit": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Abandon": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Describe": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "description": "STR"
+              }
+            ]
+          }
+        },
+        "4": {
+          "Rebase": {
+            "STRUCT": [
+              {
+                "mode": {
+                  "TYPENAME": "RebaseSourceMode"
+                }
+              },
+              {
+                "sources": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "destination": {
+                  "TYPENAME": "Destination"
+                }
+              }
+            ]
+          }
+        },
+        "5": {
+          "Squash": {
+            "STRUCT": [
+              {
+                "from": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "into": {
+                  "TYPENAME": "SquashTarget"
+                }
+              }
+            ]
+          }
+        },
+        "6": {
+          "Merge": {
+            "STRUCT": [
+              {
+                "parents": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "7": {
+          "Duplicate": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "8": {
+          "Absorb": {
+            "STRUCT": [
+              {
+                "from": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "paths": {
+                  "SEQ": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "9": {
+          "MoveBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "to": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "push_remote": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "10": {
+          "DeleteBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              }
+            ]
+          }
+        },
+        "11": {
+          "TrackBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "remote": "STR"
+              }
+            ]
+          }
+        },
+        "12": {
+          "PushBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "remote": "STR"
+              }
+            ]
+          }
+        },
+        "13": {
+          "Undo": {
+            "STRUCT": [
+              {
+                "operation_id": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "14": {
+          "Redo": "UNIT"
+        },
+        "15": {
+          "CreateBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "to": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "16": {
+          "RenameBookmark": {
+            "STRUCT": [
+              {
+                "old": "STR"
+              },
+              {
+                "new": "STR"
+              }
+            ]
+          }
+        },
+        "17": {
+          "ForgetBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              }
+            ]
+          }
+        },
+        "18": {
+          "UntrackBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "remote": "STR"
+              }
+            ]
+          }
+        },
+        "19": {
+          "Push": {
+            "NEWTYPE": {
+              "TYPENAME": "PushRequest"
+            }
+          }
+        },
+        "20": {
+          "Commit": {
+            "STRUCT": [
+              {
+                "description": "STR"
+              }
+            ]
+          }
+        },
+        "21": {
+          "NewAt": {
+            "STRUCT": [
+              {
+                "destination": {
+                  "TYPENAME": "Destination"
+                }
+              }
+            ]
+          }
+        },
+        "22": {
+          "Parallelize": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "23": {
+          "DuplicateTo": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "destination": {
+                  "OPTION": {
+                    "TYPENAME": "Destination"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "24": {
+          "KeepDivergent": {
+            "STRUCT": [
+              {
+                "keep": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "25": {
+          "Metaedit": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "update_author": "BOOL"
+              },
+              {
+                "update_author_timestamp": "BOOL"
+              }
+            ]
+          }
+        },
+        "26": {
+          "Split": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "selection": {
+                  "TYPENAME": "DiffSelection"
+                }
+              },
+              {
+                "first_description": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "second_description": "STR"
+              }
+            ]
+          }
+        },
+        "27": {
+          "SquashChanges": {
+            "STRUCT": [
+              {
+                "from": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "selection": {
+                  "TYPENAME": "DiffSelection"
+                }
+              },
+              {
+                "into": {
+                  "TYPENAME": "SquashTarget"
+                }
+              }
+            ]
+          }
+        },
+        "28": {
+          "RestoreChanges": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "selection": {
+                  "TYPENAME": "DiffSelection"
+                }
+              }
+            ]
+          }
+        },
+        "29": {
+          "ResolveConflict": {
+            "STRUCT": [
+              {
+                "target": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "resolution": {
+                  "TYPENAME": "ConflictResolution"
+                }
+              }
+            ]
+          }
+        },
+        "30": {
+          "RestoreOperation": {
+            "STRUCT": [
+              {
+                "operation_id": "STR"
+              }
+            ]
+          }
+        },
+        "31": {
+          "RevertOperation": {
+            "STRUCT": [
+              {
+                "operation_id": "STR"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "MutationOutcome": {
+      "STRUCT": [
+        {
+          "message": "STR"
+        },
+        {
+          "moved_working_copy": "BOOL"
+        },
+        {
+          "rewritten_commit": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "output": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "operation_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "bookmarks": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "Opened": {
+      "STRUCT": [
+        {
+          "root": "STR"
+        },
+        {
+          "vcs": {
+            "TYPENAME": "Vcs"
+          }
+        },
+        {
+          "scope": "STR"
+        },
+        {
+          "capabilities": {
+            "TYPENAME": "Capabilities"
+          }
+        },
+        {
+          "default_revset": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "remotes": {
+            "SEQ": {
+              "TUPLEARRAY": {
+                "CONTENT": "STR",
+                "SIZE": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "OperationChanges": {
+      "STRUCT": [
+        {
+          "operation": {
+            "TYPENAME": "OperationEntry"
+          }
+        },
+        {
+          "commits": {
+            "SEQ": {
+              "TYPENAME": "ChangedCommit"
+            }
+          }
+        },
+        {
+          "commits_truncated": "BOOL"
+        },
+        {
+          "refs": {
+            "SEQ": {
+              "TYPENAME": "RefChange"
+            }
+          }
+        },
+        {
+          "is_merge": "BOOL"
+        }
+      ]
+    },
+    "OperationEntry": {
+      "STRUCT": [
+        {
+          "id": "STR"
+        },
+        {
+          "parent_ids": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "description": "STR"
+        },
+        {
+          "user": "STR"
+        },
+        {
+          "time_millis": "I64"
+        },
+        {
+          "time": "STR"
+        },
+        {
+          "is_snapshot": "BOOL"
+        },
+        {
+          "is_current": "BOOL"
+        },
+        {
+          "args": {
+            "OPTION": "STR"
+          }
+        }
+      ]
+    },
+    "OperationRef": {
+      "STRUCT": [
+        {
+          "id": "STR"
+        },
+        {
+          "summary": "STR"
+        },
+        {
+          "time_millis": "I64"
+        }
+      ]
+    },
+    "Outline": {
+      "STRUCT": [
+        {
+          "subject": {
+            "TYPENAME": "Subject"
+          }
+        },
+        {
+          "steps": {
+            "SEQ": {
+              "TYPENAME": "Step"
+            }
+          }
+        }
+      ]
+    },
+    "ParentBrief": {
+      "STRUCT": [
+        {
+          "commit_id": "STR"
+        },
+        {
+          "change_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "summary": "STR"
+        }
+      ]
+    },
+    "Payload": {
+      "ENUM": {
+        "0": {
+          "Batch": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "rows": {
+                  "SEQ": {
+                    "TYPENAME": "StreamRow"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "1": {
+          "GraphLoaded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "tail": {
+                  "TYPENAME": "GraphTail"
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Outline": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "outline": {
+                  "TYPENAME": "Outline"
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "DiffPart": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "files": {
+                  "SEQ": {
+                    "TYPENAME": "DiffFile"
+                  }
+                }
+              },
+              {
+                "total_additions": "U64"
+              },
+              {
+                "total_deletions": "U64"
+              }
+            ]
+          }
+        },
+        "4": {
+          "DiffLoaded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "document": {
+                  "TYPENAME": "DiffDocument"
+                }
+              },
+              {
+                "details": {
+                  "OPTION": {
+                    "TYPENAME": "RevisionDetails"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "5": {
+          "SnapshotDone": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "origin": {
+                  "TYPENAME": "RefreshOrigin"
+                }
+              },
+              {
+                "snapshot": {
+                  "TYPENAME": "RepositorySnapshot"
+                }
+              },
+              {
+                "warnings": {
+                  "SEQ": "STR"
+                }
+              },
+              {
+                "disk": {
+                  "TYPENAME": "DiskState"
+                }
+              }
+            ]
+          }
+        },
+        "6": {
+          "MutationDone": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "outcome": {
+                  "TYPENAME": "MutationOutcome"
+                }
+              }
+            ]
+          }
+        },
+        "7": {
+          "PreviewDone": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "simulation": {
+                  "TYPENAME": "DraftSimulation"
+                }
+              },
+              {
+                "graph": {
+                  "OPTION": {
+                    "TYPENAME": "PostOpGraph"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "8": {
+          "FetchDone": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "outcome": {
+                  "TYPENAME": "FetchOutcome"
+                }
+              }
+            ]
+          }
+        },
+        "9": {
+          "DetailsLoaded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "details": {
+                  "TYPENAME": "RevisionDetails"
+                }
+              }
+            ]
+          }
+        },
+        "10": {
+          "EmptyStatus": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "updates": {
+                  "SEQ": {
+                    "TUPLE": [
+                      "U64",
+                      "BOOL"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "11": {
+          "TreeListed": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "entries": {
+                  "SEQ": {
+                    "TYPENAME": "SourceEntry"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "12": {
+          "FileRead": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "file": {
+                  "TYPENAME": "SourceFileLoad"
+                }
+              }
+            ]
+          }
+        },
+        "13": {
+          "FilePairRead": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "old": {
+                  "OPTION": "STR"
+                }
+              },
+              {
+                "new": {
+                  "OPTION": "STR"
+                }
+              }
+            ]
+          }
+        },
+        "14": {
+          "BookmarkChecked": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "backwards": "BOOL"
+              }
+            ]
+          }
+        },
+        "15": {
+          "FileExpanded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "file": {
+                  "OPTION": {
+                    "TYPENAME": "DiffFile"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "16": {
+          "Progress": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "loaded": "U64"
+              },
+              {
+                "total": "U64"
+              }
+            ]
+          }
+        },
+        "17": {
+          "OpLogBatch": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "entries": {
+                  "SEQ": {
+                    "TYPENAME": "OperationEntry"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "18": {
+          "History": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "response": {
+                  "TYPENAME": "HistoryResponse"
+                }
+              }
+            ]
+          }
+        },
+        "19": {
+          "OpHeadChanged": {
+            "STRUCT": [
+              {
+                "fingerprint": "STR"
+              }
+            ]
+          }
+        },
+        "20": {
+          "WorkingCopyChanged": "UNIT"
+        },
+        "21": {
+          "RepositoryChanged": "UNIT"
+        },
+        "22": {
+          "StaleWorkingCopyRecovered": "UNIT"
+        },
+        "23": {
+          "StaleWorkingCopy": {
+            "STRUCT": [
+              {
+                "message": "STR"
+              }
+            ]
+          }
+        },
+        "24": {
+          "ConflictInfoLoaded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "files": {
+                  "SEQ": {
+                    "TYPENAME": "ConflictFile"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "25": {
+          "MergeToolPrepared": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "invocation": {
+                  "TYPENAME": "MergeToolInvocation"
+                }
+              }
+            ]
+          }
+        },
+        "26": {
+          "ConflictTextLoaded": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "path": "STR"
+              },
+              {
+                "text": "STR"
+              },
+              {
+                "marker_len": "U64"
+              }
+            ]
+          }
+        },
+        "27": {
+          "RevsetResolved": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revset": "STR"
+              },
+              {
+                "result": {
+                  "TYPENAME": "Result"
+                }
+              }
+            ]
+          }
+        },
+        "28": {
+          "DiffResolved": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "revision": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "base": {
+                  "TYPENAME": "DiffBase"
+                }
+              }
+            ]
+          }
+        },
+        "29": {
+          "CommitsFound": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "hits": {
+                  "SEQ": {
+                    "TYPENAME": "CommitHit"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "30": {
+          "CliOutput": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "lines": {
+                  "SEQ": {
+                    "TYPENAME": "CliLine"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "31": {
+          "CliExited": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "code": {
+                  "OPTION": "I32"
+                }
+              }
+            ]
+          }
+        },
+        "32": {
+          "Failed": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              },
+              {
+                "error": {
+                  "TYPENAME": "RepoError"
+                }
+              }
+            ]
+          }
+        },
+        "33": {
+          "Cancelled": {
+            "STRUCT": [
+              {
+                "job": {
+                  "TYPENAME": "JobId"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "PostOpGraph": {
+      "STRUCT": [
+        {
+          "rows": {
+            "SEQ": {
+              "TYPENAME": "PostOpRow"
+            }
+          }
+        },
+        {
+          "abandoned": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "PostOpRole": {
+      "ENUM": {
+        "0": {
+          "Unchanged": "UNIT"
+        },
+        "1": {
+          "Rewritten": "UNIT"
+        },
+        "2": {
+          "Moved": "UNIT"
+        },
+        "3": {
+          "Created": "UNIT"
+        }
+      }
+    },
+    "PostOpRow": {
+      "STRUCT": [
+        {
+          "origin": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "role": {
+            "TYPENAME": "PostOpRole"
+          }
+        },
+        {
+          "edges": {
+            "SEQ": {
+              "TUPLE": [
+                "U64",
+                "U8"
+              ]
+            }
+          }
+        },
+        {
+          "summary": {
+            "OPTION": {
+              "TYPENAME": "CommitSummary"
+            }
+          }
+        },
+        {
+          "new_conflict": "BOOL"
+        }
+      ]
+    },
+    "PrInfo": {
+      "STRUCT": [
+        {
+          "number": "U64"
+        },
+        {
+          "title": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "state": {
+            "TYPENAME": "PrState"
+          }
+        },
+        {
+          "base_ref": "STR"
+        },
+        {
+          "head_ref": "STR"
+        },
+        {
+          "totals": {
+            "OPTION": {
+              "TUPLEARRAY": {
+                "CONTENT": "U64",
+                "SIZE": 2
+              }
+            }
+          }
+        },
+        {
+          "changed_files": "U64"
+        },
+        {
+          "url": "STR"
+        },
+        {
+          "body": "STR"
+        }
+      ]
+    },
+    "PrState": {
+      "ENUM": {
+        "0": {
+          "Open": "UNIT"
+        },
+        "1": {
+          "Draft": "UNIT"
+        },
+        "2": {
+          "Closed": "UNIT"
+        },
+        "3": {
+          "Merged": "UNIT"
+        }
+      }
+    },
+    "PreviewRequest": {
+      "ENUM": {
+        "0": {
+          "Rebase": {
+            "STRUCT": [
+              {
+                "mode": {
+                  "TYPENAME": "RebaseSourceMode"
+                }
+              },
+              {
+                "sources": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "destination": {
+                  "TYPENAME": "Destination"
+                }
+              }
+            ]
+          }
+        },
+        "1": {
+          "Merge": {
+            "STRUCT": [
+              {
+                "parents": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Parallelize": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "3": {
+          "Squash": {
+            "STRUCT": [
+              {
+                "sources": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "into": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              },
+              {
+                "selection": {
+                  "OPTION": {
+                    "TYPENAME": "DiffSelection"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "NewAt": {
+            "STRUCT": [
+              {
+                "destination": {
+                  "TYPENAME": "Destination"
+                }
+              }
+            ]
+          }
+        },
+        "5": {
+          "Duplicate": {
+            "STRUCT": [
+              {
+                "targets": {
+                  "SEQ": {
+                    "TYPENAME": "RevisionSelection"
+                  }
+                }
+              },
+              {
+                "destination": {
+                  "TYPENAME": "Destination"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "Probed": {
+      "STRUCT": [
+        {
+          "dir_exists": "BOOL"
+        },
+        {
+          "repository": {
+            "OPTION": {
+              "TYPENAME": "FoundRepository"
+            }
+          }
+        }
+      ]
+    },
+    "PushAllow": {
+      "STRUCT": [
+        {
+          "empty_description": "BOOL"
+        },
+        {
+          "private": "BOOL"
+        },
+        {
+          "conflicts": "BOOL"
+        }
+      ]
+    },
+    "PushCandidate": {
+      "STRUCT": [
+        {
+          "name": "STR"
+        },
+        {
+          "tag": "BOOL"
+        },
+        {
+          "ahead": "U64"
+        }
+      ]
+    },
+    "PushCheck": {
+      "ENUM": {
+        "0": {
+          "EmptyDescription": "UNIT"
+        },
+        "1": {
+          "MissingIdentity": "UNIT"
+        },
+        "2": {
+          "Conflicts": "UNIT"
+        },
+        "3": {
+          "Private": "UNIT"
+        }
+      }
+    },
+    "PushRejection": {
+      "STRUCT": [
+        {
+          "remote": "STR"
+        },
+        {
+          "moves": {
+            "SEQ": {
+              "TYPENAME": "BookmarkMove"
+            }
+          }
+        },
+        {
+          "commits": {
+            "SEQ": {
+              "TYPENAME": "RejectedCommit"
+            }
+          }
+        },
+        {
+          "truncated": "BOOL"
+        },
+        {
+          "private_commits": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "request": {
+            "TYPENAME": "PushRequest"
+          }
+        }
+      ]
+    },
+    "PushRequest": {
+      "STRUCT": [
+        {
+          "remote": "STR"
+        },
+        {
+          "targets": {
+            "SEQ": {
+              "TYPENAME": "PushTarget"
+            }
+          }
+        },
+        {
+          "allow": {
+            "TYPENAME": "PushAllow"
+          }
+        },
+        {
+          "confirm": "BOOL"
+        }
+      ]
+    },
+    "PushTarget": {
+      "ENUM": {
+        "0": {
+          "Bookmark": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "1": {
+          "SetBookmark": {
+            "STRUCT": [
+              {
+                "name": "STR"
+              },
+              {
+                "to": {
+                  "TYPENAME": "RevisionSelection"
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "DeleteBookmark": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "3": {
+          "Change": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        },
+        "4": {
+          "Tracked": "UNIT"
+        }
+      }
+    },
+    "Range": {
+      "STRUCT": [
+        {
+          "start": "U64"
+        },
+        {
+          "end": "U64"
+        }
+      ]
+    },
+    "RebasePreview": {
+      "STRUCT": [
+        {
+          "moved": "U32"
+        },
+        {
+          "descendants": "U32"
+        },
+        {
+          "abandoned_empty": "U32"
+        },
+        {
+          "new_conflicts": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "entry_points": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "moved_commit_ids": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "simulated": "BOOL"
+        }
+      ]
+    },
+    "RebaseSourceMode": {
+      "ENUM": {
+        "0": {
+          "Revisions": "UNIT"
+        },
+        "1": {
+          "WithDescendants": "UNIT"
+        },
+        "2": {
+          "Branch": "UNIT"
+        }
+      }
+    },
+    "RefChange": {
+      "STRUCT": [
+        {
+          "kind": {
+            "TYPENAME": "RefKind"
+          }
+        },
+        {
+          "name": "STR"
+        },
+        {
+          "from": {
+            "SEQ": {
+              "TYPENAME": "CommitBrief"
+            }
+          }
+        },
+        {
+          "to": {
+            "SEQ": {
+              "TYPENAME": "CommitBrief"
+            }
+          }
+        }
+      ]
+    },
+    "RefKind": {
+      "ENUM": {
+        "0": {
+          "WorkingCopy": "UNIT"
+        },
+        "1": {
+          "Bookmark": "UNIT"
+        },
+        "2": {
+          "RemoteBookmark": "UNIT"
+        },
+        "3": {
+          "Tag": "UNIT"
+        }
+      }
+    },
+    "RefreshMode": {
+      "ENUM": {
+        "0": {
+          "Auto": "UNIT"
+        },
+        "1": {
+          "Manual": "UNIT"
+        }
+      }
+    },
+    "RefreshOrigin": {
+      "ENUM": {
+        "0": {
+          "Watcher": "UNIT"
+        },
+        "1": {
+          "Focus": "UNIT"
+        }
+      }
+    },
+    "RejectedCommit": {
+      "STRUCT": [
+        {
+          "change_id": "STR"
+        },
+        {
+          "commit_id": "STR"
+        },
+        {
+          "subject": "STR"
+        },
+        {
+          "reasons": {
+            "SEQ": {
+              "TYPENAME": "PushCheck"
+            }
+          }
+        },
+        {
+          "working_copy": "BOOL"
+        }
+      ]
+    },
+    "RemoteBookmarkRef": {
+      "STRUCT": [
+        {
+          "remote": "STR"
+        },
+        {
+          "target": "STR"
+        },
+        {
+          "tracked": "BOOL"
+        }
+      ]
+    },
+    "RepoError": {
+      "ENUM": {
+        "0": {
+          "Revset": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "1": {
+          "Io": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "2": {
+          "StaleWorkspace": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "3": {
+          "Lock": "UNIT"
+        },
+        "4": {
+          "Immutable": {
+            "STRUCT": [
+              {
+                "short_id": "STR"
+              }
+            ]
+          }
+        },
+        "5": {
+          "Unsupported": "UNIT"
+        },
+        "6": {
+          "Other": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "7": {
+          "PushRejected": {
+            "NEWTYPE": {
+              "TYPENAME": "PushRejection"
+            }
+          }
+        },
+        "8": {
+          "UndoesPush": {
+            "STRUCT": [
+              {
+                "summary": "STR"
+              }
+            ]
+          }
+        },
+        "9": {
+          "Crashed": {
+            "NEWTYPE": "STR"
+          }
+        },
+        "10": {
+          "Disconnected": "UNIT"
+        }
+      }
+    },
+    "RepositorySnapshot": {
+      "STRUCT": [
+        {
+          "fingerprint": "STR"
+        },
+        {
+          "working_copy_empty": {
+            "OPTION": "BOOL"
+          }
+        },
+        {
+          "parent_fingerprint": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "working_copy_commit_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "rewrote_descendants": "BOOL"
+        },
+        {
+          "working_copy_dirty": {
+            "OPTION": "BOOL"
+          }
+        }
+      ]
+    },
+    "Result": {
+      "ENUM": {
+        "0": {
+          "Ok": {
+            "NEWTYPE": {
+              "TYPENAME": "RevsetMatch"
+            }
+          }
+        },
+        "1": {
+          "Err": {
+            "NEWTYPE": {
+              "TYPENAME": "RevsetError"
+            }
+          }
+        }
+      }
+    },
+    "RevisionDetails": {
+      "STRUCT": [
+        {
+          "commit_id": "STR"
+        },
+        {
+          "change_id": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "bookmarks": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "author": {
+            "TYPENAME": "SignatureInfo"
+          }
+        },
+        {
+          "committer": {
+            "OPTION": {
+              "TYPENAME": "SignatureInfo"
+            }
+          }
+        },
+        {
+          "signature": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "description": "STR"
+        },
+        {
+          "parents": {
+            "SEQ": {
+              "TYPENAME": "ParentBrief"
+            }
+          }
+        }
+      ]
+    },
+    "RevisionSelection": {
+      "ENUM": {
+        "0": {
+          "WorkingCopy": "UNIT"
+        },
+        "1": {
+          "Commit": {
+            "NEWTYPE": "STR"
+          }
+        }
+      }
+    },
+    "RevsetAlias": {
+      "STRUCT": [
+        {
+          "name": "STR"
+        },
+        {
+          "params": {
+            "OPTION": {
+              "SEQ": "STR"
+            }
+          }
+        },
+        {
+          "definition": "STR"
+        }
+      ]
+    },
+    "RevsetError": {
+      "STRUCT": [
+        {
+          "message": "STR"
+        },
+        {
+          "hint": {
+            "OPTION": "STR"
+          }
+        },
+        {
+          "span": {
+            "OPTION": {
+              "TYPENAME": "Range"
+            }
+          }
+        }
+      ]
+    },
+    "RevsetExpect": {
+      "ENUM": {
+        "0": {
+          "Any": "UNIT"
+        },
+        "1": {
+          "Single": "UNIT"
+        },
+        "2": {
+          "Contiguous": "UNIT"
+        }
+      }
+    },
+    "RevsetMatch": {
+      "STRUCT": [
+        {
+          "commits": {
+            "SEQ": "STR"
+          }
+        },
+        {
+          "count": "U64"
+        },
+        {
+          "count_exact": "BOOL"
+        }
+      ]
+    },
+    "RevsetQuery": {
+      "STRUCT": [
+        {
+          "revset": "STR"
+        },
+        {
+          "limit": "U64"
+        },
+        {
+          "expect": {
+            "TYPENAME": "RevsetExpect"
+          }
+        }
+      ]
+    },
+    "RevsetSymbols": {
+      "STRUCT": [
+        {
+          "aliases": {
+            "SEQ": {
+              "TYPENAME": "RevsetAlias"
+            }
+          }
+        },
+        {
+          "workspaces": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "SignatureInfo": {
+      "STRUCT": [
+        {
+          "name": "STR"
+        },
+        {
+          "email": "STR"
+        },
+        {
+          "timestamp": {
+            "OPTION": "STR"
+          }
+        }
+      ]
+    },
+    "SourceEntry": {
+      "STRUCT": [
+        {
+          "path": "STR"
+        },
+        {
+          "is_dir": "BOOL"
+        },
+        {
+          "status": {
+            "TYPENAME": "SourceEntryStatus"
+          }
+        },
+        {
+          "change": {
+            "OPTION": {
+              "TYPENAME": "DiffFileStatus"
+            }
+          }
+        }
+      ]
+    },
+    "SourceEntryStatus": {
+      "ENUM": {
+        "0": {
+          "Tracked": "UNIT"
+        },
+        "1": {
+          "Untracked": "UNIT"
+        },
+        "2": {
+          "Ignored": "UNIT"
+        }
+      }
+    },
+    "SourceFileLoad": {
+      "STRUCT": [
+        {
+          "file": {
+            "TYPENAME": "DiffFile"
+          }
+        },
+        {
+          "line_count": "U64"
+        },
+        {
+          "binary": "BOOL"
+        },
+        {
+          "too_large": "BOOL"
+        },
+        {
+          "byte_len": "U64"
+        }
+      ]
+    },
+    "SquashPreview": {
+      "STRUCT": [
+        {
+          "abandons_sources": "BOOL"
+        },
+        {
+          "new_conflicts": {
+            "SEQ": "STR"
+          }
+        }
+      ]
+    },
+    "SquashTarget": {
+      "ENUM": {
+        "0": {
+          "Parent": "UNIT"
+        },
+        "1": {
+          "Revision": {
+            "NEWTYPE": {
+              "TYPENAME": "RevisionSelection"
+            }
+          }
+        }
+      }
+    },
+    "Step": {
+      "STRUCT": [
+        {
+          "id": "STR"
+        },
+        {
+          "title": "STR"
+        },
+        {
+          "message": "STR"
+        },
+        {
+          "author": "STR"
+        },
+        {
+          "authored_millis": {
+            "OPTION": "I64"
+          }
+        },
+        {
+          "counts": {
+            "OPTION": {
+              "TUPLEARRAY": {
+                "CONTENT": "U64",
+                "SIZE": 2
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StreamRow": {
+      "STRUCT": [
+        {
+          "summary": {
+            "TYPENAME": "CommitSummary"
+          }
+        },
+        {
+          "frame": {
+            "TYPENAME": "LaneFrame"
+          }
+        }
+      ]
+    },
+    "Subject": {
+      "ENUM": {
+        "0": {
+          "PullRequest": {
+            "NEWTYPE": {
+              "TYPENAME": "PrInfo"
+            }
+          }
+        },
+        "1": {
+          "Patch": {
+            "STRUCT": [
+              {
+                "origin": "STR"
+              },
+              {
+                "mail": {
+                  "OPTION": {
+                    "TYPENAME": "Mail"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "2": {
+          "Compare": {
+            "STRUCT": [
+              {
+                "left": "STR"
+              },
+              {
+                "right": "STR"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "SyntaxKind": {
+      "ENUM": {
+        "0": {
+          "Comment": "UNIT"
+        },
+        "1": {
+          "String": "UNIT"
+        },
+        "2": {
+          "Number": "UNIT"
+        },
+        "3": {
+          "Keyword": "UNIT"
+        },
+        "4": {
+          "Function": "UNIT"
+        },
+        "5": {
+          "Type": "UNIT"
+        },
+        "6": {
+          "Property": "UNIT"
+        },
+        "7": {
+          "Punctuation": "UNIT"
+        }
+      }
+    },
+    "SyntaxSpan": {
+      "STRUCT": [
+        {
+          "start": "U64"
+        },
+        {
+          "end": "U64"
+        },
+        {
+          "kind": {
+            "TYPENAME": "SyntaxKind"
+          }
+        }
+      ]
+    },
+    "Up": {
+      "ENUM": {
+        "0": {
+          "ListDir": {
+            "STRUCT": [
+              {
+                "request": "U64"
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "1": {
+          "Probe": {
+            "STRUCT": [
+              {
+                "request": "U64"
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "2": {
+          "Open": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              },
+              {
+                "path": "STR"
+              }
+            ]
+          }
+        },
+        "3": {
+          "Run": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              },
+              {
+                "scope": "STR"
+              },
+              {
+                "command": {
+                  "TYPENAME": "Command"
+                }
+              }
+            ]
+          }
+        },
+        "4": {
+          "Close": {
+            "STRUCT": [
+              {
+                "channel": "U32"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "Vcs": {
+      "ENUM": {
+        "0": {
+          "Jj": "UNIT"
+        },
+        "1": {
+          "Git": "UNIT"
+        }
+      }
+    }
+  }
+}

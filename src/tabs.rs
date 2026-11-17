@@ -236,13 +236,41 @@ impl Diffui {
             let remotes = self
                 .tabs
                 .get(self.active)
-                .and_then(|tab| tab.state.repository.as_ref())
-                .map(|repository| diffui_core::forge::remotes(&repository.root))
+                .map(|tab| match (&tab.state.remote, tab.state.local_root()) {
+                    (Some(remote), _) => remote.remotes.clone(),
+                    (None, Some(root)) => diffui_core::forge::remotes(root),
+                    (None, None) => Vec::new(),
+                })
                 .unwrap_or_default();
             let spec = spec.with_host_from_remotes(remotes.iter().map(|(_, url)| url.as_str()));
             return self.open_pull_request(spec, cx);
         }
-        match prepare_repository(&expand_user_path(trimmed)) {
+        // The open prompt with a host picked: the path is one over there.
+        if let Some(host) = self
+            .open_repo_dialog()
+            .and_then(|dialog| dialog.host.clone())
+        {
+            let path = trimmed.to_owned();
+            return self.open_remote(diffui_core::remote::RemoteTarget { host, path }, cx);
+        }
+        // `host:/path`, unless it is, improbably, a path here.
+        if let Some(target) = diffui_core::remote::RemoteTarget::parse(trimmed)
+            && !std::path::Path::new(trimmed).exists()
+        {
+            return self.open_remote(target, cx);
+        }
+        // A path here that is really one on a host (a WSL distribution's
+        // files as Explorer names them): its transport says which.
+        if self.locate_on_host(trimmed) {
+            return;
+        }
+        self.open_local_repository(trimmed, cx);
+    }
+
+    /// Open the repository at `path` on this disk as a tab, or focus the
+    /// tab that has it.
+    pub(crate) fn open_local_repository(&mut self, path: &str, cx: &mut Cx) {
+        match prepare_repository(&expand_user_path(path)) {
             Ok(repository) => {
                 self.pop_mode(ModeKind::OpenRepo);
                 self.push_recent_repo(&repository.root);
@@ -260,6 +288,7 @@ impl Diffui {
                 let source = TabSource::Repo {
                     vcs: repository.vcs,
                     root: repository.root.clone(),
+                    host: None,
                 };
                 let state = self.repo_layouts.tab_state(repository);
                 self.push_tab(owner, name, source, state, cx)
@@ -283,7 +312,8 @@ impl Diffui {
         dialog.path = path;
         dialog.error = None;
         dialog.selected = None;
-        let Some(query) = path_browse::Query::parse(&dialog.path) else {
+        dialog.picking_host = false;
+        let Some(query) = dialog.query() else {
             return;
         };
         self.probe_open_repo_path(cx);
@@ -303,16 +333,23 @@ impl Diffui {
             return;
         }
         dialog.listing_pending = Some(dir.clone());
-        // A folder can be slow to read (a network mount, a huge directory),
-        // and each entry is stat'ed to spot repositories.
+        let remote = dialog.host.clone().zip(dialog.link.clone());
+        // A folder can be slow to read (a network mount, a huge directory, a
+        // machine that is still being reached), and each entry is stat'ed to
+        // spot repositories.
         Self::run_async(
             async move {
+                if let Some((host, link)) = remote {
+                    let listed = link.list_dir(&dir.to_string_lossy()).await;
+                    return path_browse::Listing::remote(host, dir, listed.unwrap_or_default());
+                }
                 let fallback = dir.clone();
                 tokio::task::spawn_blocking(move || path_browse::list(dir))
                     .await
                     .unwrap_or_else(|_| path_browse::Listing {
                         dir: fallback,
                         entries: Vec::new(),
+                        host: None,
                     })
             },
             cx,
@@ -381,7 +418,7 @@ impl Diffui {
 
     /// Append a new tab and make it active, kicking its load. Shared tail of
     /// the repo and PR open paths.
-    fn push_tab(
+    pub(crate) fn push_tab(
         &mut self,
         owner: String,
         name: String,
@@ -491,6 +528,7 @@ pub(crate) mod tests {
             palette_query: Default::default(),
             command_line_settle: Default::default(),
             panes: None,
+            remote: Default::default(),
             forge: Default::default(),
             plugins: Default::default(),
             #[cfg(test)]
@@ -523,6 +561,7 @@ pub(crate) mod tests {
             source: TabSource::Repo {
                 vcs: repository.vcs,
                 root: repository.root.clone(),
+                host: None,
             },
             state: TabState::unloaded(Some(repository), Some(String::new())),
         });

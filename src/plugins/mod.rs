@@ -33,10 +33,11 @@ mod forge;
 mod forge_scenarios;
 #[cfg(test)]
 pub(crate) mod github_scenarios;
-mod page;
+pub(crate) mod page;
 mod query;
 #[cfg(test)]
 mod scenarios;
+mod transport;
 mod trust;
 mod view;
 mod watch;
@@ -114,6 +115,18 @@ pub(crate) enum FromPlugin {
         plugin: String,
         instance: u64,
         hosts: Vec<String>,
+    },
+    /// A transport's `hosts()` answered.
+    TransportHosts {
+        plugin: String,
+        instance: u64,
+        hosts: Vec<diffui_plugins::protocol::FoundHost>,
+    },
+    /// A transport's `locate(path)` answered.
+    Located {
+        plugin: String,
+        path: String,
+        located: Option<diffui_plugins::protocol::Located>,
     },
     /// A forge's `account(host)` answered, for its settings page.
     Account {
@@ -787,7 +800,10 @@ impl Diffui {
         let Some(found) = self.plugins.get_mut(id) else {
             return;
         };
-        let was_forge = found.manifest.as_ref().is_some_and(|m| m.forge.is_some())
+        let was_forge = found
+            .manifest
+            .as_ref()
+            .is_some_and(|m| m.forge.is_some() || m.transport.is_some())
             && matches!(&found.state, State::Running(_) | State::Loading);
         found.running = None;
         found.state = state;
@@ -1015,6 +1031,20 @@ impl Diffui {
                     .collect();
                 self.refresh_script_forges();
             }
+            FromPlugin::TransportHosts {
+                plugin,
+                instance,
+                hosts,
+            } => {
+                if self.plugins.is_current(&plugin, instance) {
+                    self.transport_hosts_answered(&plugin, hosts);
+                }
+            }
+            FromPlugin::Located {
+                plugin,
+                path,
+                located,
+            } => self.located(&plugin, path, located, cx),
             FromPlugin::Account {
                 plugin,
                 host,
@@ -1079,7 +1109,11 @@ impl Diffui {
             .as_ref()
             .map(|manifest| manifest.main.clone());
         let announce = std::mem::take(&mut found.announce);
-        let forge = found.manifest.as_ref().is_some_and(|m| m.forge.is_some());
+        // Either kind changes what `refresh_script_forges` derives.
+        let forge = found
+            .manifest
+            .as_ref()
+            .is_some_and(|m| m.forge.is_some() || m.transport.is_some());
         match event {
             PluginEvent::Loaded(registration) => {
                 found.state = State::Running(registration);
@@ -1088,6 +1122,7 @@ impl Diffui {
                 }
                 self.tell_open_repositories(id);
                 self.ask_forge_hosts(id);
+                self.ask_transport_hosts(id);
                 self.check_page_accounts(id);
             }
             PluginEvent::Failed(why) => {
@@ -1236,6 +1271,13 @@ impl Diffui {
         let Some(plugin) = self.plugins.plugin(&command.plugin) else {
             return;
         };
+        // A script's reads and the programs it runs are on this machine.
+        if self.tab(tab).is_some_and(|state| state.remote.is_some()) {
+            return self.push_error_toast(
+                format!("{} didn't run", command.label),
+                crate::commands::reason::REMOTE,
+            );
+        }
         let Some(repo) = self.repo_handle(tab, &command.plugin) else {
             return;
         };
