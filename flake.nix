@@ -350,6 +350,7 @@
     // {
       overlays.default = final: prev: {
         diffui = self.packages.${final.system}.default;
+        diffui-serve = self.packages.${final.system}.diffui-serve;
       };
     };
 }
