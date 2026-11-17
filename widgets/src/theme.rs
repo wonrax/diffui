@@ -597,9 +597,10 @@ fn raised_fill(theme: ThemeSpec, t: f32) -> Color {
 }
 
 /// The window chrome's one fill: the tab strip, the toolbar and the status
-/// bar. The window canvas a step darker, so the panes read as raised above it.
+/// bar. The window canvas a shallow step darker, so the panes read as raised
+/// above it without the chrome turning heavy.
 pub fn chrome_fill(theme: ThemeSpec) -> Color {
-    mix(theme.background, BLACK, 0.06)
+    mix(theme.background, BLACK, 0.015)
 }
 
 /// The wash a quiet control takes under the cursor, and a row's hover: a
