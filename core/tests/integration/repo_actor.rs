@@ -5,9 +5,10 @@
 
 use crate::harness;
 
-use diffui_core::repo::{Command, JobId, Payload};
+use diffui_core::repo::{Command, DiskState, DiskSync, JobId, Payload};
 use diffui_core::{
-    Effect, Event, MutationOp, RefreshOrigin, RepoError, RepoId, RevisionSelection, Session,
+    Effect, Event, MutationOp, RefreshMode, RefreshOrigin, RepoError, RepoId, RevisionSelection,
+    Session,
 };
 use harness::{TestRepo, commit_file, commit_ids, scratch_repo, write};
 
@@ -211,6 +212,7 @@ fn a_mutation_lands_on_the_tab_that_asked_for_it() {
         },
         allow_immutable: false,
         seen_op: None,
+        seen_wc: None,
     });
     for payload in repo.drain(job) {
         let event = Event::new(repo_id(&root), payload);
@@ -245,6 +247,7 @@ fn a_fetch_queues_behind_a_mutation() {
         },
         allow_immutable: false,
         seen_op: None,
+        seen_wc: None,
     });
     let fetch = repo.send(|job| Command::Fetch {
         job,
@@ -405,12 +408,18 @@ fn an_empty_status_sweep_survives_a_working_copy_chip_flip() {
 }
 
 /// The other workspace rebases this one's working-copy commit, so this
-/// checkout is synced with a commit the repo has moved past. A mutation must
-/// recover the checkout rather than snapshot the stale tree over the rebased
+/// checkout is synced with a commit the repo has moved past. With
+/// `snapshot.auto-update-stale` set, a mutation must recover the checkout rather than snapshot the stale tree over the rebased
 /// commit, which would silently revert the other workspace's work.
 #[test]
 fn a_mutation_on_a_stale_workspace_recovers() {
     let root = scratch_repo("stale-workspace");
+    // Recovery is opt-in, as in jj-cli.
+    std::fs::write(
+        harness::repo_dir(&root).join("config.toml"),
+        "[snapshot]\nauto-update-stale = true\n",
+    )
+    .expect("write repo config");
     let mut main = TestRepo::open(&root);
     main.snapshot();
     commit_file(&mut main, "shared.txt", "base\n", "base");
@@ -962,4 +971,423 @@ fn a_cli_run_announces_the_operation_it_wrote() {
         unreachable!()
     };
     assert_eq!(fingerprint, harness::operation_log(&root)[0].1);
+}
+
+/// A command that addresses `@` names the change the sender saw. When a
+/// terminal `jj new` or an agent moved `@` in between, it is refused instead
+/// of acting on whatever `@` is now.
+#[test]
+fn a_mutation_on_a_working_copy_that_moved_is_refused() {
+    let root = scratch_repo("wc-moved");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    let seen = repo
+        .graph("@")
+        .first()
+        .expect("the @ row")
+        .summary
+        .change_id
+        .clone();
+    let describe = |seen_wc: String| {
+        move |job| Command::Mutate {
+            job,
+            op: MutationOp::Describe {
+                target: RevisionSelection::WorkingCopy,
+                description: "typed for the old @".to_owned(),
+            },
+            allow_immutable: false,
+            seen_op: None,
+            seen_wc: Some(seen_wc),
+        }
+    };
+    // `@` moves behind the sender's back.
+    repo.mutate(MutationOp::New {
+        parent: RevisionSelection::WorkingCopy,
+    })
+    .expect("move @");
+
+    let events = repo.run(describe(seen.clone()));
+    match events.last() {
+        Some(Payload::Failed { error, .. }) => {
+            assert!(error.to_string().contains("working copy moved"), "{error}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let now = repo.graph("@").first().expect("the @ row").summary.clone();
+    assert!(!now.has_description, "the new @ is left alone");
+
+    let current = now.change_id;
+    let events = repo.run(describe(current));
+    assert!(
+        matches!(events.last(), Some(Payload::MutationDone { .. })),
+        "{events:?}"
+    );
+}
+
+/// A stale checkout is left alone unless `snapshot.auto-update-stale` says
+/// otherwise, as in jj-cli: a refresh shows the repo at head without touching
+/// the files and says once how to update; a mutation is refused.
+#[test]
+fn a_stale_workspace_is_left_alone_by_default() {
+    let root = scratch_repo("stale-left-alone");
+    let mut main = TestRepo::open(&root);
+    main.snapshot();
+    commit_file(&mut main, "shared.txt", "base\n", "base");
+    let side = harness::add_workspace(&root, "side");
+    let mut other = TestRepo::open(&side);
+    let heads: Vec<RevisionSelection> = commit_ids(&root)
+        .into_iter()
+        .take(2)
+        .map(RevisionSelection::Commit)
+        .collect();
+    main.mutate(MutationOp::Merge { parents: heads })
+        .expect("merge the two workspaces' heads");
+    write(&side, "side.txt", "side-work\n");
+    other.snapshot();
+    write(&root, "local.txt", "unsaved\n");
+
+    main.snapshot();
+    main.snapshot();
+    let notices = main
+        .parked()
+        .iter()
+        .filter(|event| matches!(event.payload, Payload::StaleWorkingCopy { .. }))
+        .count();
+    assert_eq!(notices, 1, "told once, not on every refresh");
+    assert!(
+        !root.join("side.txt").exists(),
+        "the files on disk are left as they are"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).ok(),
+        Some("unsaved\n".to_owned())
+    );
+
+    match main.mutate(MutationOp::New {
+        parent: RevisionSelection::WorkingCopy,
+    }) {
+        Err(RepoError::StaleWorkspace(message)) => {
+            assert!(message.contains("jj workspace update-stale"), "{message}")
+        }
+        other => panic!("expected the stale refusal, got {other:?}"),
+    }
+}
+
+/// jj-cli imports a colocated repo's git `HEAD` and refs before every
+/// command. After a plain `git commit` and `git branch`, diffui has to show
+/// the commit under `@` and the new bookmark, not the old graph with the
+/// committed changes still inside `@`.
+#[test]
+fn a_colocated_checkout_takes_in_what_git_did() {
+    if !harness::git_available() {
+        eprintln!("skipping: the git CLI is not on PATH");
+        return;
+    }
+    let root = harness::scratch_colocated_repo("colocated-import");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+
+    write(&root, "b.txt", "two\n");
+    harness::run_git(&root, &["add", "b.txt"]);
+    harness::run_git(
+        &root,
+        &[
+            "-c",
+            "user.name=Scenario Test",
+            "-c",
+            "user.email=scenario@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "from git",
+        ],
+    );
+    harness::run_git(&root, &["branch", "topic"]);
+    let git_commit = harness::run_git(&root, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    repo.snapshot();
+    let parent = repo.graph("@-");
+    assert_eq!(parent.len(), 1);
+    assert_eq!(parent[0].summary.commit_id, git_commit);
+    assert!(
+        repo.diff(RevisionSelection::WorkingCopy).files.is_empty(),
+        "what git committed is no longer inside @"
+    );
+    assert_eq!(repo.graph("topic").len(), 1, "git's branch is a bookmark");
+    assert_eq!(git_head(&root), Some(git_commit), "git's HEAD stays put");
+}
+
+/// Bookmarks are exported to git after an operation only when the working
+/// copy is git's, as in jj-cli. A repo backed by a git repo elsewhere keeps
+/// that repo's branches until a push or `jj git export`.
+#[test]
+fn bookmarks_stay_out_of_a_backing_git_repo_that_is_not_colocated() {
+    let root = scratch_repo("no-export");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    commit_file(&mut repo, "a.txt", "one\n", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: RevisionSelection::WorkingCopy,
+    })
+    .expect("create bookmark");
+
+    let git_dir = harness::repo_dir(&root).join("store").join("git");
+    assert!(!git_dir.join("refs/heads/feature").exists());
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).unwrap_or_default();
+    assert!(!packed.contains("refs/heads/feature"), "{packed}");
+}
+
+/// A diff superseded while it waited its turn never runs: the cancel that
+/// arrived first answers it. Holding an arrow key used to queue one full diff
+/// per row passed.
+#[test]
+fn a_job_cancelled_before_its_turn_never_runs() {
+    let root = scratch_repo("cancelled-before-its-turn");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    let base = commit_ids(&root)[1].clone();
+    harness::new_chain(&root, &base, 300);
+    repo.snapshot();
+
+    // The walk keeps the actor busy while the diff and its cancel queue up.
+    let walk = repo.send(|job| Command::LoadGraph {
+        job,
+        revset: "all()".to_owned(),
+    });
+    let diff = repo.send(|job| Command::LoadDiff {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+        base: diffui_core::DiffBase::Parents,
+        expand: Vec::new(),
+    });
+    repo.handle.send(Command::Cancel { job: diff });
+
+    assert!(matches!(
+        repo.drain(walk).last(),
+        Some(Payload::GraphLoaded { .. })
+    ));
+    assert!(
+        matches!(repo.drain(diff).as_slice(), [Payload::Cancelled { .. }]),
+        "the cancelled diff answers Cancelled and nothing else"
+    );
+}
+
+/// A preview runs on a thread of its own, and the actor moves on as soon as it
+/// has started it. A cancel sent after that still has to reach the thread.
+#[test]
+fn a_detached_preview_still_hears_a_late_cancel() {
+    use diffui_core::{Destination, PreviewRequest, RebaseSourceMode};
+
+    let root = scratch_repo("detached-late-cancel");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    let base = commit_ids(&root)[1].clone();
+    let target = harness::new_commit(&root, std::slice::from_ref(&base), "target");
+    let chain = harness::new_chain(&root, &base, 390);
+    let preview = repo.send(|job| Command::Preview {
+        job,
+        draft: PreviewRequest::Rebase {
+            mode: RebaseSourceMode::WithDescendants,
+            sources: vec![RevisionSelection::Commit(chain[0].clone())],
+            destination: Destination::Onto(RevisionSelection::Commit(target.clone())),
+        },
+        graph: Some("all()".to_owned()),
+        seen_op: None,
+    });
+    // Answered only once the actor has handed the preview to its thread.
+    repo.diff(RevisionSelection::Commit(target));
+    repo.handle.send(Command::Cancel { job: preview });
+
+    assert!(
+        matches!(repo.drain(preview).last(), Some(Payload::Cancelled { .. })),
+        "the late cancel reached the preview's thread"
+    );
+}
+
+/// A read that finds an operation someone else wrote reloads onto it, and says
+/// so: the watcher's own signal arrives later, finds the head already seen,
+/// and stays quiet, so this is the only announcement the rows get.
+#[test]
+fn a_read_that_adopts_an_external_operation_announces_it() {
+    let root = scratch_repo("read-adopts-external-op");
+    let mut repo = TestRepo::open(&root);
+    commit_file(&mut repo, "a.txt", "a\n", "base");
+    repo.snapshot();
+    let head = commit_ids(&root)[1].clone();
+
+    harness::describe(&root, harness::OpBase::Head, &head, "written elsewhere");
+    let job = repo.send(|job| Command::RevisionDetails {
+        job,
+        revision: RevisionSelection::WorkingCopy,
+    });
+    repo.drain(job);
+
+    let external = harness::operation_log(&root)[0].1.clone();
+    assert!(
+        repo.parked().iter().any(|event| matches!(
+            &event.payload,
+            Payload::OpHeadChanged { fingerprint } if *fingerprint == external
+        )),
+        "{:?}",
+        repo.parked()
+    );
+}
+
+/// One snapshot of the kind `disk` names, answered with what it left between
+/// the disk and `@`.
+fn snapshot_as(
+    repo: &mut TestRepo,
+    disk: DiskSync,
+) -> (diffui_core::RepositorySnapshot, DiskState) {
+    let events = repo.run(|job| Command::Snapshot {
+        job,
+        origin: RefreshOrigin::Focus,
+        disk,
+    });
+    match events.into_iter().next_back() {
+        Some(Payload::SnapshotDone { snapshot, disk, .. }) => (snapshot, disk),
+        other => panic!("expected SnapshotDone, got {other:?}"),
+    }
+}
+
+/// The first workspace's checkout left behind: another workspace's snapshot
+/// rebased the merge `@` sits on, so `side.txt` is in `@` but not on disk.
+fn stale_checkout(test: &str) -> (std::path::PathBuf, TestRepo) {
+    let root = scratch_repo(test);
+    let mut main = TestRepo::open(&root);
+    main.snapshot();
+    commit_file(&mut main, "shared.txt", "base\n", "base");
+    let side = harness::add_workspace(&root, "side");
+    let mut other = TestRepo::open(&side);
+    let heads: Vec<RevisionSelection> = commit_ids(&root)
+        .into_iter()
+        .take(2)
+        .map(RevisionSelection::Commit)
+        .collect();
+    main.mutate(MutationOp::Merge { parents: heads })
+        .expect("merge the two workspaces' heads");
+    write(&side, "side.txt", "side-work\n");
+    other.snapshot();
+    (root, main)
+}
+
+/// A check looks without writing: no operation, and the edit it saw is still
+/// unsnapshotted the next time, because its lock was abandoned rather than
+/// finished over the edited files.
+#[test]
+fn a_check_writes_nothing_and_keeps_reporting_the_edit() {
+    let root = scratch_repo("check-reports-edits");
+    let mut repo = TestRepo::open(&root);
+    repo.snapshot();
+    let (_, clean) = snapshot_as(&mut repo, DiskSync::Check);
+    assert_eq!(clean, DiskState::default());
+
+    write(&root, "edit.txt", "unsaved\n");
+    let ops = harness::operation_log(&root).len();
+    for _ in 0..2 {
+        let (_, disk) = snapshot_as(&mut repo, DiskSync::Check);
+        assert!(disk.edits, "the edit is reported, every time");
+        assert_eq!(disk.stale, None);
+    }
+    assert_eq!(
+        harness::operation_log(&root).len(),
+        ops,
+        "a check writes no op"
+    );
+    assert!(repo.diff(RevisionSelection::WorkingCopy).files.is_empty());
+
+    let (_, folded) = snapshot_as(&mut repo, DiskSync::Fold);
+    assert!(!folded.edits);
+    assert_eq!(harness::operation_log(&root).len(), ops + 1);
+    let files = repo.diff(RevisionSelection::WorkingCopy).files;
+    assert!(
+        files.iter().any(|file| file.path == "edit.txt"),
+        "{files:?}"
+    );
+}
+
+/// A check on a stale checkout says so, with jj's message, and touches
+/// neither the files nor the op log.
+#[test]
+fn a_check_on_a_stale_checkout_reports_it_and_leaves_the_files() {
+    let (root, mut main) = stale_checkout("check-stale");
+    write(&root, "local.txt", "unsaved\n");
+    let ops = harness::operation_log(&root).len();
+
+    let (_, disk) = snapshot_as(&mut main, DiskSync::Check);
+    let message = disk.stale.expect("the checkout is reported stale");
+    assert!(message.contains("jj workspace update-stale"), "{message}");
+    assert!(disk.edits, "the edit made before is reported too");
+    assert!(!disk.stuck, "a Refresh can update this one");
+    assert_eq!(harness::operation_log(&root).len(), ops);
+    assert!(!root.join("side.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).ok(),
+        Some("unsaved\n".to_owned())
+    );
+}
+
+/// The Refresh button updates a stale checkout whatever the policy, and the
+/// edit on disk is snapshotted first rather than lost.
+#[test]
+fn a_sync_updates_a_stale_checkout_and_snapshots_the_edits_first() {
+    let (root, mut main) = stale_checkout("sync-stale");
+    write(&root, "local.txt", "unsaved\n");
+
+    let (_, disk) = snapshot_as(&mut main, DiskSync::Sync);
+    assert_eq!(disk, DiskState::default(), "nothing is left pending");
+    assert!(
+        main.parked()
+            .iter()
+            .any(|event| matches!(event.payload, Payload::StaleWorkingCopyRecovered))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("side.txt")).ok(),
+        Some("side-work\n".to_owned()),
+        "the checkout now holds the other workspace's work"
+    );
+    // As `jj workspace update-stale`: the disk was snapshotted at the
+    // operation it was synced at, so the edit lives on in a (divergent)
+    // commit next to the rebased `@` that is now checked out.
+    let kept = commit_ids(&root)
+        .iter()
+        .any(|id| harness::file_at_or_absent(&root, id, "local.txt") == "unsaved\n");
+    assert!(kept, "the edit was snapshotted before the update");
+}
+
+/// The app's mode decides what a mutation does with a stale checkout when jj
+/// leaves it to the default: automatic updates it and goes ahead, manual
+/// refuses as jj-cli does.
+#[test]
+fn the_refresh_mode_decides_whether_a_mutation_updates_a_stale_checkout() {
+    let (root, mut main) = stale_checkout("mode-decides-stale");
+    let describe = || MutationOp::Describe {
+        target: RevisionSelection::WorkingCopy,
+        description: "described merge".to_owned(),
+    };
+
+    main.handle.send(Command::SetRefreshMode {
+        mode: RefreshMode::Manual,
+    });
+    match main.mutate(describe()) {
+        Err(RepoError::StaleWorkspace(message)) => {
+            assert!(message.contains("jj workspace update-stale"), "{message}")
+        }
+        other => panic!("expected the stale refusal, got {other:?}"),
+    }
+    assert!(!root.join("side.txt").exists());
+
+    main.handle.send(Command::SetRefreshMode {
+        mode: RefreshMode::Auto,
+    });
+    main.mutate(describe())
+        .expect("the mutation updates the checkout and applies");
+    assert!(root.join("side.txt").exists());
 }

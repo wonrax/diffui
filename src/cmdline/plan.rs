@@ -10,16 +10,31 @@ use diffui_core::cli::{
 use diffui_core::revset::union_revsets;
 use diffui_core::{DiffRequest, MutationOp, RevisionSelection};
 
+use std::collections::HashMap;
+
+use diffui_core::cli::{ParseError, ParsedCommand};
+
 use super::{CommandLine, Resolution};
-use crate::Diffui;
 use crate::prose::Prose;
+use crate::{Diffui, TabState};
 
 impl Diffui {
     // ── the plan ────────────────────────────────────────────────────────
 
-    /// What Enter does with the line as it stands, in words.
+    /// What Enter does with the palette's line as it stands, in words.
     pub(crate) fn plan(&self, command: &CommandLine) -> Plan {
-        let parsed = match &command.parsed {
+        self.plan_line(self.active(), &command.parsed, &command.resolved)
+    }
+
+    /// What running `parsed` on `tab` does, given the revsets `resolved` so
+    /// far.
+    pub(crate) fn plan_line(
+        &self,
+        tab: &TabState,
+        parsed: &Result<ParsedCommand, ParseError>,
+        resolved: &HashMap<String, Resolution>,
+    ) -> Plan {
+        let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 return Plan {
@@ -32,9 +47,8 @@ impl Diffui {
                 };
             }
         };
-        let tab = self.active();
         let context = Resolver {
-            command,
+            resolved,
             working_copy: tab
                 .session
                 .bookmarks
@@ -51,14 +65,15 @@ impl Diffui {
                 .bookmarks
                 .default_push_remote()
                 .map(str::to_owned),
+            bookmarks: &tab.session.bookmarks,
         };
-        let words = Words { ui: self, command };
+        let words = Words { tab, resolved };
         // A revset that didn't resolve stops everything, whatever the kind:
         // the CLI would refuse it just the same.
         for slot in &parsed.revsets {
             if let Some(Resolution {
                 result: Err(error), ..
-            }) = command.resolved.get(&slot.revset)
+            }) = resolved.get(&slot.revset)
             {
                 let span = error
                     .span
@@ -81,7 +96,7 @@ impl Diffui {
         let pending = parsed
             .revsets
             .iter()
-            .any(|slot| !command.resolved.contains_key(&slot.revset));
+            .any(|slot| !resolved.contains_key(&slot.revset));
         let cli_plan = |reason: Option<String>| {
             let mut words = Prose::from("Runs ")
                 .code(format!("jj {}", parsed.passthrough_args.join(" ")))
@@ -151,6 +166,7 @@ impl Diffui {
                         state: PlanState::Ready(Run::Native {
                             action,
                             command: mutation.clone(),
+                            ignore_immutable: parsed.ignore_immutable,
                         }),
                     },
                     Err(LowerError::NeedsCli(reason)) => cli_plan(Some(reason)),
@@ -230,6 +246,8 @@ pub(crate) enum Run {
     Native {
         action: NativeAction,
         command: MutationCommand,
+        /// `--ignore-immutable`: run without the immutable-commit guard.
+        ignore_immutable: bool,
     },
     Ui {
         command: UiCommand,
@@ -288,9 +306,10 @@ fn resolve_view(view: &ViewCommand, context: &Resolver<'_>) -> Result<ResolvedVi
 
 /// Answers lowering from the revsets the command line already resolved.
 struct Resolver<'a> {
-    command: &'a CommandLine,
+    resolved: &'a HashMap<String, Resolution>,
     working_copy: Option<&'a str>,
     push_remote: Option<String>,
+    bookmarks: &'a diffui_core::model::BookmarksInfo,
 }
 
 impl Resolver<'_> {
@@ -326,7 +345,7 @@ impl LowerContext for Resolver<'_> {
         if revset.trim() == "@" {
             return Ok(vec![RevisionSelection::WorkingCopy]);
         }
-        match self.command.resolved.get(revset).map(|r| &r.result) {
+        match self.resolved.get(revset).map(|r| &r.result) {
             Some(Ok(found)) if found.commits.len() < found.count => Err(format!(
                 "Revset `{revset}` matches {} revisions, more than diffui acts on at once",
                 found.count
@@ -341,6 +360,12 @@ impl LowerContext for Resolver<'_> {
         }
     }
 
+    fn has_local_bookmark(&self, name: &str) -> bool {
+        self.bookmarks
+            .entry(name)
+            .is_some_and(|entry| !entry.local_targets.is_empty())
+    }
+
     fn default_push_remote(&self) -> Option<String> {
         self.push_remote.clone()
     }
@@ -350,8 +375,8 @@ impl LowerContext for Resolver<'_> {
 
 /// Builds the plan's sentence, naming revisions the way the graph does.
 struct Words<'a> {
-    ui: &'a Diffui,
-    command: &'a CommandLine,
+    tab: &'a TabState,
+    resolved: &'a HashMap<String, Resolution>,
 }
 
 impl Words<'_> {
@@ -362,11 +387,11 @@ impl Words<'_> {
         if arg.is_implicit() || text == "@" {
             return Prose::new().rev("@");
         }
-        let session = &self.ui.active().session;
+        let session = &self.tab.session;
         if session.bookmarks.entry(text).is_some() {
             return Prose::new().bookmark(text);
         }
-        match self.command.resolved.get(&arg.revset).map(|r| &r.result) {
+        match self.resolved.get(&arg.revset).map(|r| &r.result) {
             Some(Ok(found)) if found.count == 1 => {
                 let hex = found
                     .commits
@@ -462,7 +487,7 @@ impl Words<'_> {
     fn single(&self, arg: &RevsetArg) -> bool {
         arg.is_implicit()
             || matches!(
-                self.command.resolved.get(&arg.revset).map(|r| &r.result),
+                self.resolved.get(&arg.revset).map(|r| &r.result),
                 Some(Ok(found)) if found.count == 1
             )
     }
@@ -558,7 +583,8 @@ impl Words<'_> {
                 .then(quoted(&name.value))
                 .text(" at ")
                 .then(self.arg(to)),
-            MutationCommand::BookmarkSet { name, to, .. } => Prose::from("Move ")
+            MutationCommand::BookmarkSet { name, to, .. }
+            | MutationCommand::BookmarkMove { name, to, .. } => Prose::from("Move ")
                 .then(quoted(&name.value))
                 .text(" to ")
                 .then(self.arg(to)),
@@ -656,6 +682,72 @@ mod tests {
         let plan = ui.plan(&command);
         let words = plan.words.to_string();
         (plan, words)
+    }
+
+    /// A declared `run` line, its variables filled with awkward values,
+    /// plans to the very op typing the line would.
+    #[test]
+    fn a_declared_run_lowers_like_the_typed_line() {
+        use crate::user_commands::{Step, Var, jj_line, parse_commands};
+        let (commands, problems) = parse_commands(
+            std::path::Path::new("config.toml"),
+            r#"
+[[commands]]
+id = "x"
+label = "X"
+run = "jj describe {commit_id} -m {prompt.name}"
+
+[[commands.prompts]]
+name = "name"
+"#,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let Step::Run(words) = &commands[0].step else {
+            panic!("a run row");
+        };
+        let values = [
+            (Var::Prompt("name".to_owned()), "fix: a b's \"quote\" $(x)"),
+            (Var::CommitId, "abc123"),
+        ]
+        .into_iter()
+        .map(|(var, value)| (var, value.to_owned()))
+        .collect();
+        let words: Vec<String> = words
+            .iter()
+            .map(|word| word.render(&values).expect("every value is there"))
+            .collect();
+        let line = jj_line(&words);
+        // The message with spaces and quotes stays one argument.
+        assert!(line.starts_with("jj describe abc123 -m "), "{line}");
+        let resolved = [("abc123", Ok(vec!["abc123"]))];
+        let ran = |line: &str| match plan_for(line, &resolved).0.state {
+            PlanState::Ready(Run::Native { action, .. }) => format!("{action:?}"),
+            PlanState::Blocked { reason, .. } => panic!("{line}: {reason}"),
+            _ => panic!("{line} doesn't plan to a mutation"),
+        };
+        assert_eq!(
+            ran(&line),
+            ran(r#"jj describe abc123 -m 'fix: a b'"'"'s "quote" $(x)'"#),
+            "declared and typed lines lower alike"
+        );
+    }
+
+    #[test]
+    fn ignore_immutable_rides_into_the_run() {
+        let a = "a".repeat(40);
+        for (line, expected) in [
+            ("jj abandon x", false),
+            ("jj --ignore-immutable abandon x", true),
+        ] {
+            let (plan, _) = plan_for(line, &[("x", Ok(vec![&a]))]);
+            let PlanState::Ready(Run::Native {
+                ignore_immutable, ..
+            }) = plan.state
+            else {
+                panic!("{line} runs natively");
+            };
+            assert_eq!(ignore_immutable, expected, "{line}");
+        }
     }
 
     #[test]

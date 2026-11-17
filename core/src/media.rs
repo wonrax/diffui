@@ -3,7 +3,7 @@
 //! to RGBA off the UI thread.
 //!
 //! The diff loader classifies and measures (cheap: an image's header, an
-//! SVG's parse); the frontend decodes ([`decode`]) only what it displays.
+//! SVG's root element); the frontend decodes ([`decode`]) only what it displays.
 
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
@@ -55,15 +55,70 @@ pub fn dimensions(kind: BlobKind, bytes: &[u8]) -> Option<(u32, u32)> {
             .into_dimensions()
             .ok()
             .filter(|&(width, height)| width > 0 && height > 0),
-        BlobKind::Svg => {
-            let tree = usvg::Tree::from_data(bytes, &svg_options()).ok()?;
-            let size = tree.size();
-            Some((
-                size.width().ceil().max(1.0) as u32,
-                size.height().ceil().max(1.0) as u32,
-            ))
-        }
+        BlobKind::Svg => svg_dimensions(bytes),
     }
+}
+
+/// An SVG's size off its root element alone, as usvg resolves it: `width`
+/// and `height` in absolute units, a percentage of the `viewBox`, and 100%
+/// when absent. A diff load measures both sides of every SVG on every reload,
+/// and a full usvg parse (the first one loading the system fonts) there was
+/// wasted on a document the frontend parses again to decode.
+fn svg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    /// usvg's `Options::default_size`, for a percentage with no `viewBox`.
+    const DEFAULT_SIDE: f32 = 100.0;
+
+    let text = std::str::from_utf8(bytes).ok()?;
+    let document = usvg::roxmltree::Document::parse(text).ok()?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
+        return None;
+    }
+    let view_box: Option<Vec<f32>> = root.attribute("viewBox").map(|value| {
+        value
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse().ok())
+            .collect()
+    });
+    let view_box = view_box
+        .filter(|numbers| numbers.len() == 4 && numbers[2] > 0.0 && numbers[3] > 0.0)
+        .map(|numbers| (numbers[2], numbers[3]));
+    let side = |name: &str, view_box_side: Option<f32>| -> Option<f32> {
+        let value = root.attribute(name).unwrap_or("100%").trim();
+        match value.strip_suffix('%') {
+            Some(percent) => Some(
+                percent.trim().parse::<f32>().ok()? / 100.0 * view_box_side.unwrap_or(DEFAULT_SIDE),
+            ),
+            None => svg_length_px(value),
+        }
+    };
+    let width = side("width", view_box.map(|(width, _)| width))?;
+    let height = side("height", view_box.map(|(_, height)| height))?;
+    (width > 0.0 && height > 0.0).then(|| (width.ceil() as u32, height.ceil() as u32))
+}
+
+/// An absolute SVG length in pixels (`12`, `12px`, `3cm`, ...), at 96 dpi
+/// like usvg. Font-relative units resolve against a 12px font, usvg's
+/// default.
+fn svg_length_px(value: &str) -> Option<f32> {
+    let split = value
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number: f32 = number.trim().parse().ok()?;
+    let scale = match unit {
+        "" | "px" => 1.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "pt" => 4.0 / 3.0,
+        "pc" => 16.0,
+        "em" => 12.0,
+        "ex" => 6.0,
+        _ => return None,
+    };
+    Some(number * scale)
 }
 
 /// A side's descriptor, keeping `bytes` only when `keep` (the caps allowed a
@@ -258,6 +313,31 @@ mod tests {
     }
 
     const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="20" height="20" fill="#00f"/></svg>"##;
+
+    #[test]
+    fn svg_dimensions_match_usvg_without_parsing_the_document() {
+        let cases: [&[u8]; 6] = [
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"/>"#,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 150"/>"#,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="50%" viewBox="0,0,300,150"/>"#,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="2.5cm"/>"#,
+            br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
+            br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="10.2px" height="3pt"><text>hi</text></svg>"#,
+        ];
+        for svg in cases {
+            let tree = usvg::Tree::from_data(svg, &svg_options()).unwrap();
+            let size = tree.size();
+            let expected = (size.width().ceil() as u32, size.height().ceil() as u32);
+            assert_eq!(
+                dimensions(BlobKind::Svg, svg),
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(svg)
+            );
+        }
+        assert_eq!(dimensions(BlobKind::Svg, b"<html/>"), None);
+        assert_eq!(dimensions(BlobKind::Svg, b"not xml"), None);
+    }
 
     #[test]
     fn kinds_follow_extension_then_bytes() {

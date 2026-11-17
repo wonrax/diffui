@@ -8,7 +8,7 @@ use crate::model::RevisionSelection;
 /// What one push sends, mirroring `jj git push`'s target flags. Every target
 /// lands in the same transaction as the push itself, so a refused or failed
 /// push leaves no half-made local bookmark behind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PushTarget {
     /// `-b <name>`: the local bookmark as it stands. A bookmark that doesn't
     /// track this remote yet is created there (and tracked from then on); a
@@ -22,14 +22,15 @@ pub enum PushTarget {
     /// `-c <revision>`: create the bookmark `templates.git_push_bookmark`
     /// names for the revision and push it.
     Change(RevisionSelection),
-    /// No target flags at all: the tracked bookmarks whose local target sits
-    /// in `remote_bookmarks(remote=<remote>)..@` and differs from the remote.
+    /// No target flags at all: the tracked bookmarks and tags whose local
+    /// target sits in `remote_bookmarks(remote=<remote>)..@` and differs from
+    /// the remote.
     Tracked,
 }
 
 /// The CLI's escape hatches for the per-commit checks. Missing author or
 /// committer identity has none, so neither does this.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushAllow {
     /// `--allow-empty-description`
     pub empty_description: bool,
@@ -56,7 +57,7 @@ impl PushAllow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushRequest {
     pub remote: String,
     pub targets: Vec<PushTarget>,
@@ -68,7 +69,7 @@ pub struct PushRequest {
 }
 
 /// One reason `jj git push` refuses a commit it would publish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PushCheck {
     EmptyDescription,
     /// Author or committer has no name or email.
@@ -92,7 +93,7 @@ impl PushCheck {
 
 /// A commit the push would have made newly reachable on the remote, and why
 /// it may not be.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RejectedCommit {
     /// Short change id, as the graph shows it.
     pub change_id: String,
@@ -105,16 +106,76 @@ pub struct RejectedCommit {
     pub working_copy: bool,
 }
 
+/// Which way a push moves a bookmark on the remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MoveKind {
+    /// The remote doesn't have the bookmark yet.
+    Add,
+    /// The bookmark goes from the remote.
+    Delete,
+    /// To a descendant of where the remote has it: nothing is lost there.
+    Forward,
+    /// To an ancestor: the remote loses the revisions in between.
+    Backward,
+    /// Neither: the remote's revisions are replaced.
+    Sideways,
+}
+
+impl MoveKind {
+    /// Whether the remote keeps every revision it had.
+    pub fn is_fast_forward(self) -> bool {
+        matches!(self, MoveKind::Add | MoveKind::Forward)
+    }
+}
+
+/// One bookmark (or tag) a push would change on the remote.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BookmarkMove {
+    pub bookmark: String,
+    /// `bookmark` names a tag: a tracked tag the default push carries along.
+    pub tag: bool,
+    /// Short hash of where the remote has it; `None` when it's new there.
+    pub from: Option<String>,
+    /// Short hash of where it goes; `None` when it's deleted there.
+    pub to: Option<String>,
+    pub kind: MoveKind,
+    /// Short change ids of the revisions the move makes newly reachable on
+    /// the remote, newest first, at most [`BookmarkMove::LISTED`] of them.
+    pub revisions: Vec<String>,
+    /// How many revisions the move publishes in all.
+    pub revision_count: usize,
+}
+
+impl BookmarkMove {
+    /// How many of a move's revisions are named.
+    pub const LISTED: usize = 3;
+
+    /// The move as the CLI prints it before pushing:
+    /// `bookmark: main [move forward from … to …]` (`tag: v1 […]` for a tag).
+    pub fn line(&self) -> String {
+        let from = self.from.as_deref().unwrap_or_default();
+        let to = self.to.as_deref().unwrap_or_default();
+        let what = match self.kind {
+            MoveKind::Add => format!("add to {to}"),
+            MoveKind::Delete => format!("delete from {from}"),
+            MoveKind::Forward => format!("move forward from {from} to {to}"),
+            MoveKind::Backward => format!("move backward from {from} to {to}"),
+            MoveKind::Sideways => format!("move sideways from {from} to {to}"),
+        };
+        let kind = if self.tag { "tag" } else { "bookmark" };
+        format!("{kind}: {} [{what}]", self.bookmark)
+    }
+}
+
 /// Why a push stopped before anything reached the remote: commits jj's checks
 /// refuse, or — with no commits listed — a [`PushRequest::confirm`] asking for
-/// the go-ahead on `plan`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the go-ahead on `moves`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PushRejection {
     pub remote: String,
-    /// What the push would do, one line per bookmark, as the CLI prints
-    /// "Changes to push to <remote>:" (`bookmark: main [move forward from
-    /// … to …]`).
-    pub plan: Vec<String>,
+    /// What the push would do, one move per bookmark: what the CLI prints
+    /// under "Changes to push to <remote>:".
+    pub moves: Vec<BookmarkMove>,
     pub commits: Vec<RejectedCommit>,
     /// More offending commits exist than are listed.
     pub truncated: bool,
@@ -127,6 +188,11 @@ pub struct PushRejection {
 }
 
 impl PushRejection {
+    /// The moves in the CLI's words, one line per bookmark.
+    pub fn plan(&self) -> Vec<String> {
+        self.moves.iter().map(BookmarkMove::line).collect()
+    }
+
     /// Only a confirmation: nothing was refused.
     pub fn is_confirmation(&self) -> bool {
         self.commits.is_empty()
@@ -192,7 +258,7 @@ impl std::fmt::Display for PushRejection {
                 f,
                 "push to {} awaits confirmation: {}",
                 self.remote,
-                self.plan.join("; ")
+                self.plan().join("; ")
             );
         }
         write!(

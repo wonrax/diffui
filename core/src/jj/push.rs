@@ -1,7 +1,7 @@
 //! `jj git push`, with the CLI's safety checks, plus the bookmark bookkeeping
 //! (`create` / `rename` / `forget` / `untrack`) the push workflow needs.
 //!
-//! Mirrors jj-cli 0.45.1 `cli/src/commands/git/push.rs`: the ref-level
+//! Mirrors jj-cli 0.47.1 `cli/src/commands/git/push.rs`: the ref-level
 //! classification (conflicted bookmark, untracked remote bookmark in the way,
 //! refusing to create or delete a remote bookmark the user didn't name) and
 //! the per-commit checks over everything the push would make newly reachable
@@ -12,13 +12,13 @@
 //! Everything here runs inside the caller's transaction, so a refused push
 //! commits nothing — not even the bookmark a `--change` push would create.
 //!
-//! `git.sign-on-push` is the CLI's `sign_commits_before_push`: the commits
-//! about to be pushed that aren't signed yet are signed (immutable ones are
+//! `revsets.git-sign-on-push` is the CLI's `sign_commits_before_push`: the
+//! commits about to be pushed that it picks are signed (immutable ones are
 //! skipped with a warning) and their descendants rebased. The caller runs that
 //! in a transaction of its own under the working-copy lock, so a failed push
 //! keeps the signatures.
 //!
-//! Ported from jj-cli 0.45.1, whose versions take its `Ui` and command helper.
+//! Ported from jj-cli 0.47.1, whose versions take its `Ui` and command helper.
 //! Check each against its source on a jj bump:
 //! - `plan_push`, `classify`, `default_push_range`, `describe_updates` and
 //!   `ensure_new_bookmark_name`: `cmd_git_push`, `classify_bookmark_update`,
@@ -39,11 +39,10 @@ use futures::{StreamExt, TryStreamExt};
 use jj_cli::{
     cli_util::{has_tracked_remote_bookmarks, load_template_aliases, short_commit_hash},
     commit_templater::{CommitTemplateLanguage, CommitTemplateLanguageExtension},
-    revset_util::parse_immutable_heads_expression,
     template_builder,
-    template_parser::TemplateDiagnostics,
     ui::Ui,
 };
+use jj_frontend::revset_util::parse_immutable_heads_expression;
 use jj_lib::{
     backend::{BackendError, CommitId},
     commit::Commit,
@@ -61,9 +60,10 @@ use jj_lib::{
     refs::{LocalAndRemoteRef, RefPushAction, classify_ref_push_action},
     repo::{MutableRepo, Repo},
     revset::{ResolvedRevsetExpression, RevsetDiagnostics, RevsetExpression, SymbolResolver},
-    settings::UserSettings,
-    signing::{SignBehavior, SignError},
+    settings::{SignBehavior, UserSettings},
+    signing::SignError,
     ssh_signing::SshError,
+    template_parser::TemplateDiagnostics,
 };
 
 use super::mutate::{resolve_mutation_target, short_change_id};
@@ -72,7 +72,10 @@ use super::settings::cli_error;
 use super::walk::{parse_user_revset, with_revset_parse_context};
 use super::workspace::TargetContext;
 use crate::model::LoadProgress;
-use crate::push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
+use crate::push::{
+    BookmarkMove, MoveKind, PushAllow, PushCheck, PushRejection, PushRequest, PushTarget,
+    RejectedCommit,
+};
 
 /// How many offending commits a rejection lists before it says "and more".
 const MAX_REJECTED: usize = 20;
@@ -95,6 +98,8 @@ pub(super) struct PushOutcome {
     /// transaction must still be committed (the remote did change), and the
     /// caller reports this as the failure it is afterwards.
     pub partial_failure: Option<String>,
+    /// The bookmarks the request named (see [`PlannedPush`]).
+    pub bookmarks: Vec<String>,
 }
 
 /// One bookmark the request names, with the CLI's per-flag allowances.
@@ -109,10 +114,16 @@ struct Named {
 pub(super) struct PlannedPush {
     remote: String,
     updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
+    /// Tracked tags the default push carries along, as `jj git push` does.
+    /// They take no part in signing: a tag doesn't follow its commit's
+    /// rewrite.
+    tags: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
     /// Lines that lead the activity output: bookmarks created or already in
     /// place, and what signing did.
     pub notes: Vec<String>,
     plan: Vec<String>,
+    /// Every bookmark the request named, generated names included.
+    named: Vec<String>,
 }
 
 /// Plan `request` inside `repo` (a transaction's mutable repo): apply its
@@ -208,9 +219,14 @@ pub(super) async fn plan_push(
         }
     }
 
+    let named_list: Vec<String> = named
+        .iter()
+        .map(|item| item.name.as_str().to_owned())
+        .collect();
     // Classify. An explicitly named bookmark that can't be pushed fails the
     // whole push, as it does in the CLI.
     let mut updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)> = Vec::new();
+    let mut tags: Vec<(RefNameBuf, Diff<Option<CommitId>>)> = Vec::new();
     let mut seen: HashSet<RefNameBuf> = HashSet::new();
     for item in &named {
         if !seen.insert(item.name.clone()) {
@@ -228,9 +244,16 @@ pub(super) async fn plan_push(
     }
     if tracked_mode {
         // `jj git push` with no target flags: tracked bookmarks pointing into
-        // `remote_bookmarks(remote=<remote>)..@`. Ones that can't be pushed are
+        // `revsets.git-push`. Ones that can't be pushed are
         // skipped with a note rather than failing the rest.
-        let in_range = default_push_range(repo, remote, &context.targets.wc_id).await?;
+        let in_range = git_push_range(
+            context.repo_root,
+            context.settings,
+            context.workspace_name,
+            repo,
+            remote,
+        )
+        .await?;
         let candidates: Vec<RefNameBuf> = repo
             .view()
             .local_remote_bookmarks(remote)
@@ -238,7 +261,7 @@ pub(super) async fn plan_push(
             .filter(|(_, targets)| {
                 targets
                     .local_target
-                    .added_ids()
+                    .present_adds()
                     .any(|id| in_range.contains(id))
             })
             .map(|(name, _)| name.to_owned())
@@ -253,27 +276,52 @@ pub(super) async fn plan_push(
                 Err(error) => notes.push(format!("skipped: {error}")),
             }
         }
+        // And the tracked tags pointing there, as jj pushes them.
+        let tag_candidates: Vec<RefNameBuf> = repo
+            .view()
+            .local_remote_tags(remote)
+            .filter(|(_, targets)| targets.remote_ref.is_tracked())
+            .filter(|(_, targets)| {
+                targets
+                    .local_target
+                    .present_adds()
+                    .any(|id| in_range.contains(id))
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        for name in tag_candidates {
+            match classify_tag(repo, &name, remote) {
+                Ok(Some(update)) => tags.push((name, update)),
+                Ok(None) => {}
+                Err(error) => notes.push(format!("skipped: {error}")),
+            }
+        }
     }
-    if updates.is_empty() {
+    if updates.is_empty() && tags.is_empty() {
         return Ok(PlannedPush {
             remote: request.remote.clone(),
             updates,
+            tags,
             notes,
             plan: Vec::new(),
+            named: named_list,
         });
     }
 
     let new_heads: Vec<CommitId> = updates
         .iter()
+        .chain(&tags)
         .filter_map(|(_, update)| update.after.clone())
         .collect();
     let (commits, truncated, private_revset) =
         check_commits(context, repo, remote, &new_heads, request.allow).await?;
-    let plan = describe_updates(repo, &updates).await;
+    let mut moves = describe_updates(repo, remote, &updates, false).await?;
+    moves.extend(describe_updates(repo, remote, &tags, true).await?);
+    let plan = moves.iter().map(BookmarkMove::line).collect();
     if !commits.is_empty() || request.confirm {
         return Err(anyhow!(PushRejection {
             remote: request.remote.clone(),
-            plan,
+            moves,
             commits,
             truncated,
             private_commits: private_revset,
@@ -283,8 +331,10 @@ pub(super) async fn plan_push(
     Ok(PlannedPush {
         remote: request.remote.clone(),
         updates,
+        tags,
         notes,
         plan,
+        named: named_list,
     })
 }
 
@@ -298,21 +348,30 @@ pub(super) fn send_push(
     let PlannedPush {
         remote: remote_name,
         updates,
+        tags,
         mut notes,
         plan,
+        named,
     } = planned;
-    if updates.is_empty() {
+    if updates.is_empty() && tags.is_empty() {
         notes.push("Nothing changed.".to_owned());
         return Ok(PushOutcome {
             message: format!("Nothing to push to {remote_name}"),
             output: notes,
             partial_failure: None,
+            bookmarks: named,
         });
     }
     let remote = RemoteName::new(&remote_name);
+    let names: Vec<&str> = updates
+        .iter()
+        .chain(&tags)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let message = format!("Pushed {} to {remote_name}", names.join(", "));
     let targets = GitPushRefTargets {
         bookmarks: updates.clone(),
-        tags: Vec::new(),
+        tags: tags.clone(),
     };
     let mut subprocess_options = GitSubprocessOptions::from_settings(context.settings)
         .context("failed to read git subprocess options")?;
@@ -335,14 +394,12 @@ pub(super) fn send_push(
     let mut output = notes;
     output.extend(plan);
     output.append(&mut callback.lines);
-    let names: Vec<&str> = updates.iter().map(|(name, _)| name.as_str()).collect();
-    let message = format!("Pushed {} to {remote_name}", names.join(", "));
-
     if stats.all_ok() {
         return Ok(PushOutcome {
             message,
             output,
             partial_failure: None,
+            bookmarks: named,
         });
     }
     let mut problems = Vec::new();
@@ -357,17 +414,15 @@ pub(super) fn send_push(
         let reason = reason.as_deref().unwrap_or("rejected by the remote");
         problems.push(format!("{}: {reason}", git_ref.as_str()));
     }
-    for (symbol, reason) in &stats.unexported_bookmarks {
-        problems.push(format!("{symbol}: couldn't export to git ({reason})"));
-    }
     let failure = format!("push rejected: {}", problems.join("; "));
-    if !stats.some_exported() {
+    if stats.pushed.is_empty() {
         return Err(PushFailed(failure).into());
     }
     Ok(PushOutcome {
         message,
         output,
         partial_failure: Some(failure),
+        bookmarks: named,
     })
 }
 
@@ -385,7 +440,7 @@ impl std::fmt::Display for PushFailed {
 
 impl std::error::Error for PushFailed {}
 
-/// What `git.sign-on-push` asks of a planned push.
+/// What `revsets.git-sign-on-push` asks of a planned push.
 #[derive(Default)]
 pub(super) struct SignPlan {
     /// Mutable commits to sign before the push goes out.
@@ -395,81 +450,76 @@ pub(super) struct SignPlan {
 }
 
 /// jj-cli's `sign_commits_before_push` selection: the commits in
-/// `remote_bookmarks(remote)..new_heads` that aren't signed yet and that
-/// `signing.behavior = "own"` would sign. Immutable ones are left alone and
-/// named in the warning instead. Empty when `git.sign-on-push` is off.
+/// `remote_bookmarks(remote)..new_heads` that `revsets.git-sign-on-push`
+/// picks (jj 0.47; a `git.sign-on-push = true` from before migrates to
+/// `~signed() & mine()`). Immutable ones are left alone and named in the
+/// warning instead. Empty when the revset is jj's default `none()`.
 pub(super) async fn sign_plan(
     context: &PushContext<'_>,
     repo: &MutableRepo,
     planned: &PlannedPush,
 ) -> Result<SignPlan> {
-    let sign_on_push = context
-        .settings
-        .get_bool("git.sign-on-push")
-        .context("failed to read git.sign-on-push")?;
     let new_heads: Vec<CommitId> = planned
         .updates
         .iter()
         .filter_map(|(_, update)| update.after.clone())
         .collect();
-    if !sign_on_push || new_heads.is_empty() {
+    if new_heads.is_empty() {
         return Ok(SignPlan::default());
     }
+    let sign_on_push = context
+        .settings
+        .get_string("revsets.git-sign-on-push")
+        .context("failed to read revsets.git-sign-on-push")?;
     let old_heads: Vec<CommitId> = repo
         .view()
         .remote_bookmarks(RemoteName::new(&planned.remote))
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
         .cloned()
         .collect();
-    let to_push = RevsetExpression::commits(old_heads).range(&RevsetExpression::commits(new_heads));
+    let user_revset = |text: &str| {
+        parse_user_revset(
+            context.repo_root,
+            context.settings,
+            context.workspace_name,
+            text,
+        )
+    };
+    let needs_signing = RevsetExpression::commits(old_heads)
+        .range(&RevsetExpression::commits(new_heads))
+        .intersection(&user_revset(&sign_on_push).context("invalid revsets.git-sign-on-push")?);
+    let immutable = user_revset("immutable()")?;
     let symbol_resolver = SymbolResolver::new(
         repo,
         &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
     );
-    let immutable = parse_user_revset(
-        context.repo_root,
-        context.settings,
-        context.workspace_name,
-        "immutable()",
-    )?
-    .resolve_user_expression(repo, &symbol_resolver)
-    .context("failed to resolve immutable()")?;
-
-    let mut sign_settings = context.settings.sign_settings();
-    sign_settings.behavior = SignBehavior::Own;
-    let needs_signing =
-        |commit: &Commit| !commit.is_signed() && sign_settings.should_sign(commit.store_commit());
+    let evaluate = |expression: Arc<jj_lib::revset::UserRevsetExpression>| {
+        expression
+            .resolve_user_expression(repo, &symbol_resolver)
+            .context("failed to resolve the commits to sign")?
+            .evaluate()
+            .context("failed to evaluate the commits to sign")
+    };
 
     // Like the CLI, name up to ten and say "10+" past that.
     let mut skipped = Vec::new();
-    let mut stream = to_push
-        .intersection(&immutable)
-        .evaluate(repo)
-        .context("failed to evaluate the commits to sign")?
-        .stream();
+    let mut stream = evaluate(needs_signing.intersection(&immutable))?.stream();
     while let Some(id) = stream.next().await {
         let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
-        if needs_signing(&commit) {
-            skipped.push(short_change_id(&commit));
-            if skipped.len() > 10 {
-                break;
-            }
+        skipped.push(short_change_id(&commit));
+        if skipped.len() > 10 {
+            break;
         }
     }
-    let mut to_sign = Vec::new();
-    let mut stream = to_push
-        .minus(&immutable)
-        .evaluate(repo)
-        .context("failed to evaluate the commits to sign")?
-        .stream();
-    while let Some(id) = stream.next().await {
-        let commit = load_commit(repo, &id.context("failed to walk the commits to sign")?).await?;
-        if needs_signing(&commit) {
-            to_sign.push(commit.id().clone());
-        }
-    }
+    let to_sign: Vec<CommitId> = evaluate(needs_signing.minus(&immutable))?
+        .stream()
+        .map(|id| id.context("failed to walk the commits to sign"))
+        .try_collect()
+        .await?;
     if !to_sign.is_empty() && !repo.store().signer().can_sign() {
-        bail!("git.sign-on-push is set, but no signing.backend is configured");
+        bail!(
+            "revsets.git-sign-on-push picks commits to sign, but no signing.backend is configured"
+        );
     }
 
     let skipped_note = (!skipped.is_empty()).then(|| {
@@ -530,7 +580,7 @@ pub(super) async fn sign_commits(repo: &mut MutableRepo, ids: &[CommitId]) -> Re
         if wanted.contains(rewriter.old_commit().id()) {
             rewriter
                 .reparent()
-                .set_sign_behavior(SignBehavior::Own)
+                .set_sign_behavior(SignBehavior::Force)
                 .write()
                 .await?;
             stats.signed += 1;
@@ -622,6 +672,35 @@ fn classify(
     }
 }
 
+/// The CLI's `classify_tag_update` for the default push, which allows no new
+/// or deleted remote tags.
+fn classify_tag(
+    repo: &MutableRepo,
+    name: &RefName,
+    remote: &RemoteName,
+) -> Result<Option<Diff<Option<CommitId>>>> {
+    let symbol = name.to_remote_symbol(remote);
+    let targets = LocalAndRemoteRef {
+        local_target: repo.view().get_local_tag(name),
+        remote_ref: repo.view().get_remote_tag(symbol),
+    };
+    match classify_ref_push_action(targets) {
+        RefPushAction::AlreadyMatches => Ok(None),
+        RefPushAction::LocalConflicted => bail!("tag {} is conflicted", name.as_str()),
+        RefPushAction::RemoteConflicted => {
+            bail!("tag {symbol} is conflicted; fetch to update the conflicted remote tag")
+        }
+        RefPushAction::RemoteUntracked => bail!("non-tracking remote tag {symbol} exists"),
+        RefPushAction::Update(_) if !targets.remote_ref.is_tracked() => {
+            bail!("refusing to create new remote tag {symbol}; track it and try again")
+        }
+        RefPushAction::Update(update) if update.after.is_none() => {
+            bail!("refusing to push deleted tag {}", name.as_str())
+        }
+        RefPushAction::Update(update) => Ok(Some(update)),
+    }
+}
+
 /// The CLI's `CommitsValidator`, collecting every offending commit instead of
 /// stopping at the first: the range `(remote heads | immutable_heads())..new_heads`
 /// is exactly what the push would make newly reachable on the remote.
@@ -638,7 +717,8 @@ async fn check_commits(
     let known_heads: Vec<CommitId> = repo
         .view()
         .remote_bookmarks(remote)
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+        .chain(repo.view().remote_tags(remote))
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
         .cloned()
         .collect();
     let symbol_resolver = SymbolResolver::new(
@@ -652,7 +732,9 @@ async fn check_commits(
         "immutable_heads()",
     )?
     .resolve_user_expression(repo, &symbol_resolver)
-    .context("failed to resolve immutable_heads()")?;
+    .context("failed to resolve immutable_heads()")?
+    .into_inner()
+    .0;
 
     let private_revset = if allow.private {
         None
@@ -674,7 +756,7 @@ async fn check_commits(
             .context("failed to parse git.private-commits")?
             .resolve_user_expression(repo, &symbol_resolver)
             .context("failed to resolve git.private-commits")?
-            .evaluate(repo)
+            .evaluate()
             .context("failed to evaluate git.private-commits")?,
         ),
         None => None,
@@ -749,57 +831,111 @@ fn rejected_commit(commit: &Commit, reasons: Vec<PushCheck>, wc: &CommitId) -> R
     }
 }
 
-/// Commits in `remote_bookmarks(remote=<remote>)..@` — the default push range.
-async fn default_push_range(
-    repo: &MutableRepo,
+/// The default push range: `revsets.git-push` (jj's default is
+/// `remote_bookmarks(remote=exact:remote)..@`) with `remote` bound to the
+/// remote being pushed to, as jj-cli's `find_default_target_revisions` does.
+/// The toolbar's push summary reads the same range.
+pub(super) async fn git_push_range(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+    repo: &dyn Repo,
     remote: &RemoteName,
-    wc_commit_id: &CommitId,
 ) -> Result<HashSet<CommitId>> {
-    let remote_heads: Vec<CommitId> = repo
-        .view()
-        .remote_bookmarks(remote)
-        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
-        .cloned()
-        .collect();
-    let range: std::sync::Arc<ResolvedRevsetExpression> = RevsetExpression::commits(remote_heads)
-        .range(&RevsetExpression::commits(vec![wc_commit_id.clone()]));
-    range
-        .evaluate(repo)
-        .context("failed to evaluate the default push range")?
+    let text = settings
+        .get_string("revsets.git-push")
+        .context("failed to read revsets.git-push")?;
+    let expression =
+        with_revset_parse_context(repo_root, settings, workspace_name, |revset_context, _| {
+            let revset_context = jj_lib::revset::RevsetParseContext {
+                local_variables: [("remote", jj_lib::revset::new_string_node(remote.as_str()))]
+                    .into(),
+                ..revset_context
+            };
+            jj_lib::revset::parse(&mut RevsetDiagnostics::new(), &text, &revset_context)
+        })?
+        .with_context(|| format!("invalid revsets.git-push {text:?}"))?;
+    let symbol_resolver = SymbolResolver::new(
+        repo,
+        &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
+    );
+    expression
+        .resolve_user_expression(repo, &symbol_resolver)
+        .context("failed to resolve revsets.git-push")?
+        .evaluate()
+        .context("failed to evaluate revsets.git-push")?
         .stream()
-        .map(|entry| entry.context("failed to walk the default push range"))
+        .map(|entry| entry.context("failed to walk revsets.git-push"))
         .try_collect()
         .await
 }
 
-/// `  bookmark: main [move forward from abc to def]`, as the CLI prints the
-/// plan before pushing.
+/// What each update does to the remote: the CLI's "Changes to push" plan
+/// (`print_commits_ready_to_push`), with the revisions each move publishes,
+/// the ones not yet reachable from any of the remote's bookmarks.
 async fn describe_updates(
     repo: &MutableRepo,
+    remote: &RemoteName,
     updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
-) -> Vec<String> {
+    tag: bool,
+) -> Result<Vec<BookmarkMove>> {
     let short = short_commit_hash;
-    let mut lines = Vec::new();
+    let known_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
+        .cloned()
+        .collect();
+    let mut moves = Vec::new();
     for (name, update) in updates {
-        let what = match (&update.before, &update.after) {
+        let kind = match (&update.before, &update.after) {
             (Some(old), Some(new)) => {
                 let index = repo.index();
-                let direction = if index.is_ancestor(old, new).await.unwrap_or(false) {
-                    "forward"
+                if index.is_ancestor(old, new).await.unwrap_or(false) {
+                    MoveKind::Forward
                 } else if index.is_ancestor(new, old).await.unwrap_or(false) {
-                    "backward"
+                    MoveKind::Backward
                 } else {
-                    "sideways"
-                };
-                format!("move {direction} from {} to {}", short(old), short(new))
+                    MoveKind::Sideways
+                }
             }
-            (Some(old), None) => format!("delete from {}", short(old)),
-            (None, Some(new)) => format!("add to {}", short(new)),
+            (Some(_), None) => MoveKind::Delete,
+            (None, Some(_)) => MoveKind::Add,
             (None, None) => continue,
         };
-        lines.push(format!("bookmark: {} [{what}]", name.as_str()));
+        let (mut revisions, mut revision_count) = (Vec::new(), 0);
+        if let Some(new) = &update.after {
+            let published: Arc<ResolvedRevsetExpression> =
+                RevsetExpression::commits(known_heads.clone())
+                    .range(&RevsetExpression::commits(vec![new.clone()]));
+            let mut stream = published
+                .evaluate(repo)
+                .context("failed to evaluate the revisions a push publishes")?
+                .stream();
+            while let Some(id) = stream.next().await {
+                let id = id.context("failed to walk the revisions a push publishes")?;
+                revision_count += 1;
+                if revisions.len() < BookmarkMove::LISTED {
+                    let commit = repo
+                        .store()
+                        .get_commit_async(&id)
+                        .await
+                        .with_context(|| format!("failed to load jj commit {}", id.hex()))?;
+                    revisions.push(short_change_id(&commit));
+                }
+            }
+        }
+        moves.push(BookmarkMove {
+            bookmark: name.as_str().to_owned(),
+            tag,
+            from: update.before.as_ref().map(short),
+            to: update.after.as_ref().map(short),
+            kind,
+            revisions,
+            revision_count,
+        });
     }
-    lines
+    Ok(moves)
 }
 
 /// The CLI's `ensure_new_bookmark_name` for `--change`.

@@ -12,6 +12,8 @@ mod history;
 mod hunk_scenarios;
 mod jj_scenarios;
 mod push_scenarios;
+mod remote_scenarios;
 mod repo_actor;
 mod revset_scenarios;
+mod search_scenarios;
 mod watch_scenarios;

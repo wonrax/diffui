@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use diffui_core::repo::{Command, Payload, RepoError};
 use diffui_core::{
-    BookmarksInfo, MutationOp, PushAllow, PushCheck, PushRequest, PushTarget, RevisionSelection,
+    BookmarksInfo, MutationOp, PushAllow, PushCandidate, PushCheck, PushRequest, PushTarget,
+    RevisionSelection,
 };
 use harness::{TestRepo, scratch_repo, write};
 
@@ -369,6 +370,7 @@ fn push_change_creates_the_generated_bookmark() {
         "{}",
         again.message
     );
+    assert_eq!(again.bookmarks, [name], "named even when nothing moved");
 }
 
 /// `templates.git_push_bookmark` renders through jj-cli's template engine, so
@@ -389,6 +391,8 @@ fn push_change_renders_the_bookmark_template_like_jj() {
     let name = format!("me/{}-first", &change[..8]);
     assert_eq!(outcome.message, format!("Pushed {name} to origin"));
     assert_eq!(remote_ref(&remote, &name), Some(first));
+    // The generated name comes back, for what opens its pull request next.
+    assert_eq!(outcome.bookmarks, [name]);
 }
 
 #[test]
@@ -586,12 +590,124 @@ fn tracked_push_sends_tracked_bookmarks_that_moved() {
     })
     .expect("create bookmark");
 
+    // What the toolbar's Push says it sends, before it does.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "main".to_owned(),
+            tag: false,
+            ahead: 1,
+        }]
+    );
+
     let outcome = repo
         .mutate(push("origin", vec![PushTarget::Tracked]))
         .expect("plain push");
     assert_eq!(outcome.message, "Pushed main to origin");
     assert_eq!(remote_ref(&remote, "main"), Some(second));
     assert_eq!(remote_ref(&remote, "local-only"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
+}
+
+/// The range a plain push draws from is `revsets.git-push` since jj 0.46,
+/// with `remote` bound to the remote pushed to: one that stops short of the
+/// moved bookmark sends nothing, in the push and in the toolbar's summary.
+#[test]
+fn tracked_push_draws_from_revsets_git_push() {
+    let config = "[revsets]\ngit-push = \"remote_bookmarks(remote=exact:remote)..@--\"\n";
+    let Some((mut repo, remote)) = setup_with_config("push-git-push-revset", Some(config)) else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    let second = commit(&mut repo, "b.txt", "second");
+    repo.mutate(MutationOp::MoveBookmark {
+        name: "main".to_owned(),
+        to: at(&second),
+        push_remote: None,
+    })
+    .expect("move");
+
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Tracked]))
+        .expect("plain push");
+    assert_eq!(outcome.message, "Nothing to push to origin");
+    assert_eq!(remote_ref(&remote, "main"), Some(first));
+}
+
+/// `jj git push` with no targets carries tracked tags pointing into the
+/// default range along with the bookmarks; an untracked tag stays home.
+#[test]
+fn tracked_push_sends_tracked_tags_too() {
+    let Some((mut repo, remote)) = setup("push-tracked-tags") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "main".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("main".into())]))
+        .expect("push");
+    let second = commit(&mut repo, "b.txt", "second");
+    harness::block_on(async {
+        let workspace = harness::load_workspace(&repo.root);
+        let base = workspace.load_at_head().await.expect("load repo");
+        let mut tx = base.start_transaction();
+        let id = jj_lib::backend::CommitId::try_from_hex(&second).expect("commit id");
+        for (name, tracked) in [("v1", true), ("v2", false)] {
+            let name = jj_lib::ref_name::RefName::new(name);
+            tx.repo_mut()
+                .set_local_tag_target(name, jj_lib::op_store::RefTarget::normal(id.clone()));
+            if tracked {
+                tx.repo_mut().set_remote_tag(
+                    name.to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                    jj_lib::op_store::RemoteRef {
+                        target: jj_lib::op_store::RefTarget::absent(),
+                        state: jj_lib::op_store::RemoteRefState::Tracked,
+                    },
+                );
+            }
+        }
+        tx.commit("test: tags").await.expect("commit the tags");
+    });
+
+    // The toolbar's Push offers the tag alone, since no bookmark moved.
+    assert_eq!(
+        bookmarks(&mut repo).tracked_push,
+        vec![PushCandidate {
+            name: "v1".to_owned(),
+            tag: true,
+            ahead: 1,
+        }]
+    );
+
+    let outcome = repo
+        .mutate(push("origin", vec![PushTarget::Tracked]))
+        .expect("plain push");
+    assert_eq!(outcome.message, "Pushed v1 to origin");
+    let tag = |name: &str| {
+        let out = harness::run_git(
+            &remote,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/tags/{name}"),
+            ],
+        );
+        Some(out.trim().to_owned()).filter(|out| !out.is_empty())
+    };
+    assert_eq!(tag("v1"), Some(second));
+    assert_eq!(tag("v2"), None);
+    assert!(bookmarks(&mut repo).tracked_push.is_empty());
 }
 
 #[test]
@@ -602,11 +718,7 @@ fn tags_reach_the_graph_as_read_only_labels() {
     let first = commit(&mut repo, "a.txt", "first");
     harness::block_on(async {
         let workspace = harness::load_workspace(&repo.root);
-        let base = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo");
+        let base = workspace.load_at_head().await.expect("load repo");
         let mut tx = base.start_transaction();
         let id = jj_lib::backend::CommitId::try_from_hex(&first).expect("commit id");
         tx.repo_mut().set_local_tag_target(
@@ -654,13 +766,23 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
     };
     assert!(plan.is_confirmation());
     assert_eq!(
-        plan.plan,
+        plan.plan(),
         vec![format!(
             "bookmark: main [move forward from {} to {}]",
             &first[..12],
             &second[..12]
         )]
     );
+    let [moved] = plan.moves.as_slice() else {
+        panic!("one bookmark moves: {:?}", plan.moves);
+    };
+    assert_eq!(moved.kind, diffui_core::MoveKind::Forward);
+    assert!(moved.kind.is_fast_forward());
+    assert_eq!(
+        moved.revision_count, 1,
+        "only `second` is new to the remote"
+    );
+    assert_eq!(moved.revisions.len(), 1);
     assert_eq!(
         remote_ref(&remote, "main"),
         Some(first),
@@ -674,12 +796,13 @@ fn a_confirmed_push_reports_its_plan_before_pushing() {
     assert_eq!(remote_ref(&remote, "main"), Some(second));
 }
 
-// ── git.sign-on-push ────────────────────────────────────────────────────────
+// ── revsets.git-sign-on-push ─────────────────────────────────────────────────
 
 /// A stand-in for `ssh-keygen -Y sign` (or 1Password's `op-ssh-sign`) that
 /// logs each call and prints a signature-shaped blob, or fails like a
 /// cancelled prompt. Returns the repo config that signs through it with
 /// `behavior`, plus `extra`, and the call log's path.
+#[cfg(unix)]
 fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -704,7 +827,7 @@ fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (Strin
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
         .expect("make signer executable");
     let config = format!(
-        "[git]\nsign-on-push = true\n\
+        "[revsets]\ngit-sign-on-push = \"~signed() & mine()\"\n\
          [signing]\nbehavior = \"{behavior}\"\nbackend = \"ssh\"\nkey = \"ssh-ed25519 AAAAtest\"\n\
          [signing.backends.ssh]\nprogram = \"{}\"\n{extra}",
         program.display()
@@ -713,18 +836,16 @@ fn signing_config(test: &str, behavior: &str, fail: bool, extra: &str) -> (Strin
 }
 
 /// How many times the signer ran.
+#[cfg(unix)]
 fn sign_calls(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |text| text.lines().count())
 }
 
+#[cfg(unix)]
 fn is_signed(root: &Path, commit_id: &str) -> bool {
     harness::block_on(async {
         let workspace = harness::load_workspace(root);
-        let repo = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .expect("load repo at head");
+        let repo = workspace.load_at_head().await.expect("load repo at head");
         let id = jj_lib::backend::CommitId::try_from_hex(commit_id).expect("commit id");
         jj_lib::repo::Repo::store(repo.as_ref())
             .get_commit_async(&id)
@@ -735,6 +856,7 @@ fn is_signed(root: &Path, commit_id: &str) -> bool {
 }
 
 /// Whether the commit at `refs/heads/<name>` on the remote carries a signature.
+#[cfg(unix)]
 fn remote_signed(remote: &Path, name: &str) -> bool {
     harness::run_git(
         remote,
@@ -745,6 +867,7 @@ fn remote_signed(remote: &Path, name: &str) -> bool {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_with_everything_signed_pushes_without_rewriting() {
     let (config, log) = signing_config("push-sign-all-signed", "own", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-all-signed", Some(&config)) else {
@@ -776,6 +899,7 @@ fn sign_on_push_with_everything_signed_pushes_without_rewriting() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_signs_unsigned_commits_then_pushes_them() {
     let (config, _log) = signing_config("push-sign-unsigned", "keep", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-unsigned", Some(&config)) else {
@@ -828,6 +952,7 @@ fn sign_on_push_signs_unsigned_commits_then_pushes_them() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_signs_before_a_move_and_push_and_a_change_push() {
     let (config, _log) = signing_config("push-sign-move", "keep", false, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-move", Some(&config)) else {
@@ -862,18 +987,26 @@ fn sign_on_push_signs_before_a_move_and_push_and_a_change_push() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sign_on_push_skips_immutable_commits_with_a_warning() {
     let (config, _log) = signing_config(
         "push-sign-immutable",
         "keep",
         false,
-        "[revset-aliases]\n'immutable_heads()' = 'description(glob:\"frozen*\")'\n",
+        // A bookmark rather than a description: describing `@` into
+        // `immutable()` would start a new `@` on top of it, as jj-cli does.
+        "[revset-aliases]\n'immutable_heads()' = 'present(frozen)'\n",
     );
     let Some((mut repo, remote)) = setup_with_config("push-sign-immutable", Some(&config)) else {
         return;
     };
     let frozen = commit(&mut repo, "a.txt", "frozen");
     let frozen_change = repo.graph("@-")[0].summary.change_id.clone();
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "frozen".to_owned(),
+        to: at(&frozen),
+    })
+    .expect("freeze the first commit");
     let next = commit(&mut repo, "b.txt", "next");
     repo.mutate(MutationOp::CreateBookmark {
         name: "feature".to_owned(),
@@ -900,6 +1033,7 @@ fn sign_on_push_skips_immutable_commits_with_a_warning() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
     let (config, log) = signing_config("push-sign-fails", "keep", true, "");
     let Some((mut repo, remote)) = setup_with_config("push-sign-fails", Some(&config)) else {
@@ -928,4 +1062,49 @@ fn a_signing_failure_pushes_nothing_and_rewrites_nothing() {
     assert_eq!(one(&mut repo, "feature"), first);
     assert_eq!(one(&mut repo, "@"), wc);
     assert_eq!(harness::operation_log(&repo.root).len(), ops);
+}
+
+/// Undoing a push rolls back only the local record of the remote; jj-cli
+/// warns that it often leaves conflicted bookmarks. The undo is refused until
+/// the user confirms it, and the confirmed rerun is still a plain `jj undo`.
+#[test]
+fn undoing_a_push_asks_first() {
+    let Some((mut repo, remote)) = setup("push-undo") else {
+        return;
+    };
+    let first = commit(&mut repo, "a.txt", "first");
+    repo.mutate(MutationOp::CreateBookmark {
+        name: "feature".to_owned(),
+        to: at(&first),
+    })
+    .expect("create bookmark");
+    repo.mutate(push("origin", vec![PushTarget::Bookmark("feature".into())]))
+        .expect("push");
+
+    let undo = MutationOp::Undo { operation_id: None };
+    match repo.mutate(undo.clone()) {
+        Err(RepoError::UndoesPush { summary }) => {
+            assert!(summary.contains("Pushed feature"), "{summary}")
+        }
+        other => panic!("expected the push guard, got {other:?}"),
+    }
+
+    let events = repo.run(|job| Command::Mutate {
+        job,
+        op: undo,
+        allow_immutable: true,
+        seen_op: None,
+        seen_wc: None,
+    });
+    assert!(
+        matches!(events.last(), Some(Payload::MutationDone { .. })),
+        "{events:?}"
+    );
+    let args = harness::head_operation_args(&repo.root).unwrap_or_default();
+    assert!(!args.contains("--ignore-immutable"), "{args}");
+    assert_eq!(
+        remote_ref(&remote, "feature"),
+        Some(first),
+        "the remote keeps what was pushed"
+    );
 }

@@ -1,5 +1,5 @@
 //! Domain data model for diffui: the diff document, the compact commit store,
-//! and the per-revision metadata the loaders produce. Pure data — no `iced`.
+//! and the per-revision metadata the loaders produce. Pure data, no UI.
 
 use std::{
     cell::RefCell,
@@ -49,7 +49,7 @@ impl LoadProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RevisionSelection {
     #[default]
     WorkingCopy,
@@ -72,7 +72,7 @@ impl RevisionSelection {
 
 /// What a revision's diff is taken against. The revision itself is the "to"
 /// side of every base but [`DiffBase::Range`]; this names the "from" side.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DiffBase {
     /// `jj diff -r X`: X against its (merged) parents.
     #[default]
@@ -137,7 +137,7 @@ impl DiffBase {
 /// `jj diff`'s revision arguments as typed, before anything resolved them.
 /// [`crate::Session::diff_revsets`] resolves them with jj's rules and shows
 /// the result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffRequest {
     /// `jj diff -r REVSET…`: several are their union, none means `@`. One
     /// commit is that commit's own diff; several are a [`DiffBase::Range`],
@@ -154,7 +154,7 @@ pub enum DiffRequest {
 
 /// The commits a range diff covers, carried on its [`DiffDocument`] so the
 /// view can label the range and tint its rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiffRange {
     /// The revset as given.
     pub revset: String,
@@ -178,7 +178,7 @@ impl DiffRange {
     pub const COMMIT_LIMIT: usize = 10_000;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiffDocument {
     pub files: Vec<DiffFile>,
     pub total_additions: usize,
@@ -219,7 +219,7 @@ impl DiffDocument {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffFile {
     pub path: String,
     pub old_path: Option<String>,
@@ -235,10 +235,13 @@ pub struct DiffFile {
     /// preview caps, its bytes (see [`crate::media`]). Boxed: text files are
     /// the common case and carry none of it.
     pub blob: Option<Box<BlobChange>>,
+    /// The file's git mode before and after (`0o100644` to `0o100755`), when
+    /// it changed and the file exists on both sides.
+    pub mode_change: Option<(u32, u32)>,
 }
 
 /// The two sides of a file whose diff isn't (only) text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobChange {
     pub kind: BlobKind,
     /// `None` where the file is absent: before an add, after a delete.
@@ -256,7 +259,7 @@ impl BlobChange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlobKind {
     /// Any binary the app can't render: shown as its sizes.
     Binary,
@@ -267,7 +270,7 @@ pub enum BlobKind {
 }
 
 /// One side of a [`BlobChange`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobSide {
     pub size: u64,
     /// Content identity (`<blob hash>:<size>`): keys decodes, so a reload or
@@ -280,7 +283,7 @@ pub struct BlobSide {
 }
 
 /// Why a file's diff came back without rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffCollapse {
     /// The file alone changes too many lines.
     LargeFile,
@@ -292,13 +295,16 @@ pub enum DiffCollapse {
 /// builder input — it's pushed into a [`CommitStore`], which keeps the data
 /// compactly (interned authors, an arena for ids/descriptions, packed flags)
 /// so a million-commit history fits in memory. Read it back via [`RowView`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitSummary {
     pub change_id: String,
     pub commit_id: String,
     pub shortest_change_id_len: Option<usize>,
     pub description: String,
     pub author: String,
+    /// When the author made the commit, in milliseconds since the epoch.
+    /// `None` when the backend doesn't say (git's synthesized working copy).
+    pub author_timestamp: Option<i64>,
     pub has_description: bool,
     pub is_empty: Option<bool>,
     /// Whether the commit's tree is in a conflicted state (jj only — git
@@ -382,6 +388,8 @@ pub struct CommitStore {
     spans: Vec<CommitSpans>,
     authors: Vec<Arc<str>>,
     author_idx: Vec<u32>,
+    /// Author timestamps in epoch millis; [`NO_TIMESTAMP`] when unknown.
+    author_millis: Vec<i64>,
     shortest_change_id_len: Vec<u32>,
     flags: Vec<u16>,
     bookmarks: HashMap<usize, Vec<String>>,
@@ -413,6 +421,10 @@ pub struct CommitStore {
 /// after a load scanning.
 const INDEX_IDLE: Duration = Duration::from_millis(250);
 
+/// [`CommitStore::author_millis`]'s "no timestamp", so the column stays a
+/// plain `i64` per row rather than an `Option` twice the size.
+const NO_TIMESTAMP: i64 = i64::MIN;
+
 /// Row indices sorted by the id they carry, so `find_by_change_id` /
 /// `find_by_commit_id` binary-search rather than scan the whole store — the
 /// palette does one change-id lookup per displayed row per `view`, and the
@@ -426,8 +438,8 @@ const INDEX_IDLE: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Default)]
 struct IdOrder {
     /// Row count the lanes were built at; any other length means they're stale.
-    /// Only `push` changes it, and the one id that changes in place
-    /// ([`CommitStore::set_commit_id`]) clears it.
+    /// Only `push` changes it; the one id that changes in place
+    /// ([`CommitStore::set_commit_id`]) moves its row within the lane.
     built_at: Option<usize>,
     by_change_id: Vec<u32>,
     by_commit_id: Vec<u32>,
@@ -548,6 +560,14 @@ impl CommitStore {
         self.working_copy_row.map(|index| self.row(index))
     }
 
+    /// The row `selection` names, if it's in the loaded graph.
+    pub fn find(&self, selection: &RevisionSelection) -> Option<RowView<'_>> {
+        match selection {
+            RevisionSelection::WorkingCopy => self.working_copy(),
+            RevisionSelection::Commit(hex) => self.find_by_commit_id(hex),
+        }
+    }
+
     /// Row index of the working-copy (`@`) commit, if it's in the loaded graph.
     /// Used to refresh @'s "empty" chip from a working-copy snapshot without
     /// re-walking the graph.
@@ -609,13 +629,37 @@ impl CommitStore {
     /// without touching anything else in the graph, so patching the one row is
     /// all a re-walk would have changed. The old text stays in the arena (a few
     /// dozen bytes per save, gone at the next reload).
+    ///
+    /// The commit-id lane of [`IdOrder`] is patched in place rather than
+    /// dropped: this runs on every watcher snapshot, and a dropped order costs
+    /// the next lookup a sort of both lanes over the whole store.
     pub fn set_commit_id(&mut self, index: usize, commit_id: &str) {
         if index >= self.len() || self.row(index).commit_id() == commit_id {
             return;
         }
+        let mut order = std::mem::take(self.id_order.get_mut());
+        let built = order.built_at == Some(self.len());
+        if built {
+            let old = self.row(index).commit_id();
+            let start = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < old);
+            if let Some(offset) = order.by_commit_id[start..]
+                .iter()
+                .position(|&row| row as usize == index)
+            {
+                order.by_commit_id.remove(start + offset);
+            }
+        }
         let span = self.intern_text(commit_id);
         self.spans[index].commit_id = span;
-        self.id_order.get_mut().built_at = None;
+        if built {
+            let at = order
+                .by_commit_id
+                .partition_point(|&row| self.id(IdKind::Commit, row as usize) < commit_id);
+            order.by_commit_id.insert(at, index as u32);
+        }
+        *self.id_order.get_mut() = order;
     }
 
     /// Set a row's empty status, used to fill in the merge/root commits left
@@ -661,6 +705,8 @@ impl CommitStore {
 
         let author = intern_author(&mut self.authors, author_interner, &commit.author);
         self.author_idx.push(author);
+        self.author_millis
+            .push(commit.author_timestamp.unwrap_or(NO_TIMESTAMP));
 
         self.shortest_change_id_len
             .push(commit.shortest_change_id_len.unwrap_or(0) as u32);
@@ -745,6 +791,7 @@ impl CommitStore {
         total += self.authors.capacity() * size_of::<Arc<str>>();
         total += self.authors.iter().map(|name| name.len()).sum::<usize>();
         total += self.author_idx.capacity() * size_of::<u32>();
+        total += self.author_millis.capacity() * size_of::<i64>();
         total += self.shortest_change_id_len.capacity() * size_of::<u32>();
         total += self.flags.capacity() * size_of::<u16>();
         for names in self.bookmarks.values() {
@@ -787,6 +834,15 @@ impl<'a> RowView<'a> {
 
     pub fn author(&self) -> &'a str {
         &self.store.authors[self.store.author_idx[self.index] as usize]
+    }
+
+    /// When the author made the commit, in epoch millis (see
+    /// [`CommitSummary::author_timestamp`]).
+    pub fn author_timestamp(&self) -> Option<i64> {
+        match self.store.author_millis[self.index] {
+            NO_TIMESTAMP => None,
+            millis => Some(millis),
+        }
     }
 
     pub fn shortest_change_id_len(&self) -> Option<usize> {
@@ -875,6 +931,7 @@ impl CommitStoreBuilder {
         let mut store = CommitStore::default();
         store.spans.reserve(commits);
         store.author_idx.reserve(commits);
+        store.author_millis.reserve(commits);
         store.shortest_change_id_len.reserve(commits);
         store.flags.reserve(commits);
         Self {
@@ -1015,7 +1072,7 @@ pub fn file_tree_rows(
     rows
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffFileStatus {
     Added,
     Deleted,
@@ -1056,7 +1113,7 @@ pub struct BackendOutput {
 /// these into its live `CommitStore` + `GraphLayout` per `Batch` event, so the
 /// sidebar paints after the first batch instead of waiting for the whole (up to
 /// ~1M-row) history to load.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamRow {
     pub summary: CommitSummary,
     pub frame: LaneFrame,
@@ -1079,7 +1136,7 @@ pub struct CommitsTail {
 /// bookmark at or behind `@`, its tracked upstream (if any), and how far `@`
 /// sits ahead/behind that upstream. `None` when the working copy has no local
 /// bookmark in its ancestry, or for backends without branch tracking (git).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BranchStatus {
     /// The nearest local bookmark at or behind `@`.
     pub branch: String,
@@ -1096,7 +1153,7 @@ pub struct BranchStatus {
 /// which commit each points at (to know which bookmarks sit on a right-clicked
 /// revision) and per-remote tracking state (to offer push vs. track). Computed
 /// once per load alongside [`BranchStatus`]; empty for git repos.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BookmarksInfo {
     pub bookmarks: Vec<BookmarkEntry>,
     /// `@`'s commit id (hex), so a working-copy right-click can resolve the
@@ -1104,8 +1161,9 @@ pub struct BookmarksInfo {
     pub working_copy_commit: Option<String>,
     /// Every configured git remote, sorted — where a new bookmark can go.
     pub remotes: Vec<String>,
-    /// The `git.push` setting, when configured.
-    pub git_push: Option<String>,
+    /// The remotes the `git.push` setting matches, when it's configured. Since
+    /// jj 0.46 it holds name patterns and may pick several.
+    pub git_push: Option<Vec<String>>,
     /// Tag labels by commit id (hex), in jj's `tags` template form (`v1`,
     /// `v1@origin` for a remote tag elsewhere, `v1??` when conflicted). Read
     /// only: the graph shows them, nothing acts on them.
@@ -1113,15 +1171,31 @@ pub struct BookmarksInfo {
     /// `trunk()`'s commit id (hex), unless it falls back to the root commit
     /// because no trunk bookmark exists. jj only.
     pub trunk: Option<String>,
+    /// What a plain `jj git push` to [`Self::default_push_remote`] would send,
+    /// bookmarks then tags, by name. jj only; empty when nothing would go.
+    pub tracked_push: Vec<PushCandidate>,
+}
+
+/// A bookmark or tag a plain push would send, and how many commits its local
+/// target is ahead of the remote's copy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PushCandidate {
+    pub name: String,
+    pub tag: bool,
+    pub ahead: usize,
 }
 
 impl BookmarksInfo {
     /// The remote `jj git push` picks without `--remote`: `git.push`, else the
     /// only remote, else `origin` — `None` when that names no real remote
-    /// (several remotes, none of them `origin`), and the caller has to ask.
+    /// (several remotes, none of them `origin`) or `git.push` matches several,
+    /// which jj pushes to in turn and diffui doesn't, and the caller has to ask.
     pub fn default_push_remote(&self) -> Option<&str> {
         let pick = match (&self.git_push, self.remotes.as_slice()) {
-            (Some(configured), _) => configured.as_str(),
+            (Some(configured), _) => match configured.as_slice() {
+                [one] => one.as_str(),
+                _ => return None,
+            },
             (None, [only]) => only.as_str(),
             (None, _) => "origin",
         };
@@ -1133,7 +1207,7 @@ impl BookmarksInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BookmarkEntry {
     pub name: String,
     /// Commit ids (hex) the local bookmark points at. One entry normally;
@@ -1146,7 +1220,7 @@ pub struct BookmarkEntry {
     pub remotes: Vec<RemoteBookmarkRef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteBookmarkRef {
     pub remote: String,
     /// Commit id (hex) this remote ref points at.
@@ -1186,7 +1260,7 @@ impl BookmarkEntry {
 
 /// `jj show`-style summary of a single revision, used to render the header
 /// strip above the diff view.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RevisionDetails {
     pub commit_id: String,
     pub change_id: Option<String>,
@@ -1200,7 +1274,7 @@ pub struct RevisionDetails {
 }
 
 /// A parent named in [`RevisionDetails`]: enough to show and open it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParentBrief {
     pub commit_id: String,
     /// `None` on git, which has no change ids.
@@ -1210,16 +1284,59 @@ pub struct ParentBrief {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SignatureInfo {
     pub name: String,
     pub email: String,
     pub timestamp: Option<String>,
 }
 
+/// What a source without a graph says about itself: what the whole is (its
+/// header), and the steps it's made of, oldest first. A pull request's
+/// commits; a patch series' patches.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Outline {
+    pub subject: Subject,
+    pub steps: Vec<Step>,
+}
+
+/// What an [`Outline`] is of.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Subject {
+    PullRequest(crate::forge::PrInfo),
+    /// A patch, or a series of them (each a step), read from `origin`.
+    Patch {
+        /// Where it came from: a path, "stdin", "Clipboard".
+        origin: String,
+        /// A series' cover letter, or a single patch's email.
+        mail: Option<crate::patch::Mail>,
+    },
+    /// Two files or two folders, compared.
+    Compare {
+        left: std::path::PathBuf,
+        right: std::path::PathBuf,
+    },
+}
+
+/// One of the ordered pieces an [`Outline`] is made of.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Step {
+    /// What selects it: [`RevisionSelection::Commit`] of this id.
+    pub id: String,
+    /// The first line of its message.
+    pub title: String,
+    /// The whole message, title included.
+    pub message: String,
+    pub author: String,
+    /// When it was authored, in epoch millis.
+    pub authored_millis: Option<i64>,
+    /// Lines added and removed, when the source counts them.
+    pub counts: Option<(usize, usize)>,
+}
+
 // ---- Diff line model (moved here from the UI `diff_view` module) ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub old_line: Option<usize>,
@@ -1234,13 +1351,13 @@ pub struct DiffLine {
     pub emphasis: Vec<(usize, usize)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffHunkView {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffLineKind {
     Context,
     Addition,
@@ -1249,14 +1366,14 @@ pub enum DiffLineKind {
     Note,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyntaxSpan {
     pub start: usize,
     pub end: usize,
     pub kind: SyntaxKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SyntaxKind {
     Comment,
     String,
@@ -1283,6 +1400,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         }
     }
 
@@ -1294,6 +1412,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -1338,6 +1457,7 @@ mod tests {
             shortest_change_id_len: None,
             description: String::new(),
             author: String::new(),
+            author_timestamp: None,
             has_description: false,
             is_empty: None,
             has_conflict: false,
@@ -1386,6 +1506,38 @@ mod tests {
         assert!(store.find_by_change_id("bc").is_none());
         assert!(store.find_by_commit_id("a0x").is_none());
         assert!(CommitStore::default().find_by_change_id("ac").is_none());
+    }
+
+    #[test]
+    fn a_rewritten_commit_id_moves_within_the_built_order() {
+        let mut store = CommitStore::default();
+        let mut interner = HashMap::new();
+        for (change_id, commit_id) in [("zc", "z0"), ("ac", "a0"), ("mc", "m0")] {
+            store.push(ids(change_id, commit_id), &mut interner);
+        }
+        store.id_order.get_mut().last_push = None;
+        assert!(store.find_by_commit_id("a0").is_some());
+
+        // A watcher snapshot gives `@` (row 1) a new id, sorting last now.
+        store.set_commit_id(1, "zz");
+        assert_eq!(
+            store.id_order.borrow().built_at,
+            Some(3),
+            "the order survives the patch"
+        );
+        assert!(store.find_by_commit_id("a0").is_none());
+        assert_eq!(
+            store.find_by_commit_id("zz").map(|row| row.change_id()),
+            Some("ac")
+        );
+        assert_eq!(
+            store.find_by_commit_id("m0").map(|row| row.change_id()),
+            Some("mc")
+        );
+        assert_eq!(
+            store.find_by_change_id("ac").map(|row| row.commit_id()),
+            Some("zz")
+        );
     }
 
     #[test]

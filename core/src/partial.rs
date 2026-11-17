@@ -32,26 +32,26 @@ use jj_lib::merge::Diff;
 use crate::diff_parse::format_hunk_header;
 use crate::model::{DiffLine, DiffLineKind};
 
-/// Lines of context around each hunk. Must match the diff pane's (see
-/// `jj::diff::diff_jj_with_repo`), or hunk indices would name different lines
-/// on the two sides.
+/// Lines of context around each hunk. The diff pane's hunks are cut with it
+/// too (`jj::diff::diff_trees_with_copies`), or hunk indices would name
+/// different lines on the two sides.
 pub const HUNK_CONTEXT: usize = 3;
 
 /// A subset of one revision's changes, by file, hunk and line.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiffSelection {
     pub files: Vec<FileSelection>,
 }
 
 /// The picked part of one file's change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileSelection {
     /// Repo-relative path, as the diff lists it.
     pub path: String,
     pub hunks: HunkPick,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HunkPick {
     /// The whole file: its tree value as is — content, executable bit,
     /// deletion, binary or conflicted state. Path granularity, what
@@ -64,7 +64,7 @@ pub enum HunkPick {
 
 /// One hunk, by position in the file's diff, with the header it was shown
 /// with as a staleness check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HunkRef {
     pub index: usize,
     pub header: String,
@@ -74,7 +74,9 @@ pub struct HunkRef {
 
 /// One changed line of a hunk, by its 0-based index into the content of the
 /// side it lives on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum LineRef {
     /// A line of the parent's content that the change removes.
     Removed(usize),

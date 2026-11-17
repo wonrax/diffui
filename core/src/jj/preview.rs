@@ -7,6 +7,7 @@ use jj_lib::{
     backend::{ChangeId, CommitId},
     commit::Commit,
     graph::{GraphEdge, GraphEdgeType, TopoGroupedGraph},
+    id_prefix::IdPrefixIndex,
     object_id::ObjectId,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo},
@@ -21,7 +22,7 @@ use jj_lib::{
 
 use super::mutate::*;
 use super::walk::{describe_resolution_error, parse_user_revset, ref_labels};
-use super::workspace::TargetContext;
+use super::workspace::{Place, TargetContext, start_transaction};
 use crate::model::{CommitSummary, RevisionSelection};
 use crate::mutations::{
     Destination, DraftSimulation, InsertPreview, MergePreview, MutationOp, RebasePreview,
@@ -78,8 +79,13 @@ pub(crate) async fn preview(
         .get_wc_commit_id(scope.workspace_name)
         .context("jj workspace has no working-copy commit")?
         .clone();
-    let context = TargetContext::new(scope.repo.loader(), wc_commit_id, scope.seen_op);
-    let mut tx = scope.repo.start_transaction();
+    let context = TargetContext::new(scope.repo.loader(), wc_commit_id, scope.seen_op)
+        .resolving_trunk(&Place {
+            settings: scope.settings,
+            workspace_name: scope.workspace_name,
+            workspace_root: &scope.repository.root,
+        });
+    let mut tx = start_transaction(scope.repo, scope.workspace_name);
     let simulated = match request {
         PreviewRequest::Rebase {
             mode,
@@ -189,7 +195,8 @@ async fn simulate_merge(
         .context("failed to merge parent trees")?;
     let mut conflicts: Vec<String> = Vec::new();
     let mut truncated = false;
-    for (path, _value) in tree.conflicts() {
+    let mut tree_conflicts = tree.conflicts();
+    while let Some((path, _value)) = tree_conflicts.next().await {
         if conflicts.len() == CONFLICT_LIST_CAP {
             truncated = true;
             break;
@@ -601,7 +608,7 @@ async fn post_op_graph(
     let name = scope.workspace_name;
     let root = &scope.repository.root;
     let expression = parse_user_revset(root, base.settings(), name, revset)?;
-    let resolve = |repo: &dyn Repo| {
+    let evaluate = |repo: &dyn Repo| {
         let resolver = SymbolResolver::new(
             repo,
             &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
@@ -609,17 +616,15 @@ async fn post_op_graph(
         expression
             .resolve_user_expression(repo, &resolver)
             .map_err(describe_resolution_error)
-            .context("failed to resolve jj revset")
+            .context("failed to resolve jj revset")?
+            .evaluate()
+            .context("failed to evaluate jj revset")
     };
     // What the loaded graph shows: rows it has need no data shipped back.
-    let base_set = resolve(base.as_ref())?
-        .evaluate(base.as_ref())
-        .context("failed to evaluate jj revset")?;
+    let base_set = evaluate(base.as_ref())?;
     let shown_before = base_set.containing_fn();
-    let post_set = resolve(repo)?
-        .evaluate(repo)
-        .context("failed to evaluate jj revset")?;
-    if let Ok((lower, _)) = post_set.count_estimate()
+    let post_set = evaluate(repo)?;
+    if let Ok((lower, _)) = post_set.count_estimate().await
         && lower > GRAPH_CAP
     {
         return Ok(None);
@@ -670,11 +675,16 @@ async fn post_op_graph(
         })
         .and_then(|resolved| {
             resolved
-                .evaluate(repo)
+                .evaluate()
                 .context("failed to evaluate immutable()")
         })
         .ok();
     let is_immutable = immutable.as_ref().map(|set| set.containing_fn());
+    // Prefixes as the graph walk shortens them.
+    let id_prefixes = super::revset::id_prefix_context(root, base.settings(), name);
+    let id_prefix_index = id_prefixes
+        .populate(repo)
+        .unwrap_or_else(|_| IdPrefixIndex::empty());
 
     let mut missing: HashMap<CommitId, usize> = HashMap::new();
     let mut rows: Vec<PostOpRow> = Vec::with_capacity(nodes.len());
@@ -712,7 +722,16 @@ async fn post_op_graph(
                     new_conflict: commit.has_conflict()
                         && !pred.is_some_and(|pred| pred.has_conflict()),
                     summary: Some(
-                        summary_of(repo, &commit, origin.hex(), labels, is_wc, immutable).await,
+                        summary_of(
+                            repo,
+                            &id_prefix_index,
+                            &commit,
+                            origin.hex(),
+                            labels,
+                            is_wc,
+                            immutable,
+                        )
+                        .await,
                     ),
                 }
             }
@@ -725,7 +744,18 @@ async fn post_op_graph(
                     None
                 } else {
                     let commit = load_commit(repo, id).await?;
-                    Some(summary_of(repo, &commit, id.hex(), labels, is_wc, immutable).await)
+                    Some(
+                        summary_of(
+                            repo,
+                            &id_prefix_index,
+                            &commit,
+                            id.hex(),
+                            labels,
+                            is_wc,
+                            immutable,
+                        )
+                        .await,
+                    )
                 };
                 PostOpRow {
                     origin: Some(id.hex()),
@@ -749,6 +779,7 @@ async fn post_op_graph(
 /// draft sources keep matching it.
 async fn summary_of(
     repo: &dyn Repo,
+    id_prefixes: &IdPrefixIndex<'_>,
     commit: &Commit,
     commit_id: String,
     bookmarks: Vec<String>,
@@ -770,8 +801,8 @@ async fn summary_of(
     CommitSummary {
         change_id: commit.change_id().to_string(),
         commit_id,
-        shortest_change_id_len: repo
-            .shortest_unique_change_id_prefix_len(commit.change_id())
+        shortest_change_id_len: id_prefixes
+            .shortest_change_prefix_len(repo, commit.change_id())
             .await
             .ok(),
         description: if description.is_empty() {
@@ -780,6 +811,7 @@ async fn summary_of(
             description.to_owned()
         },
         author: commit.author().name.clone(),
+        author_timestamp: Some(commit.author().timestamp.timestamp.0),
         has_description: !description.is_empty(),
         is_empty,
         has_conflict: commit.has_conflict(),

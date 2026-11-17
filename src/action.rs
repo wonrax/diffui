@@ -2,14 +2,12 @@
 //!
 //! Every producer — the keyboard (through [`crate::keymap`]), the command
 //! palette, the menus, toolbar buttons, drag & drop — ends up emitting an
-//! [`Action`], and `Message::Action` is the single arm that performs it. That
-//! is what keeps a fix in one place: before this existed the same intent was
-//! spelled three ways (a `MenuAction`, a palette `CommandId`, a key match) and
-//! a bug fixed in one spelling stayed alive in the other two.
+//! [`Action`], and [`crate::Diffui::perform`] is the one place that carries it
+//! out, so a fix lands once for every way of asking.
 //!
 //! An `Action` is *what the user asked for*, not how a widget said it. Widget
-//! plumbing (scroll offsets, hover, debounce ticks) stays out — see
-//! [`crate::message::UiEvent`].
+//! plumbing (scroll offsets, hover, debounce ticks) stays out: those are
+//! listeners that change state directly.
 
 use diffui_core::{FetchTarget, RevisionSelection};
 
@@ -90,7 +88,10 @@ pub(crate) enum Action {
     FindPrevious,
     OpenRepoDialog,
     CloseRepoDialog,
+    /// Open the clipboard's text as a patch, in a tab of its own.
+    OpenClipboardPatch,
     /// Pick a local working-copy directory with the native folder chooser.
+    #[cfg(target_os = "macos")]
     ChooseRepoFolder,
     /// Resolve the dialog's path and open it as a tab — or, with a folder
     /// suggestion highlighted, act on that row as a click would.
@@ -104,6 +105,16 @@ pub(crate) enum Action {
     OpenRepoPick(usize),
     /// Open a repository (or PR) by path/reference.
     OpenRepo(String),
+    /// Open a row of the recent list, by its key: a root here, or
+    /// `host:root`.
+    OpenRecent(String),
+    /// List the hosts in the open prompt, to pick the machine the path is
+    /// on (or put the folders back).
+    OpenRepoHosts,
+    /// Point the open prompt at a host; `None` is this machine.
+    OpenRepoHost(Option<String>),
+    /// Reach the active tab's host again after its connection was lost.
+    ReconnectHost,
     /// Remove one path from the persisted recent-repository list.
     RemoveRecentRepo(String),
     ClearRecentRepos,
@@ -114,6 +125,8 @@ pub(crate) enum Action {
     /// Open or close the keyboard-shortcut cheat sheet.
     ToggleShortcuts,
     CloseShortcuts,
+    OpenSettings,
+    CloseSettings,
     ConfirmAccept,
     ConfirmCancel,
 
@@ -122,6 +135,9 @@ pub(crate) enum Action {
     Fetch(FetchTarget),
     Undo,
     Redo,
+    /// `jj workspace update-stale`, through the jj CLI: bring a stale
+    /// checkout's files up to date.
+    UpdateStaleWorkingCopy,
     /// Revert exactly this jj operation (an activity row's "Revert").
     UndoOperation(activity::ActivityId, String),
     /// Replace the revset and re-evaluate.
@@ -142,6 +158,13 @@ pub(crate) enum Action {
     /// Collapse or restore the changed-files pane.
     ToggleFilesPanel,
     SetTheme(ThemePreference),
+    /// Keep up with the disk on its own, or only when Refresh is pressed.
+    SetRefreshMode(diffui_core::RefreshMode),
+    /// A font or code text setting from the settings dialog: applied now and
+    /// saved.
+    ChangeSetting(crate::config::Setting),
+    /// Show a section of the settings dialog.
+    SettingsSection(crate::settings::Section),
     SetMainView(MainView),
 
     // ── Tabs ────────────────────────────────────────────────────────────
@@ -176,6 +199,8 @@ pub(crate) enum Action {
 
     /// Bookmark workflow and push — see [`crate::bookmarks`].
     Bookmark(crate::bookmarks::BookmarkAction),
+    /// The pull-request workflow (see [`crate::forge_dialog`]).
+    Forge(crate::forge_dialog::ForgeAction),
 
     /// Answer the credential prompt — see [`crate::credentials`].
     Credential(crate::credentials::CredentialAction),
@@ -189,6 +214,9 @@ pub(crate) enum Action {
     /// A change-selection or conflict-resolution intent (see
     /// [`crate::changes`]).
     Changes(crate::changes::ChangesMsg),
+    /// Review notes: reply, resolve, step through, the Notes view (see
+    /// [`crate::notes`]).
+    Notes(crate::notes::NotesMsg),
 
     // ── History ─────────────────────────────────────────────────────────
     /// Op log, evolog, file history, annotate — see [`crate::history_panel`].
@@ -197,14 +225,43 @@ pub(crate) enum Action {
     // ── Diagnostics ─────────────────────────────────────────────────────
     /// Show diffui's log file in the file manager.
     RevealLogFile,
-    /// Open `config.toml` in a text editor, creating it if missing.
-    OpenConfigFile,
+    /// Show `config.toml` or `settings.toml` in the file manager.
+    RevealConfigFile(crate::config::ConfigFile),
 
     // ── Comparing ───────────────────────────────────────────────────────
     /// Diff two revisions against each other (see [`crate::compare`]).
     Compare(crate::compare::CompareAction),
     /// Range diffs: diff since trunk, and the range banner's edit.
     Range(crate::range::RangeAction),
+    /// A tab's scope, its steps, and how its header reads (see
+    /// [`crate::review`]).
+    Review(crate::review::ReviewAction),
     /// Load the full diff of a file (by index) the backend collapsed for size.
     ExpandFile(usize),
+
+    // ── Declared commands ───────────────────────────────────────────────
+    /// Run a `[[commands]]` row on `arg`, on `tab`: the tab it was offered
+    /// on, which its prompts and its output stay with whatever is on screen
+    /// by then.
+    RunUserCommand {
+        command: std::sync::Arc<crate::user_commands::UserCommand>,
+        tab: TabId,
+        arg: crate::commands::CommandArg,
+    },
+    /// Run a plugin's command on `arg`, on `tab`: the tab it was offered on.
+    RunPluginCommand {
+        command: std::sync::Arc<crate::plugins::PluginCommand>,
+        tab: TabId,
+        arg: crate::commands::CommandArg,
+    },
+    /// The permission dialog's answer, and what Settings does to a plugin.
+    Plugin(crate::plugins::PluginAction),
+    /// Settings' hosts: the list's field and a host's page.
+    Host(crate::host_page::HostAction),
+    /// Settings → AI.
+    Ai(crate::ai::AiAction),
+    /// Stop the program writing into the description editor.
+    StopGenerating,
+    /// Read `config.toml`'s keys and commands again.
+    ReloadCommands,
 }

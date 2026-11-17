@@ -1,11 +1,11 @@
-//! `jj git fetch`, as jj-cli 0.45.1 runs it: which remotes, which bookmarks
+//! `jj git fetch`, as jj-cli 0.47.1 runs it: which remotes, which bookmarks
 //! and tags from each, the import (auto-tracking, abandoning what the remote
 //! dropped), and the transaction tail (rebasing mutable descendants, a fresh
 //! `@` when the old one became immutable, the colocated git sync). It runs
 //! under the same locked prologue as a mutation, with git's progress and the
 //! credential prompt wired in.
 //!
-//! Ported from jj-cli 0.45.1, where the command is private. Check each against
+//! Ported from jj-cli 0.47.1, where the command is private. Check each against
 //! its source on a jj bump:
 //! - `fetch_locked`: `cmd_git_fetch` (`cli/src/commands/git/fetch.rs`).
 //! - `default_fetch_remotes`: `get_default_fetch_remotes` (same file) and
@@ -17,6 +17,8 @@
 //! - The transaction tail: `WorkspaceCommandTransaction::finish`,
 //!   `rebase_mutable_descendants` and `finish_transaction`
 //!   (`cli/src/cli_util.rs`).
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use jj_cli::{
@@ -30,13 +32,12 @@ use jj_lib::{
     config::ConfigGetResultExt as _,
     git::{
         GitFetch, GitFetchRefExpression, GitImportStats, GitSettings, IgnoredRefspecs,
-        expand_fetch_refspecs, get_all_remote_names, get_git_backend, load_default_fetch_bookmarks,
+        get_all_remote_names, get_git_backend, load_default_fetch_bookmarks,
     },
     object_id::ObjectId,
     op_store::RemoteRefState,
-    ref_name::{RefName, RemoteName, RemoteNameBuf, WorkspaceName},
-    repo::Repo,
-    revset::{ResolvedRevsetExpression, RevsetExpression, SymbolResolver},
+    ref_name::{RefName, RemoteName, RemoteNameBuf},
+    repo::{ReadonlyRepo, Repo},
     rewrite::RebaseOptions,
     settings::UserSettings,
     store::Store,
@@ -46,8 +47,10 @@ use jj_lib::{
 
 use super::remote::CollectingCallback;
 use super::settings::cli_error;
-use super::walk::parse_user_revset;
-use super::workspace::{LockOutcome, LockedWorkingCopy, SnapshotContext, lock_working_copy};
+use super::workspace::{
+    LockOutcome, LockedWorkingCopy, Place, SnapshotContext, WC_BECAME_IMMUTABLE_NOTE,
+    fold_into_working_copy, lock_working_copy, renew_immutable_working_copy, start_transaction,
+};
 use crate::model::LoadProgress;
 use crate::repository::{FetchOutcome, FetchTarget};
 
@@ -58,44 +61,54 @@ use crate::repository::{FetchOutcome, FetchTarget};
 ///
 /// jj-lib's [`GitFetch`] spawns `git fetch`, so authentication reuses the
 /// user's git credential setup, plus diffui's credential prompt.
+///
+/// A stale checkout is updated first when `update_stale` says so (the flag
+/// beside the outcome reports it), as [`apply_mutation`] does.
+///
+/// Also returns the repo at the operation the fetch left at head, for the
+/// caller to keep instead of loading it again.
+///
+/// [`apply_mutation`]: super::mutate::apply_mutation
 pub(crate) async fn fetch_jj(
     workspace: &mut Workspace,
     settings: &UserSettings,
     context: &SnapshotContext,
+    update_stale: bool,
     target: &FetchTarget,
     progress: &LoadProgress,
-) -> Result<FetchOutcome> {
+) -> Result<(FetchOutcome, bool, Arc<ReadonlyRepo>)> {
     let workspace_name = workspace.workspace_name().to_owned();
     let workspace_root = workspace.workspace_root().to_owned();
     let repo_loader = workspace.repo_loader().clone();
-    let options = context.options();
-    let mut locked =
-        match lock_working_copy(workspace, &repo_loader, &workspace_name, &options).await? {
+    // A recovered checkout already finished its own lock at the merged
+    // operation, so the fetch takes a new one over the updated `@`.
+    for attempt in 0..2 {
+        let mut locked = match lock_working_copy(
+            workspace,
+            &repo_loader,
+            &workspace_name,
+            context,
+            update_stale,
+        )
+        .await?
+        {
             LockOutcome::Locked(locked) => locked,
-            // A recovered checkout already finished its own lock at the merged
-            // operation; the caller refreshes and the user can fetch again.
-            LockOutcome::Recovered { .. } => {
-                bail!("the working copy was stale and has been recovered; try the fetch again")
+            LockOutcome::Recovered { .. } => continue,
+        };
+        let place = Place {
+            settings,
+            workspace_name: &workspace_name,
+            workspace_root: &workspace_root,
+        };
+        return match fetch_locked(&mut locked, &place, target, progress).await {
+            Ok((outcome, repo)) => Ok((outcome, attempt > 0, repo)),
+            Err(error) => {
+                locked.abandon();
+                Err(error)
             }
         };
-    let place = Place {
-        settings,
-        workspace_name: &workspace_name,
-        workspace_root: &workspace_root,
-    };
-    match fetch_locked(&mut locked, &place, target, progress).await {
-        Ok(outcome) => Ok(outcome),
-        Err(error) => {
-            locked.abandon();
-            Err(error)
-        }
     }
-}
-
-struct Place<'a> {
-    settings: &'a UserSettings,
-    workspace_name: &'a WorkspaceName,
-    workspace_root: &'a std::path::Path,
+    bail!("jj working copy kept going stale while fetching")
 }
 
 /// `cmd_git_fetch`, with the lock held. Split out so [`fetch_jj`] has exactly
@@ -105,7 +118,7 @@ async fn fetch_locked(
     place: &Place<'_>,
     target: &FetchTarget,
     progress: &LoadProgress,
-) -> Result<FetchOutcome> {
+) -> Result<(FetchOutcome, Arc<ReadonlyRepo>)> {
     let ui = Ui::null();
     let settings = place.settings;
     let repo = locked.repo.clone();
@@ -146,7 +159,7 @@ async fn fetch_locked(
         .map(|remote| remote.as_str().to_owned())
         .collect();
 
-    let mut tx = repo.start_transaction();
+    let mut tx = start_transaction(&repo, place.workspace_name);
     tx.set_attribute(
         "args".to_owned(),
         crate::plan::args_tag(&crate::plan::fetch_command(target)),
@@ -155,16 +168,9 @@ async fn fetch_locked(
     // operation carries them instead of stranding them behind an op that
     // rewrote the view. (jj snapshots into an operation of its own first.)
     if locked.tree_changed() {
-        let rewritten = tx
-            .repo_mut()
-            .rewrite_commit(&locked.wc_commit)
-            .set_tree(locked.tree.clone())
-            .write()
+        fold_into_working_copy(place, tx.repo_mut(), &locked.wc_commit, locked.tree.clone())
             .await
             .context("failed to fold working-copy changes before fetch")?;
-        tx.repo_mut()
-            .set_wc_commit(place.workspace_name.to_owned(), rewritten.id().clone())
-            .context("failed to update working-copy pointer before fetch")?;
         tx.repo_mut()
             .rebase_descendants()
             .await
@@ -182,7 +188,7 @@ async fn fetch_locked(
         ),
         FetchTarget::Default | FetchTarget::AllRemotes => (None, None),
     };
-    let mut expansions = Vec::with_capacity(matching_remotes.len());
+    let mut remote_ref_exprs = Vec::with_capacity(matching_remotes.len());
     {
         let git_repo = get_git_backend(tx.repo().store())
             .context("fetching needs a git-backed repo")?
@@ -214,11 +220,7 @@ async fn fetch_locked(
             } else {
                 StringExpression::all()
             };
-            let expanded = expand_fetch_refspecs(remote, GitFetchRefExpression { bookmark, tag })
-                .with_context(|| {
-                format!("invalid fetch patterns for {}", remote.as_symbol())
-            })?;
-            expansions.push((remote, expanded));
+            remote_ref_exprs.push((remote, GitFetchRefExpression { bookmark, tag }));
         }
     }
 
@@ -233,12 +235,15 @@ async fn fetch_locked(
         let askpass = crate::askpass::Scope::new();
         let mut subprocess_options = git_settings.to_subprocess_options();
         subprocess_options.environment.extend(askpass.environment());
+        subprocess_options
+            .environment
+            .extend(crate::git::stall_limit_env());
         let mut fetcher = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)
             .context("failed to start git fetch")?;
         let mut callback = CollectingCallback::new(progress.clone());
-        for (remote, expanded) in expansions {
+        for (remote, ref_expr) in &remote_ref_exprs {
             fetcher
-                .fetch(remote, expanded, &mut callback, None)
+                .fetch(remote, ref_expr, &mut callback, None)
                 .map_err(|error| askpass.explain(error.into()))
                 .with_context(|| format!("failed to fetch from {}", remote.as_symbol()))?;
         }
@@ -264,13 +269,13 @@ async fn fetch_locked(
         outcome.output.push("Nothing changed.".to_owned());
         outcome.output.extend(git_output);
         locked.finish(repo.op_id().clone()).await?;
-        return Ok(outcome);
+        return Ok((outcome, repo));
     }
     outcome.changed = true;
 
     // Fetching can move immutable commits to match the remote; their
     // immutable descendants stay put.
-    let immutable = immutable_set(place, tx.base_repo().as_ref())?;
+    let immutable = place.immutable(tx.base_repo().as_ref())?;
     let mut rebased = 0usize;
     tx.repo_mut()
         .rebase_descendants_with_options(&immutable, &RebaseOptions::default(), |_, _| rebased += 1)
@@ -283,59 +288,23 @@ async fn fetch_locked(
     }
 
     // A working-copy commit the fetch made immutable gets a fresh one on top.
-    if let Some(wc_id) = tx
-        .repo()
-        .view()
-        .get_wc_commit_id(place.workspace_name)
-        .cloned()
-    {
-        let immutable_now = immutable_set(place, tx.repo())?;
-        let is_immutable = immutable_now
-            .intersection(&RevsetExpression::commit(wc_id.clone()))
-            .evaluate(tx.repo())
-            .context("failed to check the working-copy commit")?
-            .is_empty()
-            .map(|empty| !empty)
-            .context("failed to check the working-copy commit")?;
-        if is_immutable {
-            let wc_commit = tx
-                .repo()
-                .store()
-                .get_commit_async(&wc_id)
-                .await
-                .context("failed to load the working-copy commit")?;
-            let fresh = tx
-                .repo_mut()
-                .new_commit(vec![wc_id], wc_commit.tree())
-                .write()
-                .await
-                .context("failed to write a new working-copy commit")?;
-            tx.repo_mut()
-                .set_wc_commit(place.workspace_name.to_owned(), fresh.id().clone())
-                .context("failed to move the working copy")?;
-            outcome.warnings.push(
-                "The working-copy commit became immutable; a new commit has been created on top \
-                 of it."
-                    .to_owned(),
-            );
-        }
+    if renew_immutable_working_copy(place, tx.repo_mut()).await? {
+        outcome.warnings.push(WC_BECAME_IMMUTABLE_NOTE.to_owned());
     }
 
     // Only a colocated workspace exports to git here, as in jj-cli; elsewhere
     // the fetched refs stay jj's until a push or `jj git export`.
-    if super::colocate::is_colocated(tx.repo().store(), place.workspace_root)? {
-        super::colocate::sync_git_after_transaction(
-            tx.repo_mut(),
-            place.workspace_name,
-            place.workspace_root,
-        )
-        .await?;
-    }
+    super::colocate::sync_git_after_transaction(
+        tx.repo_mut(),
+        place.workspace_name,
+        place.workspace_root,
+    )
+    .await?;
     let remotes = matching_remotes
         .iter()
         .map(|remote| remote.as_symbol().to_string())
         .collect::<Vec<_>>()
-        .join(",");
+        .join(", ");
     let new_repo = tx
         .commit(format!("diffui: fetch from git remote(s) {remotes}"))
         .await
@@ -357,7 +326,7 @@ async fn fetch_locked(
     locked.finish(new_repo.op_id().clone()).await?;
 
     outcome.output.extend(git_output);
-    Ok(outcome)
+    Ok((outcome, new_repo))
 }
 
 /// `get_default_fetch_remotes`: `git.fetch` (a name, a pattern or a list of
@@ -394,27 +363,6 @@ fn default_fetch_remotes(
         }
         None => StringExpression::exact(DEFAULT_REMOTE),
     })
-}
-
-/// `immutable()` as jj resolves it for the transaction tail.
-fn immutable_set(
-    place: &Place<'_>,
-    repo: &dyn Repo,
-) -> Result<std::sync::Arc<ResolvedRevsetExpression>> {
-    parse_user_revset(
-        place.workspace_root,
-        place.settings,
-        place.workspace_name,
-        "immutable()",
-    )?
-    .resolve_user_expression(
-        repo,
-        &SymbolResolver::new(
-            repo,
-            &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
-        ),
-    )
-    .context("failed to resolve immutable()")
 }
 
 fn warn_ignored_refspecs(

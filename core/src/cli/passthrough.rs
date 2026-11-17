@@ -1,7 +1,7 @@
 //! Running the real jj CLI for the commands diffui doesn't run itself.
 //!
 //! The CLI is diffui's own binary: started with `argv[0]` = `jj` it runs
-//! jj-cli 0.45.1's `CliRunner` (see [`jj_main`]), which links the same jj-lib
+//! jj-cli 0.47.1's `CliRunner` (see [`jj_main`]), which links the same jj-lib
 //! diffui embeds. So the CLI always matches the repo format diffui writes,
 //! whatever `jj` is on the user's `PATH`, and it reads the user's jj config
 //! the way the real CLI does. Core can't know the app's executable, so the
@@ -19,10 +19,12 @@ use crate::repo::cancel::CancelFlag;
 use crate::repo::{JobId, Payload};
 
 /// The jj-cli version linked in, which `jj version` reports.
-pub const JJ_VERSION: &str = "0.45.1";
+pub const JJ_VERSION: &str = "0.47.1";
 
-/// Set in a passthrough child's environment: the CLI then writes plain text
-/// (no colour, no pager) whatever the user's `ui.color` says.
+/// Set in a passthrough child's environment: the binary runs as the jj CLI
+/// (the only way to say so on Windows, whose `argv[0]` can't be set), and
+/// writes plain text (no colour, no pager) whatever the user's `ui.color`
+/// says.
 const PASSTHROUGH_ENV: &str = "DIFFUI_JJ_PASSTHROUGH";
 
 /// How long output may sit before it's sent, and how often a cancel is
@@ -33,7 +35,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_BATCH: usize = 256;
 
 /// One jj CLI run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CliInvocation {
     /// An executable that runs jj-cli when started as `jj`: the app's own
     /// binary (`std::env::current_exe()`).
@@ -57,7 +59,7 @@ impl CliInvocation {
 }
 
 /// Which stream a line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CliStream {
     Stdout,
     Stderr,
@@ -65,7 +67,7 @@ pub enum CliStream {
 
 /// One line of CLI output, without its newline and with any ANSI styling
 /// removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CliLine {
     pub stream: CliStream,
     pub text: String,
@@ -239,16 +241,24 @@ fn strip_ansi(text: &str) -> String {
 
 /// The app's first call in `main`, before anything else is set up.
 ///
-/// - Started as `jj` (`argv[0]`'s file name): run jj-cli and return its exit
-///   code. This is how passthrough children run.
+/// - Started as `jj` (`argv[0]`'s file name), or as a passthrough child
+///   ([`PASSTHROUGH_ENV`]): run jj-cli and return its exit code.
 /// - Started as `diffui jj <args…>`: re-execute as `jj <args…>`, so jj's
 ///   usage and error text say `jj`. Returns only if that fails.
 /// - Otherwise `None`: carry on as the GUI.
 pub fn jj_main() -> Option<u8> {
+    let passthrough = std::env::var_os(PASSTHROUGH_ENV).is_some();
+    if passthrough {
+        // Off before jj starts anything that could inherit it: a merge tool
+        // or credential helper that is this same binary must come up as
+        // itself, not as jj.
+        // SAFETY: the app's first calls, before any other thread exists.
+        unsafe { std::env::remove_var(PASSTHROUGH_ENV) };
+    }
     let mut args = std::env::args_os();
     let argv0 = args.next()?;
-    if Path::new(&argv0).file_name() == Some(OsStr::new("jj")) {
-        return Some(run_cli());
+    if passthrough || named_jj(Path::new(&argv0)) {
+        return Some(run_cli(passthrough));
     }
     if args.next().as_deref() != Some(OsStr::new("jj")) {
         return None;
@@ -273,9 +283,19 @@ fn reexec_as_jj(_args: std::env::ArgsOs) -> u8 {
     1
 }
 
-fn run_cli() -> u8 {
+/// Whether `argv0` names jj: `jj`, or `jj.exe` on Windows.
+fn named_jj(argv0: &Path) -> bool {
+    argv0.file_stem() == Some(OsStr::new("jj"))
+        && argv0
+            .extension()
+            .is_none_or(|extension| cfg!(windows) && extension.eq_ignore_ascii_case("exe"))
+}
+
+/// jj-cli on this process's arguments. `plain` (a passthrough child) turns
+/// colour and the pager off.
+fn run_cli(plain: bool) -> u8 {
     let runner = jj_cli::cli_util::CliRunner::init().version(JJ_VERSION);
-    let runner = if std::env::var_os(PASSTHROUGH_ENV).is_some() {
+    let runner = if plain {
         runner.add_dispatch_hook(async |ui, helper, dispatch| {
             // Plain output for the GUI, without putting `--color=never
             // --no-pager` into the args jj records in the op log.
@@ -313,6 +333,16 @@ mod tests {
             "link"
         );
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn knows_jj_by_its_file_name() {
+        assert!(named_jj(Path::new("jj")));
+        assert!(named_jj(Path::new("/usr/local/bin/jj")));
+        assert_eq!(named_jj(Path::new(r"C:\tools\jj.exe")), cfg!(windows));
+        assert!(!named_jj(Path::new("diffui")));
+        assert!(!named_jj(Path::new("jj.sh")));
+        assert!(!named_jj(Path::new(r"C:\tools\diffui.exe")));
     }
 
     #[cfg(unix)]

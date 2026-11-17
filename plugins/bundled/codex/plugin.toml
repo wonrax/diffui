@@ -1,0 +1,19 @@
+# Codex, the `codex` program, as diffui's AI: `codex exec` with the prompt as
+# its argument and the diff on stdin. Bundled with diffui; Settings → AI picks
+# it, and `diffui plugin eject codex` copies it out to edit.
+id = "codex"
+name = "Codex"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+exec = [["{config.program}"]]
+
+[provides.ai]
+ready = "program"
+model = "model"
+
+[config.schema]
+program = { type = "path", default = "codex", label = "The codex program" }
+model = { type = "string", label = "Model", hint = "Passed as --model. Empty uses Codex's own." }

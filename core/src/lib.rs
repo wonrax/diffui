@@ -2,15 +2,16 @@
 //!
 //! This crate owns the jj/git diffing, the commit graph, and — as the
 //! extraction proceeds — the diff data model and a `Session` orchestration
-//! engine. It has **no `iced` dependency**, so alternative frontends
+//! engine. It has **no UI dependency**, so alternative frontends
 //! (electron, swiftui, web, …) can build on it.
 
 pub mod askpass;
 pub mod cli;
+pub mod commit_search;
 pub mod completion;
 pub mod diff_parse;
+pub mod forge;
 pub mod git;
-pub mod github;
 pub mod graph;
 pub mod graph_layout;
 pub mod highlights;
@@ -19,10 +20,14 @@ pub mod jj;
 pub mod media;
 pub mod model;
 pub mod mutations;
+pub mod notes;
 pub mod partial;
+pub mod patch;
 pub mod plan;
 pub mod preview_graph;
+pub mod process;
 pub mod push;
+pub mod remote;
 pub mod repo;
 pub mod repository;
 pub mod resolve;
@@ -44,10 +49,13 @@ pub use mutations::{
 };
 pub use partial::{DiffSelection, FileSelection, HunkPick, HunkRef, LineRef};
 pub use preview_graph::{PostOpGraph, PreviewGraph, PreviewRole, PreviewRow, RowSource};
-pub use push::{PushAllow, PushCheck, PushRejection, PushRequest, PushTarget, RejectedCommit};
+pub use push::{
+    BookmarkMove, MoveKind, PushAllow, PushCheck, PushRejection, PushRequest, PushTarget,
+    RejectedCommit,
+};
 pub use repo::{
-    Capabilities, Command, Event, JobId, OpenSpec, Payload, PreviewRequest, RepoError, RepoHandle,
-    RepoId, canonical_selection, rewritten_targets,
+    Capabilities, Command, DiskState, DiskSync, Event, JobId, OpenSpec, Payload, PreviewRequest,
+    RemoteRepository, RepoError, RepoHandle, RepoId, canonical_selection, rewritten_targets,
 };
 pub use repository::{
     FetchOutcome, FetchTarget, Repository, RepositorySnapshot, Vcs, prepare_repository,
@@ -60,7 +68,7 @@ pub use revset::{
     RevsetCompleter, RevsetError, RevsetExpect, RevsetMatch, RevsetQuery, RevsetSymbols,
 };
 pub use session::{
-    ColdBatchFold, ColdCursor, DiffSpan, Effect, LoadStatus, RefreshOrigin, Session,
+    ColdBatchFold, ColdCursor, DiffSpan, Effect, LoadStatus, RefreshMode, RefreshOrigin, Session,
     coalesce_refresh, fold_cold_batch,
 };
 pub use source_browse::{

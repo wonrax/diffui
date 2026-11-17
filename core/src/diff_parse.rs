@@ -10,6 +10,29 @@ struct PendingHunk {
     rows: Vec<DiffLine>,
     next_old_line: usize,
     next_new_line: usize,
+    /// Old and new lines the header says are still to come. `None` when the
+    /// header gives no counts (a forge's placeholder), and then the hunk runs
+    /// to the next header, as every hunk used to.
+    left: Option<(usize, usize)>,
+    /// Marker columns before each line's text: 1, or one per parent in a
+    /// combined (`diff --cc`) diff.
+    columns: usize,
+}
+
+impl PendingHunk {
+    /// Whether the next line is still the hunk's. Once its counts are used
+    /// up, what follows (a mail signature, commentary between files) isn't
+    /// diff content.
+    fn open(&self) -> bool {
+        self.left.is_none_or(|(old, new)| old > 0 || new > 0)
+    }
+
+    fn take(&mut self, old: bool, new: bool) {
+        if let Some((left_old, left_new)) = &mut self.left {
+            *left_old = left_old.saturating_sub(usize::from(old));
+            *left_new = left_new.saturating_sub(usize::from(new));
+        }
+    }
 }
 
 pub fn format_hunk_header(
@@ -43,51 +66,122 @@ fn format_hunk_range(range: &std::ops::Range<usize>) -> String {
 /// ready to display — as soon as the next file's header shows it's done, so a
 /// huge diff renders progressively instead of after the whole download.
 /// [`parse_unified_diff`] is the one-shot wrapper over this.
+///
+/// Besides git's own output it reads what other tools write: plain
+/// `---`/`+++` pairs (`diff -u`, `diff -ruN`, svn, hg) with whatever
+/// headers they put before them (`Index:`, `===`, `diff -r …`), a
+/// `git format-patch` email around its diff, combined merge diffs
+/// (`diff --cc`), shown against the first parent, and CRLF line ends.
+/// A hunk ends when its header's line counts are used up, so text after
+/// it is never read as rows.
 #[derive(Default)]
 pub struct DiffStreamParser {
     current_file: Option<DiffFile>,
     current_hunk: Option<PendingHunk>,
+    /// The current file's header lines are still coming: from its
+    /// `diff --git` to its `+++` or first hunk.
+    in_header: bool,
+    /// The file came from a `---`/`+++` pair alone, with no `diff --git`
+    /// header to say whether it was added or deleted.
+    plain: bool,
+    /// A `---` line outside any header: a plain diff's old side, waiting
+    /// for its `+++`.
+    pending_old: Option<String>,
+    /// Fed bare hunks by [`Self::begin_file`]: a forge's per-file patch,
+    /// with nothing after its hunks, so they run to the next header as they
+    /// always have, whatever their counts say.
+    bare: bool,
+    /// Every line ends in CRLF; decided by the first line, so git's own
+    /// output (whose first line never does) keeps a CR that's content.
+    crlf: Option<bool>,
 }
 
 impl DiffStreamParser {
     /// Consume one line (without its trailing newline). Returns the previous
     /// file when `line` starts a new one.
     pub fn push_line(&mut self, line: &str) -> Option<DiffFile> {
-        if let Some(paths) = line.strip_prefix("diff --git ") {
-            let finished = self.take_file();
+        let crlf = *self.crlf.get_or_insert_with(|| line.ends_with('\r'));
+        let line = if crlf {
+            line.strip_suffix('\r').unwrap_or(line)
+        } else {
+            line
+        };
 
+        if let Some(paths) = line.strip_prefix("diff --git ") {
             let (old_path, path) = parse_diff_git_paths(paths);
-            self.current_file = Some(DiffFile {
-                path,
-                old_path,
-                status: DiffFileStatus::Modified,
-                hunks: Vec::new(),
-                additions: 0,
-                deletions: 0,
-                collapsed: None,
-                blob: None,
-            });
-            return finished;
+            return self.start_file(path, old_path);
+        }
+        if let Some(path) = line
+            .strip_prefix("diff --cc ")
+            .or_else(|| line.strip_prefix("diff --combined "))
+        {
+            let path = unquote_git_path(path);
+            return self.start_file(path.clone(), Some(path));
         }
 
-        let file = self.current_file.as_mut()?;
-
         if line.starts_with("@@") {
+            let file = self.current_file.as_mut()?;
             flush_current_hunk(file, &mut self.current_hunk);
-            let (next_old_line, next_new_line) = parse_hunk_header(line);
-            self.current_hunk = Some(PendingHunk {
-                header: line.to_owned(),
-                rows: Vec::new(),
-                next_old_line,
-                next_new_line,
-            });
+            self.in_header = false;
+            let mut hunk = parse_hunk_header(line);
+            if self.bare {
+                hunk.left = None;
+            }
+            if hunk.columns > 1 && file.hunks.is_empty() {
+                hunk.rows.push(note_row(format!(
+                    "Combined diff of {} parents, shown against the first",
+                    hunk.columns
+                )));
+            }
+            self.current_hunk = Some(hunk);
             return None;
         }
 
-        if let Some(hunk) = self.current_hunk.as_mut() {
+        if let (Some(file), Some(hunk)) = (self.current_file.as_mut(), self.current_hunk.as_mut())
+            && (hunk.open() || line.starts_with('\\'))
+        {
             push_hunk_row(file, hunk, line);
-        } else {
+            return None;
+        }
+
+        if self.in_header {
+            let file = self.current_file.as_mut()?;
+            if line.starts_with("+++ ") {
+                self.in_header = false;
+            }
             update_file_metadata(file, line);
+            return None;
+        }
+
+        // Between files: a plain diff's `---`/`+++` pair starts the next
+        // one; anything else (an email's headers and message, `Index:`
+        // lines, commentary) is skipped.
+        if let Some(old) = line.strip_prefix("--- ") {
+            self.pending_old = Some(old.to_owned());
+            return None;
+        }
+        let pending_old = self.pending_old.take();
+        if let (Some(old), Some(new)) = (pending_old, line.strip_prefix("+++ ")) {
+            let finished = self.start_file(String::new(), None);
+            self.in_header = false;
+            self.plain = true;
+            if let Some(file) = self.current_file.as_mut() {
+                set_plain_paths(file, &old, new);
+            }
+            return finished;
+        }
+        if let Some(sides) = line
+            .strip_prefix("Binary files ")
+            .and_then(|rest| rest.strip_suffix(" differ"))
+            && let Some((old, new)) = sides.split_once(" and ")
+        {
+            let finished = self.start_file(String::new(), None);
+            self.in_header = false;
+            if let Some(file) = self.current_file.as_mut() {
+                set_plain_paths(file, old, new);
+                file.hunks.push(binary_hunk());
+            }
+            return finished;
         }
         None
     }
@@ -99,6 +193,7 @@ impl DiffStreamParser {
     pub fn begin_file(&mut self, file: DiffFile) -> Option<DiffFile> {
         let finished = self.take_file();
         self.current_file = Some(file);
+        self.bare = true;
         finished
     }
 
@@ -107,9 +202,33 @@ impl DiffStreamParser {
         self.take_file()
     }
 
+    /// Finish the file in progress and start one at `path`, its header to
+    /// follow.
+    fn start_file(&mut self, path: String, old_path: Option<String>) -> Option<DiffFile> {
+        let finished = self.take_file();
+        self.current_file = Some(DiffFile {
+            path,
+            old_path,
+            status: DiffFileStatus::Modified,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            collapsed: None,
+            blob: None,
+            mode_change: None,
+        });
+        self.in_header = true;
+        finished
+    }
+
     fn take_file(&mut self) -> Option<DiffFile> {
         let mut file = self.current_file.take()?;
         flush_current_hunk(&mut file, &mut self.current_hunk);
+        self.in_header = false;
+        self.pending_old = None;
+        if std::mem::take(&mut self.plain) {
+            infer_plain_status(&mut file);
+        }
         // No highlighting here: it reads each file's full sources, so it runs
         // in the background after the document is already on screen (see
         // `syntax::highlight_file`).
@@ -151,12 +270,24 @@ fn flush_current_hunk(file: &mut DiffFile, current_hunk: &mut Option<PendingHunk
 }
 
 fn update_file_metadata(file: &mut DiffFile, line: &str) {
-    if let Some(path) = line.strip_prefix("rename from ") {
+    // A copy shows as the jj backend shows one: under both its paths, the
+    // way a rename does.
+    if let Some(path) = line
+        .strip_prefix("rename from ")
+        .or_else(|| line.strip_prefix("copy from "))
+    {
         file.old_path = Some(unquote_git_path(path));
         file.status = DiffFileStatus::Renamed;
-    } else if let Some(path) = line.strip_prefix("rename to ") {
+    } else if let Some(path) = line
+        .strip_prefix("rename to ")
+        .or_else(|| line.strip_prefix("copy to "))
+    {
         file.path = unquote_git_path(path);
         file.status = DiffFileStatus::Renamed;
+    } else if let Some(mode) = line.strip_prefix("old mode ").and_then(parse_mode) {
+        file.mode_change = Some((mode, file.mode_change.map_or(mode, |(_, new)| new)));
+    } else if let Some(mode) = line.strip_prefix("new mode ").and_then(parse_mode) {
+        file.mode_change = Some((file.mode_change.map_or(mode, |(old, _)| old), mode));
     } else if line.starts_with("new file mode ") || line == "--- /dev/null" {
         file.status = DiffFileStatus::Added;
     } else if line.starts_with("deleted file mode ") || line == "+++ /dev/null" {
@@ -180,6 +311,11 @@ fn update_file_metadata(file: &mut DiffFile, line: &str) {
     }
 }
 
+/// A git file mode as its octal digits print it (`100755`).
+pub fn parse_mode(digits: &str) -> Option<u32> {
+    u32::from_str_radix(digits.trim(), 8).ok()
+}
+
 /// One header-only hunk standing in for content the diff can't show.
 fn binary_hunk() -> DiffHunkView {
     DiffHunkView {
@@ -198,7 +334,88 @@ fn side_path(rest: &str, prefix: &str) -> Option<String> {
     path.strip_prefix(prefix).map(str::to_owned)
 }
 
+/// The paths of a plain diff's `--- old` / `+++ new` pair. Each may carry a
+/// tab and a timestamp (`diff -u`) or a revision (`(revision 12)`, svn)
+/// after it. Like `patch -p1`, a leading folder that differs between the
+/// sides (`a/` and `b/`, `old/` and `new/`) is the tool's, not the file's.
+fn set_plain_paths(file: &mut DiffFile, old: &str, new: &str) {
+    let name = |side: &str| unquote_git_path(side.split('\t').next().unwrap_or(side).trim_end());
+    let (old, new) = (name(old), name(new));
+    let absent = |path: &str| path == "/dev/null";
+    let strip = match (old.split_once('/'), new.split_once('/')) {
+        (Some((old_top, _)), Some((new_top, _))) => old_top != new_top,
+        (None, Some(_)) if absent(&old) => new.starts_with("b/"),
+        (Some(_), None) if absent(&new) => old.starts_with("a/"),
+        _ => false,
+    };
+    let trim = |path: String| match path.split_once('/') {
+        Some((_, rest)) if strip && !absent(&path) => rest.to_owned(),
+        _ => path,
+    };
+    let (old, new) = (trim(old), trim(new));
+    if absent(&old) {
+        file.status = DiffFileStatus::Added;
+        file.path = new;
+    } else if absent(&new) {
+        file.status = DiffFileStatus::Deleted;
+        file.path = old.clone();
+        file.old_path = Some(old);
+    } else {
+        file.path = new;
+        file.old_path = Some(old);
+    }
+}
+
+/// A plain diff names no added or deleted files: `diff -N` writes the
+/// absent side as an empty file. Its one hunk then starts at line 0 there.
+fn infer_plain_status(file: &mut DiffFile) {
+    if file.status != DiffFileStatus::Modified || file.hunks.len() != 1 {
+        return;
+    }
+    let mut ranges = file.hunks[0].header.split_whitespace().skip(1);
+    match (ranges.next(), ranges.next()) {
+        (Some("-0,0"), _) => file.status = DiffFileStatus::Added,
+        (_, Some("+0,0")) => file.status = DiffFileStatus::Deleted,
+        _ => {}
+    }
+}
+
+/// A row with no line numbers: a `\ No newline` marker, or something the
+/// parser says about the file.
+fn note_row(content: String) -> DiffLine {
+    DiffLine {
+        kind: DiffLineKind::Note,
+        old_line: None,
+        new_line: None,
+        content,
+        syntax: Vec::new(),
+        emphasis: Vec::new(),
+    }
+}
+
+/// One line of a hunk. A combined diff's line has a marker per parent and
+/// shows as a diff against the first: a line only another parent had is
+/// left out.
 fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
+    if hunk.columns > 1 && !line.starts_with('\\') {
+        let markers = line.get(..hunk.columns).unwrap_or(line);
+        let text = line.get(hunk.columns..).unwrap_or_default();
+        let in_result = !markers.contains('-');
+        let first = markers.chars().next().unwrap_or(' ');
+        let row = match (in_result, first) {
+            (true, '+') => format!("+{text}"),
+            (true, _) => format!(" {text}"),
+            (false, '-') => format!("-{text}"),
+            (false, _) => {
+                hunk.take(false, false);
+                return;
+            }
+        };
+        let columns = std::mem::replace(&mut hunk.columns, 1);
+        push_hunk_row(file, hunk, &row);
+        hunk.columns = columns;
+        return;
+    }
     match line.chars().next() {
         Some('+') => {
             file.additions += 1;
@@ -211,6 +428,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 emphasis: Vec::new(),
             });
             hunk.next_new_line += 1;
+            hunk.take(false, true);
         }
         Some('-') => {
             file.deletions += 1;
@@ -223,6 +441,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
                 emphasis: Vec::new(),
             });
             hunk.next_old_line += 1;
+            hunk.take(true, false);
         }
         // An empty line is a context line that lost its leading space —
         // `diff.suppressBlankEmpty`, or a diff that went through a
@@ -240,6 +459,7 @@ fn push_hunk_row(file: &mut DiffFile, hunk: &mut PendingHunk, line: &str) {
             });
             hunk.next_old_line += 1;
             hunk.next_new_line += 1;
+            hunk.take(true, true);
         }
         Some('\\') => {
             hunk.rows.push(DiffLine {
@@ -403,22 +623,37 @@ fn unquote_git_path(path: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn parse_hunk_header(header: &str) -> (usize, usize) {
+/// A hunk from its header: `@@ -12,3 +12,4 @@`, or a combined diff's
+/// `@@@ -12,3 -12,3 +12,4 @@@` with a range per parent, of which the
+/// first counts.
+fn parse_hunk_header(header: &str) -> PendingHunk {
     let mut parts = header.split_whitespace();
-    let _marker = parts.next();
-    let old = parts.next().unwrap_or_default();
-    let new = parts.next().unwrap_or_default();
+    let columns = parts
+        .next()
+        .map_or(1, |marker| marker.len().saturating_sub(1).max(1));
+    let old = parts.next().and_then(|part| parse_hunk_range(part, '-'));
+    let new = parts
+        .find(|part| part.starts_with('+'))
+        .and_then(|part| parse_hunk_range(part, '+'));
 
-    (
-        parse_hunk_range(old, '-').unwrap_or(0),
-        parse_hunk_range(new, '+').unwrap_or(0),
-    )
+    PendingHunk {
+        header: header.to_owned(),
+        rows: Vec::new(),
+        next_old_line: old.map_or(0, |(start, _)| start),
+        next_new_line: new.map_or(0, |(start, _)| start),
+        left: old.zip(new).map(|((_, old), (_, new))| (old, new)),
+        columns,
+    }
 }
 
-fn parse_hunk_range(part: &str, prefix: char) -> Option<usize> {
-    part.strip_prefix(prefix)
-        .and_then(|value| value.split(',').next())
-        .and_then(|value| value.parse::<usize>().ok())
+/// `-start,count` (or `-start`, a count of one) as its two numbers.
+fn parse_hunk_range(part: &str, prefix: char) -> Option<(usize, usize)> {
+    let range = part.strip_prefix(prefix)?;
+    let (start, count) = match range.split_once(',') {
+        Some((start, count)) => (start, count.parse().ok()?),
+        None => (range, 1),
+    };
+    Some((start.parse().ok()?, count))
 }
 
 // ---- Intra-line (word-level) change emphasis ----
@@ -696,6 +931,7 @@ mod tests {
         let file = &document.files[0];
         assert_eq!(file.path, "mode only.sh");
         assert_eq!(file.old_path.as_deref(), Some("mode only.sh"));
+        assert_eq!(file.mode_change, Some((0o100644, 0o100755)));
         assert_eq!(file.status, DiffFileStatus::Modified);
     }
 
@@ -831,5 +1067,203 @@ mod tests {
         assert!(finish_line_emphasis("foo", vec![(0, 4)]).is_empty());
         // Whitespace-only emphasis trims to nothing.
         assert!(finish_line_emphasis("a  b", vec![(1, 3)]).is_empty());
+    }
+
+    fn fixture(name: &str) -> DiffDocument {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/patches")
+                .join(name),
+        )
+        .expect("the fixture");
+        parse_unified_diff(&text)
+    }
+
+    fn rows(file: &DiffFile) -> Vec<(DiffLineKind, Option<usize>, Option<usize>, &str)> {
+        file.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|row| (row.kind, row.old_line, row.new_line, row.content.as_str()))
+            .collect()
+    }
+
+    /// The `-- ` and version under a `git format-patch` email's diff are
+    /// its signature, not a deleted line, and the message above isn't
+    /// diff content either.
+    #[test]
+    fn a_format_patch_email_ends_its_hunk_at_the_signature() {
+        let document = fixture("format-patch.patch");
+        assert_eq!(document.files.len(), 1);
+        let file = &document.files[0];
+        assert_eq!(file.path, "list.txt");
+        assert_eq!((file.additions, file.deletions), (2, 1));
+        let rows = rows(file);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[4], (DiffLineKind::Addition, None, Some(4), "delta"));
+    }
+
+    /// A series: three emails, the cover letter's diffstat skipped, the
+    /// copy read as its two paths.
+    #[test]
+    fn a_patch_series_reads_each_patch_and_its_copy() {
+        let document = fixture("series.mbox");
+        let paths: Vec<_> = document
+            .files
+            .iter()
+            .map(|file| (file.old_path.as_deref(), file.path.as_str(), file.status))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                (Some("list.txt"), "list.txt", DiffFileStatus::Modified),
+                (Some("list.txt"), "copy.txt", DiffFileStatus::Renamed),
+            ]
+        );
+        let copy = rows(&document.files[1]);
+        assert_eq!(copy.len(), 4);
+        assert_eq!(copy[0], (DiffLineKind::Context, Some(2), Some(2), "BETA"));
+        assert_eq!(document.total_deletions, 1);
+    }
+
+    #[test]
+    fn a_plain_diff_u_takes_the_new_side_s_name() {
+        let document = fixture("diff-u.diff");
+        let file = &document.files[0];
+        assert_eq!(file.path, "notes.txt");
+        assert_eq!(file.old_path.as_deref(), Some("notes.txt"));
+        assert_eq!(file.status, DiffFileStatus::Modified);
+        assert_eq!((file.additions, file.deletions), (2, 1));
+    }
+
+    /// `diff -ruN`: its `diff -ruN …` lines between files, the folders
+    /// stripped, and the files `-N` wrote as empty read as added and
+    /// deleted.
+    #[test]
+    fn a_recursive_plain_diff_reads_each_file() {
+        let document = fixture("diff-ruN.diff");
+        let files: Vec<_> = document
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.status,
+                    file.additions,
+                    file.deletions,
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("notes.txt", DiffFileStatus::Modified, 2, 1),
+                ("src/added.rs", DiffFileStatus::Added, 1, 0),
+                ("src/gone.rs", DiffFileStatus::Deleted, 0, 1),
+                ("src/main.rs", DiffFileStatus::Modified, 1, 1),
+            ]
+        );
+    }
+
+    /// svn: `Index:` and `===` headers, `(revision N)` after the names,
+    /// which keep their folder (both sides have the same one).
+    #[test]
+    fn an_svn_diff_keeps_its_paths_whole() {
+        let document = fixture("svn.diff");
+        let paths: Vec<_> = document
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["trunk/src/parse.c", "trunk/README"]);
+        assert_eq!(
+            rows(&document.files[0])[3],
+            (
+                DiffLineKind::Deletion,
+                Some(13),
+                None,
+                "    if (line == NULL)"
+            )
+        );
+        assert_eq!(rows(&document.files[1]).len(), 3);
+    }
+
+    /// hg: its export header, `diff -r` lines, a blank context line, and an
+    /// added file against `/dev/null` with a date after it.
+    #[test]
+    fn an_hg_export_reads_each_file() {
+        let document = fixture("hg.diff");
+        let files: Vec<_> = document
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.status,
+                    file.additions,
+                    file.deletions,
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("bugs.py", DiffFileStatus::Modified, 2, 1),
+                ("moth.txt", DiffFileStatus::Added, 1, 0),
+            ]
+        );
+        assert_eq!(rows(&document.files[0]).len(), 5);
+    }
+
+    /// `git show --cc` of a merge: shown against the first parent, with a
+    /// note saying so; the line only the second parent had is left out.
+    #[test]
+    fn a_combined_diff_shows_against_its_first_parent() {
+        let document = fixture("combined.diff");
+        assert_eq!(document.files.len(), 1);
+        let file = &document.files[0];
+        assert_eq!(file.path, "list.txt");
+        assert_eq!(
+            rows(file),
+            [
+                (
+                    DiffLineKind::Note,
+                    None,
+                    None,
+                    "Combined diff of 2 parents, shown against the first"
+                ),
+                (DiffLineKind::Context, Some(1), Some(1), "alpha"),
+                (DiffLineKind::Context, Some(2), Some(2), "BETA"),
+                (DiffLineKind::Context, Some(3), Some(3), "gamma"),
+                (DiffLineKind::Context, Some(4), Some(4), "delta"),
+                (DiffLineKind::Addition, None, Some(5), "zeta"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_crlf_patch_reads_without_its_carriage_returns() {
+        let document = fixture("crlf.patch");
+        let file = &document.files[0];
+        assert_eq!(file.path, "win.txt");
+        assert_eq!(
+            rows(file),
+            [
+                (DiffLineKind::Context, Some(1), Some(1), "first"),
+                (DiffLineKind::Deletion, Some(2), None, "second"),
+                (DiffLineKind::Addition, None, Some(2), "2nd"),
+            ]
+        );
+    }
+
+    /// A `\ No newline` marker after a hunk's last counted line stays in it.
+    #[test]
+    fn a_no_newline_marker_after_the_counts_stays_in_the_hunk() {
+        let document = parse_unified_diff(
+            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\nnot diff\n",
+        );
+        let file = &document.files[0];
+        assert_eq!(file.path, "f");
+        assert_eq!(rows(file).len(), 4);
+        assert_eq!(rows(file)[3].0, DiffLineKind::Note);
     }
 }

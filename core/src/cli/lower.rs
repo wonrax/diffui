@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use super::command::{MutationCommand, RevsetArg, RevsetDestination, Spanned};
 use crate::model::RevisionSelection;
-use crate::mutations::{Destination, DraftKind, MutationOp, PlacementKind, SquashTarget};
+use crate::mutations::{
+    Destination, DraftKind, MutationOp, PlacementKind, RebaseSourceMode, SquashTarget,
+};
 use crate::push::{PushRequest, PushTarget};
 use crate::repository::FetchTarget;
 
@@ -17,6 +19,10 @@ pub trait LowerContext {
     /// [`RevisionSelection::WorkingCopy`] for the working-copy commit so the
     /// op addresses `@` the way the GUI's ops do.
     fn resolve(&self, revset: &str) -> Result<Vec<RevisionSelection>, String>;
+
+    /// Whether local bookmark `name` exists: `jj bookmark move` only moves
+    /// one that does.
+    fn has_local_bookmark(&self, name: &str) -> bool;
 
     /// `git.push`, or the only remote, or `origin`: where a `jj git push`
     /// without `--remote` goes.
@@ -242,11 +248,22 @@ pub fn lower(
             mode,
             sources,
             destination,
-        } => MutationOp::Rebase {
-            mode: *mode,
-            sources: r.non_empty(sources)?,
-            destination: r.destination(destination)?,
-        },
+        } => {
+            let sources = r.non_empty(sources)?;
+            // jj puts every `-s` revision directly on the destination, even
+            // one inside another's subtree; diffui's op moves the set's
+            // roots and keeps a stack intact.
+            if *mode == RebaseSourceMode::WithDescendants && sources.len() > 1 {
+                return Err(LowerError::NeedsCli(
+                    "several -s revisions; diffui moves one subtree".to_owned(),
+                ));
+            }
+            MutationOp::Rebase {
+                mode: *mode,
+                sources,
+                destination: r.destination(destination)?,
+            }
+        }
         MutationCommand::Squash { from, into: None } => {
             let [from] = from.as_slice() else {
                 return Err(LowerError::NeedsCli(
@@ -280,6 +297,7 @@ pub fn lower(
         },
         MutationCommand::Absorb { from } => MutationOp::Absorb {
             from: r.single(from)?,
+            paths: Vec::new(),
         },
         MutationCommand::Metaedit {
             targets,
@@ -299,6 +317,24 @@ pub fn lower(
             to: r.single(to)?,
             push_remote: None,
         },
+        MutationCommand::BookmarkMove { name, to, .. } => {
+            if !context.has_local_bookmark(&name.value) {
+                // jj's warning; it then moves nothing.
+                return Err(LowerError::Resolve {
+                    text: name.value.clone(),
+                    span: Some(name.span.clone()),
+                    message: format!(
+                        "No matching bookmarks for names: {}",
+                        jj_lib::revset::format_symbol(&name.value)
+                    ),
+                });
+            }
+            MutationOp::MoveBookmark {
+                name: name.value.clone(),
+                to: r.single(to)?,
+                push_remote: None,
+            }
+        }
         MutationCommand::BookmarkDelete { name } => MutationOp::DeleteBookmark {
             name: name.value.clone(),
         },
@@ -331,8 +367,12 @@ pub fn lower(
                 .iter()
                 .map(|name| PushTarget::Bookmark(name.value.clone()))
                 .collect();
-            for revision in r.union(changes)? {
-                targets.push(PushTarget::Change(revision));
+            // jj refuses a `-c` that resolves to nothing ("Empty revision
+            // set") rather than falling back to the default push.
+            if !changes.is_empty() {
+                for revision in r.non_empty(changes)? {
+                    targets.push(PushTarget::Change(revision));
+                }
             }
             if targets.is_empty() {
                 targets.push(PushTarget::Tracked);
@@ -412,8 +452,13 @@ mod tests {
                 match revset {
                     "none()" => Ok(Vec::new()),
                     "@" => Ok(vec![RevisionSelection::WorkingCopy]),
+                    "one" => Ok(vec![commit('a')]),
                     _ => Ok(vec![commit('a'), commit('b')]),
                 }
+            }
+
+            fn has_local_bookmark(&self, name: &str) -> bool {
+                name == "main"
             }
         }
         let lower_line = |line: &str| {
@@ -438,6 +483,35 @@ mod tests {
         assert!(matches!(
             lower_line("jj git push"),
             Err(LowerError::NoPushRemote)
+        ));
+        assert!(matches!(
+            lower_line("jj git push --remote origin -c 'none()'"),
+            Err(LowerError::NotSingle { count: 0, .. })
+        ));
+        // Several `-s` are jj's to place; one moves natively.
+        assert!(matches!(
+            lower_line("jj rebase -s x -o one"),
+            Err(LowerError::NeedsCli(_))
+        ));
+        assert!(matches!(
+            lower_line("jj rebase -s one -o one"),
+            Ok(NativeAction::Mutate(MutationOp::Rebase { .. }))
+        ));
+        assert!(matches!(
+            lower_line("jj rebase -r x -o one"),
+            Ok(NativeAction::Mutate(MutationOp::Rebase { .. }))
+        ));
+        // `move` never creates; `set` does.
+        let error = lower_line("jj bookmark move mian --to one").unwrap_err();
+        assert_eq!(error.to_string(), "No matching bookmarks for names: mian");
+        assert_eq!(error.span(), Some(17..21));
+        assert!(matches!(
+            lower_line("jj bookmark move main --to one"),
+            Ok(NativeAction::Mutate(MutationOp::MoveBookmark { .. }))
+        ));
+        assert!(matches!(
+            lower_line("jj bookmark set mian -r one"),
+            Ok(NativeAction::Mutate(MutationOp::MoveBookmark { .. }))
         ));
         // Several parents make a merge.
         assert!(matches!(

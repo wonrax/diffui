@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// the previous one), so the two together stay under twice this.
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Our own crates at `info`, everything else (iced, wgpu, jj-lib) at `warn`.
+/// Our own crates at `info`, everything else (GPUI, jj-lib) at `warn`.
 const DEFAULT_FILTER: &str = "warn,diffui=info,diffui_core=info";
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -36,17 +36,7 @@ pub(crate) fn log_path() -> Option<PathBuf> {
 }
 
 fn default_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from);
-    if cfg!(target_os = "macos") {
-        return Some(home?.join("Library/Logs/diffui/diffui.log"));
-    }
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| home.join(".local/state")))?;
-    Some(state.join("diffui/diffui.log"))
+    crate::app_files::app_file(crate::app_files::AppDir::Logs, "diffui.log")
 }
 
 /// Install the subscriber and the panic hook. Call once, first thing in

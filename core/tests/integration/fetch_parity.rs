@@ -259,8 +259,8 @@ fn jj_lines(stderr: &str, prefixes: &[&str]) -> Vec<String> {
 
 fn target(target: &RefTarget) -> String {
     let ids = |ids: Vec<String>| ids.join(",");
-    let added = ids(target.added_ids().map(|id| id.hex()).collect());
-    let removed = ids(target.removed_ids().map(|id| id.hex()).collect());
+    let added = ids(target.present_adds().map(|id| id.hex()).collect());
+    let removed = ids(target.present_removes().map(|id| id.hex()).collect());
     if removed.is_empty() {
         added
     } else {
@@ -273,7 +273,7 @@ fn target(target: &RefTarget) -> String {
 /// the working-copy commits (which are each repo's own).
 fn view(root: &Path) -> Vec<String> {
     let workspace = harness::load_workspace(root);
-    let repo = block_on(workspace.repo_loader().load_at_head()).expect("load repo");
+    let repo = block_on(workspace.load_at_head()).expect("load repo");
     let view = repo.view();
     let state = |state: RemoteRefState| match state {
         RemoteRefState::New => "untracked",

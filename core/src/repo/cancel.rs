@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::JobId;
+use super::{JobId, Jobs};
 
 /// A job's stop switch, shared between whoever sets it and the loop that polls
 /// it. Cloning shares the flag.
@@ -74,7 +74,52 @@ impl CancelRegistry {
         }
     }
 
+    /// Raise every running job's flag: the actor is shutting down.
+    pub fn cancel_all(&mut self) {
+        for flag in self.flags.values() {
+            flag.cancel();
+        }
+    }
+
     pub fn finish(&mut self, job: JobId) {
         self.flags.remove(&job);
+    }
+}
+
+/// A started job's place in its actor's [`CancelRegistry`]: a `Cancel` for the
+/// job reaches [`flag`](Self::flag) for as long as the ticket lives, and
+/// dropping it finishes the job. Work the actor hands to a thread of its own
+/// takes the ticket along, so a cancel still lands after the actor has moved
+/// on to the next command.
+#[derive(Debug)]
+pub(crate) struct JobTicket {
+    jobs: Jobs,
+    job: JobId,
+    flag: CancelFlag,
+}
+
+impl JobTicket {
+    pub fn begin(jobs: &Jobs, job: JobId) -> Self {
+        let flag = match jobs.lock() {
+            Ok(mut registry) => registry.begin(job),
+            Err(_) => CancelFlag::default(),
+        };
+        Self {
+            jobs: jobs.clone(),
+            job,
+            flag,
+        }
+    }
+
+    pub fn flag(&self) -> &CancelFlag {
+        &self.flag
+    }
+}
+
+impl Drop for JobTicket {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.jobs.lock() {
+            registry.finish(self.job);
+        }
     }
 }

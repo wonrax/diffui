@@ -1,0 +1,4038 @@
+//! Every scene of `fixtures/scenes.md`, through the real root view, written to
+//! `integrate/<scene-id>.png` under the shots directory (`DIFFUI_SHOTS_DIR`, else
+//! `target/shots`) for the parity sweep. The steps are the baseline
+//! capture's, so each scene reaches its state the way the iced one did.
+//!
+//! ```text
+//! cargo test --bin diffui scene_suite -- --ignored --nocapture
+//! DIFFUI_SCENES=diff-tabs,menu-file cargo test --bin diffui scene_suite::every -- --ignored --nocapture
+//! ```
+//!
+//! Each scene gets a fresh copy of the fixture and a clean scratch `HOME`, as the
+//! baseline's did. After its shot, it's drawn again with every cache dropped and the
+//! two images have to agree: a difference is a cached pane showing something stale.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use diffui_core::askpass::{AskpassEvent, Prompt, PromptKind, PromptRequest};
+use gpui_kit::MouseButton;
+
+use crate::commands::CommandArg;
+use crate::geometry::{Point, Rectangle, Size};
+use crate::harness::{Harness, at};
+use crate::menu::{AnchorSpec, MenuEntry, OverlayMenu};
+use crate::modes::Mode;
+use crate::{Action, MainView};
+
+const W: f32 = 1440.0;
+const H: f32 = 900.0;
+const LANE: &str = "integrate";
+
+pub(crate) struct Scene {
+    id: &'static str,
+    size: (f32, f32),
+    theme: &'static str,
+    config: &'static str,
+    /// Appended to the `settings.toml` that sets the theme.
+    settings: &'static str,
+    open_repo: bool,
+    /// Mid-flight: no settling after the steps, and no stale check.
+    raw: bool,
+    /// Looks before the first load is done.
+    cold: bool,
+    /// Something on screen moves with time, so two draws can't be compared.
+    animated: bool,
+    prepare: fn(&Path),
+    /// What else the launch finds in its home (a plugin's folder), written
+    /// once the home is cleared.
+    home: fn(&Path),
+    steps: fn(&mut Ctx),
+}
+
+impl Scene {
+    fn dark(mut self) -> Self {
+        self.theme = "Dark";
+        self
+    }
+    fn contrast(mut self) -> Self {
+        self.theme = "Contrast";
+        self
+    }
+    fn size(mut self, width: f32, height: f32) -> Self {
+        self.size = (width, height);
+        self
+    }
+    fn config(mut self, config: &'static str) -> Self {
+        self.config = config;
+        self
+    }
+    fn settings(mut self, settings: &'static str) -> Self {
+        self.settings = settings;
+        self
+    }
+    fn no_repo(mut self) -> Self {
+        self.open_repo = false;
+        self
+    }
+    fn raw(mut self) -> Self {
+        self.raw = true;
+        self
+    }
+    fn cold(mut self) -> Self {
+        self.raw = true;
+        self.cold = true;
+        self
+    }
+    fn animated(mut self) -> Self {
+        self.animated = true;
+        self
+    }
+    fn prepare(mut self, prepare: fn(&Path)) -> Self {
+        self.prepare = prepare;
+        self
+    }
+    fn home(mut self, home: fn(&Path)) -> Self {
+        self.home = home;
+        self
+    }
+}
+
+#[derive(Default)]
+struct Table {
+    scenes: Vec<Scene>,
+}
+
+impl Table {
+    fn group(&mut self, _group: &'static str) {}
+    fn add(&mut self, scene: Scene) {
+        self.scenes.push(scene);
+    }
+}
+
+fn s(id: &'static str, _state: &'static str, _steps: &'static str, steps: fn(&mut Ctx)) -> Scene {
+    Scene {
+        id,
+        size: (W, H),
+        theme: "Light",
+        config: "",
+        settings: "",
+        open_repo: true,
+        raw: false,
+        cold: false,
+        animated: false,
+        prepare: |_| {},
+        home: |_| {},
+        steps,
+    }
+}
+
+/// One scene's run: the harness, and the baseline capture's verbs over it.
+pub(crate) struct Ctx {
+    h: Harness,
+    manifest: Vec<(String, String)>,
+    repo: PathBuf,
+    held: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+}
+
+impl Ctx {
+    fn settle(&mut self) {
+        self.h.settle();
+        self.h.frames();
+        self.h.settle();
+    }
+
+    fn pump_ms(&mut self, ms: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < until {
+            self.h.pump();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn act(&mut self, action: Action) {
+        self.h.perform(action);
+        self.settle();
+    }
+
+    fn cmd_action(&mut self, action: Action) {
+        self.act(action);
+    }
+
+    fn cmd(&mut self, id: &'static str) {
+        self.cmd_arg(id, CommandArg::None);
+    }
+
+    fn cmd_arg(&mut self, id: &'static str, arg: CommandArg) {
+        let action = self.h.act(|ui, _| {
+            let registry = ui.registry.clone();
+            let command = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("no command {id}"));
+            if let Err(reason) = command.enabled(ui, &arg) {
+                panic!("command {id} is disabled: {reason:?}");
+            }
+            command
+                .build(ui, arg)
+                .unwrap_or_else(|| panic!("command {id} built nothing"))
+        });
+        self.act(action);
+    }
+
+    /// `cmd`, but a disabled command is only logged: the shot shows why.
+    fn try_cmd(&mut self, id: &'static str) {
+        let verdict = self.h.read(|ui| {
+            ui.registry
+                .get(id)
+                .unwrap_or_else(|| panic!("no command {id}"))
+                .enabled(ui, &CommandArg::None)
+        });
+        match verdict {
+            Ok(()) => self.cmd(id),
+            Err(reason) => eprintln!("{id}: disabled: {reason:?}"),
+        }
+    }
+
+    fn key(&mut self, chord: &str) {
+        self.h.press(&chord_to_keystroke(chord));
+        self.settle();
+    }
+
+    fn typed(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.h.type_text(&ch.to_string());
+        }
+        self.settle();
+    }
+
+    fn send_enter(&mut self) {
+        self.key("enter");
+    }
+
+    fn focus(&mut self, id: &'static str) {
+        self.h.act(|_, cx| crate::input::focus(id, cx));
+        self.settle();
+    }
+
+    /// Focuses a field with its text selected, so what's typed next replaces it. The
+    /// baseline typed into the text it found, which is why its shot reads `bookmpresent(@)`.
+    fn focus_replacing(&mut self, id: &'static str) {
+        self.h
+            .act(|_, cx| crate::input::focus_and_select_all(id, cx));
+        self.settle();
+    }
+
+    fn hover(&mut self, x: f32, y: f32) {
+        self.h.hover_point(at(x, y));
+        self.settle();
+    }
+
+    /// Rests the pointer on the middle of the element `id`.
+    fn hover_element(&mut self, id: impl Into<gpui_kit::ElementId>) {
+        let centre = self.h.bounds(id).center();
+        self.h.hover_point(centre);
+        self.settle();
+    }
+
+    fn right_click(&mut self, x: f32, y: f32) {
+        // macOS pops the native menu, so the overlay is raised the way the baseline's
+        // capture build did: the row under the point, its menu at the point.
+        self.h.hover_point(at(x, y));
+        self.settle();
+        let tree = if x < self.h.read(|ui| ui.sidebar_width) {
+            let selection = self
+                .h
+                .read(|ui| ui.active().session.selected_revision.clone());
+            self.h.read(|ui| ui.revision_menu_tree(&selection))
+        } else {
+            self.h.read(|ui| ui.file_context_menu_tree(1))
+        };
+        let glow = (x < self.h.read(|ui| ui.sidebar_width))
+            .then(|| Rectangle::new(Point::new(8.0, y - 22.0), Size::new(330.0, 44.0)));
+        self.raise(tree, AnchorSpec::At(Point::new(x, y)), glow);
+    }
+
+    fn raise(&mut self, tree: Vec<MenuEntry>, anchor: AnchorSpec, glow: Option<Rectangle>) {
+        self.h.act(|ui, _| {
+            let mut menu = OverlayMenu::new(tree, anchor, None);
+            menu.glow = glow;
+            ui.push_mode(Mode::Menu(menu));
+        });
+        self.settle();
+    }
+
+    fn right_click_selected(&mut self) {
+        let selection = self
+            .h
+            .read(|ui| ui.active().session.selected_revision.clone());
+        let tree = self.h.read(|ui| ui.revision_menu_tree(&selection));
+        let glow = Rectangle::new(Point::new(8.0, 200.0), Size::new(300.0, 28.0));
+        self.raise(tree, AnchorSpec::At(Point::new(180.0, 214.0)), Some(glow));
+    }
+
+    fn open_first_submenu(&mut self) {
+        let index = self.h.read(|ui| {
+            ui.menu().and_then(|menu| {
+                menu.root
+                    .iter()
+                    .position(|entry| matches!(entry, MenuEntry::Submenu { .. }))
+            })
+        });
+        if let Some(index) = index {
+            self.h.act(|ui, _| ui.menu_on_hover(vec![index]));
+            self.settle();
+        }
+    }
+
+    fn open_toolbar_menu(&mut self, which: crate::ToolbarMenu) {
+        let (tree, anchor) = match which {
+            crate::ToolbarMenu::FetchBranches => (
+                self.h.read(|ui| ui.fetch_menu_entries()),
+                Rectangle::new(Point::new(300.0, 37.0), Size::new(120.0, 28.0)),
+            ),
+            crate::ToolbarMenu::RevsetPresets => (
+                self.h.read(|ui| ui.revset_menu_entry_tree()),
+                Rectangle::new(Point::new(8.0, 78.0), Size::new(300.0, 28.0)),
+            ),
+        };
+        self.raise(tree, AnchorSpec::Below(anchor), None);
+    }
+
+    fn scroll(&mut self, x: f32, y: f32, dy: f32) {
+        self.h.wheel(at(x, y), dy);
+        self.settle();
+    }
+
+    /// Presses at `from` and moves to `to` in steps, the button left down.
+    fn drag(&mut self, from: (f32, f32), to: (f32, f32)) {
+        let start = at(from.0, from.1);
+        self.h.hover_point(start);
+        self.h.pointer_down(start, MouseButton::Left);
+        for step in 1..=12 {
+            let t = step as f32 / 12.0;
+            let position = at(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            self.h.pointer_move(position, Some(MouseButton::Left));
+            self.held = Some(position);
+            self.pump_ms(16);
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(position) = self.held.take() {
+            self.h.pointer_up(position, MouseButton::Left);
+        }
+    }
+
+    fn commit_of(&self, name: &str) -> String {
+        self.manifest
+            .iter()
+            .find(|(names, _)| names.split(',').any(|it| it == name))
+            .map(|(_, commit)| commit.clone())
+            .unwrap_or_else(|| panic!("no such fixture name: {name}"))
+    }
+
+    fn select(&mut self, name: &str) {
+        let commit = self.commit_of(name);
+        self.act(Action::SelectRevision(
+            diffui_core::RevisionSelection::Commit(commit),
+        ));
+    }
+
+    /// Selects a file of the shown revision and lets the diff scroll to it.
+    fn file(&mut self, path: &str) {
+        self.act(Action::JumpToFile(path.to_owned()));
+    }
+
+    fn source_file(&mut self, path: &str) {
+        let revision = self
+            .h
+            .read(|ui| ui.active().session.selected_revision.clone());
+        self.act(Action::BrowseSource {
+            revision,
+            path: Some(path.to_owned()),
+        });
+    }
+
+    fn confirm(&mut self) {
+        self.act(Action::ConfirmAccept);
+    }
+
+    fn act_find_regex(&mut self) {
+        self.h.act(|ui, _| ui.find_on_toggle_regex());
+        self.settle();
+    }
+
+    fn select_draft_candidate(&mut self, name: &str) {
+        let commit = self.commit_of(name);
+        self.h.act(|ui, cx| {
+            let index = ui
+                .active()
+                .session
+                .commits
+                .iter()
+                .position(|row| row.commit_id() == commit);
+            ui.on_draft_hover_candidate(index, cx);
+        });
+        self.settle();
+    }
+
+    fn select_op(&mut self, nth: usize) {
+        let id = self.h.read(|ui| ui.active().history.operation_id(nth));
+        match id {
+            Some(id) => self.act(Action::History(
+                crate::history_panel::HistoryAction::SelectOperation(id),
+            )),
+            None => eprintln!("no operation {nth}"),
+        }
+    }
+
+    fn expand_first_activity(&mut self) {
+        let id = self.h.read(|ui| ui.active().activities.first_with_output());
+        match id {
+            Some(id) => {
+                self.h.act(|ui, _| ui.on_activity_expand(id));
+                self.settle();
+            }
+            None => eprintln!("no activity with output"),
+        }
+    }
+
+    /// A ⌘- or ⇧-click on a row, by name.
+    fn modified_row_click(&mut self, name: &str, modifiers: crate::keys::Modifiers) {
+        let key = crate::revision_list::RowSelectionKey::Commit(self.commit_of(name));
+        self.h.act(|ui, cx| {
+            ui.modifiers = modifiers;
+            ui.on_select_row_key(key, cx);
+            ui.modifiers = crate::keys::Modifiers::default();
+        });
+        self.settle();
+    }
+
+    fn mark(&mut self, name: &str) {
+        self.modified_row_click(name, crate::keys::Modifiers::COMMAND);
+    }
+
+    fn shift_mark(&mut self, name: &str) {
+        self.modified_row_click(name, crate::keys::Modifiers::SHIFT);
+    }
+}
+
+/// The baseline's chord spelling as GPUI's keystroke: `cmd+k` to `cmd-k`, `R` to
+/// `shift-r`, `esc` to `escape`.
+fn chord_to_keystroke(chord: &str) -> String {
+    let mut parts: Vec<&str> = chord.split('+').collect();
+    let last = parts.pop().unwrap_or(chord);
+    let key = match last {
+        "esc" => "escape".to_owned(),
+        key if key.len() == 1 && key.chars().all(char::is_uppercase) => {
+            parts.push("shift");
+            key.to_lowercase()
+        }
+        key => key.to_owned(),
+    };
+    parts.push(&key);
+    parts.join("-")
+}
+
+fn jj(repo: &Path, args: &[&str]) {
+    let status = Command::new(crate::harness::fixture_jj())
+        .current_dir(repo)
+        .env("JJ_TIMESTAMP", "2026-03-20T10:00:00+00:00")
+        .env("JJ_OP_TIMESTAMP", "2026-03-20T10:00:00+00:00")
+        .args(["--quiet"])
+        .args(args)
+        .status()
+        .expect("spawn jj");
+    assert!(status.success(), "jj {args:?}");
+}
+
+/// The Refresh scenes show what they say: edits and staleness as the
+/// session has them.
+fn disk_shows(c: &mut Ctx, edits: bool, stale: bool) {
+    let disk = c.h.read(|ui| ui.active().session.disk().clone());
+    assert_eq!(
+        (disk.edits, disk.stale.is_some()),
+        (edits, stale),
+        "{disk:?}"
+    );
+}
+
+/// A new file on disk that `@` doesn't hold until something snapshots it.
+fn edit_on_disk(repo: &Path) {
+    std::fs::write(repo.join("NOTES.md"), "Draft notes\n").unwrap();
+}
+
+/// `@` moved to another tree without updating the files on disk, as another
+/// workspace or a `--ignore-working-copy` command leaves it: the checkout is
+/// stale.
+fn stale_checkout(repo: &Path) {
+    jj(repo, &["--ignore-working-copy", "new", "@-"]);
+}
+
+/// Drops jj from the copy, leaving the colocated git repository. `.jj` holds the
+/// manifest, which steps still read, so that moves aside first.
+fn plain_git(repo: &Path) {
+    std::fs::rename(
+        repo.join(".jj/fixture-manifest"),
+        repo.join(".git/fixture-manifest"),
+    )
+    .unwrap();
+    let remote = repo.join(".jj/fixture-remote.git");
+    std::fs::rename(&remote, repo.join(".git/fixture-remote.git")).unwrap();
+    std::fs::remove_dir_all(repo.join(".jj")).unwrap();
+    let config = repo.join(".git/config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace(".jj/fixture-remote.git", ".git/fixture-remote.git"),
+    )
+    .unwrap();
+}
+
+/// Fourteen heads off `main`, `@` on the twelfth: a wide graph.
+fn wide_graph(repo: &Path) {
+    for branch in 1..=14 {
+        jj(
+            repo,
+            &[
+                "new",
+                "main",
+                "-m",
+                &format!("feat: parallel branch {branch}"),
+            ],
+        );
+    }
+    jj(
+        repo,
+        &["edit", "description(substring:\"parallel branch 12\")"],
+    );
+}
+
+/// Everything's visible: the revset box says `all()`.
+fn all_revs(c: &mut Ctx) {
+    c.act(Action::SetRevset("all()".to_owned()));
+}
+
+/// Pull requests on the fixture's bookmarks, as a refresh against a GitHub
+/// origin would have left them: one of each state, with and without checks.
+/// The AI providers with their programs nowhere, so no scene finds a real
+/// one, and Anthropic's address a closed local port, so none reaches it.
+const AI_CONFIG: &str = "[plugins.claude-code]\nprogram = \"/nonexistent/claude\"\n\n[plugins.codex]\nprogram = \"/nonexistent/codex\"\n\n[plugins.anthropic]\nbase_url = \"http://127.0.0.1:9\"\n";
+
+fn save_anthropic_key(home: &Path) {
+    use diffui_plugins::secrets::{FileStore, SecretStore};
+    FileStore::new(home.join(".diffui-secrets.json"))
+        .set("anthropic.api_key", "sk-scene")
+        .expect("save the key");
+}
+
+fn forge_badges(c: &mut Ctx) {
+    use diffui_core::forge::{CheckState, Checks, ForgeRemote, PrState, PullRequest};
+    let github = crate::plugins::bundled_kind("github");
+    let remote = ForgeRemote::new(github, "github.com", "acme", "render-toolkit");
+    let badges = [
+        (
+            "feature/render-pipeline",
+            41,
+            PrState::Open,
+            Some(CheckState::Pending),
+            "Rework the render pipeline",
+        ),
+        (
+            "feature/auth",
+            38,
+            PrState::Draft,
+            Some(CheckState::Failure),
+            "Sign in with a device code",
+        ),
+        (
+            "fix/parser-crash",
+            35,
+            PrState::Merged,
+            None,
+            "Fix the parser crash on empty input",
+        ),
+        (
+            "fix/changelog-note",
+            42,
+            PrState::Open,
+            Some(CheckState::Success),
+            "Note the release in the changelog",
+        ),
+        (
+            "data/regenerate",
+            30,
+            PrState::Closed,
+            None,
+            "Regenerate the lookup tables",
+        ),
+    ];
+    c.h.act(|ui, _| {
+        let state = ui.active_mut();
+        let targets = crate::forge::bookmark_targets(&state.session.bookmarks);
+        state.forge.home = Some(("origin".to_owned(), remote.clone()));
+        for (name, number, pr_state, checks, title) in badges {
+            let Some(target) = targets.get(name) else {
+                continue;
+            };
+            state.forge.decorations.insert(
+                name.to_owned(),
+                crate::forge::Decoration {
+                    remote: remote.clone(),
+                    pr: PullRequest {
+                        number,
+                        url: format!("{}/pull/{number}", remote.web_url),
+                        title: title.to_owned(),
+                        head: name.to_owned(),
+                        base: "main".to_owned(),
+                        head_sha: target.clone(),
+                        state: pr_state,
+                        review: None,
+                    },
+                    checks: checks.map(|state| Checks {
+                        state,
+                        url: Some(format!("{}/commit/{target}", remote.web_url)),
+                    }),
+                    target: target.clone(),
+                },
+            );
+        }
+        state.session.repaint_version += 1;
+    });
+    c.settle();
+}
+
+/// Submit stack's preview, as `scene` shows it, over the badged fixture.
+fn stack_scene(c: &mut Ctx, scene: crate::forge_dialog::stack_tests::Scene) {
+    forge_badges(c);
+    c.h.act(move |ui, _| crate::forge_dialog::stack_tests::show(ui, scene));
+    c.settle();
+}
+
+/// The fake `glab`'s answers for `acme/render-toolkit!7` on gitlab.com.
+fn answer_merge_request() {
+    let project = "api --hostname gitlab.com projects/acme%2Frender-toolkit/merge_requests/7";
+    crate::harness::answer_forge(&[
+        (
+            &format!("{project}/commits*"),
+            r#"[{"id": "2222222222222222222222222222222222222222", "title": "Bind once per frame", "author_name": "Mika", "authored_date": "2026-03-12T09:30:00Z"},
+                {"id": "1111111111111111111111111111111111111111", "title": "Rework the render pipeline", "author_name": "Mika", "authored_date": "2026-03-10T10:00:00Z"}]"#,
+        ),
+        (
+            &format!("{project}/diffs*"),
+            r#"[{"old_path": "src/render.rs", "new_path": "src/render.rs", "diff": "@@ -1,4 +1,5 @@\n fn render(frame: &Frame) {\n-    draw(frame);\n+    let bindings = bind(frame);\n+    draw(frame, &bindings);\n }\n"},
+                {"old_path": "CHANGELOG.md", "new_path": "CHANGELOG.md", "new_file": true, "diff": "@@ -0,0 +1,2 @@\n+## Unreleased\n+- Bindings are cached per frame.\n"}]"#,
+        ),
+        (
+            project,
+            r#"{"iid": 7, "web_url": "https://gitlab.com/acme/render-toolkit/-/merge_requests/7", "title": "Cache the pipeline's bindings", "source_branch": "feature/render-pipeline", "target_branch": "main", "sha": "2222222222222222222222222222222222222222", "state": "opened", "source_project_id": 1, "target_project_id": 1, "author": {"username": "mika"}, "changes_count": "2"}"#,
+        ),
+    ]);
+}
+
+fn prompt(c: &mut Ctx, kind: PromptKind, text: &str, subject: Option<&str>, detail: Option<&str>) {
+    let event = AskpassEvent::Prompt(PromptRequest {
+        id: 1,
+        prompt: Prompt {
+            text: text.to_owned(),
+            kind,
+            subject: subject.map(str::to_owned),
+            detail: detail.map(str::to_owned),
+        },
+    });
+    c.h.act(|ui, cx| ui.on_askpass_event(event, cx));
+    c.settle();
+}
+
+/// Opens a second repository as another tab.
+fn second_repo(c: &mut Ctx, name: &str) {
+    let path = c.repo.parent().unwrap().join(name);
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(&c.repo)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    c.act(Action::OpenRepo(path.to_string_lossy().into_owned()));
+}
+
+fn all() -> Vec<Scene> {
+    let mut t = Table::default();
+
+    t.group("Welcome (no repository open)");
+    t.add(s("welcome-empty", "Wordmark, inline open-repository card with no recents, tips below. No tab strip content.", "Launch with no path, from a directory that isn't a repository, with no saved session.", |_c| {}).no_repo());
+    t.add(s(
+        "welcome-recents",
+        "Same screen with recent repositories listed in the open card.",
+        "Open a repository, then close its tab (cmd+W).",
+        |c| {
+            c.key("cmd+w");
+        },
+    ));
+    t.add(
+        s(
+            "welcome-typed-path",
+            "Open card with a typed path and the folder suggestion list under it.",
+            "Welcome screen, type a path prefix into the card.",
+            |c| {
+                let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+                c.typed(&format!("{dir}/"));
+            },
+        )
+        .no_repo(),
+    );
+    t.add(s(
+        "welcome-open-error",
+        "Error line 'Couldn't open repository: ...' above the open card.",
+        "Launch with --path naming something that isn't a repository.",
+        |_c| {},
+    ));
+    t.add(
+        s(
+            "welcome-dark",
+            "welcome-empty in dark.",
+            "As welcome-empty, theme Dark.",
+            |_c| {},
+        )
+        .no_repo()
+        .dark(),
+    );
+
+    t.group("Shell: tabs and toolbar");
+    t.add(s("base-working-copy", "The default layout: tab strip, toolbar, revision list with revset filter, changed-files pane, diff of @ (unified, wrap on). Working copy selected, activity indicator idle, status bar along the bottom.", "Open the fixture repo.", |_c| {}));
+    t.add(
+        s(
+            "base-dark",
+            "base-working-copy in dark.",
+            "As base-working-copy, theme Dark.",
+            |_c| {},
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "base-contrast",
+            "base-working-copy in the high-contrast theme.",
+            "As base-working-copy, theme High contrast.",
+            |_c| {},
+        )
+        .contrast(),
+    );
+    t.add(s("tabs-two-repos", "Two repository tabs, second active; first tab shows owner/name dimmed and the uncommitted-changes dot.", "Open a second repository (cmd+O, pick it).", |c| { second_repo(c, "second-repo"); }));
+    t.add(s("tabs-many-long", "Many tabs with long directory names squeezing the strip: ellipsis in tab labels, + and the palette control stay pinned.", "Open six repositories with long directory names.", |c| {
+        for name in ["a-rather-long-repository-name-one", "a-rather-long-repository-name-two", "a-rather-long-repository-name-three", "a-rather-long-repository-name-four", "a-rather-long-repository-name-five", "a-rather-long-repository-name-six"] { second_repo(c, name); }
+    }));
+    t.add(s("tabs-tooltip", "Pointer resting on the name of a tab whose working copy has changes: a two-line tooltip just under the tab, the repository's path over what the dot means.", "Rest the pointer on the tab's name until the tooltip shows.", |c| {
+        let tab = c.h.read(|ui| ui.active_tab_id().unwrap());
+        c.hover_element(("tab-label", tab.0 as usize));
+        // A tooltip waits half a second for the pointer to rest.
+        c.h.advance(std::time::Duration::from_millis(600));
+        c.h.frames();
+    }).raw());
+    t.add(s("segmented-active-hover", "Pointer on the view switcher's active segment: its raised face a shade deeper, still raised and ringed.", "Hover the Diff segment.", |c| {
+        c.hover_element("segment-Diff");
+    }));
+    t.add(s("toolbar-running-activity", "Toolbar while work runs: spinner with the task's label, +N chip for a second running task, progress line along the toolbar's bottom edge.", "Start two long operations (a slow fetch and a refresh). The harness starts two activity rows directly, since real ones finish too fast to catch.", |c| {
+        c.h.act(|ui, _| {
+            let tab = ui.active_tab_id().unwrap();
+            ui.begin_activity(tab, "Fetching from origin", false);
+            ui.begin_activity(tab, "Refreshing", false);
+        });
+        c.pump_ms(300);
+    }).raw());
+    t.add(s("toolbar-source-view", "Toolbar in the Source view: view switcher plus the browsed revision's id and description instead of the repo actions.", "Press the Source segment of the view switcher.", |c| { c.cmd("view.source"); }));
+    t.add(s("toolbar-plain-git", "A plain git repository: no jj-only actions (no Undo, no Push), revset placeholder and git graph.", "Open a repository that has .git and no .jj.", |_c| {}).prepare(plain_git));
+    t.add(s("toolbar-refresh-edits", "Manual refresh with an edit on disk: an accent dot on Refresh's glyph; the diff of @ doesn't show the edit yet.", "Set refresh = \"manual\", edit a file, focus the window.", |c| disk_shows(c, true, false)).config("refresh = \"manual\"\n").prepare(edit_on_disk));
+    t.add(s("toolbar-refresh-stale", "Manual refresh on a stale checkout: Refresh's glyph in the warning ink, the stale toast once.", "Set refresh = \"manual\", move @ with --ignore-working-copy, open the repository.", |c| disk_shows(c, false, true)).config("refresh = \"manual\"\n").prepare(stale_checkout));
+    t.add(
+        s(
+            "toolbar-refresh-stale-dark",
+            "toolbar-refresh-stale in dark.",
+            "As toolbar-refresh-stale, theme Dark.",
+            |c| disk_shows(c, false, true),
+        )
+        .config("refresh = \"manual\"\n")
+        .prepare(stale_checkout)
+        .dark(),
+    );
+    t.add(s("toolbar-refresh-stale-edits", "Manual refresh on a stale checkout with an edit on disk: the warning glyph and the accent dot together.", "As toolbar-refresh-stale, with a file edited too.", |c| disk_shows(c, true, true)).config("refresh = \"manual\"\n").prepare(|repo| { stale_checkout(repo); edit_on_disk(repo); }));
+    t.add(s("load-cold", "A cold load mid-flight: the list growing or 'Loading revisions…', progress line on the toolbar.", "Open a repository and look immediately.", |_c| {}).cold());
+
+    t.group("Revision list");
+    t.add(s("graph-all", "Revset all(): branching graph, merges, the octopus merge, immutable diamonds, conflict marks, bookmarks, tags, remote bookmarks, divergent ids.", "Type all() in the revset field, Enter.", all_revs));
+    t.add(s("graph-all-scrolled", "The same list scrolled to the middle: scrollbar thumb, gutter reserved, rows stop short of it.", "As graph-all, scroll the list down.", |c| { all_revs(c); c.scroll(150.0, 500.0, -900.0); }));
+    t.add(s("graph-wide", "Fourteen parallel branches off main: each row's text starts just past its own lanes, so wide rows trade alignment for room.", "Open a repository with many heads off one commit.", |_c| {}).prepare(wide_graph));
+    t.add(s("graph-bookmark-states", "Bookmark chips in every state: ahead (*), conflicted (??), remote-only, deleted, tracked; a very long bookmark ellipsised.", "Revset 'bookmarks() | remote_bookmarks()'.", |c| { c.act(Action::SetRevset("bookmarks() | remote_bookmarks()".to_owned())); }));
+    t.add(s(
+        "graph-marked-rows",
+        "Three rows marked for a batch action, one selected; marks distinct from the selection.",
+        "cmd-click rows (Space marks the selected one).",
+        |c| {
+            all_revs(c);
+            c.select("long-description");
+            c.mark("long-description");
+            c.mark("empty-revision");
+            c.mark("many-files");
+        },
+    ));
+    t.add(s(
+        "revset-empty-result",
+        "List empty state: 'No revisions match' with the hint and the Reset to default button.",
+        "Revset none().",
+        |c| {
+            c.act(Action::SetRevset("none()".to_owned()));
+        },
+    ));
+    t.add(s(
+        "revset-error",
+        "List error state: 'Couldn't evaluate this revset' with jj's message and Reset to default.",
+        "Revset 'foo(' and Enter.",
+        |c| {
+            c.act(Action::SetRevset("foo(".to_owned()));
+        },
+    ));
+    t.add(s("revset-completion", "The revset field focused with a partial word: completion dropdown with kinds and live counts.", "Click the revset field, type 'bookm'.", |c| { c.focus_replacing(crate::sidebar::REVSET_INPUT_ID); c.typed("bookm"); }));
+    t.add(s(
+        "revset-completion-args",
+        "Completion dropdown inside a function argument, offering bookmark names.",
+        "Type 'ancestors(feat'.",
+        |c| {
+            c.focus_replacing(crate::sidebar::REVSET_INPUT_ID);
+            c.typed("ancestors(feat");
+        },
+    ));
+    t.add(s("selection-outside-revset", "The diff pane keeps showing a revision the revset no longer lists, with the note saying so.", "Select a revision, then change the revset so it drops out.", |c| { c.select("kitchen-sink"); c.act(Action::SetRevset("main".to_owned())); }));
+    t.add(s(
+        "panel-history-collapsed",
+        "Revision list hidden: it takes no width, changed files and diff widen, its toolbar toggle is off and the ids in the diff header carry a chevron.",
+        "Click the toolbar's revisions toggle.",
+        |c| {
+            c.cmd_action(Action::ToggleHistoryPanel);
+        },
+    ));
+    t.add(s(
+        "panel-files-collapsed",
+        "Changed files hidden: no width, the diff widens, the file count in the diff header carries a chevron.",
+        "Click the toolbar's changed-files toggle.",
+        |c| {
+            c.cmd_action(Action::ToggleFilesPanel);
+        },
+    ));
+    t.add(s(
+        "panel-both-collapsed",
+        "Both panels hidden: the diff has the window.",
+        "Hide both.",
+        |c| {
+            c.cmd_action(Action::ToggleHistoryPanel);
+            c.cmd_action(Action::ToggleFilesPanel);
+        },
+    ));
+    t.add(s(
+        "panel-files-peek",
+        "Changed files hidden, the header's file count pressed: the file tree floats under it, over the diff.",
+        "Hide the changed files, click 'N files' in the diff header.",
+        |c| {
+            c.select("kitchen-sink");
+            c.cmd_action(Action::ToggleFilesPanel);
+            c.h.click("commit-files-trigger");
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "panel-revisions-peek",
+        "Revisions hidden, the header's ids pressed: the revision list floats down the window's left edge, over the panes.",
+        "Hide the revisions, click the ids in the diff header.",
+        |c| {
+            c.cmd_action(Action::ToggleHistoryPanel);
+            c.h.click("commit-revisions-trigger");
+            c.settle();
+        },
+    ));
+
+    t.group("Diff: file kinds");
+    t.add(s("diff-kitchen-sink", "A revision touching 20 files: commit header (title, body, author, date, ids, parents), file tree with stats, first file's diff.", "Select the 'rework the pipeline' revision.", |c| { c.select("kitchen-sink"); }));
+    t.add(s(
+        "diff-details-collapsed",
+        "Commit details folded to title and one metadata line.",
+        "Press the fold control in the diff header.",
+        |c| {
+            c.select("kitchen-sink");
+            c.cmd("view.toggle-commit-details");
+        },
+    ));
+    t.add(s("diff-rename", "A renamed file in a jj repo. The app passes jj no copy records (core/src/jj/diff.rs), so it reads as an add here and a delete at old_name.rs, not as a rename. Parity is this, not jj's own 'R'.", "Select src/renderer/frame_loop.rs in the tree.", |c| { c.select("kitchen-sink"); c.file("src/renderer/frame_loop.rs"); }));
+    t.add(s("diff-rename-git", "A rename where the app does show one: a plain git repository's diff, 'R' status and old path in the file header.", "Open the repository as plain git, select the revision, select the renamed file.", |c| { c.act(Action::SetRevset("--all".to_owned())); c.select("kitchen-sink"); c.file("src/renderer/frame_loop.rs"); }).prepare(plain_git));
+    t.add(s(
+        "diff-deleted",
+        "A deleted file: all removal rows.",
+        "Select src/removed.rs.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/removed.rs");
+        },
+    ));
+    t.add(s(
+        "diff-binary",
+        "A modified binary file: the size summary card instead of text.",
+        "Select vendor/blob.bin.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("vendor/blob.bin");
+        },
+    ));
+    t.add(s(
+        "diff-binary-added",
+        "An added binary file.",
+        "Select vendor/new-blob.dat.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("vendor/new-blob.dat");
+        },
+    ));
+    t.add(s(
+        "diff-image-modified",
+        "A modified PNG: old and new side by side with dimensions and sizes.",
+        "Select assets/logo.png.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("assets/logo.png");
+        },
+    ));
+    t.add(s(
+        "diff-image-added",
+        "An added PNG preview.",
+        "Select assets/hero.png.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("assets/hero.png");
+        },
+    ));
+    t.add(s(
+        "diff-svg-rendered",
+        "A modified SVG rendered old and new, with the markup toggle.",
+        "Select assets/logo.svg.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("assets/logo.svg");
+        },
+    ));
+    t.add(s(
+        "diff-svg-markup",
+        "The same SVG as a text diff.",
+        "Toggle SVG markup.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("assets/logo.svg");
+            c.act(Action::SetSvgSource(true));
+        },
+    ));
+    t.add(s(
+        "diff-long-lines-wrap",
+        "Very long lines, wrap on: rows grow, continuation rows align under the text.",
+        "Select src/generated/minified.js, wrap on.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/generated/minified.js");
+        },
+    ));
+    t.add(s(
+        "diff-long-lines-nowrap",
+        "The same with wrap off: lines clip at the pane edge, horizontal scrollbar.",
+        "Toggle wrap (alt+Z).",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/generated/minified.js");
+            c.cmd("view.toggle-wrap");
+        },
+    ));
+    t.add(s(
+        "diff-tabs",
+        "Tabs in code: Makefile with leading and inner tabs.",
+        "Select Makefile.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("Makefile");
+        },
+    ));
+    t.add(s(
+        "diff-cjk-wrap",
+        "CJK and mixed-width text with intra-line highlights, wrapping a long Japanese line.",
+        "Select i18n/ja.txt.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("i18n/ja.txt");
+        },
+    ));
+    t.add(s(
+        "diff-cjk-emoji-nowrap",
+        "CJK and emoji with wrap off.",
+        "Select i18n/zh.txt, wrap off.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("i18n/ja.txt");
+            c.cmd("view.toggle-wrap");
+        },
+    ));
+    t.add(s(
+        "diff-mode-change",
+        "A mode-only change: the file header and its note, no hunks.",
+        "Select scripts/run.sh.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("scripts/run.sh");
+        },
+    ));
+    t.add(s(
+        "diff-empty-file",
+        "An added empty file.",
+        "Select docs/empty-file.txt.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("docs/empty-file.txt");
+        },
+    ));
+    t.add(s("diff-deep-path", "A deeply nested file: tree indentation and the header path ellipsise.", "Select the deep file.", |c| { c.select("kitchen-sink"); c.scroll(600.0, 500.0, 0.0); c.file("src/this/path/is/deliberately/nested/very/deeply/so/that/the/file/row/has/to/ellipsize/in/the/changes/list/and/the/diff/header/a_module_with_a_rather_long_file_name_as_well.rs"); }));
+    t.add(s("diff-large-collapsed", "A whole-file rewrite of 20k lines: the backend's collapsed placeholder with 'show full diff'.", "Select the 'regenerate the large table' revision.", |c| { c.select("large-diff"); }));
+    t.add(s(
+        "diff-large-expanded",
+        "The same file expanded in full, scrolled into the middle.",
+        "Press Show full diff, scroll.",
+        |c| {
+            c.select("large-diff");
+            c.try_cmd("file.expand-diff");
+            c.scroll(1000.0, 500.0, -60000.0);
+        },
+    ));
+    t.add(s("diff-many-files", "240 added files: file tree overflows, scrollbar and gutter in the tree, stats column aligned.", "Select the 'generate 240 module stubs' revision.", |c| { c.select("many-files"); }));
+    t.add(s(
+        "diff-many-files-scrolled",
+        "The same with the tree and diff scrolled.",
+        "Scroll the tree and the diff.",
+        |c| {
+            c.select("many-files");
+            c.scroll(1000.0, 500.0, -2000.0);
+            c.scroll(450.0, 500.0, -1200.0);
+        },
+    ));
+    t.add(s(
+        "diff-merge-commit",
+        "A merge revision: two parents as links in the header.",
+        "Select the merge.",
+        |c| {
+            c.select("merge-commit");
+        },
+    ));
+    t.add(s(
+        "diff-empty-revision",
+        "An empty revision: no changed-files pane, the empty diff state.",
+        "Select the empty revision.",
+        |c| {
+            all_revs(c);
+            c.select("empty-revision");
+        },
+    ));
+    t.add(s(
+        "diff-no-description",
+        "A revision without a description: the '(no description)' title treatment.",
+        "Select it.",
+        |c| {
+            all_revs(c);
+            c.select("no-description");
+        },
+    ));
+    t.add(s("diff-long-description", "An enormous first line and a multi-paragraph body: title ellipsises and expands, graph row ellipsises, gutter respected.", "Select it.", |c| { all_revs(c); c.select("long-description"); }));
+    t.add(s(
+        "diff-immutable",
+        "An immutable trunk revision: immutable badge, edit control unavailable.",
+        "Select main.",
+        |c| {
+            c.select("main");
+        },
+    ));
+    t.add(s(
+        "diff-divergent",
+        "A divergent change: the divergent badge and suffixed id.",
+        "Select one divergent copy.",
+        |c| {
+            all_revs(c);
+            c.select("divergent/take-a");
+        },
+    ));
+    t.add(s("diff-scrolled-sticky", "A diff scrolled past the header: sticky file header, hunk headers, scrollbar on the right.", "Select the rename and scroll.", |c| { c.select("kitchen-sink"); c.file("src/renderer/frame_loop.rs"); c.scroll(1000.0, 500.0, -300.0); }));
+
+    t.group("Diff: layout modes");
+    t.add(s(
+        "split-kitchen-sink",
+        "Side by side: two columns with their own line numbers.",
+        "Toggle split.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/main.rs");
+            c.cmd("view.toggle-split");
+        },
+    ));
+    t.add(s(
+        "split-nowrap",
+        "Side by side with wrap off.",
+        "Toggle split, wrap off.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/generated/minified.js");
+            c.cmd("view.toggle-split");
+            c.cmd("view.toggle-wrap");
+        },
+    ));
+    t.add(s(
+        "split-wrap-long-lines",
+        "Side by side with wrap on, long lines: both sides stay row-aligned.",
+        "Toggle split on the long-lines file.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/generated/minified.js");
+            c.cmd("view.toggle-split");
+        },
+    ));
+    t.add(s(
+        "split-cjk",
+        "Side by side with CJK.",
+        "Toggle split on i18n/ja.txt.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("i18n/ja.txt");
+            c.cmd("view.toggle-split");
+        },
+    ));
+    t.add(s(
+        "split-image",
+        "Side by side on an image file.",
+        "Toggle split on assets/logo.png.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("assets/logo.png");
+            c.cmd("view.toggle-split");
+        },
+    ));
+    t.add(
+        s(
+            "split-dark",
+            "Side by side in dark.",
+            "As split-kitchen-sink, theme Dark.",
+            |c| {
+                c.select("kitchen-sink");
+                c.file("src/main.rs");
+                c.cmd("view.toggle-split");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "diff-kitchen-sink-dark",
+            "Unified diff with syntax colours in dark.",
+            "As diff-rename, theme Dark.",
+            |c| {
+                c.select("kitchen-sink");
+                c.file("src/main.rs");
+            },
+        )
+        .dark(),
+    );
+
+    t.add(s(
+        "diff-text-selection",
+        "Text selected by dragging in the diff.",
+        "Drag across a few lines of code.",
+        |c| {
+            c.file("src/main.rs");
+            c.drag((800.0, 320.0), (1150.0, 420.0));
+            c.release();
+            c.pump_ms(100);
+        },
+    ));
+    t.add(s(
+        "diff-hunk-hover",
+        "Pointer on a hunk header: its controls.",
+        "Hover a hunk header.",
+        |c| {
+            c.file("src/main.rs");
+            c.hover(1000.0, 250.0);
+        },
+    ));
+
+    t.group("Find");
+    t.add(s(
+        "find-open",
+        "Find bar pinned top-right of the diff: empty query, case and regex toggles.",
+        "cmd+F.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("cmd+f");
+        },
+    ));
+    t.add(s(
+        "find-matches",
+        "Query with matches: count, current and other matches highlighted in the diff.",
+        "cmd+F, type 'render', Enter.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("cmd+f");
+            c.typed("render");
+            c.key("enter");
+        },
+    ));
+    t.add(s(
+        "find-no-matches",
+        "Query with no matches: zero count state.",
+        "cmd+F, type a miss.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("cmd+f");
+            c.typed("zzzqqq");
+        },
+    ));
+    t.add(s(
+        "find-regex-invalid",
+        "Regex mode with a broken pattern.",
+        "cmd+F, enable regex, type 'ren(der'.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("cmd+f");
+            c.act_find_regex();
+            c.typed("ren(der");
+        },
+    ));
+
+    t.group("Command palette and command line");
+    t.add(s(
+        "palette-empty",
+        "Palette open, empty input, mixed list.",
+        "cmd+K.",
+        |c| {
+            c.key("cmd+k");
+        },
+    ));
+    t.add(s(
+        "palette-mixed-query",
+        "Mixed fuzzy search across revisions, files and commands.",
+        "cmd+K, type 'render'.",
+        |c| {
+            c.key("cmd+k");
+            c.typed("render");
+        },
+    ));
+    t.add(s(
+        "palette-commands",
+        "Commands only: labels, chords on the right, disabled rows greyed with a reason.",
+        "cmd+K, type '>'.",
+        |c| {
+            c.key("cmd+k");
+            c.typed(">");
+        },
+    ));
+    t.add(s(
+        "palette-files",
+        "Files of the current revision.",
+        "cmd+K, type '@'.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("cmd+k");
+            c.typed("@");
+        },
+    ));
+    t.add(s(
+        "palette-actions-column",
+        "A highlighted revision result with its actions column pushed to the right.",
+        "cmd+K, type 'pipeline', Tab.",
+        |c| {
+            c.key("cmd+k");
+            c.typed("pipeline");
+            c.key("tab");
+            c.pump_ms(400);
+        },
+    ));
+    t.add(s(
+        "palette-history-search",
+        "A ':' revision search after Enter: the loaded rows' hits with all history merged in, rows the log leaves out marked.",
+        "cmd+K, type ':render', Enter, wait for the history search.",
+        |c| {
+            c.key("cmd+k");
+            c.typed(":render");
+            c.send_enter();
+            c.h.wait_until("the history search", |ui| {
+                ui.palette()
+                    .and_then(|state| state.top())
+                    .is_some_and(|column| column.searched && column.history.is_none())
+            });
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "palette-no-results",
+        "A query that matches nothing.",
+        "cmd+K, type a miss.",
+        |c| {
+            c.key("cmd+k");
+            c.typed("zzzqqqxxx");
+        },
+    ));
+    t.add(
+        s(
+            "palette-dark",
+            "palette-commands in dark.",
+            "As palette-commands, theme Dark.",
+            |c| {
+                c.key("cmd+k");
+                c.typed(">");
+            },
+        )
+        .dark(),
+    );
+    t.add(s(
+        "cmdline-empty",
+        "Command line: the palette input with the jj prompt and a command list.",
+        "Press ':'.",
+        |c| {
+            c.key(":");
+        },
+    ));
+    t.add(s("cmdline-typed-rebase", "A typed rebase: words coloured in place, revset arguments with live counts, footer saying what Enter does.", "':' then 'rebase -s @ -d main'.", |c| { c.key(":"); c.typed("rebase -s @ -d main"); }));
+    t.add(
+        s(
+            "cmdline-typed-rebase-dark",
+            "cmdline-typed-rebase in dark.",
+            "As cmdline-typed-rebase, theme Dark.",
+            |c| {
+                c.key(":");
+                c.typed("rebase -s @ -d main");
+            },
+        )
+        .dark(),
+    );
+    t.add(s(
+        "cmdline-revset-error",
+        "A typed command with a broken revset argument: the error pointed at.",
+        "':' then 'rebase -s foo( -d main'.",
+        |c| {
+            c.key(":");
+            c.typed("rebase -s foo( -d main");
+        },
+    ));
+    t.add(s(
+        "cmdline-completion",
+        "Completion list inside a command: subcommands or flags.",
+        "':' then 'git pu'.",
+        |c| {
+            c.key(":");
+            c.typed("git pu");
+        },
+    ));
+    t.add(s(
+        "cmdline-unknown",
+        "A command the grammar doesn't know.",
+        "':' then 'frobnicate'.",
+        |c| {
+            c.key(":");
+            c.typed("frobnicate --now");
+        },
+    ));
+    t.add(s(
+        "cli-output-panel",
+        "A passthrough jj run's output panel with its captured text.",
+        "':' then 'status', Enter.",
+        |c| {
+            c.key(":");
+            c.typed("status");
+            c.key("enter");
+            c.pump_ms(1500);
+            c.settle();
+            // A real run is this binary started as jj, which under test is the test
+            // runner, so its lines go in by hand: one of each stream.
+            c.h.act(|ui, _| {
+                use diffui_core::cli::{
+                    CliLine,
+                    CliStream::{Stderr, Stdout},
+                };
+                let line = |stream, text: &str| CliLine {
+                    stream,
+                    text: text.to_owned(),
+                };
+                ui.active_mut().cmdline.runs.last_mut().unwrap().lines = vec![
+                    line(Stdout, "Working copy changes:"),
+                    line(Stdout, "A assets/working-copy.png"),
+                    line(Stdout, "D docs/empty-file.txt"),
+                    line(Stdout, "M src/main.rs"),
+                    line(
+                        Stdout,
+                        "Working copy  (@) : lvtsvnkk fa52156f (no description set)",
+                    ),
+                    line(Stderr, "Warning: These bookmarks have conflicts:"),
+                    line(Stderr, "  release/conflicted"),
+                ];
+            });
+            c.settle();
+        },
+    ));
+
+    t.group("Target mode (drafts)");
+    t.add(s("draft-rebase-start", "Rebase target mode: op bar with source, placement segments, hint strip under the diff, no candidate yet.", "Select a revision, press r.", |c| { c.select("cache-bindings"); c.key("r"); }));
+    t.add(s("draft-rebase-candidate", "A destination armed: graph preview of the result, verdict in the op bar, target row styled.", "r, then j/k to a destination.", |c| { c.select("cache-bindings"); c.key("r"); c.key("j"); c.key("j"); c.key("j"); c.pump_ms(600); c.settle(); }));
+    t.add(s(
+        "draft-rebase-after",
+        "Placement set to After.",
+        "r, j, a.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("r");
+            c.key("j");
+            c.key("j");
+            // With a candidate armed the key applies the draft, which is what the
+            // baseline's shot shows; the scene is about the placement.
+            c.act(Action::DraftPlacement(diffui_core::PlacementKind::After));
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "draft-rebase-before",
+        "Placement set to Before.",
+        "r, j, b.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("r");
+            c.key("j");
+            c.key("j");
+            // With a candidate armed the key applies the draft, which is what the
+            // baseline's shot shows; the scene is about the placement.
+            c.act(Action::DraftPlacement(diffui_core::PlacementKind::Before));
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "draft-rebase-descendants",
+        "Rebase with descendants.",
+        "Select, R.",
+        |c| {
+            c.select("kitchen-sink");
+            c.key("R");
+            c.key("j");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "draft-rebase-branch",
+        "Rebase whole branch.",
+        "Select, b.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("b");
+        },
+    ));
+    t.add(s("draft-rebase-conflict-verdict", "A preview that forecasts conflicts: the conflict verdict and conflicted rows.", "Rebase the 'lower the sample count' stack's parent side onto a destination that conflicts.", |c| { all_revs(c); c.select("auth-refresh"); c.key("r"); c.select_draft_candidate("conflicted"); c.pump_ms(800); c.settle(); }));
+    t.add(s(
+        "draft-squash",
+        "Squash target mode.",
+        "Select, s.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("s");
+            c.key("k");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "draft-merge",
+        "Merge target mode with an added parent.",
+        "Select, m, j, Space.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("m");
+            c.key("j");
+            c.key("space");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "draft-new",
+        "New change at a picked spot.",
+        "Select, N.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("N");
+            c.key("j");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s("draft-duplicate", "Duplicate onto.", "Select, Y.", |c| {
+        c.select("cache-bindings");
+        c.key("Y");
+        c.key("j");
+        c.pump_ms(600);
+        c.settle();
+    }));
+    t.add(s("draft-parallelize", "Parallelize.", "Select, p.", |c| {
+        c.select("cache-bindings");
+        c.key("p");
+        c.key("j");
+        c.pump_ms(600);
+        c.settle();
+    }));
+    t.add(s(
+        "draft-batch-sources",
+        "Batch: several marked revisions as sources; op bar lists them.",
+        "Mark two rows, palette 'Rebase marked revisions onto…'.",
+        |c| {
+            c.select("cache-bindings");
+            c.mark("cache-bindings");
+            c.mark("kitchen-sink");
+            c.cmd("selection.rebase.start");
+            c.key("j");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s("draft-drag", "Dragging a revision row: the drag has started a rebase draft, the drop spot under the cursor is armed.", "Press a row and drag it onto another.", |c| { c.drag((150.0, 200.0), (150.0, 330.0)); c.pump_ms(700); }).raw());
+    t.add(
+        s(
+            "draft-dark",
+            "draft-rebase-candidate in dark.",
+            "As draft-rebase-candidate, theme Dark.",
+            |c| {
+                c.select("cache-bindings");
+                c.key("r");
+                c.key("j");
+                c.key("j");
+                c.key("j");
+                c.pump_ms(600);
+                c.settle();
+            },
+        )
+        .dark(),
+    );
+
+    t.add(s(
+        "draft-command-line",
+        "Target mode turned into its jj command in the command line.",
+        "r, j, then ':'.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("r");
+            c.key("j");
+            c.key("j");
+            c.pump_ms(600);
+            c.settle();
+            c.key(":");
+        },
+    ));
+    t.add(s(
+        "draft-move-changes",
+        "Move picked changes into a target: target mode with the changes named.",
+        "Pick a file with x, run Move selected changes into….",
+        |c| {
+            c.key("x");
+            c.try_cmd("changes.move-into");
+            c.key("j");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+
+    t.group("Partial changes and line selection");
+    t.add(s("picks-files-hunks", "File and hunk checkboxes in use: some files picked, the action strip with split, squash, move, discard.", "Press x on a file; click a hunk checkbox.", |c| { c.key("x"); c.key("j"); c.key("x"); }));
+    t.add(s(
+        "lines-select-mode",
+        "Line-select mode: changed lines pickable, hint strip with its keys.",
+        "Press v.",
+        |c| {
+            c.file("src/main.rs");
+            c.key("v");
+        },
+    ));
+    t.add(s(
+        "lines-picked",
+        "Some lines picked and a range extended.",
+        "v, j, Space, J, J, Space.",
+        |c| {
+            c.file("src/main.rs");
+            c.key("v");
+            c.key("j");
+            c.key("space");
+            c.key("J");
+            c.key("J");
+        },
+    ));
+    t.add(s(
+        "lines-split",
+        "Line select in side by side.",
+        "Toggle split, v, pick lines.",
+        |c| {
+            c.file("src/main.rs");
+            c.cmd("view.toggle-split");
+            c.key("v");
+            c.key("j");
+            c.key("space");
+        },
+    ));
+    t.add(s(
+        "split-modal",
+        "The split dialog: the two description editors.",
+        "Pick files, press X.",
+        |c| {
+            c.key("x");
+            c.key("X");
+        },
+    ));
+    t.add(s(
+        "discard-confirm",
+        "Confirm dialog for discarding picked changes.",
+        "Pick a file, run Discard selected changes.",
+        |c| {
+            c.key("x");
+            c.cmd("changes.discard");
+        },
+    ));
+
+    t.group("Description editing");
+    t.add(s(
+        "description-editor",
+        "Inline description editor above the diff with Save and Cancel.",
+        "Press d.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("d");
+        },
+    ));
+    t.add(s("description-editor-multiline", "Editor grown to fit a typed multi-line message.", "d, then type.", |c| { c.key("d"); c.typed("A new description for the working copy"); c.send_enter(); c.send_enter(); c.typed("With a second paragraph that runs on for a while so the editor shows its wrapping behaviour on long lines of prose."); }));
+    t.add(s(
+        "commit-editor",
+        "The same editor in commit mode.",
+        "Press c on @.",
+        |c| {
+            c.key("c");
+        },
+    ));
+
+    t.group("Dialogs");
+    t.add(s(
+        "confirm-abandon",
+        "Confirm dialog: abandon a revision.",
+        "Select, a.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("a");
+        },
+    ));
+    t.add(s(
+        "confirm-abandon-many",
+        "Confirm dialog naming several marked revisions.",
+        "Mark rows, a.",
+        |c| {
+            c.select("cache-bindings");
+            c.mark("cache-bindings");
+            c.mark("many-files");
+            c.key("a");
+        },
+    ));
+    t.add(s(
+        "confirm-immutable",
+        "Guarded edit of an immutable revision: the confirm that offers to ignore immutability.",
+        "Select main, abandon or edit it.",
+        |c| {
+            c.select("main");
+            c.key("e");
+        },
+    ));
+    t.add(s(
+        "confirm-push-tracked",
+        "Push confirm listing what goes out.",
+        "Press P.",
+        |c| {
+            c.key("P");
+        },
+    ));
+    t.add(
+        s(
+            "confirm-push-tracked-dark",
+            "confirm-push-tracked in dark.",
+            "As confirm-push-tracked, theme Dark.",
+            |c| {
+                c.key("P");
+            },
+        )
+        .dark(),
+    );
+    t.add(s(
+        "confirm-push-working-copy",
+        "The warning for pushing the working-copy commit.",
+        "Palette 'Push as new bookmark' on @.",
+        |c| {
+            c.cmd("revision.push-change");
+        },
+    ));
+    t.add(s(
+        "confirm-rebase-trunk-conflicts",
+        "Rebase onto trunk's forecast confirm naming the changes that end up conflicted.",
+        "Run 'Whole branch onto trunk' on the docs(changelog) revision.",
+        |c| {
+            all_revs(c);
+            c.select("trunk-conflict");
+            c.try_cmd("revision.rebase.onto-trunk");
+            c.pump_ms(1200);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "confirm-restore-operation",
+        "Confirm restoring the repo to an operation.",
+        "History view, select an op, Restore.",
+        |c| {
+            c.key("O");
+            c.settle();
+            c.select_op(3);
+            c.try_cmd("history.restore-operation");
+        },
+    ));
+    t.add(s(
+        "confirm-push-refused",
+        "The dialog for a push jj's checks refused (conflicted commit).",
+        "Push a bookmark on a conflicted revision.",
+        |c| {
+            all_revs(c);
+            c.cmd_arg(
+                "bookmark.push",
+                CommandArg::Bookmark {
+                    name: "conflict/settings".to_owned(),
+                    remote: Some("origin".to_owned()),
+                    to: None,
+                },
+            );
+            c.pump_ms(800);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "confirm-push-new",
+        "Push of a new local bookmark naming the remote.",
+        "Bookmark row's Push.",
+        |c| {
+            c.cmd_arg(
+                "bookmark.push",
+                CommandArg::Bookmark {
+                    name: "fix/parser-crash".to_owned(),
+                    remote: Some("origin".to_owned()),
+                    to: None,
+                },
+            );
+            c.pump_ms(800);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "confirm-restore-file",
+        "Discard a file's changes.",
+        "File row's Restore from parent.",
+        |c| {
+            c.file("src/main.rs");
+            c.try_cmd("file.restore");
+        },
+    ));
+    t.add(
+        s(
+            "confirm-dark",
+            "confirm-abandon in dark.",
+            "As confirm-abandon, theme Dark.",
+            |c| {
+                c.select("cache-bindings");
+                c.key("a");
+            },
+        )
+        .dark(),
+    );
+    t.add(s(
+        "name-prompt-create",
+        "Bookmark name prompt, empty.",
+        "Press B.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("B");
+        },
+    ));
+    t.add(s(
+        "name-prompt-invalid",
+        "Prompt with an invalid name: the verdict line.",
+        "B, type 'bad name'.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("B");
+            c.typed("bad name");
+        },
+    ));
+    t.add(s(
+        "name-prompt-exists",
+        "Prompt with an existing name: move instead wording.",
+        "B, type 'main'.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("B");
+            c.typed("main");
+        },
+    ));
+    t.add(s(
+        "name-prompt-rename",
+        "Prompt in rename mode.",
+        "Bookmark row's Rename….",
+        |c| {
+            c.cmd_arg(
+                "bookmark.rename",
+                CommandArg::Bookmark {
+                    name: "fix/parser-crash".to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            );
+        },
+    ));
+    t.add(s(
+        "open-repo-dialog",
+        "Open-repository dialog over a tab, recents listed.",
+        "Have opened another repository before, cmd+O.",
+        |c| {
+            second_repo(c, "older-repo");
+            c.key("cmd+w");
+            c.key("cmd+o");
+        },
+    ));
+    t.add(s(
+        "open-repo-typed",
+        "Dialog with a typed path and folder suggestions highlighted.",
+        "cmd+O, type a path, down.",
+        |c| {
+            c.key("cmd+o");
+            let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+            c.typed(&format!("{dir}/"));
+            c.key("down");
+        },
+    ));
+    t.add(s(
+        "open-repo-not-repo",
+        "Dialog after submitting a path that isn't a repository: the open's own error in the status line.",
+        "cmd+O, type /usr/bin, Enter.",
+        |c| {
+            c.key("cmd+o");
+            c.typed("/usr/bin");
+            c.key("enter");
+        },
+    ));
+    t.add(s(
+        "open-repo-repository",
+        "A typed path that is a repository: the status line says so and what Enter does.",
+        "cmd+O, type the fixture repository's path.",
+        |c| {
+            c.key("cmd+o");
+            let path = c.repo.to_string_lossy().into_owned();
+            c.typed(&path);
+            c.pump_ms(300);
+        },
+    ));
+    t.add(s(
+        "open-repo-no-match",
+        "A typed name no folder starts with: the warning status line.",
+        "cmd+O, type a folder and a name nothing matches.",
+        |c| {
+            c.key("cmd+o");
+            let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+            c.typed(&format!("{dir}/zzq"));
+            c.pump_ms(300);
+        },
+    ));
+    t.add(s(
+        "open-repo-pull-request",
+        "A pull request reference: its status line and the card saying how it opens.",
+        "cmd+O, type acme/render-toolkit#42.",
+        |c| {
+            c.key("cmd+o");
+            c.typed("acme/render-toolkit#42");
+        },
+    ));
+    t.add(
+        s(
+            "open-repo-typed-dark",
+            "open-repo-typed in dark.",
+            "As open-repo-typed, theme Dark.",
+            |c| {
+                c.key("cmd+o");
+                let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+                c.typed(&format!("{dir}/"));
+                c.key("down");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "open-repo-hosts",
+            "The open prompt listing where to open: this machine, then the hosts with how each is reached. The band shows the host chip.",
+            "Launch with two `[hosts]` tables, cmd+O, click the host chip.",
+            |c| {
+                c.key("cmd+o");
+                c.act(Action::OpenRepoHosts);
+                c.key("down");
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "open-repo-on-host",
+            "The open prompt browsing a host: its name on the chip, a folder of that machine listed with the repository flagged.",
+            "As open-repo-hosts, pick the host, type the fixture's folder.",
+            |c| {
+                c.key("cmd+o");
+                c.act(Action::OpenRepoHost(Some("box".to_owned())));
+                let dir = c.repo.parent().unwrap().to_string_lossy().into_owned();
+                c.h.act(|ui, cx| ui.open_repo_typed(format!("{dir}/"), cx));
+                c.h.wait_until("the host's folder listing", |ui| {
+                    ui.open_repo_dialog()
+                        .and_then(|dialog| dialog.suggestions())
+                        .is_some_and(|(_, rows)| !rows.is_empty())
+                });
+                c.key("down");
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "remote-tab",
+            "A repository on another machine in a tab beside a local one: the host before the name, in mono.",
+            "Launch with a `[hosts]` table, open the fixture on that host.",
+            open_on_host,
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "remote-connection-lost",
+            "The strip atop a remote tab's diff once its connection is gone, with Reconnect; the graph stays.",
+            "As remote-tab, then the host's server stops.",
+            |c| {
+                open_on_host(c);
+                crate::remote::in_process::stop();
+                c.h.wait_until("the tab to hear its link is gone", |ui| {
+                    ui.active()
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.lost.is_some())
+                });
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(s(
+        "shortcuts-sheet",
+        "The keyboard-shortcut cheat sheet over the window.",
+        "Press ?.",
+        |c| {
+            c.key("?");
+        },
+    ));
+    t.add(
+        s(
+            "shortcuts-dark",
+            "The cheat sheet in dark.",
+            "Press ?, theme Dark.",
+            |c| {
+                c.key("?");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "shortcuts-welcome",
+            "The cheat sheet over the welcome screen.",
+            "Welcome, click Keyboard shortcuts (the card's input has focus, so ? types).",
+            |c| {
+                c.act(Action::ToggleShortcuts);
+            },
+        )
+        .no_repo(),
+    );
+
+    t.group("Settings");
+    t.add(s(
+        "settings-dialog",
+        "The settings dialog over the window: the sections down its left side, General selected, every row editable.",
+        "Press cmd+,.",
+        |c| {
+            c.key("cmd+,");
+        },
+    ));
+    t.add(
+        s(
+            "settings-dialog-dark",
+            "The settings dialog in dark.",
+            "Press cmd+,, theme Dark.",
+            |c| {
+                c.key("cmd+,");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "settings-locked-broken",
+            "Rows config.toml sets are locked; a settings.toml that doesn't parse shows its banner.",
+            "Launch with config.toml setting theme, refresh and code_font_size, and a broken settings.toml; press cmd+,.",
+            |c| {
+                c.key("cmd+,");
+            },
+        )
+        .config("theme = \"Light\"\nrefresh = \"Manual\"\ncode_font_size = 14\n")
+        .settings("multi_click_ms = = 400\n"),
+    );
+
+    t.add(
+        s(
+            "settings-hosts",
+            "Settings, Hosts: a row per host with how it is reached and what runs there, then the field that adds one.",
+            "Launch with two `[hosts]` tables, press cmd+,, click Hosts.",
+            |c| {
+                c.key("cmd+,");
+                c.act(Action::SettingsSection(crate::settings::Section::Hosts));
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+    t.add(
+        s(
+            "settings-host-page",
+            "A host's page: how it is reached with the transport's own settings, the Test row, and the server's command and environment. What config.toml sets is locked.",
+            "As settings-hosts, click the pencil on the ssh host's row.",
+            |c| {
+                c.key("cmd+,");
+                c.act(Action::Host(crate::host_page::HostAction::Open(
+                    "staging".to_owned(),
+                )));
+            },
+        )
+        .config(REMOTE_HOSTS),
+    );
+
+    t.add(
+        s(
+            "settings-host-failed",
+            "A host's page after its server didn't start: why in red on the Connection row with Try again, and under it what was run and what that wrote.",
+            "Launch with a host whose command fails, open its page, click Connect.",
+            |c| {
+                use crate::host_page::HostAction;
+                c.key("cmd+,");
+                c.act(Action::Host(HostAction::Open("devbox".to_owned())));
+                c.act(Action::Host(HostAction::Connect));
+                c.h.wait_until("the start to fail", |ui| {
+                    matches!(
+                        ui.host_state(&diffui_core::remote::HostId("devbox".to_owned())),
+                        Some(crate::connections::HostState::Failed(_))
+                    )
+                });
+            },
+        )
+        .config(
+            "[hosts.devbox]\ncommand = [\"sh\", \"-c\", \"echo 'Warning: Permanently added devbox to the list of known hosts.' >&2; echo 'bash: line 1: exec: diffui-serve: not found' >&2; exit 127\"]\n",
+        ),
+    );
+
+    t.group("Credential prompt");
+    t.add(s(
+        "credential-password",
+        "git asking for a password: masked field, subject in mono.",
+        "Push over https to a remote that needs auth. The harness injects the prompt event.",
+        |c| {
+            prompt(
+                c,
+                PromptKind::Secret,
+                "Password for 'https://ada@example.com':",
+                Some("https://ada@example.com"),
+                None,
+            );
+        },
+    ));
+    t.add(s(
+        "credential-username",
+        "git asking for a username: plain field.",
+        "As above, first prompt.",
+        |c| {
+            prompt(
+                c,
+                PromptKind::Text,
+                "Username for 'https://example.com':",
+                Some("https://example.com"),
+                None,
+            );
+        },
+    ));
+    t.add(s("credential-host-key", "ssh's unknown host key question: fingerprint and Yes/Cancel.", "First ssh to a new host.", |c| { prompt(c, PromptKind::YesNo, "The authenticity of host 'git.example.com (203.0.113.7)' can't be established.\nED25519 key fingerprint is SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?", Some("git.example.com"), Some("SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")); }));
+    t.add(s(
+        "credential-passphrase",
+        "ssh key passphrase.",
+        "Push over ssh with an encrypted key.",
+        |c| {
+            prompt(
+                c,
+                PromptKind::Secret,
+                "Enter passphrase for key '/Users/ada/.ssh/id_ed25519':",
+                Some("/Users/ada/.ssh/id_ed25519"),
+                None,
+            );
+        },
+    ));
+    t.add(s(
+        "credential-notice",
+        "A notice with nothing to answer (touch your security key).",
+        "ssh with a hardware key.",
+        |c| {
+            prompt(
+                c,
+                PromptKind::Notice,
+                "Confirm user presence for key ED25519-SK SHA256:abc",
+                None,
+                None,
+            );
+        },
+    ));
+    t.add(
+        s(
+            "credential-dark",
+            "Password prompt in dark.",
+            "As credential-password, theme Dark.",
+            |c| {
+                prompt(
+                    c,
+                    PromptKind::Secret,
+                    "Password for 'https://ada@example.com':",
+                    Some("https://ada@example.com"),
+                    None,
+                );
+            },
+        )
+        .dark(),
+    );
+
+    t.group("Activity and toasts");
+    t.add(s(
+        "activity-popover",
+        "Activity popover: rows with status icons, titles, results, elapsed times.",
+        "Refresh and fetch, click the activity indicator.",
+        |c| {
+            c.act(Action::Refresh);
+            c.key("f");
+            c.settle();
+            c.act(Action::ToggleActivityPopover);
+        },
+    ));
+    t.add(s(
+        "activity-popover-expanded",
+        "A row expanded: captured output in a code block.",
+        "Push, open the popover, expand the push row.",
+        |c| {
+            c.act(Action::Bookmark(
+                crate::bookmarks::BookmarkAction::PushTracked,
+            ));
+            c.settle();
+            c.confirm();
+            c.settle();
+            c.act(Action::ToggleActivityPopover);
+            c.expand_first_activity();
+        },
+    ));
+    t.add(s(
+        "activity-popover-failed",
+        "A failed row: its error text.",
+        "Fail a fetch, open the popover.",
+        |c| {
+            let git = c.repo.join(".git/config");
+            let config = std::fs::read_to_string(&git).unwrap();
+            let mut lines = String::new();
+            for line in config.lines() {
+                if line.trim_start().starts_with("url") {
+                    lines.push_str("\turl = /nonexistent/remote.git\n");
+                } else {
+                    lines.push_str(line);
+                    lines.push('\n');
+                }
+            }
+            std::fs::write(&git, lines).unwrap();
+            c.key("f");
+            c.settle();
+            c.act(Action::ToggleActivityPopover);
+        },
+    ));
+    t.add(s(
+        "activity-popover-two-failed",
+        "Two failed rows, one above the other: a sliver of the card between their tints.",
+        "Fail two operations, open the popover. The harness finishes two activity rows as failed directly.",
+        |c| {
+            c.h.act(|ui, _| {
+                let tab = ui.active_tab_id().unwrap();
+                for (label, why) in [
+                    (
+                        "Fetch from origin",
+                        "Could not reach origin: the remote hung up",
+                    ),
+                    (
+                        "Load pull request",
+                        "The GitLab CLI (`glab`) wasn't found. Install it and sign in.",
+                    ),
+                ] {
+                    let (id, _) = ui.begin_activity(tab, label, false);
+                    ui.tab_mut(tab).unwrap().activities.finish(
+                        id,
+                        crate::activity::ActivityStatus::Error,
+                        Some(why.to_owned()),
+                    );
+                }
+            });
+            c.act(Action::ToggleActivityPopover);
+        },
+    ));
+    t.add(
+        s(
+            "activity-popover-dark",
+            "The popover in dark.",
+            "As activity-popover, theme Dark.",
+            |c| {
+                c.act(Action::Refresh);
+                c.key("f");
+                c.settle();
+                c.act(Action::ToggleActivityPopover);
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "toast-config-error",
+            "Error toast at startup for a config file that doesn't parse.",
+            "Launch with a broken config.toml.",
+            |c| {
+                c.pump_ms(100);
+            },
+        )
+        .config("this is = = not toml\n"),
+    );
+    t.add(s(
+        "toast-operation-failed",
+        "Error toast from a failed operation.",
+        "Fail a fetch.",
+        |c| {
+            let git = c.repo.join(".git/config");
+            let config = std::fs::read_to_string(&git).unwrap();
+            let mut lines = String::new();
+            for line in config.lines() {
+                if line.trim_start().starts_with("url") {
+                    lines.push_str("\turl = /nonexistent/remote.git\n");
+                } else {
+                    lines.push_str(line);
+                    lines.push('\n');
+                }
+            }
+            std::fs::write(&git, lines).unwrap();
+            c.key("f");
+            c.settle();
+        },
+    ));
+
+    t.group("Source view");
+    t.add(s(
+        "source-file",
+        "Source view: full tree on the left, selected file's code with line numbers.",
+        "Source segment, click a file.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("src/main.rs");
+        },
+    ));
+    t.add(s(
+        "source-no-file",
+        "Source view with no file to open first: 'Select a file to view its source'.",
+        "Select an empty revision, Source segment.",
+        |c| {
+            all_revs(c);
+            c.select("empty-revision");
+            c.cmd("view.source");
+        },
+    ));
+    t.add(s("source-opened", "Source view as it opens from the working copy: the first changed file is picked, here a PNG, which the source view doesn't preview.", "Source segment.", |c| { c.cmd("view.source"); }));
+    t.add(s(
+        "source-filter",
+        "Fuzzy file filter in the tree's search box.",
+        "Type in the filter.",
+        |c| {
+            c.cmd("view.source");
+            c.focus(crate::source_panel::SOURCE_FILTER_INPUT_ID);
+            c.typed("frame");
+        },
+    ));
+    t.add(s(
+        "source-annotate",
+        "Annotate on: blame column beside the code.",
+        "Press A.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("src/main.rs");
+            c.key("A");
+            c.pump_ms(600);
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "source-long-lines",
+        "A file of very long lines.",
+        "Open src/generated/minified.js.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("src/generated/minified.js");
+        },
+    ));
+    t.add(s(
+        "source-image",
+        "An image in the source view: 'Binary file, not shown', no preview.",
+        "Open assets/hero.png.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("assets/hero.png");
+        },
+    ));
+    t.add(s(
+        "source-binary",
+        "A binary file in the source view.",
+        "Open vendor/blob.bin.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("vendor/blob.bin");
+        },
+    ));
+    t.add(s(
+        "source-cjk",
+        "CJK text in the source view.",
+        "Open i18n/ja.txt.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("i18n/ja.txt");
+        },
+    ));
+    t.add(s(
+        "source-find",
+        "Find bar over the source view.",
+        "cmd+F, type 'render'.",
+        |c| {
+            c.cmd("view.source");
+            c.source_file("src/main.rs");
+            c.key("cmd+f");
+            c.typed("render");
+        },
+    ));
+    t.add(
+        s(
+            "source-dark",
+            "Source view in dark.",
+            "As source-file, theme Dark.",
+            |c| {
+                c.cmd("view.source");
+                c.source_file("src/main.rs");
+            },
+        )
+        .dark(),
+    );
+
+    t.group("History view");
+    t.add(s("history-oplog", "History view: operation log on the left (snapshot runs folded), selected operation's changes on the right.", "Press O.", |c| { c.key("O"); c.settle(); }));
+    t.add(s("history-op-selected", "An older operation selected: what it changed, changed-commit list, a commit's diff, restore and revert.", "Press O, click an operation.", |c| { c.key("O"); c.settle(); c.select_op(4); }));
+    t.add(s(
+        "history-evolog",
+        "Evolution log of a revision that was rewritten, with interdiffs.",
+        "Select a revision, press E.",
+        |c| {
+            c.select("feature/auth");
+            c.key("E");
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "history-evolog-selected",
+        "An older evolog version selected.",
+        "Select a version.",
+        |c| {
+            c.select("feature/auth");
+            c.key("E");
+            c.settle();
+            c.act(Action::History(
+                crate::history_panel::HistoryAction::SelectVersion(1),
+            ));
+        },
+    ));
+    t.add(
+        s(
+            "history-dark",
+            "The operation log in dark.",
+            "As history-oplog, theme Dark.",
+            |c| {
+                c.key("O");
+                c.settle();
+            },
+        )
+        .dark(),
+    );
+    t.add(s(
+        "file-history",
+        "File history filter: list narrowed to revisions touching one path, banner above it.",
+        "Select a file, press H.",
+        |c| {
+            c.select("kitchen-sink");
+            c.file("src/main.rs");
+            c.key("H");
+            c.settle();
+        },
+    ));
+
+    t.group("Compare and range");
+    t.add(s("compare-with-wc", "Comparing a revision with the working copy: the 'Comparing A → B' banner with swap, interdiff, exit; hint strip.", "Palette 'Compare with working copy'.", |c| { c.select("cache-bindings"); c.cmd("compare.with-working-copy"); }));
+    t.add(s(
+        "compare-picking",
+        "Compare with… armed: the banner asks to click another revision.",
+        "Press C.",
+        |c| {
+            c.select("cache-bindings");
+            c.key("C");
+        },
+    ));
+    t.add(s(
+        "compare-interdiff",
+        "Interdiff mode of a comparison.",
+        "Comparing, press Interdiff.",
+        |c| {
+            c.select("cache-bindings");
+            c.cmd("compare.with-working-copy");
+            c.try_cmd("compare.interdiff");
+        },
+    ));
+    t.add(s(
+        "range-since-trunk",
+        "Diff since trunk: range banner and the commit list standing in for commit info.",
+        "Palette 'Diff since trunk'.",
+        |c| {
+            c.select("cache-bindings");
+            c.cmd("diff.since-trunk");
+        },
+    ));
+    t.add(s(
+        "range-typed",
+        "A typed range diff from the command line.",
+        "':' then \"diff -r 'main..feature/render-pipeline'\".",
+        |c| {
+            c.key(":");
+            c.typed("diff -r main..feature/render-pipeline");
+            c.key("enter");
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "range-empty",
+        "A range with no commits: its empty state.",
+        "Diff since trunk on a revision already in trunk.",
+        |c| {
+            c.select("main");
+            c.try_cmd("diff.since-trunk");
+        },
+    ));
+    t.add(s(
+        "range-span-marked",
+        "shift-click span: two connected marked rows shown as one diff.",
+        "Click a row, shift-click another.",
+        |c| {
+            c.select("cache-bindings");
+            c.shift_mark("kitchen-sink");
+        },
+    ));
+    t.add(s(
+        "compare-marked",
+        "Two marked rows compared against each other.",
+        "cmd-click two rows, palette 'Compare marked revisions'.",
+        |c| {
+            c.select("many-files");
+            c.mark("many-files");
+            c.mark("empty-revision");
+            c.try_cmd("compare.marked");
+        },
+    ));
+    t.add(s(
+        "range-disconnected",
+        "A span over rows that aren't connected: 'Not a connected range'.",
+        "Click a row, shift-click rows on other branches.",
+        |c| {
+            // The baseline's rows turned out connected. These two skip the one between.
+            let marked = vec![
+                c.commit_of("feature/render-pipeline"),
+                c.commit_of("kitchen-sink"),
+            ];
+            c.h.act(|ui, _| {
+                ui.active_mut().revision_multi_selection = marked;
+                ui.sync_span(true);
+            });
+            c.settle();
+        },
+    ));
+
+    t.group("Conflicts");
+    t.add(s("conflict-revision", "A conflicted revision selected: conflict banner, regions in the diff with take-side controls, file marked in the tree.", "Select the conflicted revision.", |c| { all_revs(c); c.select("conflicted"); }));
+    t.add(s(
+        "conflict-config-file",
+        "The conflicted src/config.rs: region controls and hint strip keys.",
+        "Select src/config.rs.",
+        |c| {
+            all_revs(c);
+            c.select("conflicted");
+            c.file("src/config.rs");
+        },
+    ));
+    t.add(s(
+        "conflict-modify-delete",
+        "A modify/delete conflict: no regions to pick, take-a-side only.",
+        "Select src/removed.rs.",
+        |c| {
+            all_revs(c);
+            c.select("conflicted");
+            c.file("src/removed.rs");
+        },
+    ));
+    t.add(s(
+        "conflict-octopus",
+        "A three-sided conflict from the octopus merge.",
+        "Select the octopus merge.",
+        |c| {
+            all_revs(c);
+            c.select("conflict/octopus");
+            c.file("docs/guide.md");
+        },
+    ));
+    t.add(s(
+        "conflict-marker-editor",
+        "Marker editor open on a conflicted file with Save and Cancel.",
+        "Palette 'Edit conflict markers'.",
+        |c| {
+            all_revs(c);
+            c.select("conflicted");
+            c.file("src/config.rs");
+            c.try_cmd("conflict.edit-markers");
+        },
+    ));
+    t.add(s(
+        "conflict-split",
+        "Conflict regions in side by side.",
+        "Toggle split.",
+        |c| {
+            all_revs(c);
+            c.select("conflicted");
+            c.file("src/config.rs");
+            c.cmd("view.toggle-split");
+        },
+    ));
+    t.add(
+        s(
+            "conflict-dark",
+            "A conflicted file in dark.",
+            "As conflict-config-file, theme Dark.",
+            |c| {
+                all_revs(c);
+                c.select("conflicted");
+                c.file("src/config.rs");
+            },
+        )
+        .dark(),
+    );
+    t.add(
+        s(
+            "conflict-working-copy",
+            "The working copy itself conflicted.",
+            "jj new on the conflicted revision, then open.",
+            |c| {
+                c.file("src/config.rs");
+            },
+        )
+        .prepare(|repo| {
+            jj(repo, &["new", "conflict/settings"]);
+        }),
+    );
+    t.add(s(
+        "graph-conflict-preset",
+        "The Conflicts preset revset: only conflicted rows.",
+        "Revset conflicts().",
+        |c| {
+            c.act(Action::SetRevset("conflicts()".to_owned()));
+        },
+    ));
+
+    t.group("Menus (the overlay; macOS shows native NSMenus)");
+    t.add(s("menu-revision", "Revision context menu at a row, row glow. Content and order match the native menu; the look is the non-macOS overlay.", "Right-click a revision row.", |c| { c.right_click(180.0, 180.0); }).animated());
+    t.add(
+        s(
+            "menu-revision-submenu",
+            "The same menu with a flyout open.",
+            "Right-click, hover a submenu row.",
+            |c| {
+                c.right_click(180.0, 180.0);
+                c.open_first_submenu();
+            },
+        )
+        .animated(),
+    );
+    t.add(
+        s(
+            "menu-revision-immutable",
+            "The menu on an immutable revision. The glow's position is nominal here.",
+            "Right-click main's row.",
+            |c| {
+                c.select("main");
+                c.right_click_selected();
+            },
+        )
+        .animated(),
+    );
+    t.add(
+        s(
+            "menu-revision-marked",
+            "The menu with several rows marked: batch verbs.",
+            "Mark rows, right-click one.",
+            |c| {
+                c.select("cache-bindings");
+                c.mark("cache-bindings");
+                c.mark("many-files");
+                c.right_click_selected();
+            },
+        )
+        .animated(),
+    );
+    t.add(s(
+        "menu-file",
+        "File context menu in the tree.",
+        "Right-click a file row.",
+        |c| {
+            c.select("kitchen-sink");
+            c.right_click(460.0, 180.0);
+        },
+    ));
+    t.add(s(
+        "menu-fetch",
+        "Fetch dropdown.",
+        "Click Fetch's caret.",
+        |c| {
+            c.open_toolbar_menu(crate::ToolbarMenu::FetchBranches);
+        },
+    ));
+    t.add(s(
+        "menu-revset-presets",
+        "Revset presets dropdown.",
+        "Click the revset field's caret.",
+        |c| {
+            c.open_toolbar_menu(crate::ToolbarMenu::RevsetPresets);
+        },
+    ));
+
+    t.group("Narrow and long-text stress");
+    t.add(
+        s(
+            "narrow-base",
+            "Narrow window (900×620): panes clamp, split unavailable, toolbar trims.",
+            "Resize the window.",
+            |_c| {},
+        )
+        .size(900.0, 620.0),
+    );
+    t.add(
+        s(
+            "narrow-very",
+            "Very narrow window (640×480).",
+            "Resize smaller.",
+            |_c| {},
+        )
+        .size(640.0, 480.0),
+    );
+    t.add(
+        s(
+            "narrow-split-fallback",
+            "Split on but the pane too narrow: falls back to unified.",
+            "Toggle split in a narrow window.",
+            |c| {
+                c.select("kitchen-sink");
+                c.cmd("view.toggle-split");
+            },
+        )
+        .size(900.0, 620.0),
+    );
+    t.add(
+        s(
+            "narrow-palette",
+            "Palette in a narrow window.",
+            "cmd+K.",
+            |c| {
+                c.key("cmd+k");
+                c.typed("render");
+            },
+        )
+        .size(640.0, 480.0),
+    );
+    t.add(
+        s(
+            "narrow-confirm",
+            "Confirm dialog in a narrow window.",
+            "a.",
+            |c| {
+                c.select("cache-bindings");
+                c.key("a");
+            },
+        )
+        .size(640.0, 480.0),
+    );
+    t.add(
+        s(
+            "narrow-find",
+            "Find bar in a narrow window.",
+            "cmd+F.",
+            |c| {
+                c.select("kitchen-sink");
+                c.key("cmd+f");
+                c.typed("render");
+            },
+        )
+        .size(900.0, 620.0),
+    );
+    t.add(
+        s(
+            "narrow-dark",
+            "Narrow window in dark.",
+            "Resize, theme Dark.",
+            |c| {
+                c.select("kitchen-sink");
+            },
+        )
+        .size(900.0, 620.0)
+        .dark(),
+    );
+    t.add(
+        s(
+            "large-window",
+            "A large window (2200×1300): widths don't stretch dialogs, panes keep their sizes.",
+            "Maximize.",
+            |c| {
+                c.select("kitchen-sink");
+            },
+        )
+        .size(2200.0, 1300.0),
+    );
+    t.add(s("longtext-graph-narrow-sidebar", "Long bookmark and long title in the graph at the sidebar's minimum width: chips and subject ellipsise before the gutter.", "Drag the sidebar handle to its minimum.", |c| { all_revs(c); c.select("long-description"); c.h.act(|ui, _| { let width = ui.sidebar_min_width + 1.0; ui.on_sidebar_width_changed(width); }); c.settle(); }));
+    t.add(s(
+        "longtext-tree-narrow-files",
+        "Deep paths in a narrow file tree.",
+        "Drag the files handle to its minimum.",
+        |c| {
+            c.select("kitchen-sink");
+            c.h.act(|ui, _| {
+                let position = ui.sidebar_width + 2.0 + crate::diff_panel::MIN_FILE_NAV_WIDTH;
+                ui.on_changed_files_width_changed(position);
+            });
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "longtext-header-hover",
+        "Pointer resting on an ellipsised commit title. This title has no expand-on-hover; the full text is in the body and the palette.",
+        "Hover the title.",
+        |c| {
+            all_revs(c);
+            c.select("long-description");
+            c.hover(900.0, 97.0);
+        },
+    ));
+    t.add(s(
+        "hover-row",
+        "Pointer resting on a graph row: hover treatment; the action buttons appear.",
+        "Hover a row.",
+        |c| {
+            c.hover(180.0, 240.0);
+        },
+    ));
+    t.add(s(
+        "view-switcher-main-view",
+        "History view's segment selected via the switcher.",
+        "Click the History segment.",
+        |c| {
+            c.act(Action::SetMainView(MainView::History));
+        },
+    ));
+
+    t.group("Declared commands");
+    t.add(
+        s(
+            "commands-palette",
+            "Declared commands under their own heading: one runs, one that needs a bookmark is greyed with why, one whose when-clause doesn't hold says so.",
+            "Declare them in config.toml, select a revision without a bookmark, cmd+K, type >staging.",
+            |c| {
+                c.select("no-description");
+                c.key("cmd+k");
+                c.typed(">staging");
+            },
+        )
+        .config(DECLARED),
+    );
+    t.add(
+        s(
+            "commands-choose",
+            "A declared command's choose prompt: its choices in a palette column, the prompt's label in the footer.",
+            "Run a declared command whose prompt is a choose.",
+            |c| {
+                c.select("no-description");
+                c.cmd("user.rebase-staging");
+            },
+        )
+        .config(DECLARED),
+    );
+    t.add(s(
+        "commands-generate",
+        "The description editor with Generate beside Cancel and Save.",
+        "d on a revision.",
+        |c| {
+            c.select("no-description");
+            c.key("d");
+        },
+    ));
+    t.add(
+        s(
+            "commands-generate-dark",
+            "commands-generate in dark.",
+            "d on a revision, theme Dark.",
+            |c| {
+                c.select("no-description");
+                c.key("d");
+            },
+        )
+        .dark(),
+    );
+
+    t.group("Forges");
+    // A wide sidebar, so every badged chip has room beside its row's ids.
+    let badges = |c: &mut Ctx| {
+        all_revs(c);
+        c.h.act(|ui, _| ui.on_sidebar_width_changed(760.0));
+        forge_badges(c);
+    };
+    t.add(s(
+        "forge-badges",
+        "Bookmark chips wearing their pull request: open with checks running, draft with checks failing, merged, open and passing, closed.",
+        "Refresh pull requests against a GitHub origin.",
+        badges,
+    ));
+    t.add(
+        s(
+            "forge-badges-dark",
+            "The same badges in the dark theme.",
+            "Refresh pull requests against a GitHub origin.",
+            badges,
+        )
+        .dark(),
+    );
+    t.add(s(
+        "forge-badges-narrow",
+        "A narrow sidebar with every revision: badged chips fold into +N, and on deep rows the change id ellipsises rather than running under a chip.",
+        "Refresh pull requests against a GitHub origin, then drag the sidebar to its narrowest.",
+        |c| {
+            all_revs(c);
+            c.h.act(|ui, _| ui.on_sidebar_width_changed(ui.sidebar_min_width + 1.0));
+            forge_badges(c);
+        },
+    ));
+    t.add(s(
+        "forge-commit-info",
+        "A revision whose bookmark has an open pull request: the commit info block's Pull request field, its state, and its checks.",
+        "Select feature/render-pipeline's revision.",
+        |c| {
+            forge_badges(c);
+            c.select("feature/render-pipeline");
+        },
+    ));
+    t.add(s(
+        "forge-create-dialog",
+        "The create pull request dialog for a bookmark: title and body from the description, base main, push first.",
+        "Create pull request on fix/changelog-note.",
+        |c| {
+            forge_badges(c);
+            c.h.act(|ui, _| {
+                ui.active_mut().forge.decorations.remove("fix/changelog-note");
+            });
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Open(
+                CommandArg::Bookmark {
+                    name: "fix/changelog-note".to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            )));
+        },
+    ));
+    t.add(s(
+        "forge-mr-tab",
+        "A GitLab merge request open as a tab: the tab reads render-toolkit!7, the header says Merge request.",
+        "Open acme/render-toolkit!7.",
+        |c| {
+            answer_merge_request();
+            c.act(Action::OpenRepo("acme/render-toolkit!7".to_owned()));
+            c.wait_for_load();
+        },
+    ));
+
+    t.add(
+        s(
+            "forge-auth-error",
+            "A pull request tab GitHub has no token for: the card says to add one or sign gh in, with Add a token.",
+            "Launch with GitHub set to sign in with a token and none kept; open acme/app#5.",
+            |c| {
+                c.act(Action::OpenRepo("acme/app#5".to_owned()));
+                c.wait_for_load();
+            },
+        )
+        .config("[plugins.github]\nauth = \"token\"\n"),
+    );
+
+    t.group("Plugins");
+    t.add(
+        s(
+            "plugins-account",
+            "GitHub's page in Settings: github.com signed in with gh, under it a second account named work with its paste field, a company host set to a token, then the rows that add a host or an account and its settings.",
+            "Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Accounts, and add an account named work.",
+            |c| {
+                crate::harness::answer_forge(&[("api user --jq .login", "octo\n")]);
+                c.key("cmd+,");
+                c.act(Action::SettingsSection(crate::settings::Section::Accounts));
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "github".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                for action in [
+                    crate::plugins::PageAction::Draft {
+                        field: crate::plugins::page::NEW_ACCOUNT,
+                        text: "work".to_owned(),
+                    },
+                    crate::plugins::PageAction::AddAccount,
+                ] {
+                    c.act(Action::Plugin(crate::plugins::PluginAction::Page(action)));
+                }
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                c.settle();
+            },
+        )
+        .settings(
+            "[plugins.github.config]\nhosts = [\"github.acme.com\"]\n\n[plugins.github.config.per_host.\"github.acme.com\"]\nauth = \"token\"\n",
+        ),
+    );
+    t.add(
+        s(
+            "settings-ai",
+            "Settings, AI: the provider pop-up set to Anthropic, then Claude Code and Codex not installed, Anthropic in use with its key saved and a passed Test, and OpenAI-compatible with no key. Each row has Test and a pencil.",
+            "Launch with Anthropic picked and its key saved; open Settings, click AI and Test Anthropic.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.key("cmd+,");
+                c.h.act(|ui, _| {
+                    ui.ai
+                        .tests
+                        .insert("anthropic".to_owned(), crate::ai::Test::Replied("OK".to_owned()));
+                });
+                c.act(Action::SettingsSection(crate::settings::Section::Ai));
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(
+        s(
+            "plugins-ai-models",
+            "Anthropic's page in Settings: Provider with its status and Test, then Model with Choose open and the models listed under it, API address, and API key saved with Remove.",
+            "Open Anthropic's page from Settings, AI, and press Choose next to Model.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.key("cmd+,");
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "anthropic".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.act(|ui, _| {
+                    let model = |id: &str, name: &str| diffui_plugins::protocol::AiModel {
+                        id: id.to_owned(),
+                        name: Some(name.to_owned()),
+                    };
+                    if let Some(page) = ui.plugins.page.as_mut() {
+                        page.show_ai(
+                            "The API key works",
+                            vec![
+                                model("claude-opus-5-5", "Claude Opus 5.5"),
+                                model("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                                model("claude-haiku-5-5", "Claude Haiku 5.5"),
+                                model("claude-fable-5-2", "Claude Fable 5.2"),
+                            ],
+                        );
+                    }
+                });
+                c.settle();
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(
+        s(
+            "description-generating",
+            "The description editor while Anthropic writes into it: half a description, the field read-only, Stop in place of Generate, and Writing with Anthropic in the footer.",
+            "Select fix/parser-crash, press Generate; caught mid-stream.",
+            |c| {
+                c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
+                c.select("fix/parser-crash");
+                c.key("d");
+                c.h.act(|ui, _| {
+                    let activity = ui.allocate_activity_id();
+                    if let Some(editor) = ui.active_mut().description_editor_mut() {
+                        editor.content =
+                            "Fix the parser crash on empty input\n\nThe tokenizer now returns".to_owned();
+                        editor.generating = Some(crate::user_commands::Generation {
+                            activity,
+                            cancel: Default::default(),
+                            before: String::new(),
+                            running: true,
+                        });
+                    }
+                });
+                c.settle();
+            },
+        )
+        .config(AI_CONFIG)
+        .settings("[ai]\nprovider = \"anthropic\"\n")
+        .home(save_anthropic_key),
+    );
+    t.add(s(
+        "ai-explain-panel",
+        "Explain this change in the output panel, rendered: a heading, a list with inline code and a nested numbered list, a quote, a code block, a rule and a link; Rendered | Raw, Copy and Close.",
+        "Select fix/parser-crash and run Explain this change.",
+        |c| {
+            c.select("fix/parser-crash");
+            c.h.act(|ui, _| {
+                let Some(tab) = ui.active_tab_id() else {
+                    return;
+                };
+                let activity = ui.allocate_activity_id();
+                let Some(state) = ui.tab_mut(tab) else {
+                    return;
+                };
+                let job = state.session.next_job();
+                let mut run = crate::cli_output::CliRun::program(
+                    activity,
+                    job,
+                    "Anthropic".to_owned(),
+                    Vec::new(),
+                    Default::default(),
+                );
+                run.heading = Some("Explain this change \u{b7} Anthropic".to_owned());
+                run.exit = Some(crate::cli_output::Exit::Code(Some(0)));
+                run.lines = [
+                    "This change stops the parser from **panicking** when it is given an empty file.",
+                    "",
+                    "## What changes",
+                    "",
+                    "- `src/parser.rs`: the tokenizer used to index the first byte of the input without checking that there was one. It now returns an empty token list for empty input.",
+                    "- `tests/parser.rs`: a new test parses an empty file and expects no tokens.",
+                    "  1. it builds an empty buffer",
+                    "  2. it asserts *nothing* comes back",
+                    "",
+                    "> The parser treats an empty token list as an empty document.",
+                    "",
+                    "```rust",
+                    "if input.is_empty() {",
+                    "    return Vec::new();",
+                    "}",
+                    "```",
+                    "",
+                    "---",
+                    "",
+                    "See [the issue](https://example.com/issues/12) for the crash report.",
+                ]
+                .into_iter()
+                .map(|text| diffui_core::cli::CliLine {
+                    stream: diffui_core::cli::CliStream::Stdout,
+                    text: text.to_owned(),
+                })
+                .collect();
+                crate::cli_output::keep_run(&mut state.cmdline.runs, run);
+                ui.open_cli_output(tab, activity);
+            });
+            c.settle();
+        },
+    ));
+    t.add(s(
+        "pull-request-preview",
+        "The create pull request dialog with its description in Preview: the Markdown body rendered (a heading, a list, inline code, a link), Edit | Preview above it.",
+        "Create pull request on fix/changelog-note, write a Markdown description, press Preview.",
+        |c| {
+            forge_badges(c);
+            c.h.act(|ui, _| {
+                ui.active_mut().forge.decorations.remove("fix/changelog-note");
+            });
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Open(
+                CommandArg::Bookmark {
+                    name: "fix/changelog-note".to_owned(),
+                    remote: None,
+                    to: None,
+                },
+            )));
+            c.act(Action::Forge(crate::forge_dialog::ForgeAction::Body(
+                "## Why\n\nThe release needs a **changelog** note.\n\n- adds `CHANGELOG.md`\n- links [the release](https://example.com/r/1)\n".to_owned(),
+            )));
+            c.act(Action::Ai(crate::ai::AiAction::PrPreview(true)));
+        },
+    ));
+    t.add(s(
+        "forge-stack-preview",
+        "Submit stack's preview: three rows bottom to top, a new draft one, an update whose long bookmark ellipsises and whose history is force-pushed, and one up to date; what it pushes, the force-push callout, Cancel and Submit.",
+        "Submit stack on a stack of three bookmarks, one new, one rewritten with an open pull request, one up to date.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Preview),
+    ));
+    t.add(s(
+        "forge-stack-editing",
+        "Submit stack's preview with the update's row open: its title, its description, and Generate, the other rows collapsed.",
+        "Submit stack, then open the second row and edit its title and description.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Editing),
+    ));
+    t.add(s(
+        "forge-stack-progress",
+        "Submit stack after Submit: Talking to GitHub, the first row Opened #43, the second Updating, the third skipped as up to date; Close, and the note that closing doesn't stop it.",
+        "Submit stack and Submit; caught while the second pull request is being updated.",
+        |c| stack_scene(c, crate::forge_dialog::stack_tests::Scene::Running),
+    )
+    // The toolbar's activity spinner turns.
+    .animated());
+    t.add(
+        s(
+            "plugins-remove-host",
+            "GitHub's page in Settings: github.acme.com with a saved token, its x pressed, the row asking whether to remove the host and its token with Cancel and Remove.",
+            "Launch with github.acme.com added and a token saved for it; open GitHub's page and press the host's x.",
+            |c| {
+                crate::harness::answer_forge(&[("api user --jq .login", "octo\n")]);
+                c.key("cmd+,");
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::Open {
+                        id: "github".to_owned(),
+                        host: None,
+                    },
+                )));
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                c.act(Action::Plugin(crate::plugins::PluginAction::Page(
+                    crate::plugins::PageAction::RemoveHost {
+                        host: "github.acme.com".to_owned(),
+                        confirmed: false,
+                    },
+                )));
+                c.settle();
+            },
+        )
+        .settings(
+            "[plugins.github.config]\nhosts = [\"github.acme.com\"]\n\n[plugins.github.config.per_host.\"github.acme.com\"]\nauth = \"cli\"\n",
+        )
+        .home(|home| {
+            use diffui_plugins::secrets::{FileStore, SecretStore};
+            FileStore::new(home.join(".diffui-secrets.json"))
+                .set("github@github.acme.com", "tok")
+                .expect("save the token");
+        }),
+    );
+    t.add(
+        s(
+            "plugins-permission",
+            "The dialog that asks whether a plugin may run: its id, version and folder, each thing it could do, Don't allow and Allow.",
+            "Launch with a plugin nobody has answered for.",
+            plugins_loaded,
+        )
+        .home(|home| forge_plugin().write(home)),
+    );
+    t.add(
+        s(
+            "plugins-settings",
+            "Settings, Plugins: one running, one that failed with where, one not allowed, each with its folder, actions and toggle; then the plugins folder.",
+            "Launch with three plugins (two allowed, one refused); press cmd+, and click Plugins.",
+            plugins_in_settings,
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS),
+    );
+    t.add(
+        s(
+            "plugins-settings-dark",
+            "plugins-settings in dark.",
+            "As plugins-settings, theme Dark.",
+            plugins_in_settings,
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS)
+        .dark(),
+    );
+    t.add(
+        s(
+            "plugins-palette",
+            "A plugin's commands in the palette under the plugin's name: one runs, one of a plugin that isn't allowed is greyed with why.",
+            "Launch with the three plugins; cmd+K, type >labels.",
+            |c| {
+                plugins_loaded(c);
+                c.key("cmd+k");
+                c.typed(">labels");
+            },
+        )
+        .home(three_plugins)
+        .settings(THREE_PLUGINS),
+    );
+
+    t.group("Review notes");
+    t.add(s(
+        "notes-diff",
+        "The working copy's diff with review notes: a change note above the files, a file note at frame_loop.rs's header, and a line note under main.rs's line, expanded with the user's reply and the agent's answer; the others folded to one line. The pointer rests on a line, which shows its + in the gutter.",
+        "Agents leave three notes with diffui notes add; the user replies to the line note; open it from the Notes view.",
+        |c| {
+            let (line, _, _) = working_copy_notes(c);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(line)));
+            c.settle();
+            hover_a_diff_line(c);
+        },
+    ));
+    t.add(s(
+        "notes-compose-range",
+        "A note being started on three lines of main.rs: the rows washed in the accent with a bar at the gutter's edge, the composer under them naming Lines 12-14 of src/main.rs, and each file header's note button, with a count where the file has notes.",
+        "Leave the working copy's notes; press the + on a line of main.rs and shift-press the one two lines down; type.",
+        |c| {
+            working_copy_notes(c);
+            let rows = c.h.read(|ui| {
+                let files = &ui.active().session.document.files;
+                let file = files.iter().position(|file| file.path == "src/main.rs")?;
+                files[file].hunks.iter().enumerate().find_map(|(hunk, view)| {
+                    let line = view
+                        .lines
+                        .iter()
+                        .position(|line| line.content.contains("[--samples N]"))?;
+                    (line + 2 < view.lines.len())
+                        .then_some((crate::diff_view::LineAt { file, hunk, line }, line + 2))
+                })
+            });
+            let (first, last) = rows.expect("main.rs's usage line in the diff");
+            let press = |line, extend| crate::diff_view::LinePress {
+                line,
+                extend,
+                one_side: false,
+            };
+            c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(press(first, false)),
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(press(
+                    crate::diff_view::LineAt { line: last, ..first },
+                    true,
+                )),
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                "Keep --samples out of the usage until it parses.".to_owned(),
+            )));
+        },
+    ));
+    t.add(s(
+        "notes-reply",
+        "A line note in the diff with the reply field open under it, two lines typed, Cancel and Reply with their keys.",
+        "Press Reply on the line note and type.",
+        |c| {
+            let (line, _, _) = working_copy_notes(c);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(line.clone())));
+            c.act(Action::Notes(crate::notes::NotesMsg::StartReply(line)));
+            c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                "Hold the usage change until --samples parses:\nthe help shouldn't promise a flag that errors.".to_owned(),
+            )));
+        },
+    ));
+    t.add(s(
+        "notes-log-count",
+        "The revision list with open note counts: two on fix/parser-crash beside its bookmark, three on the working copy, none elsewhere.",
+        "Agents leave notes on the working copy and on fix/parser-crash.",
+        |c| {
+            working_copy_notes(c);
+            let parser = c.commit_of("fix/parser-crash");
+            for text in ["Returns `None` on empty input instead of panicking.", "No test for a file of only newlines."] {
+                crate::notes::scenarios::add(&c.repo, &["--as", "claude", "-r", &parser, text]);
+            }
+            wait_notes(c, 5);
+        },
+    ));
+    t.add(
+        s(
+            "notes-overview",
+            "A conflicted revision's diff in a short window: the scrollbar's overview strip with accent marks for three notes and conflict-coloured marks for each conflict, the first conflict in view.",
+            "Agents leave notes on the conflicted revision; select it; press ] twice.",
+            |c| {
+                let commit = c.commit_of("conflicted");
+                let repo = c.repo.clone();
+                let main = line_in(&repo, &commit, "src/main.rs", "fn main");
+                crate::notes::scenarios::add(&repo, &["--as", "claude", "-r", &commit, "Both sides changed the defaults; I kept neither yet."]);
+                crate::notes::scenarios::add(&repo, &["--as", "claude", "-r", &commit, "--file", "src/main.rs", "--line", &main.to_string(), "The usage line is in conflict below."]);
+                crate::notes::scenarios::add(&repo, &["--as", "codex", "-r", &commit, "--file", "src/config.rs", "Pick 8 samples: laptops have the fast path now."]);
+                c.select("conflicted");
+                wait_notes(c, 3);
+                c.key("]");
+                c.key("]");
+            },
+        )
+        .size(1440.0, 620.0),
+    );
+    t.add(s(
+        "notes-view",
+        "The Notes view on For you with the working copy's line note selected: the list grouped under change sections, and on the right its change's three notes stacked in one scroll (the change note, the frame_loop.rs file note, the main.rs line note with its highlighted excerpt), scrolled to the line note.",
+        "Leave notes on two changes from claude and codex, reply to one, resolve one; open the Notes view, select the line note.",
+        |c| {
+            let (line, file, _) = working_copy_notes(c);
+            let parser = c.commit_of("fix/parser-crash");
+            let resolved = crate::notes::scenarios::add(&c.repo, &["--as", "codex", "-r", &parser, "--file", "src/parser/mod.rs", "--line", "2", "`lines().next()` returns `None` for empty input."]);
+            crate::notes::scenarios::add(&c.repo, &["--as", "codex", "-r", &parser, "Kept the signature so callers don't change."]);
+            crate::notes::scenarios::notes(&c.repo, &["resolve", &resolved]);
+            wait_notes(c, 5);
+            let _ = line;
+            let _ = file;
+            c.act(Action::SetMainView(MainView::Notes));
+            c.act(Action::Notes(crate::notes::NotesMsg::Filter(
+                crate::notes::app::Filter::WaitingOnYou,
+            )));
+            c.act(Action::Notes(crate::notes::NotesMsg::SelectThread(line)));
+        },
+    ));
+    t.add(s(
+        "notes-view-picking",
+        "The Notes view on All open while picking: every row's box showing, three picked, and the floating bar with Picked 3 notes, Resolve, Copy, Delete and Clear.",
+        "Leave the working copy's notes; open the Notes view, pick All open from its menu, pick three rows.",
+        |c| {
+            let (line, file, change) = working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.act(Action::Notes(crate::notes::NotesMsg::FilterNamed("open".to_owned())));
+            c.act(Action::Notes(crate::notes::NotesMsg::SelectThread(line.clone())));
+            for id in [line, file, change] {
+                c.act(Action::Notes(crate::notes::NotesMsg::Select(id)));
+            }
+        },
+    ));
+    t.add(s(
+        "notes-view-narrow",
+        "The Notes view with its pane at its narrowest: the filter's three segments sharing the track, each label whole or cut inside its own segment, the menu button in its own room.",
+        "Leave the working copy's notes; open the Notes view; drag the pane to its minimum.",
+        |c| {
+            working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.h.act(|ui, _| ui.sidebar_width = ui.sidebar_min_width);
+        },
+    ));
+    t.add(s(
+        "notes-view-wide",
+        "The Notes view with a wide pane: the filter's segments filling the track in equal shares, no gap at its end.",
+        "Leave the working copy's notes; open the Notes view; widen the pane.",
+        |c| {
+            working_copy_notes(c);
+            c.act(Action::SetMainView(MainView::Notes));
+            c.h.act(|ui, _| ui.sidebar_width = 560.0);
+        },
+    ));
+    t.add(s(
+        "notes-view-empty",
+        "The Notes view on a repository with no notes: the list says No notes yet, the main area No review notes yet and how notes start.",
+        "Open the Notes view.",
+        |c| {
+            c.act(Action::SetMainView(MainView::Notes));
+        },
+    ));
+    t.add(s(
+        "notes-card-states",
+        "Thread cards in the diff: a resolved change note folded and dimmed with its Resolved tag, an outdated line note open at its file's header with its Outdated tag and the lines it lost, a folded line note with its reply count.",
+        "Leave the working copy's notes; resolve the change note; an agent's note on lines the change no longer has; open it.",
+        |c| {
+            let (_, _, change) = working_copy_notes(c);
+            crate::notes::scenarios::notes(&c.repo, &["resolve", &change]);
+            let repo = c.repo.clone();
+            let outdated = outdated_note(&repo);
+            wait_notes(c, 4);
+            c.act(Action::Notes(crate::notes::NotesMsg::Open(outdated)));
+        },
+    ));
+    t.add(s(
+        "notes-pr-comments",
+        "fix/changelog-note's diff, its pull request #42 badged: under CHANGELOG.txt's added line an agent's note open, then a GitHub review thread open with its reply, tagged GitHub, its footer saying it's from GitHub, read-only, with Open on GitHub and no Reply or Resolve; at the file's header an outdated GitHub thread folded to its first comment.",
+        "Badge the pull requests; an agent leaves a note on the line; GitHub's threads read for #42; select fix/changelog-note; open the note and the thread.",
+        pr_comments_beside_a_note,
+    ));
+
+    t.group("Review layout");
+    t.add(
+        s(
+            "review-pr-all",
+            "A pull request tab on all changes: the commits panel with the 'All changes' item selected over three numbered commits (title, age, short id, author, +/-); the header with the title, the pull request's number and state, author and branches, then its description rendered as Markdown (a heading, a list, code, a link).",
+            "Open acme/render-toolkit#41.",
+            pull_request_tab,
+        )
+        .no_repo(),
+    );
+    t.add(
+        s(
+            "review-pr-all-narrow",
+            "review-pr-all in a narrow window: rows, header facts and the bar's line cut to fit, nothing overlapping.",
+            "Open acme/render-toolkit#41 in a 1000 px window.",
+            pull_request_tab,
+        )
+        .no_repo()
+        .size(1000.0, 760.0),
+    );
+    t.add(
+        s(
+            "review-pr-step",
+            "The same pull request with its second commit selected: the bar reads 'All changes / Commit 2 of 3' with previous and next, the header the commit's title, author, date and id, the diff and files that commit's alone.",
+            "Open acme/render-toolkit#41, select its second commit.",
+            |c| {
+                pull_request_tab(c);
+                c.act(Action::Review(crate::review::ReviewAction::Scope(
+                    crate::review::Scope::Step(1),
+                )));
+                c.h.wait_until("the commit's diff", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && ui.active().session.document.files.len() == 1
+                });
+                c.settle();
+            },
+        )
+        .no_repo(),
+    );
+    t.add(s(
+        "review-jj-header",
+        "A jj revision's header in the same layout: the title, the fields, then the message's body as written, with the Rendered/Raw toggle in the bar.",
+        "Select the 'rework the pipeline' revision.",
+        |c| {
+            c.select("kitchen-sink");
+        },
+    ));
+
+    t.group("Patches and comparisons");
+    t.add(
+        s(
+            "patch-email",
+            "A git format-patch email open as a tab of its own: no steps panel; the header with its subject, author, date and commit, the patch file's path, then its message as written; list.txt's hunk without the mail's signature; a note on the added delta line, and under the toolbar the quiet strip saying the tab's notes aren't saved, with Copy.",
+            "Open core/tests/fixtures/patches/format-patch.patch; leave a note on its last line.",
+            |c| {
+                let patch = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("core/tests/fixtures/patches/format-patch.patch");
+                c.h.act(|ui, cx| {
+                    ui.open_diff(
+                        diffui_core::patch::DiffInput::Patch(
+                            diffui_core::patch::PatchOrigin::File(patch),
+                        ),
+                        cx,
+                    )
+                });
+                c.h.wait_until("the patch", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && !ui.active().session.document.files.is_empty()
+                });
+                c.act(Action::Notes(crate::notes::NotesMsg::StartNote(
+                    crate::notes::NoteTarget::Line(crate::diff_view::LinePress {
+                        line: crate::diff_view::LineAt {
+                            file: 0,
+                            hunk: 0,
+                            line: 4,
+                        },
+                        extend: false,
+                        one_side: false,
+                    }),
+                )));
+                c.act(Action::Notes(crate::notes::NotesMsg::ReplyEdited(
+                    "Why add delta here rather than at the top?".to_owned(),
+                )));
+                c.act(Action::Notes(crate::notes::NotesMsg::SendReply));
+                c.h.wait_until("the note", |ui| !ui.active().notes.notes.is_empty());
+                // Its toast says it once; the strip is what stays.
+                c.h.act(|ui, _| ui.toasts.clear());
+            },
+        )
+        .no_repo(),
+    );
+    t.add(
+        s(
+            "compare-folders",
+            "Two folders compared, as jj's diff tool: no steps panel; under the toolbar the strip saying jj is waiting for this comparison, with Done; the header titled old → new with the Left and Right paths as fields; the files changed, added and deleted between them.",
+            "Make two folders; compare them as `jj diff --tool diffui` would.",
+            |c| {
+                let root = crate::harness::scratch_home().join("compare-scene");
+                let _ = std::fs::remove_dir_all(&root);
+                let (left, right) = (root.join("old"), root.join("new"));
+                for (dir, files) in [
+                    (
+                        &left,
+                        &[
+                            ("README.md", "# Parser\n\nRun make.\n"),
+                            ("src/parse.rs", "fn parse(line: &str) -> i32 {\n    if line.is_empty() {\n        return -1;\n    }\n    0\n}\n"),
+                            ("notes/old.txt", "to do\n"),
+                        ][..],
+                    ),
+                    (
+                        &right,
+                        &[
+                            ("README.md", "# Parser\n\nRun make, then make check.\n"),
+                            ("src/parse.rs", "fn parse(line: &str) -> i32 {\n    if line.trim().is_empty() {\n        return -1;\n    }\n    0\n}\n"),
+                            ("src/lexer.rs", "pub fn tokens(line: &str) -> Vec<&str> {\n    line.split_whitespace().collect()\n}\n"),
+                        ][..],
+                    ),
+                ] {
+                    for (path, text) in files {
+                        let path = dir.join(path);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, text).unwrap();
+                    }
+                }
+                // No one answers: the scene keeps the tab open.
+                let (reply, _answer) = futures::channel::oneshot::channel();
+                c.h.act(|ui, cx| {
+                    ui.ctl_compare(
+                        left.display().to_string(),
+                        right.display().to_string(),
+                        Some("jj".to_owned()),
+                        reply,
+                        cx,
+                    )
+                });
+                c.h.wait_until("the comparison", |ui| {
+                    !ui.active().session.diff_in_flight()
+                        && !ui.active().session.document.files.is_empty()
+                });
+            },
+        )
+        .no_repo(),
+    );
+
+    t.scenes
+}
+
+/// A pull request open in a tab of its own, through the bundled GitHub
+/// plugin and the harness's fake `gh`.
+fn pull_request_tab(c: &mut Ctx) {
+    crate::review::scenarios::answer_pull_request(crate::review::scenarios::BODY, 3);
+    crate::review::scenarios::open_pull_request(&mut c.h);
+}
+
+/// A pull request's review threads in a revision's diff, beside an agent's
+/// note on the same line.
+fn pr_comments_beside_a_note(c: &mut Ctx) {
+    use diffui_core::forge::{ForgeRemote, ReviewComment, ReviewThread};
+    use diffui_core::notes::Side;
+    forge_badges(c);
+    let repo = c.repo.clone();
+    let needle = "rc35: this line collides";
+    let line = line_in(&repo, "fix/changelog-note", "CHANGELOG.txt", needle);
+    let note = crate::notes::scenarios::add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "-r",
+            "fix/changelog-note",
+            "--file",
+            "CHANGELOG.txt",
+            "--line",
+            &line.to_string(),
+            "Kept trunk's wording above this line; it only records the release candidate.",
+        ],
+    );
+    wait_notes(c, 1);
+    let url = "https://github.com/acme/render-toolkit/pull/42#discussion_r";
+    let at = |iso: &str| diffui_core::history::parse_timestamp_millis(iso);
+    let comment = |author: &str, body: &str, iso: &str| ReviewComment {
+        author: author.to_owned(),
+        body: body.to_owned(),
+        created_millis: at(iso),
+    };
+    let threads = vec![
+        ReviewThread {
+            path: "CHANGELOG.txt".to_owned(),
+            side: Side::New,
+            line: Some(line),
+            start_line: None,
+            original_line: Some(line),
+            text: vec![needle.to_owned() + " with what trunk wrote here"],
+            outdated: false,
+            resolved: false,
+            url: format!("{url}1"),
+            comments: vec![
+                comment(
+                    "mika",
+                    "Should this name the **breaking change** too?",
+                    "2026-11-14T09:30:00Z",
+                ),
+                comment(
+                    "bob",
+                    "It's in the release notes; this file only lists candidates.",
+                    "2026-11-14T10:05:00Z",
+                ),
+            ],
+        },
+        ReviewThread {
+            path: "CHANGELOG.txt".to_owned(),
+            side: Side::New,
+            line: None,
+            start_line: None,
+            original_line: Some(line),
+            text: vec!["rc35: collides with trunk".to_owned()],
+            outdated: true,
+            resolved: false,
+            url: format!("{url}2"),
+            comments: vec![comment("mika", "Typo: collides.", "2026-11-13T16:00:00Z")],
+        },
+    ];
+    c.h.act(move |ui, _| {
+        let github = crate::plugins::bundled_kind("github");
+        let pr = ForgeRemote::new(github, "github.com", "acme", "render-toolkit").pull_request(42);
+        let state = ui.active_mut();
+        state
+            .forge
+            .comments
+            .insert(pr, crate::notes::forge::fetched(threads));
+    });
+    let commit = c.h.read(|ui| {
+        ui.active()
+            .forge
+            .of("fix/changelog-note")
+            .unwrap()
+            .target
+            .clone()
+    });
+    c.act(Action::SelectRevision(
+        diffui_core::RevisionSelection::Commit(commit),
+    ));
+    c.settle();
+    c.act(Action::Notes(crate::notes::NotesMsg::Toggle(note)));
+    c.act(Action::Notes(crate::notes::NotesMsg::Toggle(format!(
+        "{url}1"
+    ))));
+}
+
+/// Hovers the pointer down the diff's text until a line shows its "+".
+fn hover_a_diff_line(c: &mut Ctx) {
+    use gpui_kit::test::TestWindowExt as _;
+    let x = c.h.read(|ui| ui.left_pane_width() + ui.files_pane_width()) + 400.0;
+    let mut y = H / 2.0;
+    while y < H - 40.0 {
+        c.h.hover_point(at(x, y));
+        c.h.frames();
+        let shown =
+            c.h.with_window(|window, _| window.try_find("diff-add-note-button").is_some());
+        if shown {
+            return;
+        }
+        y += 6.0;
+    }
+    panic!("no line showed its +");
+}
+
+/// The 1-based line of `path` holding `needle`, in `revision` of `repo`.
+fn line_in(repo: &Path, revision: &str, path: &str, needle: &str) -> usize {
+    let notes = diffui_core::notes::NotesRepo::open(repo, true).expect("the repo");
+    let commit = notes.resolve(revision).expect("the revision")[0]
+        .commit_id
+        .clone();
+    let text = notes
+        .read(&commit, path, diffui_core::notes::Side::New)
+        .unwrap_or_else(|| panic!("no {path}"));
+    text.lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no {needle} in {path}"))
+        + 1
+}
+
+/// An agent's note on lines of src/main.rs the working copy doesn't have:
+/// outdated from the start. Its id.
+fn outdated_note(repo: &Path) -> String {
+    use crate::notes::store::{Anchor, Lines, Message, Role, Side, Store, Thread, now};
+    let notes = diffui_core::notes::NotesRepo::open(repo, true).expect("the repo");
+    let change = notes.resolve("@").expect("@").remove(0);
+    let store = Store::for_repo(&notes.repo_dir()).expect("the store");
+    store
+        .create(Thread::on_change(
+            &change,
+            Some(Anchor {
+                path: "src/main.rs".to_owned(),
+                lines: Some(Lines {
+                    side: Side::New,
+                    start: 20,
+                    text: vec![
+                        "    let settings = config::load();".to_owned(),
+                        "    let frames = render(path, &settings)?;".to_owned(),
+                    ],
+                }),
+            }),
+            Message {
+                author: "codex".to_owned(),
+                role: Role::Agent,
+                at: now(),
+                body:
+                    "Loading the config before the args are checked costs a disk read on `--help`."
+                        .to_owned(),
+            },
+        ))
+        .expect("store the note")
+}
+
+/// Waits until the active tab holds `count` notes, located.
+fn wait_notes(c: &mut Ctx, count: usize) {
+    c.h.wait_until("the notes", |ui| {
+        ui.active().notes.settled() && ui.active().notes.notes.len() == count
+    });
+    c.settle();
+}
+
+/// Three notes on the working copy, as agents leave them: a line note the
+/// user answered and the agent answered back, a file note and a change note.
+/// Their ids: line, file, change.
+fn working_copy_notes(c: &mut Ctx) -> (String, String, String) {
+    use crate::notes::scenarios::{add, notes, user_reply};
+    let repo = c.repo.clone();
+    let line = line_in(&repo, "@", "src/main.rs", "[--samples N]");
+    let line = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "--file",
+            "src/main.rs",
+            "--line",
+            &line.to_string(),
+            "Documented **--samples** in the usage line; parsing it lands in the next change.\n\nThe old usage is still in `docs/guide.md`; I left it, since that page is versioned.",
+        ],
+    );
+    let file = add(
+        &repo,
+        &[
+            "--as",
+            "codex",
+            "--file",
+            "src/renderer/frame_loop.rs",
+            "Dropped step 45: nothing reads its output since the pipeline rework.",
+        ],
+    );
+    let change = add(
+        &repo,
+        &[
+            "--as",
+            "claude",
+            "Split the release notes out of the README so the pipeline rework has its own entry.",
+        ],
+    );
+    user_reply(&repo, &line, "Does anything parse the usage line?");
+    notes(
+        &repo,
+        &[
+            "reply",
+            &line,
+            "--as",
+            "claude",
+            "Only `scripts/ci-check.sh`, which matches on `usage:`; it still does.",
+        ],
+    );
+    wait_notes(c, 3);
+    (line, file, change)
+}
+
+/// A forge plugin that asks for a bit of everything.
+fn forge_plugin() -> crate::plugins::PluginDir {
+    let mut plugin = crate::plugins::PluginDir::new(
+        "forgejo",
+        "http = [\"codeberg.org\", \"*.forgejo.example\"]\nexec = [[\"git\", \"config\"]]\njj = \"write\"",
+        &[],
+        "",
+    );
+    plugin
+        .manifest
+        .push_str("\n[provides]\nforge = { hosts = [\"codeberg.org\"] }\n");
+    plugin
+}
+
+/// Three plugins: `labels` loads, `review-queue` throws while loading, and
+/// `telemetry` is one the user refused.
+fn three_plugins(home: &Path) {
+    use crate::plugins::PluginDir;
+    let labels = "import { commands, ui } from \"diffui\";\n\
+                  commands.register(\"labels.sync\", () => {});\n\
+                  commands.register(\"labels.open\", () => {});\n\
+                  await ui.status.set(\"3 labels\");\n";
+    PluginDir::new("labels", "jj = \"read\"", &["sync", "open"], labels).write(home);
+    PluginDir::new(
+        "review-queue",
+        "http = [\"codeberg.org\"]",
+        &[],
+        "import { config } from \"diffui\";\n\nconst team = config.team.toLowerCase();\n",
+    )
+    .write(home);
+    PluginDir::new(
+        "telemetry",
+        "http = [\"metrics.example.com\"]\njj = \"read\"",
+        &["labels-report"],
+        "",
+    )
+    .write(home);
+}
+
+/// What the user answered for [`three_plugins`].
+const THREE_PLUGINS: &str = r#"
+[plugins.labels]
+allowed = true
+[plugins.labels.permissions]
+http = []
+exec = []
+jj = "read"
+
+[plugins.review-queue]
+allowed = true
+[plugins.review-queue.permissions]
+http = ["codeberg.org"]
+exec = []
+jj = "none"
+
+[plugins.telemetry]
+allowed = false
+[plugins.telemetry.permissions]
+http = ["metrics.example.com"]
+exec = []
+jj = "read"
+"#;
+
+/// Wait for every plugin to have loaded or failed, and put the toasts that
+/// said so away: they go by the clock.
+fn plugins_loaded(c: &mut Ctx) {
+    c.h.wait_until("the plugins", |ui| {
+        ui.plugins
+            .found
+            .iter()
+            .all(|found| found.state != crate::plugins::State::Loading)
+    });
+    c.h.act(|ui, _| ui.toasts.clear());
+    c.settle();
+}
+
+fn plugins_in_settings(c: &mut Ctx) {
+    plugins_loaded(c);
+    c.key("cmd+,");
+    c.act(Action::SettingsSection(crate::settings::Section::Plugins));
+}
+
+/// The `config.toml` the declared-command scenes run with.
+const DECLARED: &str = r#"
+[[commands]]
+id = "user.deploy-staging"
+label = "Deploy to staging"
+exec = ["true"]
+
+[[commands]]
+id = "user.push-staging"
+label = "Push bookmark to staging"
+run = "jj git push -b {bookmark} --remote staging"
+
+[[commands]]
+id = "user.open-staging-pr"
+label = "Open staging PR"
+when = "bookmark.has_remote"
+exec = ["gh", "pr", "view", "--web", "{bookmark}"]
+
+[[commands]]
+id = "user.rebase-staging"
+label = "Rebase onto a staging branch"
+run = "jj rebase -r {change_id} -o {prompt.target}"
+
+[[commands.prompts]]
+name = "target"
+kind = "choose"
+label = "Rebase onto"
+choices = ["staging", "staging-next", "release/1.0"]
+"#;
+
+/// The ids of `fixtures/scenes.md`, in order.
+/// Two hosts: `box`, whose server runs in this process, and one reached over
+/// the bundled ssh transport (never connected to here).
+const REMOTE_HOSTS: &str = "[hosts.box]\ncommand = [\"<in this process>\"]\n\n\
+                            [hosts.staging]\ntransport = \"ssh\"\n\
+                            destination = \"deploy@staging.acme.dev\"\n";
+
+/// Open the fixture again as a repository on `box`, and wait for its graph.
+fn open_on_host(c: &mut Ctx) {
+    let target = format!("box:{}", c.repo.display());
+    c.h.act(|ui, cx| ui.open_repository(&target, cx));
+    c.h.wait_until("the remote tab's graph", |ui| {
+        let state = ui.active();
+        state.remote.is_some()
+            && !state.session.commits.is_empty()
+            && matches!(state.session.status, crate::LoadStatus::Loaded)
+            && !state.session.diff_in_flight()
+    });
+}
+
+fn baseline_ids() -> Vec<String> {
+    let md =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/scenes.md"))
+            .expect("fixtures/scenes.md");
+    md.lines()
+        .filter_map(|line| line.strip_prefix("### `")?.strip_suffix('`'))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn read_manifest(repo: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(repo.join(".jj/fixture-manifest"))
+        .or_else(|_| std::fs::read_to_string(repo.join(".git/fixture-manifest")))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split(' ');
+            let names = parts.next()?.to_owned();
+            parts.next()?;
+            Some((names, parts.next()?.to_owned()))
+        })
+        .collect()
+}
+
+fn run(scene: &Scene) -> Result<(), String> {
+    let repo = crate::harness::fresh_repo_named("acme/render-toolkit");
+    (scene.prepare)(&repo);
+    let manifest = read_manifest(&repo);
+    let open = if scene.id == "welcome-open-error" {
+        Some(repo.join("does/not/exist"))
+    } else {
+        scene.open_repo.then(|| repo.clone())
+    };
+    // `DIFFUI_SCENE_THEME=Dark` reshoots light scenes in another theme, as
+    // `<id>-dark.png`.
+    let theme_override = std::env::var("DIFFUI_SCENE_THEME").ok();
+    let theme = theme_override.as_deref().unwrap_or(scene.theme);
+    // In `settings.toml`, where the dialog would put it, so a scene's
+    // `config.toml` holds only what the scene sets.
+    let settings = format!("theme = \"{theme}\"\n{}", scene.settings);
+    let h = Harness::open_prepared(
+        open.as_deref(),
+        scene.size,
+        scene.config,
+        &settings,
+        scene.home,
+    );
+    let mut c = Ctx {
+        h,
+        manifest,
+        repo,
+        held: None,
+    };
+    if !scene.cold {
+        c.wait_for_load();
+    }
+    (scene.steps)(&mut c);
+    if !scene.raw {
+        c.settle();
+    }
+    match &theme_override {
+        Some(theme) => {
+            c.h.shot_now(LANE, &format!("{}-{}", scene.id, theme.to_lowercase()))
+        }
+        None => c.h.shot_now(LANE, scene.id),
+    };
+    if scene.raw || scene.animated {
+        return Ok(());
+    }
+    c.h.same_after_a_refresh()
+        .map_err(|diff| format!("stale: {diff}"))
+}
+
+impl Ctx {
+    fn wait_for_load(&mut self) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(30) {
+            let done = self.h.read(|ui| {
+                ui.tabs.is_empty()
+                    || matches!(
+                        ui.active().session.status,
+                        crate::LoadStatus::Loaded | crate::LoadStatus::Failed(_)
+                    )
+            });
+            if done {
+                break;
+            }
+            self.pump_ms(10);
+        }
+        self.settle();
+    }
+}
+
+/// The table covers `scenes.md` exactly.
+#[test]
+fn the_table_is_the_baselines() {
+    let mut mine: Vec<String> = all().iter().map(|scene| scene.id.to_owned()).collect();
+    let mut baseline = baseline_ids();
+    mine.sort();
+    baseline.sort();
+    assert_eq!(mine, baseline);
+}
+
+/// Shoots every scene, or the ones `DIFFUI_SCENES` names.
+#[test]
+#[ignore = "shoots the whole baseline: run on demand"]
+fn every() {
+    let only: Option<Vec<String>> = std::env::var("DIFFUI_SCENES")
+        .ok()
+        .map(|list| list.split(',').map(str::to_owned).collect());
+    let mut failed = Vec::new();
+    for scene in all().iter().filter(|scene| {
+        only.as_ref()
+            .is_none_or(|only| only.iter().any(|id| id == scene.id))
+    }) {
+        let started = std::time::Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(scene)))
+            .unwrap_or_else(|panic| {
+                Err(panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                    .unwrap_or_else(|| "panicked".to_owned()))
+            });
+        match outcome {
+            Ok(()) => eprintln!("ok   {} ({:.1?})", scene.id, started.elapsed()),
+            Err(error) => {
+                eprintln!("FAIL {} ({:.1?}): {error}", scene.id, started.elapsed());
+                failed.push(format!("{}: {error}", scene.id));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} scenes failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}

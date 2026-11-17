@@ -7,10 +7,11 @@ use jj_lib::{
     backend::{CommitId, TreeId},
     git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
     graph::TopoGroupedGraph,
+    id_prefix::IdPrefixIndex,
     merge::Merge,
     object_id::ObjectId,
     op_store::LocalRemoteRefTarget,
-    ref_name::WorkspaceName,
+    ref_name::{RemoteName, WorkspaceName},
     repo::{ReadonlyRepo, Repo},
     revset::{
         RevsetAliasesMap, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
@@ -25,8 +26,8 @@ use jj_lib::{
 use super::settings::*;
 use crate::graph::LaneAssigner;
 use crate::model::{
-    BookmarkEntry, BookmarksInfo, BranchStatus, CommitSummary, LoadProgress, RemoteBookmarkRef,
-    StreamRow,
+    BookmarkEntry, BookmarksInfo, BranchStatus, CommitSummary, LoadProgress, PushCandidate,
+    RemoteBookmarkRef, StreamRow,
 };
 use crate::repo::CancelFlag;
 
@@ -35,6 +36,29 @@ use crate::repo::CancelFlag;
 /// skipped (jj-cli warns about it) rather than breaking every revset parse.
 pub(super) fn revset_aliases_map(settings: &UserSettings) -> Result<RevsetAliasesMap> {
     jj_cli::cli_util::load_revset_aliases(&Ui::null(), settings.config()).map_err(cli_error)
+}
+
+/// The remotes `git.push` picks, as jj-cli's `get_default_push_remotes` reads
+/// it: a list of name patterns or a single one, matched against `remotes`.
+/// `None` when it isn't set; a pattern that doesn't parse picks nothing.
+fn git_push_remotes(settings: &UserSettings, remotes: &[String]) -> Option<Vec<String>> {
+    const KEY: &str = "git.push";
+    let patterns = match settings.get::<Vec<String>>(KEY) {
+        Ok(patterns) => patterns,
+        Err(_) => vec![settings.get_string(KEY).ok()?],
+    };
+    let Ok(expression) = jj_cli::revset_util::parse_union_name_patterns(&Ui::null(), &patterns)
+    else {
+        return Some(Vec::new());
+    };
+    let matcher = expression.to_matcher();
+    Some(
+        remotes
+            .iter()
+            .filter(|remote| matcher.is_match(remote))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// The revset diffui opens a jj repo with when the user has no per-repo revset
@@ -122,7 +146,7 @@ pub(super) fn with_revset_parse_context<T>(
         aliases_map: &aliases,
         local_variables: HashMap::new(),
         user_email: settings.user_email(),
-        date_pattern_context: chrono::Local::now().into(),
+        current_time: jiff::Zoned::now(),
         default_ignored_remote: Some(REMOTE_NAME_FOR_LOCAL_GIT_REPO),
         fileset_aliases_map: &fileset_aliases,
         extensions: &extensions,
@@ -164,16 +188,9 @@ pub async fn walk_jj_commits(
     // is empty unless `user.email` is read from the user/repo config. The cold
     // load already does this via `jj_settings`; this is the refresh path.
     let settings = jj_settings(&repository_root)?;
-    let workspace = jj_lib::workspace::Workspace::load(
-        &settings,
-        &repository_root,
-        &jj_lib::default_backend_factories::default_backend_factories(),
-        &jj_lib::default_backend_factories::default_working_copy_factories(),
-    )
-    .context("failed to load jj workspace")?;
+    let workspace = super::workspace::load_workspace(&settings, &repository_root)?;
     let workspace_name = workspace.workspace_name();
     let repo = workspace
-        .repo_loader()
         .load_at_head()
         .await
         .context("failed to load jj repo")?;
@@ -239,14 +256,14 @@ pub async fn walk_jj_with_repo(
         .map_err(describe_resolution_error)
         .context("failed to resolve jj revset")?;
     let revset = resolved
-        .evaluate(repo)
+        .evaluate()
         .context("failed to evaluate jj revset")?;
 
     // Determinate progress: count the revset's commits up front so the toolbar
     // shows N / total during a big cold load. This is a position-only walk (no
     // commit/tree loading) — ~20ms for 43k commits, so a fraction of the
     // streaming load it precedes; best-effort, we stay indeterminate on error.
-    if let Ok((lower, upper)) = revset.count_estimate() {
+    if let Ok((lower, upper)) = revset.count_estimate().await {
         progress.set_total(upper.unwrap_or(lower));
     }
 
@@ -275,7 +292,7 @@ pub async fn walk_jj_with_repo(
             })
             .and_then(|resolved| {
                 resolved
-                    .evaluate(repo)
+                    .evaluate()
                     .context("failed to evaluate immutable()")
             });
     if let Err(error) = &immutable_revset {
@@ -295,7 +312,7 @@ pub async fn walk_jj_with_repo(
             })
             .and_then(|resolved| {
                 resolved
-                    .evaluate(repo)
+                    .evaluate()
                     .with_context(|| format!("failed to evaluate {source}"))
             })
     };
@@ -311,6 +328,15 @@ pub async fn walk_jj_with_repo(
         None => None,
     };
     let on_trunk_fn = on_trunk_revset.as_ref().map(|rs| rs.containing_fn());
+
+    // Change-id prefixes as short as `jj log` shows them: unique within
+    // `revsets.short-prefixes` first. Best-effort: an index that won't load
+    // falls back to whole-repo uniqueness.
+    let id_prefixes = super::revset::id_prefix_context(repo_root, repo.settings(), workspace_name);
+    let id_prefix_index = id_prefixes.populate(repo).unwrap_or_else(|error| {
+        tracing::warn!("revsets.short-prefixes unavailable: {error}");
+        IdPrefixIndex::empty()
+    });
 
     let mut lane_assigner = LaneAssigner::new();
     let mut tree_ids: HashMap<CommitId, Merge<TreeId>> = HashMap::new();
@@ -350,8 +376,8 @@ pub async fn walk_jj_with_repo(
             });
 
             let description = commit.description().lines().next().unwrap_or("").trim();
-            let shortest_change_id_len = repo
-                .shortest_unique_change_id_prefix_len(commit.change_id())
+            let shortest_change_id_len = id_prefix_index
+                .shortest_change_prefix_len(repo, commit.change_id())
                 .await
                 .with_context(|| {
                     format!(
@@ -402,6 +428,7 @@ pub async fn walk_jj_with_repo(
                     description.to_owned()
                 },
                 author: commit.author().name.clone(),
+                author_timestamp: Some(commit.author().timestamp.timestamp.0),
                 has_description: !description.is_empty(),
                 is_empty: None,
                 has_conflict: commit.has_conflict(),
@@ -463,6 +490,10 @@ pub async fn walk_jj_with_repo(
     // delete/push) — a single bookmarks() walk on the same repo.
     let mut bookmarks = compute_bookmarks_info(repo, wc_commit_id);
     bookmarks.trunk = trunk_id.map(|id| id.hex());
+    if let Some(remote) = bookmarks.default_push_remote().map(str::to_owned) {
+        bookmarks.tracked_push =
+            compute_tracked_push(repo, repo_root, workspace_name, &remote).await;
+    }
     Ok(Some((empty_updates, branch_status, bookmarks)))
 }
 
@@ -512,16 +543,16 @@ pub(super) fn collect_bookmark_labels(
     target: &LocalRemoteRefTarget<'_>,
     mut emit: impl FnMut(&CommitId, String),
 ) {
-    let local_id = target.local_target.added_ids().next();
+    let local_id = target.local_target.present_adds().next();
     // Conflicted (several added ids — concurrent moves, a force-pushed
     // remote): jj log suffixes `??`, and the chip lands on *every* side. The
     // conflict marker wins over the divergence `*` — jj renders it the same
     // way, and "this name means two commits" is the more urgent fact.
-    let local_conflicted = target.local_target.added_ids().nth(1).is_some();
+    let local_conflicted = target.local_target.present_adds().nth(1).is_some();
     let diverged = target.remote_refs.iter().any(|(remote, remote_ref)| {
         remote.as_str() != REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str()
             && remote_ref.is_tracked()
-            && remote_ref.target.added_ids().next() != local_id
+            && remote_ref.target.present_adds().next() != local_id
     });
     let local_label = if local_conflicted {
         format!("{name}??")
@@ -530,7 +561,7 @@ pub(super) fn collect_bookmark_labels(
     } else {
         name.to_owned()
     };
-    for id in target.local_target.added_ids() {
+    for id in target.local_target.present_adds() {
         emit(id, local_label.clone());
     }
     for (remote, remote_ref) in &target.remote_refs {
@@ -539,8 +570,8 @@ pub(super) fn collect_bookmark_labels(
         }
         let tracked = remote_ref.is_tracked();
         // A conflicted remote ref (concurrent fetches) gets the same `??`.
-        let remote_conflicted = remote_ref.target.added_ids().nth(1).is_some();
-        for id in remote_ref.target.added_ids() {
+        let remote_conflicted = remote_ref.target.present_adds().nth(1).is_some();
+        for id in remote_ref.target.present_adds() {
             // A tracked remote in sync with the local bookmark is redundant.
             if tracked && !local_conflicted && !remote_conflicted && Some(id) == local_id {
                 continue;
@@ -612,8 +643,11 @@ pub(super) fn compute_bookmarks_info(
         // Every added id, not just the first: a conflicted bookmark carries
         // all of its sides so the menu can flag it, match any side's row,
         // and withhold the push actions jj would refuse.
-        let local_targets: Vec<String> =
-            target.local_target.added_ids().map(|id| id.hex()).collect();
+        let local_targets: Vec<String> = target
+            .local_target
+            .present_adds()
+            .map(|id| id.hex())
+            .collect();
         let mut remotes = Vec::new();
         for (remote, remote_ref) in &target.remote_refs {
             // Skip jj's colocated-git pseudo-remote ("git"): it mirrors the
@@ -622,7 +656,7 @@ pub(super) fn compute_bookmarks_info(
             if remote.as_str() == REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str() {
                 continue;
             }
-            if let Some(id) = remote_ref.target.added_ids().next() {
+            if let Some(id) = remote_ref.target.present_adds().next() {
                 remotes.push(RemoteBookmarkRef {
                     remote: remote.as_str().to_owned(),
                     target: id.hex(),
@@ -646,7 +680,7 @@ pub(super) fn compute_bookmarks_info(
         .map(|names| names.iter().map(|name| name.as_str().to_owned()).collect())
         .unwrap_or_default();
     remotes.sort();
-    let git_push = repo.settings().get_string("git.push").ok();
+    let git_push = git_push_remotes(repo.settings(), &remotes);
     // Tags follow the bookmark chip rules (`collect_bookmark_labels`): a
     // remote tag in sync with the local one is redundant, and `@git` never
     // shows.
@@ -663,7 +697,103 @@ pub(super) fn compute_bookmarks_info(
         git_push,
         tags,
         trunk: None,
+        tracked_push: Vec::new(),
     }
+}
+
+/// The bookmarks and tags a plain `jj git push --remote <remote>` would send,
+/// picked as the push's tracked mode picks them (`jj::push`): tracked refs
+/// whose local target sits in `revsets.git-push` for that remote. Each
+/// carries how many commits it is ahead of the remote's copy. Conflicted
+/// refs, and bookmarks the remote no longer has, are left out, as the push
+/// skips them. A tracked tag the remote doesn't have yet goes, as it does in
+/// the push, counted from the remote's bookmarks.
+/// Best-effort, like the branch summary: a failure leaves the list empty.
+pub(super) async fn compute_tracked_push(
+    repo: &ReadonlyRepo,
+    repo_root: &Path,
+    workspace_name: &WorkspaceName,
+    remote: &str,
+) -> Vec<PushCandidate> {
+    let remote = RemoteName::new(remote);
+    match tracked_push_inner(repo, repo_root, workspace_name, remote).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!("failed to work out what a push would send: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+async fn tracked_push_inner(
+    repo: &ReadonlyRepo,
+    repo_root: &Path,
+    workspace_name: &WorkspaceName,
+    remote: &RemoteName,
+) -> Result<Vec<PushCandidate>> {
+    let view = repo.view();
+    let remote_heads: Vec<CommitId> = view
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.present_adds())
+        .cloned()
+        .collect();
+    let in_range =
+        super::push::git_push_range(repo_root, repo.settings(), workspace_name, repo, remote)
+            .await?;
+    let mut candidates = Vec::new();
+    for (name, targets) in view.local_remote_bookmarks(remote) {
+        if !targets.remote_ref.is_tracked() {
+            continue;
+        }
+        let (Some(local), Some(theirs)) = (
+            targets.local_target.as_normal(),
+            targets.remote_ref.target.as_normal(),
+        ) else {
+            continue;
+        };
+        if !in_range.contains(local) {
+            continue;
+        }
+        candidates.push(PushCandidate {
+            name: name.as_str().to_owned(),
+            tag: false,
+            ahead: count_ahead(repo, vec![theirs.clone()], local).await?,
+        });
+    }
+    for (name, targets) in view.local_remote_tags(remote) {
+        if !targets.remote_ref.is_tracked() {
+            continue;
+        }
+        let Some(local) = targets.local_target.as_normal() else {
+            continue;
+        };
+        if !in_range.contains(local) {
+            continue;
+        }
+        let base = match targets.remote_ref.target.as_normal() {
+            Some(theirs) if theirs == local => continue,
+            Some(theirs) => vec![theirs.clone()],
+            None if targets.remote_ref.target.is_absent() => remote_heads.clone(),
+            None => continue,
+        };
+        candidates.push(PushCandidate {
+            name: name.as_str().to_owned(),
+            tag: true,
+            ahead: count_ahead(repo, base, local).await?,
+        });
+    }
+    Ok(candidates)
+}
+
+/// How many commits `base..local` holds: what a push of `local` adds.
+async fn count_ahead(repo: &ReadonlyRepo, base: Vec<CommitId>, local: &CommitId) -> Result<usize> {
+    Ok(RevsetExpression::commits(base)
+        .range(&RevsetExpression::commit(local.clone()))
+        .evaluate(repo)
+        .context("failed to count a ref's unpushed commits")?
+        .stream()
+        .count()
+        .await)
 }
 
 /// Compute the working-copy's branch summary: the nearest local bookmark at or
@@ -696,7 +826,7 @@ pub(super) async fn branch_status_inner(
     let mut tracked_upstream: HashMap<String, (String, CommitId)> = HashMap::new();
     for (name, target) in view.bookmarks() {
         let name_str = name.as_str().to_owned();
-        for id in target.local_target.added_ids() {
+        for id in target.local_target.present_adds() {
             local_targets.push(id.clone());
             local_by_commit
                 .entry(id.clone())
@@ -711,7 +841,7 @@ pub(super) async fn branch_status_inner(
                 continue;
             }
             if remote_ref.is_tracked()
-                && let Some(id) = remote_ref.target.added_ids().next()
+                && let Some(id) = remote_ref.target.present_adds().next()
             {
                 tracked_upstream
                     .entry(name_str.clone())
@@ -737,7 +867,7 @@ pub(super) async fn branch_status_inner(
             .resolve_user_expression(repo, &symbol_resolver)
             .context("failed to resolve nearest-bookmark revset")?;
         let revset = resolved
-            .evaluate(repo)
+            .evaluate()
             .context("failed to evaluate nearest-bookmark revset")?;
         match revset.stream().next().await {
             Some(result) => result.context("failed to read nearest bookmark commit")?,
@@ -796,7 +926,7 @@ pub(super) async fn count_revset(
         .resolve_user_expression(repo, symbol_resolver)
         .context("failed to resolve count revset")?;
     let revset = resolved
-        .evaluate(repo)
+        .evaluate()
         .context("failed to evaluate count revset")?;
     let mut count = 0usize;
     let mut ids = revset.stream();
@@ -839,7 +969,7 @@ pub(crate) async fn compute_jj_empty_status(
         let Ok(commit) = repo.store().get_commit_async(&id).await else {
             continue;
         };
-        if let Ok(empty) = commit.is_empty(repo).await {
+        if let Ok(empty) = commit.is_empty(repo.index()).await {
             out.push((index, empty));
         }
     }
@@ -853,7 +983,8 @@ mod revset_tests {
     use super::*;
 
     fn settings() -> UserSettings {
-        UserSettings::from_config(StackedConfig::with_defaults()).expect("default settings")
+        UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)
+            .expect("default settings")
     }
 
     #[test]
@@ -893,7 +1024,25 @@ mod revset_tests {
             jj_lib::config::ConfigLayer::parse(jj_lib::config::ConfigSource::User, toml)
                 .expect("parse the user config"),
         );
-        UserSettings::from_config(config).expect("settings")
+        UserSettings::from_config_and_home_dir(config, None).expect("settings")
+    }
+
+    /// `git.push` is a list of remote name patterns since jj 0.46, or still
+    /// a single name; either way the remotes it matches are what counts.
+    #[test]
+    fn git_push_picks_the_remotes_its_patterns_match() {
+        let remotes = ["origin", "upstream", "upstream-old"].map(str::to_owned);
+        let picks = |toml: &str| git_push_remotes(&user_settings(toml), &remotes);
+        assert_eq!(picks(""), None);
+        assert_eq!(
+            picks("git.push = \"origin\"\n"),
+            Some(vec!["origin".to_owned()])
+        );
+        assert_eq!(
+            picks("git.push = [\"upstream*\"]\n"),
+            Some(vec!["upstream".to_owned(), "upstream-old".to_owned()])
+        );
+        assert_eq!(picks("git.push = [\"gone\"]\n"), Some(Vec::new()));
     }
 
     /// The default log revset is jj-cli's shipped `revsets.log`, expanded
@@ -977,10 +1126,11 @@ mod revset_tests {
     #[ignore = "needs the diffui jj repo + a configured user.email"]
     fn refresh_path_loads_user_email() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let default_email = UserSettings::from_config(StackedConfig::with_defaults())
-            .expect("default settings")
-            .user_email()
-            .to_owned();
+        let default_email =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)
+                .expect("default settings")
+                .user_email()
+                .to_owned();
         let loaded_email = jj_settings(&root)
             .expect("jj settings")
             .user_email()
@@ -1055,20 +1205,12 @@ mod lane_width_probe {
 
         let widths: Vec<u32> = runtime.block_on(async {
             let settings =
-                UserSettings::from_config(StackedConfig::with_defaults()).expect("jj settings");
-            let workspace = Workspace::load(
-                &settings,
-                &root,
-                &StoreFactories::default(),
-                &default_working_copy_factories(),
-            )
-            .expect("jj workspace");
+                UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)
+                    .expect("jj settings");
+            let workspace =
+                crate::jj::workspace::load_workspace(&settings, &root).expect("jj workspace");
             let workspace_name = workspace.workspace_name();
-            let repo = workspace
-                .repo_loader()
-                .load_at_head()
-                .await
-                .expect("jj repo");
+            let repo = workspace.load_at_head().await.expect("jj repo");
             let wc = repo
                 .view()
                 .get_wc_commit_id(workspace_name)
@@ -1082,7 +1224,7 @@ mod lane_width_probe {
             let resolved = expr
                 .resolve_user_expression(repo.as_ref(), &resolver)
                 .expect("resolve revset");
-            let revset = resolved.evaluate(repo.as_ref()).expect("evaluate revset");
+            let revset = resolved.evaluate().expect("evaluate revset");
             let nodes: Vec<jj_lib::graph::GraphNode<CommitId>> = {
                 let mut topo =
                     TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);

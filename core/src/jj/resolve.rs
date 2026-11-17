@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bstr::BString;
+use futures::StreamExt;
 use jj_lib::{
     backend::{CopyId, MergedTreeValueExt as _, TreeValue},
     commit::Commit,
@@ -69,7 +70,7 @@ pub(crate) async fn conflict_files(commit: &Commit) -> Result<Vec<ConflictFile>>
     if !tree.has_conflict() {
         return Ok(Vec::new());
     }
-    let paths: Vec<_> = tree.conflicts().map(|(path, _)| path).collect();
+    let paths: Vec<_> = tree.conflicts().map(|(path, _)| path).collect().await;
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         let label = path.as_internal_file_string().to_owned();
@@ -329,7 +330,9 @@ pub(super) async fn resolve_conflict(
         }
     };
     let mut builder = MergedTreeBuilder::new(tree);
-    builder.set_or_remove(repo_path, new_value);
+    builder
+        .set_or_remove_merge(repo_path, new_value)
+        .context("failed to write the resolved value")?;
     let new_tree = builder
         .write_tree()
         .await
@@ -479,7 +482,12 @@ pub(crate) async fn prepare_merge_tool(
     variables.insert("path", path.to_owned());
 
     Ok(MergeToolInvocation {
-        args: jj_cli::config::interpolate_variables(&tool.merge_args, &variables),
+        // The arguments and the values are all UTF-8 here, so nothing is
+        // lost going back from jj's `OsString`s.
+        args: jj_cli::config::interpolate_variables(&tool.merge_args, &variables)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
         output: dir.join(format!("output{suffix}")),
         dir,
         tool: tool.name,

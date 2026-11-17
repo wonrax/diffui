@@ -7,21 +7,29 @@
 //! like that, ask the user's login shell for its `PATH` (the way a terminal
 //! would have set it up) and fall back to appending the usual install dirs.
 //!
+//! The shell's answer is cached: a launch takes the last one and asks the
+//! shell again in the background for the next, so an interactive login
+//! shell (up to [`SHELL_TIMEOUT`] of rc files) runs ahead of the window only
+//! on the first launch.
+//!
 //! A terminal launch is left alone, minimal `PATH` or not: there the user (or
 //! their shell) chose it.
 
 #[cfg(unix)]
 use std::io::IsTerminal;
+#[cfg(any(unix, test))]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// What launchd hands a GUI app. A `PATH` made only of these is the default,
 /// not a choice.
+#[cfg(any(unix, test))]
 const SYSTEM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Brackets the shell's answer, so whatever its rc files print around it
 /// (greetings, prompts, update nags) can be told apart from the value.
+#[cfg(any(unix, test))]
 const MARKER: &str = "__DIFFUI_PATH__";
 
 /// How long a login shell gets to start. A slow `.zshrc` beyond this costs the
@@ -47,7 +55,15 @@ pub(crate) fn repair_path() -> Option<String> {
             .ok()
             .filter(|shell| !shell.is_empty())
             .unwrap_or_else(|| "/bin/zsh".to_owned());
-        let from_shell = login_shell_path(&shell);
+        let cache = crate::app_files::app_file(crate::app_files::AppDir::State, "login-path");
+        let cached = cache
+            .as_deref()
+            .and_then(|cache| std::fs::read_to_string(cache).ok())
+            .filter(|path| path.contains('/'));
+        let from_shell = match &cached {
+            Some(path) => Ok(path.clone()),
+            None => login_shell_path(&shell),
+        };
         let repaired = merge_paths(from_shell.as_ref().ok().map(String::as_str), &current, {
             let mut dirs = fallback_dirs();
             dirs.retain(|dir| dir.is_dir());
@@ -57,7 +73,28 @@ pub(crate) fn repair_path() -> Option<String> {
         // has spawned a thread, so nothing can be reading the environment
         // concurrently.
         unsafe { std::env::set_var("PATH", &repaired) };
+        // Threads may exist from here on; refresh the cache for next time.
+        if let Some(cache) = cache {
+            let shell = shell.clone();
+            let ask = cached.is_some();
+            let fresh = from_shell.clone().ok();
+            let _ = std::thread::Builder::new()
+                .name("diffui-login-path".to_owned())
+                .spawn(move || {
+                    let path = if ask {
+                        login_shell_path(&shell).ok()
+                    } else {
+                        fresh
+                    };
+                    if let Some(path) = path {
+                        let _ = crate::app_files::write_atomic(&cache, path.as_bytes());
+                    }
+                });
+        }
         Some(match from_shell {
+            Ok(_) if cached.is_some() => {
+                format!("GUI launch: PATH from login shell {shell}, cached: {repaired}")
+            }
             Ok(_) => format!("GUI launch: PATH taken from login shell {shell}: {repaired}"),
             Err(error) => {
                 format!("GUI launch: login shell {shell} gave no PATH ({error}); using {repaired}")
@@ -68,6 +105,7 @@ pub(crate) fn repair_path() -> Option<String> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn looks_minimal(path: &str) -> bool {
     path.split(':')
         .filter(|entry| !entry.is_empty())
@@ -77,6 +115,7 @@ fn looks_minimal(path: &str) -> bool {
 /// Where Homebrew (Apple silicon and Intel), nix (single-user, nix-darwin,
 /// home-manager, the daemon's default profile) and per-user tool installs put
 /// their binaries.
+#[cfg(unix)]
 fn fallback_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin"]
         .iter()
@@ -139,6 +178,7 @@ fn login_shell_path(shell: &str) -> Result<String, String> {
     parse_marked(&output).ok_or_else(|| "no PATH in its output".to_owned())
 }
 
+#[cfg(any(unix, test))]
 fn parse_marked(output: &str) -> Option<String> {
     let (_, rest) = output.split_once(MARKER)?;
     let (path, _) = rest.split_once(MARKER)?;
@@ -148,6 +188,7 @@ fn parse_marked(output: &str) -> Option<String> {
 
 /// `primary` (the shell's answer) first, then what we started with, then the
 /// fallback dirs; each entry once, in first-seen order.
+#[cfg(any(unix, test))]
 fn merge_paths(primary: Option<&str>, current: &str, fallback: Vec<PathBuf>) -> String {
     let mut seen: Vec<String> = Vec::new();
     let entries = primary

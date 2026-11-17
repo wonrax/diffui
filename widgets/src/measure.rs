@@ -1,141 +1,107 @@
-//! Headless one-line text measurement, shared by chip sizing, sidebar path
+//! One-line and wrapped text measurement, shared by chip sizing, sidebar path
 //! truncation, menu layout, and the diff view's column metrics.
 //!
-//! We previously approximated text width with `chars * 7px`-style heuristics,
-//! which silently misbehaved for any glyph wider or narrower than the assumed
-//! average — `@` clipped into `…` in revision IDs, abbreviated paths over- or
-//! under-shot the available room, and badges would clip if the user ever
-//! switched to a larger font. Going through real `cosmic_text` shaping fixes
-//! the entire class of bug because it's the same engine the wgpu renderer
-//! draws with, so measurements match painted pixels exactly.
-//!
-//! Why headless `iced::advanced::graphics::text::Paragraph` rather than the
-//! renderer's `R::Paragraph`: much of this measurement runs in `view()`, well
-//! before any `draw()` call, where the renderer's `Paragraph` type isn't
-//! reachable without threading renderer generics through `main.rs`. The wgpu
-//! renderer is built on top of `iced_graphics`, so the headless `Paragraph`
-//! shapes text identically.
+//! These answers go through the same text system the renderer shapes with, so
+//! measurements match painted pixels exactly. They're free functions because
+//! much of the app measures in places with no `Window` at hand, so the module
+//! holds on to the app's text system ([`install`]). In a test with no app it
+//! makes its own.
 
-use iced::advanced::graphics::text::Paragraph;
-use iced::advanced::text::{self, Paragraph as _, Shaping, Text};
-use iced::{Font, Pixels, Size, alignment};
+use std::cell::RefCell;
+use std::sync::{Arc, OnceLock};
+
+use gpui_kit::{Hsla, Pixels, SharedString, Size, TextRun, TextSystem, WindowTextSystem, px, size};
+
+use crate::theme::Font;
 
 /// Line box used by single-line UI text throughout the app.
 pub const LINE_HEIGHT_MULTIPLIER: f32 = 1.4;
 
-/// Rendered width of one line of `content`, shaped like UI text
-/// (`Shaping::Advanced`).
+static TEXT_SYSTEM: OnceLock<Arc<TextSystem>> = OnceLock::new();
+
+/// Measures with the app's text system, so fonts it loaded (Lucide) resolve.
+/// Call once at startup, before anything measures.
+pub fn install(system: Arc<TextSystem>) {
+    let _ = TEXT_SYSTEM.set(system);
+}
+
+/// The text system measurements go through.
+pub fn text_system() -> Arc<TextSystem> {
+    TEXT_SYSTEM
+        .get_or_init(|| Arc::new(TextSystem::new(platform_text_system())))
+        .clone()
+}
+
+/// A fresh platform text system, without a platform. Building a whole platform
+/// demands the main thread on macOS, which tests don't run on.
+pub fn platform_text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(gpui_apple::AppleTextSystem::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        gpui_kit::platform::current_platform(true).text_system()
+    }
+}
+
+/// Measurements before the shaper is rebuilt. Its layout cache only drops
+/// entries at a frame boundary, and this thread has no frames of its own.
+const SHAPER_FRAME: u32 = 4096;
+
+thread_local! {
+    static SHAPER: RefCell<(Option<WindowTextSystem>, u32)> = const { RefCell::new((None, 0)) };
+}
+
+fn with_shaper<R>(f: impl FnOnce(&WindowTextSystem) -> R) -> R {
+    SHAPER.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let (shaper, count) = &mut *cell;
+        *count += 1;
+        if *count >= SHAPER_FRAME {
+            *shaper = None;
+            *count = 0;
+        }
+        f(shaper.get_or_insert_with(|| WindowTextSystem::new(text_system())))
+    })
+}
+
+fn run(len: usize, font: Font) -> TextRun {
+    TextRun {
+        len,
+        font: font.gpui(),
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+/// Rendered width of one line of `content`.
 pub fn line_width(content: &str, size: f32, font: Font) -> f32 {
-    line_width_shaped(content, size, font, Shaping::Advanced)
-}
-
-/// Rendered extent (width × line box) of one line of `content`, for callers
-/// sizing a box around the text — e.g. the sidebar's hover tooltip.
-pub fn line_bounds(content: &str, size: f32, font: Font) -> Size {
-    one_line(content, size, font, Shaping::Advanced).min_bounds()
-}
-
-/// [`line_width`] with an explicit shaping strategy, for callers that must
-/// match a renderer path shaping differently from UI text (the diff grid,
-/// which shapes `Shaping::Auto`).
-pub fn line_width_shaped(content: &str, size: f32, font: Font, shaping: Shaping) -> f32 {
     if content.is_empty() {
         return 0.0;
     }
-    one_line(content, size, font, shaping).min_width()
+    let width = with_shaper(|shaper| {
+        shaper
+            .layout_line(content, px(size), &[run(content.len(), font)], None)
+            .width
+    });
+    f32::from(width)
 }
 
-/// Shape `content` exactly the way the diff grid draws a code line — same
-/// font/size, absolute `line_height` box, and the caller's `wrapping` —
-/// bounded to `max_width`, and say which shaping it took.
-///
-/// `Shaping::Auto` keeps the cheap `Basic` path for ASCII and switches to
-/// full shaping (with font fallback) for anything else, so CJK, Cyrillic,
-/// emoji and arrows measure as the glyphs they are instead of as the tofu
-/// `Basic` produces when the primary font has no coverage. When the fallback
-/// face `Auto` reaches reports no usable metrics the line is shaped `Basic`
-/// instead (see the body), and the returned shaping is what the painter has
-/// to use so its glyphs sit on the columns measured here.
-///
-/// The height bound is infinite on purpose: cosmic stops laying out lines
-/// once they pass the box, so a finite height would hide the very overflow
-/// the caller is measuring.
-pub fn code_paragraph(
-    content: &str,
-    size: f32,
-    font: Font,
-    line_height: f32,
-    max_width: f32,
-    wrapping: text::Wrapping,
-) -> (Paragraph, Shaping) {
-    let auto = code_paragraph_shaped(
-        content,
-        size,
-        font,
-        line_height,
-        max_width,
-        wrapping,
-        Shaping::Auto,
-    );
-    if metrics_are_finite(&auto) {
-        return (auto, Shaping::Auto);
-    }
-    // `Auto` reached a fallback face that reports no usable advance. macOS
-    // ships one, GB18030 Bitmap: once it is picked for a CJK char its glyph
-    // has an infinite advance and every glyph after it sits at infinity, so
-    // nothing downstream can place a break, a column or a rectangle. Shape
-    // the line `Basic` instead — tofu where the code font has no glyph, every
-    // column finite — and tell the caller, so the painter draws it the same
-    // way and the glyphs land on the columns that were measured.
-    let basic = code_paragraph_shaped(
-        content,
-        size,
-        font,
-        line_height,
-        max_width,
-        wrapping,
-        Shaping::Basic,
-    );
-    (basic, Shaping::Basic)
-}
-
-/// Whether every glyph the layout placed has a finite position and advance.
-fn metrics_are_finite(paragraph: &Paragraph) -> bool {
-    paragraph.buffer().layout_runs().all(|run| {
-        run.glyphs
-            .iter()
-            .all(|glyph| glyph.x.is_finite() && glyph.w.is_finite())
-    })
-}
-
-/// [`code_paragraph`] with the shaping named, and no fallback.
-pub fn code_paragraph_shaped(
-    content: &str,
-    size: f32,
-    font: Font,
-    line_height: f32,
-    max_width: f32,
-    wrapping: text::Wrapping,
-    shaping: Shaping,
-) -> Paragraph {
-    Paragraph::with_text(Text {
-        content,
-        bounds: Size::new(max_width.max(1.0), f32::INFINITY),
-        size: Pixels(size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height.max(1.0))),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping,
-        wrapping,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
-    })
+/// Rendered extent (width × line box) of one line of `content`, for callers
+/// sizing a box around the text, e.g. the sidebar's hover tooltip.
+pub fn line_bounds(content: &str, text_size: f32, font: Font) -> Size<Pixels> {
+    size(
+        px(line_width(content, text_size, font)),
+        px((text_size * LINE_HEIGHT_MULTIPLIER).max(1.0)),
+    )
 }
 
 /// How many visual lines `content` occupies when word-wrapped at `max_width`
-/// (1 for a line that fits). Engine truth — the same shaping the renderer
-/// uses, so reserved heights match painted pixels.
+/// (1 for a line that fits). Engine truth: the same shaping the renderer uses,
+/// so reserved heights match painted pixels.
 pub fn wrapped_line_count(
     content: &str,
     size: f32,
@@ -143,82 +109,73 @@ pub fn wrapped_line_count(
     line_height: f32,
     max_width: f32,
 ) -> usize {
-    let (paragraph, _) = code_paragraph(
-        content,
-        size,
-        font,
-        line_height,
-        max_width,
-        text::Wrapping::WordOrGlyph,
-    );
-    let lines = (paragraph.min_bounds().height / line_height.max(1.0)).round() as usize;
-    lines.max(1)
+    content
+        .split('\n')
+        .map(|line| wrapped_line_starts(line, size, font, line_height, max_width).len())
+        .sum()
 }
 
 /// Byte offset at which each visual line of word-wrapped `content` starts:
 /// index 0 is always present (and 0); one entry means no wrapping. The break
-/// points come from hit-testing the shaped paragraph itself, so consumers
-/// slicing the line for hit tests or highlight rects agree with the renderer
-/// byte-for-byte.
-///
-/// May hold *fewer* entries than [`wrapped_line_count`]: cosmic can lay out
-/// trailing line boxes that start no new character (they paint nothing
-/// selectable), and the table stops at the last advancing one.
-/// Consumers clamp their visual-row index into the table, so clicks on such
-/// a phantom row resolve to the final real range.
+/// points come from the shaped line itself, so consumers slicing the line for
+/// hit tests or highlight rects agree with the renderer byte-for-byte.
 pub fn wrapped_line_starts(
     content: &str,
     size: f32,
     font: Font,
-    line_height: f32,
+    _line_height: f32,
     max_width: f32,
 ) -> Vec<usize> {
-    let line_height = line_height.max(1.0);
-    let (paragraph, _) = code_paragraph(
-        content,
-        size,
-        font,
-        line_height,
-        max_width,
-        text::Wrapping::WordOrGlyph,
-    );
-    let lines = ((paragraph.min_bounds().height / line_height).round() as usize).max(1);
-    let mut starts = Vec::with_capacity(lines);
-    starts.push(0);
-    for visual in 1..lines {
-        let Some(hit) = paragraph.hit_test(iced::Point::new(
-            0.0,
-            visual as f32 * line_height + line_height / 2.0,
-        )) else {
-            break;
-        };
-        let byte = hit.cursor().min(content.len());
-        // A hit that doesn't advance, or that lands on the end of the text,
-        // means the remaining line boxes start no new character — the table
-        // ends at the last real break (see the doc).
-        if byte <= starts.last().copied().unwrap_or(0) || byte >= content.len() {
-            break;
+    if content.is_empty() {
+        return vec![0];
+    }
+    let one_line: String = content.replace('\n', " ");
+    let lines = with_shaper(|shaper| {
+        shaper.shape_text(
+            SharedString::from(one_line),
+            px(size),
+            &[run(content.len(), font)],
+            Some(px(max_width.max(1.0))),
+            None,
+        )
+    });
+    let Ok(lines) = lines else {
+        return vec![0];
+    };
+    let mut starts = vec![0];
+    if let Some(line) = lines.first() {
+        for boundary in line.wrap_boundaries() {
+            if let Some(glyph) = line
+                .runs()
+                .get(boundary.run_ix)
+                .and_then(|run| run.glyphs.get(boundary.glyph_ix))
+            {
+                starts.push(glyph.index);
+            }
         }
-        starts.push(byte);
     }
     starts
 }
 
-fn one_line(content: &str, size: f32, font: Font, shaping: Shaping) -> Paragraph {
-    let line_height = (size * LINE_HEIGHT_MULTIPLIER).max(1.0);
-    Paragraph::with_text(Text {
-        content,
-        bounds: Size::new(f32::INFINITY, line_height),
-        size: Pixels(size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height)),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping,
-        wrapping: text::Wrapping::None,
-        ellipsis: text::Ellipsis::None,
-        hint_factor: None,
+/// `content` shaped as one line, wrapped at `wrap_width` if there is one: glyph
+/// positions and break points, for geometry that has to land on what's painted.
+pub fn shape_wrapped(
+    content: &str,
+    size: f32,
+    font: Font,
+    wrap_width: Option<f32>,
+) -> Option<gpui_kit::WrappedLine> {
+    let lines = with_shaper(|shaper| {
+        shaper.shape_text(
+            SharedString::new(content),
+            px(size),
+            &[run(content.len(), font)],
+            wrap_width.map(|width| px(width.max(1.0))),
+            None,
+        )
     })
+    .ok()?;
+    lines.into_iter().next()
 }
 
 #[cfg(test)]
@@ -246,8 +203,10 @@ mod tests {
     /// hanging on the previous line), not mid-word at the width limit.
     #[test]
     fn wrap_breaks_at_word_boundaries() {
-        // 7 chars fit: "aaa bbb" + hanging blank, then "ccc".
-        assert_eq!(starts("aaa bbb ccc", 7.4), vec![0, 8]);
+        // GPUI doesn't let a trailing blank hang past the width: 8 chars fit
+        // "aaa bbb " and then "ccc", while 7 send "bbb" down to join "ccc".
+        assert_eq!(starts("aaa bbb ccc", 8.4), vec![0, 8]);
+        assert_eq!(starts("aaa bbb ccc", 7.4), vec![0, 4]);
         // 5 chars fit: one word (+ hanging blank) per visual line.
         assert_eq!(starts("aaa bbb ccc", 5.4), vec![0, 4, 8]);
     }
@@ -282,8 +241,6 @@ mod tests {
                 let starts =
                     wrapped_line_starts(content, SIZE, Font::MONOSPACE, LINE_HEIGHT, width);
                 let count = wrapped_line_count(content, SIZE, Font::MONOSPACE, LINE_HEIGHT, width);
-                // The painted height can include trailing line boxes that
-                // start no new character; the break table never exceeds it.
                 assert!(
                     starts.len() <= count,
                     "break table larger than painted lines for {content:?} at \

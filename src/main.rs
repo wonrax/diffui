@@ -1,15 +1,20 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    pin::Pin,
     time::{Duration, Instant},
 };
 
 mod action;
 mod activity;
+mod ai;
+#[cfg(all(test, unix))]
+mod ai_scenarios;
+mod app_files;
 mod app_menu;
 mod bookmarks;
 mod changes;
+#[cfg(test)]
+mod chrome_scenes;
 mod cli_output;
 mod cmdline;
 mod cmdline_view;
@@ -18,40 +23,74 @@ mod commit_info;
 mod compare;
 mod config;
 mod conflicts;
+mod connections;
 mod credentials;
+mod ctl;
 mod diff_panel;
 mod empty_states;
 mod field;
 mod find;
+mod forge;
+mod forge_dialog;
 mod graph_preview;
+#[cfg(test)]
+mod harness;
 mod history_panel;
+mod host_page;
 mod jj_version;
 mod keymap;
 mod launch_env;
 mod logging;
+// Under test `menus::run_popup` stands in for the tracking loop and no bar goes up, so
+// the AppKit side has no callers.
+#[cfg(test)]
+mod field_scenes;
 #[cfg(target_os = "macos")]
+#[cfg_attr(test, allow(dead_code))]
 mod macos_native;
 mod media;
 mod menu;
 mod menus;
-mod message;
 mod meta_line;
 mod mode_hints;
 mod modes;
+mod notes;
+mod opened;
+mod overlay_kit;
+#[cfg(test)]
+mod overlay_scenes;
 mod palette;
+#[cfg(test)]
+mod pane_scenes;
+#[cfg(test)]
+mod panels_scenes;
 mod path_browse;
 mod plan;
+mod plugins;
 mod range;
+mod remote;
+#[cfg(all(test, unix))]
+mod remote_scenarios;
+mod review;
+mod revision_rows;
 mod revops;
 mod revset_assist;
+mod root;
+#[cfg(test)]
+mod scene_suite;
+mod settings;
 mod shortcuts;
 mod sidebar;
 mod source_panel;
+mod spawn;
+mod status_bar;
 mod tab_bar;
 mod tabs;
 mod toolbar;
 mod trunk;
 mod update;
+mod user_commands;
+mod when;
 mod window_state;
 
 // Domain logic now lives in the headless `diffui-core` crate. Re-export the
@@ -59,15 +98,15 @@ mod window_state;
 // …) so those call sites stay unchanged.
 pub(crate) use action::Action;
 pub(crate) use diffui_core::{
-    FetchTarget, JobId, RepoHandle, github, graph_layout, jj, mutations, repository,
+    FetchTarget, JobId, RepoHandle, graph_layout, jj, mutations, repository,
 };
-pub(crate) use message::{Message, UiEvent, WindowEvent};
 // The same for the widget layer in `diffui-widgets`: `crate::theme`,
 // `crate::ui`, `crate::diff_view` and the rest resolve as they did when they
 // were modules of this crate.
 pub(crate) use diffui_widgets::{
-    chip, chrome, diff_view, editor_drag, ellipsis, graph_view, hunk_actions, icons, input,
-    measure, pointer, prose, resize_handle, revision_list, scrollbar, theme, typography, ui, wheel,
+    chip, chrome, diff_view, ellipsis, geometry, graph_view, hunk_actions, icons, input, keys,
+    markdown, measure, prose, resize_handle, revision_list, scrollbar, squircle, system_fonts,
+    theme, typography, ui,
 };
 
 /// Profiling-only global allocator (enabled by the `track-alloc` feature). It
@@ -145,28 +184,21 @@ use commands::{CommandArg, Context};
 use config::AppConfig;
 use diffui_core::{DiffFile, LoadProgress, RevisionDetails, RevisionSelection, SignatureInfo};
 use find::FindState;
-use futures::{Stream, StreamExt};
-use iced::theme as iced_theme;
-use iced::{
-    Element, Length, Padding, Point, Size, Subscription, Task, Theme, alignment,
-    event::{self, Event},
-    font::Weight,
-    keyboard, system, time,
-    widget::{self, column, container, row, stack, text},
-    window,
-};
+use geometry::{Point, Rectangle, Size};
 use keymap::{Chord, Keymap};
 use modes::{Mode, ModeKind, TabMode};
 use palette::{
     ColumnSource, PaletteState, Recents, ResultRef, change_id_for_recents, revision_selection,
 };
 use repository::{Repository, Vcs, prepare_repository};
-use resize_handle::ResizeHandle;
-use theme::{
-    ResolvedTheme, ThemePreference, ThemeSpec, app_shell_style, emphasis_font, horizontal_divider,
-    text_size, vertical_divider,
-};
+use theme::{ResolvedTheme, SystemAppearance, ThemePreference};
 use window_state::WindowState;
+
+/// What every piece of update code takes: the root entity's context.
+pub(crate) type Cx<'a> = gpui_kit::Context<'a, Diffui>;
+
+/// The window's size when nothing better is known.
+const DEFAULT_WINDOW_SIZE: Size = Size::new(1280.0, 800.0);
 
 /// Debounce before re-running the palette matcher. It scans every commit, so
 /// coalescing fast typing keeps the input responsive on large repos.
@@ -181,27 +213,7 @@ const WINDOW_STATE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// quick-pick list. Bounded so the persisted state file stays small.
 const RECENT_REPOS_MAX: usize = 12;
 
-/// Fallback duration for the custom zoom animation when AppKit's own
-/// `animationResizeTime:` isn't available (e.g. un-zooming with no saved
-/// duration). The real path queries the native value so the timing matches a
-/// native zoom exactly; this is only a sane default.
-pub(crate) const ZOOM_FALLBACK_SECS: f64 = 0.25;
-
-/// True when two window frames (`[x, y, w, h]`) match within a pixel or two —
-/// used to tell whether the window is already sitting at its zoom target.
-pub(crate) fn frames_approx_eq(a: [f64; 4], b: [f64; 4]) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 2.0)
-}
-
-/// The frame to un-zoom to when we have no saved pre-zoom frame (e.g. the window
-/// opened already maximized): a centered 70% of the screen's visible area.
-pub(crate) fn zoom_default_restore(visible: [f64; 4]) -> [f64; 4] {
-    let [vx, vy, vw, vh] = visible;
-    let (w, h) = (vw * 0.7, vh * 0.7);
-    [vx + (vw - w) / 2.0, vy + (vh - h) / 2.0, w, h]
-}
-
-fn main() -> iced::Result {
+fn main() {
     // Started by git or ssh to ask for a credential: relay it and exit.
     if let Some(code) = diffui_core::askpass::run_helper() {
         std::process::exit(code);
@@ -210,9 +222,48 @@ fn main() -> iced::Result {
     if let Some(code) = diffui_core::cli::passthrough::jj_main() {
         std::process::exit(code.into());
     }
+    // `diffui serve`: be the far end of a repository on another machine,
+    // for a host whose `server` names the app itself rather than
+    // `diffui-serve`.
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        std::process::exit(match std::env::current_exe() {
+            Ok(exe) => {
+                if diffui_core::remote::serve::serve_stdio(exe) == std::process::ExitCode::SUCCESS {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(error) => {
+                eprintln!("diffui: can't find its own executable: {error}");
+                1
+            }
+        });
+    }
+    // `diffui ctl …` talks to the running app; `diffui skill` prints its guide,
+    // which names every subcommand here (see `ctl::tests`).
+    if let Some(code) = ctl::client_main() {
+        std::process::exit(code);
+    }
+    // `diffui notes …` leaves and reads review notes, with the app or without.
+    if let Some(code) = notes::cli::client_main() {
+        std::process::exit(code);
+    }
+    // `diffui plugin …` starts, checks and lists plugins.
+    if let Some(code) = plugins::client_main() {
+        std::process::exit(code);
+    }
+    // `diffui diff LEFT RIGHT`: compare, through the running app.
+    if let Some(code) = opened::client_main() {
+        std::process::exit(code);
+    }
     // First, while the process is still single-threaded: it may `set_var`.
     let path_repair = launch_env::repair_path();
     let cli = Cli::parse();
+    // Patches only, and an app is running: they open there.
+    if let Some(code) = opened::hand_off(&cli.requested_paths().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     logging::init();
     if let Some(repair) = path_repair {
         tracing::info!("{repair}");
@@ -220,48 +271,21 @@ fn main() -> iced::Result {
     if let Err(error) = diffui_core::askpass::start() {
         tracing::warn!("credential prompts unavailable: {error}");
     }
-
-    // Restore the last window geometry before the window is created. The
-    // sidebar split lives in app state, so it's restored later in
-    // `Diffui::new`; `saved` is handed to the boot closure for that.
-    let saved = WindowState::load();
-    let mut window_settings = window::Settings::default();
-    if let Some((width, height)) = saved.size() {
-        window_settings.size = Size::new(width, height);
-    } else if let Some((width, height)) = window_state::default_window_size(screen_visible_size()) {
-        window_settings.size = Size::new(width, height);
-        window_settings.position = window::Position::Centered;
+    if let Err(error) = ctl::listen() {
+        tracing::warn!("diffui ctl unavailable: {error}");
     }
-    if let Some((x, y)) = saved.position() {
-        window_settings.position = window::Position::Specific(Point::new(x, y));
-    }
-    // Platform window chrome (e.g. macOS transparent title bar so the tab strip
-    // sits inline with the traffic lights). See `chrome`.
-    chrome::apply_window_settings(&mut window_settings);
 
-    iced::application(
-        move || Diffui::new(cli.clone(), saved.clone()),
-        Diffui::update,
-        view,
-    )
-    .title("diffui")
-    .fonts([icons::ICON_FONT_BYTES])
-    // iced's default moved to 1.375; the layout (toolbar fills, icon boxes) is
-    // measured against 1.3 line boxes.
-    .line_height(iced::widget::text::LineHeight::Relative(1.3))
-    .window(window_settings)
-    // The close is ours to perform: `Message::WindowCloseRequested` flushes the
-    // pending window state before exiting, which winit gives us no other chance
-    // to do (⌘Q and the close button raise no `Unfocused`).
-    .exit_on_close_request(false)
-    .subscription(Diffui::subscription)
-    .theme(Diffui::theme)
-    .run()
-}
-
-/// The app's view, with wheel deltas normalized for the window's scale factor.
-fn view(app: &Diffui) -> Element<'_, Message> {
-    wheel::normalized(app.view(), app.scale_factor)
+    // The UI thread runs inside the tokio runtime: the repository actor's channels
+    // and the core's process spawns look for one where they're called from.
+    let _tokio = spawn::runtime().enter();
+    gpui_kit::application().run(move |cx| {
+        root::init(cx);
+        let saved = WindowState::load();
+        if let Err(error) = root::open_window(cli, saved, cx) {
+            tracing::error!("couldn't open the window: {error}");
+            cx.quit();
+        }
+    });
 }
 
 /// The primary display's usable size, where the platform can tell us before
@@ -274,16 +298,21 @@ fn screen_visible_size() -> Option<(f32, f32)> {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(version, about = "Native GUI diff viewer for jj and git")]
+#[command(
+    version,
+    about = "Native GUI diff viewer for jj and git",
+    after_help = opened::AFTER_HELP
+)]
 struct Cli {
-    /// Repository path (or GitHub PR reference) to open as a tab; repeat to
-    /// open several. Same as passing it positionally.
+    /// Repository path (or GitHub PR reference, or patch) to open as a tab;
+    /// repeat to open several. Same as passing it positionally.
     #[arg(short = 'p', long = "path", value_name = "REPO")]
     paths: Vec<PathBuf>,
 
-    /// Repositories (or GitHub PR references) to open, e.g. `diffui .`. With
-    /// none, diffui restores your last session and, when started inside a
-    /// repository, opens and focuses that one too.
+    /// Repositories (or GitHub PR references, or patches; `-` for stdin)
+    /// to open, e.g. `diffui .`. With none, diffui restores your last
+    /// session and, when started inside a repository, opens and focuses
+    /// that one too.
     #[arg(value_name = "REPO")]
     repos: Vec<PathBuf>,
 }
@@ -314,7 +343,7 @@ pub(crate) struct PendingMutation {
 pub(crate) struct Diffui {
     pub(crate) app_focused: bool,
     pub(crate) selected_theme: ThemePreference,
-    pub(crate) system_theme: iced_theme::Mode,
+    pub(crate) system_theme: SystemAppearance,
     /// Last usable widths for the two resizable navigation panes. Collapsing a
     /// pane keeps its width here so reopening restores the user's split.
     pub(crate) sidebar_width: f32,
@@ -329,27 +358,30 @@ pub(crate) struct Diffui {
     /// of the description body and the field grid. Global, persisted with
     /// the window state.
     pub(crate) commit_details_collapsed: bool,
+    /// Whether descriptions and messages read rendered or as written.
+    /// Persisted with the window state.
+    pub(crate) text_views: review::TextViews,
     /// SVG files show their text diff rather than the rendered preview.
     /// Global across tabs and diff sources.
     pub(crate) svg_source: bool,
     /// Decoded image and SVG previews, by blob id (see [`media`]).
     pub(crate) media: media::MediaCache,
     /// View-time memo for the file list's stat-column widths and flattened file
-    /// tree, keyed on document identity. Without it, the sidebar re-shaped ~5·N
-    /// strings through `cosmic_text` on every diff-scroll file-boundary crossing
-    /// (each crossing publishes `SelectFile`, which forces a full `view()`
-    /// rebuild) and tanked the frame rate on large PRs. Interior-mutable because
-    /// `view()` only has `&self`; global rather than per-tab since every cache
+    /// tree, keyed on document identity, so a file-boundary crossing in the
+    /// diff doesn't re-shape ~5·N strings. Interior-mutable because a render
+    /// only has `&self`; global rather than per-tab since every cache
     /// key carries `document_id`, which is unique across tabs — a switch is
     /// already a miss.
     /// See [`sidebar::SidebarFileCache`].
     pub(crate) sidebar_file_cache: std::cell::RefCell<sidebar::SidebarFileCache>,
     /// Cached result of `sidebar::min_width(config)`. The min width is
     /// purely a function of `config.ui_font` + `config.mono_font` glyph
-    /// advances at `CAPTION_TEXT_SIZE`, which are stable for the life of
-    /// the app — caching avoids re-shaping six strings on every `view()`
-    /// rebuild and on every drag tick of the resize handle.
+    /// advances at `CAPTION_TEXT_SIZE`, which only change when the settings
+    /// dialog changes a font — caching avoids re-shaping six strings on every
+    /// render and on every drag tick of the resize handle.
     pub(crate) sidebar_min_width: f32,
+    /// The section the settings dialog shows.
+    pub(crate) settings_section: crate::settings::Section,
     /// Last window geometry seen from the compositor: inner (client) size and
     /// outer top-left position. Updated on `Opened`/`Resized`/`Moved` and
     /// written back — debounced — so the next launch restores it. Position is
@@ -357,34 +389,36 @@ pub(crate) struct Diffui {
     /// doesn't report window positions).
     pub(crate) window_size: Size,
     pub(crate) window_position: Option<Point>,
-    /// The window's display scale factor, from `Opened` and `Rescaled`;
-    /// [`wheel::normalized`] divides trackpad deltas by it.
-    pub(crate) scale_factor: f32,
+    /// The display `window_position` is relative to, where that's how the platform
+    /// reports it.
+    pub(crate) window_display: Option<String>,
     /// Set when the window geometry or sidebar width changes; cleared once the
     /// new value is persisted. While it's `Some`, the subscription runs a
     /// debounce timer whose tick flushes the geometry to disk after the
     /// changes settle. `None` when nothing is pending.
     pub(crate) geometry_dirty_since: Option<Instant>,
-    /// In-flight custom double-click zoom animation (macOS), or `None` when idle.
-    /// We drive the zoom ourselves frame-by-frame instead of using AppKit's
-    /// `performZoom:` so the layout re-flows each step like an edge-drag resize
-    /// rather than the whole GPU surface morphing mid-animation. While `Some`,
-    /// the subscription ticks it.
-    pub(crate) zoom_anim: Option<ZoomAnim>,
-    /// The pre-zoom window frame to restore on the next un-zoom (AppKit screen
-    /// coords `[x, y, w, h]`) paired with the native animation duration used to
-    /// zoom in — reused for the symmetric un-zoom so its timing matches without a
-    /// second `animationResizeTime:` round-trip. `None` when not in our zoomed
-    /// state.
-    pub(crate) zoom_restore: Option<([f64; 4], f64)>,
     pub(crate) config: AppConfig,
+    /// Where `config` came from, and the one way to save a setting.
+    pub(crate) config_files: config::ConfigFiles,
+    /// Every command: the built-ins plus what config declares. Rebuilt on
+    /// reload; the keymap, the menu bar and the palette are derived from it.
+    pub(crate) registry: std::rc::Rc<commands::Registry>,
     /// Chord → command id per context, built from the registry's defaults
     /// with the `[keys]` section of `config.toml` layered on top.
     pub(crate) keymap: Keymap,
+    /// What `config.toml` declares beyond settings: keys, commands, and the
+    /// editor and agent CLI they start.
+    pub(crate) user_config: config::UserConfig,
+    /// The declared command waiting on a prompt, its confirm or the
+    /// repository.
+    pub(crate) user_runs: user_commands::Runs,
     /// Window-level modes, innermost last. The top of this stack (or, when it
     /// is empty, the top of the active tab's) owns the keyboard — see
     /// [`crate::modes`].
     pub(crate) modes: Vec<Mode>,
+    /// What had the keyboard when the first window-level mode opened, given
+    /// back when the last one closes: `Some` while a mode is open.
+    pub(crate) focus_before_modes: Option<Option<gpui_kit::FocusHandle>>,
     /// In-session recents (revisions + commands) used to score palette
     /// matches. Persisted to the XDG data dir between sessions.
     pub(crate) recents: Recents,
@@ -421,7 +455,7 @@ pub(crate) struct Diffui {
     pub(crate) active: usize,
     /// The state reached by [`Diffui::active`] when no tab is open at all (a
     /// launch with nothing to restore, or after the last tab is closed). Its
-    /// `Session::empty` is `Loaded`, so `view()` renders the welcome screen
+    /// `Session::empty` is `Loaded`, so the window shows the welcome screen
     /// rather than a spinner, and handlers that fire with no tab open write
     /// here harmlessly instead of forcing an `Option` on every call site.
     pub(crate) no_tab: TabState,
@@ -435,6 +469,8 @@ pub(crate) struct Diffui {
     /// Most-recently-opened repo roots (newest first), surfaced as quick-pick
     /// rows in the open dialog. Seeded from / persisted to `WindowState`.
     pub(crate) recent_repos: Vec<String>,
+    /// Each repository's revset and panel layout, open or not.
+    pub(crate) repo_layouts: window_state::RepoLayouts,
 
     // ── Toolbar / activity / revset ─────────────────────────────────────
     /// Monotonic source of `ActivityId`s across every tab.
@@ -442,14 +478,10 @@ pub(crate) struct Diffui {
     /// The caret control the cursor is currently over, if any — drives the
     /// hover highlight that `mouse_area` (unlike `button`) doesn't provide.
     pub(crate) hovered: Option<HoverTarget>,
-    /// Whether the collapsed changed-files rail is exposing its temporary tree.
-    /// Only the rail's icon opens it; the hover flags keep a delayed close from
-    /// landing while the pointer is still on the icon, the rail or the tree, or
-    /// crossing between them.
-    pub(crate) changed_files_peek_open: bool,
-    pub(crate) changed_files_trigger_hovered: bool,
-    pub(crate) changed_files_rail_hovered: bool,
-    pub(crate) changed_files_popup_hovered: bool,
+    /// A hidden panel shown over the diff for a moment (see `root::Panel`).
+    pub(crate) panel_peek: Option<root::PanelPeek>,
+    /// The tab strip's drag and slide state.
+    pub(crate) tab_strip: tab_bar::Strip,
     /// Transient error toasts (failed mutation/fetch/undo), newest last.
     /// The activity log keeps the durable record; these only make a failure
     /// impossible to miss. Auto-pruned after a few seconds, click to dismiss.
@@ -458,12 +490,33 @@ pub(crate) struct Diffui {
     /// Live keyboard modifier state, tracked from the event subscription so
     /// pointer gestures can read it at decision time (⌥-drop = rebase with
     /// descendants).
-    pub(crate) modifiers: keyboard::Modifiers,
+    pub(crate) modifiers: keys::Modifiers,
+    /// The window this view lives in, once it has one. Update code holds no
+    /// `Window`; see [`Diffui::with_window`].
+    pub(crate) window: Option<gpui_kit::AnyWindowHandle>,
+    /// The loops that run while their condition holds.
+    pub(crate) background: root::Background,
+    /// The palette's matcher, waiting for typing to pause.
+    pub(crate) palette_query: spawn::Debounce,
+    /// The command line's check, waiting for typing to pause.
+    pub(crate) command_line_settle: spawn::Debounce,
+    /// The window's regions as cached views, once it has a window.
+    pub(crate) panes: Option<root::Panes>,
+    /// The hosts repositories are opened on, and the links to them.
+    pub(crate) remote: remote::Remote,
+    /// The forges, and when to ask them again.
+    pub(crate) forge: forge::ForgeUi,
+    /// The plugins found in the plugins folder, and what runs of them.
+    pub(crate) plugins: plugins::Plugins,
+    /// Settings → AI's tests and what it knows of the secret store.
+    pub(crate) ai: ai::AiState,
+    /// How many times the root has rendered.
+    #[cfg(test)]
+    pub(crate) renders: usize,
 }
 
 /// Frontend wrapper around the core [`diffui_core::OpDraft`]: the draft
-/// itself plus the preview bookkeeping (version-guarded like every async
-/// load).
+/// itself plus the preview bookkeeping.
 #[derive(Debug, Clone)]
 pub(crate) struct DraftUi {
     pub(crate) draft: diffui_core::OpDraft,
@@ -471,18 +524,14 @@ pub(crate) struct DraftUi {
     /// `Some`, the widget draws the drop indicators itself and the keyboard
     /// candidate's marker is suppressed.
     pub(crate) hover_spot: Option<revision_list::DropSpot>,
-    /// Bumped on every candidate/placement change; `DraftPreview` results
-    /// carrying an older version are dropped.
-    pub(crate) preview_version: u64,
     pub(crate) preview: DraftPreviewState,
     /// Commit ids (hex) of the moved set the last rebase simulation resolved
     /// — the sidebar washes these rows so a branch-mode draft shows exactly
     /// which branch is coming along. Kept until the next simulation lands
     /// (so it doesn't flicker per candidate hop); dropped with the draft.
     pub(crate) moved_highlight: HashSet<String>,
-    /// The derived simulation parked while the debounce timer runs.
-    /// `DraftPreviewKick` takes it only if `preview_version` still matches,
-    /// so rapid candidate hops expire here without ever reaching the
+    /// The derived simulation parked while [`TabState::preview_debounce`]
+    /// runs, so rapid candidate hops expire here without ever reaching the
     /// backend (each stale hop would otherwise run a full simulation and
     /// write throwaway objects).
     pub(crate) preview_request: Option<Box<PreviewRequest>>,
@@ -520,7 +569,6 @@ impl DraftUi {
         Self {
             draft,
             hover_spot: None,
-            preview_version: 0,
             preview: DraftPreviewState::Idle,
             moved_highlight: HashSet::new(),
             preview_request: None,
@@ -542,6 +590,8 @@ pub(crate) struct Toast {
     /// Stays up until dismissed instead of expiring after [`TOAST_TTL`] — for
     /// startup problems the user may not be looking at the window for.
     pub(crate) sticky: bool,
+    /// Something to read rather than a failure: no warning glyph or color.
+    pub(crate) info: bool,
 }
 
 /// How long a toast lingers before the tick prunes it.
@@ -551,7 +601,7 @@ pub(crate) const TOAST_TTL: Duration = Duration::from_secs(7);
 pub(crate) struct DescriptionEditor {
     pub(crate) target: RevisionSelection,
     pub(crate) original: String,
-    pub(crate) content: widget::text_editor::Content,
+    pub(crate) content: String,
     /// The mutation activity that owns an in-flight save. `None` means the
     /// draft is editable.
     pub(crate) saving_activity: Option<activity::ActivityId>,
@@ -559,15 +609,43 @@ pub(crate) struct DescriptionEditor {
     /// Commit mode ("Commit…"): saving runs `jj commit` — describe `@` and
     /// start a new change on top — instead of a plain describe.
     pub(crate) commit: bool,
+    /// The change `@` was on when the editor opened. A save that addresses
+    /// `@` is refused once `@` has moved to another change, so the text never
+    /// lands on a change the user wasn't describing.
+    pub(crate) wc_change: Option<String>,
+    /// A program writing the description (Generate): the field is read-only
+    /// until it exits.
+    pub(crate) generating: Option<user_commands::Generation>,
 }
 
 impl DescriptionEditor {
     pub(crate) fn text(&self) -> String {
-        self.content.text()
+        self.content.clone()
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.text().trim_end() != self.original.trim_end()
+    }
+}
+
+/// What a [`ConfirmDialog`] holds until it's answered.
+#[derive(Debug, Clone)]
+pub(crate) enum Held {
+    /// A mutation, run on accept.
+    Mutation(PendingMutation),
+    /// A declared command's run, which carries on past its `confirm` on
+    /// accept and stops on cancel; or a plugin's confirm prompt, which
+    /// resolves with the answer.
+    Command(user_commands::RunId),
+}
+
+impl Held {
+    /// The tab the held work is for.
+    pub(crate) fn tab_id(&self) -> TabId {
+        match self {
+            Held::Mutation(pending) => pending.tab_id,
+            Held::Command(run) => run.tab,
+        }
     }
 }
 
@@ -583,7 +661,24 @@ pub(crate) struct ConfirmDialog {
     pub(crate) title: prose::Prose,
     pub(crate) body: prose::Prose,
     pub(crate) confirm_label: String,
-    pub(crate) pending: PendingMutation,
+    /// What the dialog shows beyond its words, and how its confirm looks.
+    pub(crate) look: ConfirmLook,
+    pub(crate) pending: Held,
+}
+
+/// The parts of a [`ConfirmDialog`] only some confirms have. The default is
+/// the plain guard: words and a destructive confirm.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfirmLook {
+    /// The confirm goes ahead with something ordinary (a push the user
+    /// started), rather than destroying or overriding something: the
+    /// primary button, not the red one.
+    pub(crate) routine: bool,
+    /// The bookmarks a push moves, a row each.
+    pub(crate) moves: Vec<diffui_core::BookmarkMove>,
+    /// Things to know before confirming that don't stop it, as warning
+    /// callouts: what's wrong, then what it means.
+    pub(crate) callouts: Vec<(prose::Prose, Option<prose::Prose>)>,
 }
 
 /// Which main view the active tab shows: the diff (default) or the source
@@ -595,6 +690,8 @@ pub(crate) enum MainView {
     Source,
     /// The operation log or a revision's evolog (jj only).
     History,
+    /// Every review note in the repository (jj only).
+    Notes,
 }
 
 /// One loaded file in the source browser: the synthesized all-context
@@ -658,8 +755,8 @@ pub(crate) struct SourceState {
     pub(crate) reveal_pending: bool,
 }
 
-/// Which toolbar dropdown is open. Both render as iced overlays anchored near
-/// their trigger.
+/// Which toolbar dropdown is open. Off macOS both render as overlays anchored
+/// near their trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolbarMenu {
     /// The fetch split-button's caret: one row per known remote branch.
@@ -676,26 +773,10 @@ pub(crate) enum ToolbarMenu {
 pub(crate) enum HoverTarget {
     /// The Fetch split button's caret half (the main half uses `button`'s own
     /// hover state; only the `mouse_area` caret needs manual tracking).
-    FetchCaret,
     RevsetCaret,
     /// A title-bar tab, keyed by id — drives its inset hover fill. At most one is
     /// hovered at a time.
     Tab(TabId),
-}
-
-/// One in-flight custom zoom animation: interpolate the window frame from `from`
-/// to `to` (AppKit screen coords `[x, y, w, h]`) over `duration` seconds, applying
-/// each step as a non-animated `setFrame:` so the resize routes through the same
-/// live-repaint path an edge-drag uses. `duration` is AppKit's own
-/// `animationResizeTime:` for this resize, so the timing matches a native zoom;
-/// `start` is the wall-clock the animation began and the tick handler eases
-/// `elapsed / duration`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ZoomAnim {
-    pub(crate) start: Instant,
-    pub(crate) from: [f64; 4],
-    pub(crate) to: [f64; 4],
-    pub(crate) duration: f64,
 }
 
 /// Everything one tab owns: its core [`Session`] (all domain + orchestration
@@ -716,27 +797,42 @@ pub(crate) struct TabState {
     pub(crate) handle: Option<RepoHandle>,
     /// Jobs this tab issued whose results it routes itself, because the
     /// projection has no state to fold them into.
-    pub(crate) jobs: PendingJobs,
-    /// Mutations waiting for [`PendingJobs::mutation`] to free up. The actor
+    pub(crate) jobs: JobTable,
+    /// Mutations waiting for [`JobTable::mutation`] to free up. The actor
     /// serializes the work; this keeps the ones behind it addressable, so each
     /// completion still finds the activity row that started it.
     pub(crate) queued_mutations: VecDeque<PendingMutation>,
     /// This repo's default revset (its `revsets.log`, or jj's default) — what
     /// the "Default" preset in the revset menu applies. Read from jj's config
-    /// on disk once, when the tab is created, so neither a render nor a tab
-    /// switch does config-file I/O on the UI thread.
-    pub(crate) default_revset: String,
+    /// on disk once: when the tab is created without a revset of its own, else
+    /// on its first load, so a restored session doesn't read every tab's
+    /// config before the window opens and neither a render nor a tab switch
+    /// does config-file I/O. `None` until then.
+    pub(crate) default_revset: Option<String>,
     /// Per-tab pane visibility so a focused review layout survives tab hops.
     pub(crate) history_panel_collapsed: bool,
     pub(crate) files_panel_collapsed: bool,
     /// Collapsed directories of the sidebar file tree, by full path prefix.
     pub(crate) collapsed_dirs: HashSet<String>,
+    /// Files folded to their headers in the diff, by path, and the diff they
+    /// were folded in (see `diff_panel::folded_files`).
+    pub(crate) folded_files: (String, HashSet<String>),
     pub(crate) selected_file: usize,
+    /// Per file of the shown document, bumped each time highlight spans merge
+    /// into it: the diff view's [`DiffProps::paint_stamps`], so a merge
+    /// re-shapes that file's rows and keeps every other cache. Never reset: a
+    /// new document bumps `document_version`, which drops the caches anyway.
+    ///
+    /// [`DiffProps::paint_stamps`]: diffui_widgets::diff_view::DiffProps::paint_stamps
+    pub(crate) paint_stamps: Vec<u32>,
     /// Bumped whenever the user picks a revision through a path that doesn't go
     /// through the revision list (currently: the palette). The sidebar's
     /// `RevisionList` watches this and scrolls the matching row into view on
     /// disagreement.
     pub(crate) revision_reveal_token: u64,
+    /// Bumped when the keyboard moves the draft's destination candidate: the
+    /// revision list scrolls that row into view.
+    pub(crate) candidate_reveal_token: u64,
     /// True while a palette-initiated revision load is in flight. We can't bump
     /// `revision_reveal_token` at the moment the user accepts the result — at
     /// that point `selected_revision` is still the old value, so the sidebar
@@ -777,9 +873,6 @@ pub(crate) struct TabState {
     /// `WorkingCopy` matches every tab, so a global one opened the editor on
     /// whichever tab produced the next `@` diff.
     pub(crate) pending_description_edit: Option<RevisionSelection>,
-    /// A `Copy → Author / Committer / Description` waiting on the revision
-    /// header it reads from. Per tab, like every other routed job.
-    pub(crate) pending_detail_copy: Option<(JobId, DetailField, String)>,
     /// Commit ids marked via ⌘-click / ⇧-click for a batch action (the context
     /// menu's "Abandon N revisions"), in mark order. A separate axis from
     /// `session.selected_revision` — marking never changes which diff is shown.
@@ -798,6 +891,24 @@ pub(crate) struct TabState {
     /// The command line's per-repository state: its grammar, CLI runs and
     /// the revset field's completion.
     pub(crate) cmdline: cmdline::TabCommandLine,
+    /// The find bar's matcher, waiting for typing to pause.
+    pub(crate) find_debounce: spawn::Debounce,
+    /// The draft's simulation, waiting for candidate hops to pause.
+    pub(crate) preview_debounce: spawn::Debounce,
+    /// This repository's pull requests.
+    pub(crate) forge: forge::TabForge,
+    /// What this tab last told plugins.
+    pub(crate) plugins: plugins::TabPlugins,
+    /// The connection to the repository's host, for a repository on another
+    /// machine.
+    pub(crate) remote: Option<remote::RemoteTab>,
+    /// Review notes on this repository (see [`notes`]).
+    pub(crate) notes: notes::TabNotes,
+    /// The description the header shows whole, by its hash, after "Show
+    /// all"; any other shows its first lines.
+    pub(crate) description_whole: Option<u64>,
+    /// The `diffui diff` commands waiting for this tab to close.
+    pub(crate) waiting: opened::Waiting,
 }
 
 impl TabState {
@@ -806,21 +917,29 @@ impl TabState {
     /// becomes the active tab (`status != Loaded`). `revset` is the persisted
     /// filter for this repo, or `None` to start on its default.
     fn unloaded(repository: Option<Repository>, revset: Option<String>) -> Self {
-        let default_revset = repository.as_ref().map(default_revset).unwrap_or_default();
-        let revset = revset.unwrap_or_else(|| default_revset.clone());
+        let (revset, default_revset) = match revset {
+            Some(revset) => (revset, None),
+            None => {
+                let default = repository.as_ref().map(default_revset).unwrap_or_default();
+                (default.clone(), Some(default))
+            }
+        };
         Self {
             session: Session::unloaded(revset),
             repository,
             handle: None,
-            jobs: PendingJobs::default(),
+            jobs: JobTable::default(),
             queued_mutations: VecDeque::new(),
             default_revset,
             modes: Vec::new(),
             history_panel_collapsed: false,
             files_panel_collapsed: false,
             collapsed_dirs: HashSet::new(),
+            folded_files: (String::new(), HashSet::new()),
             selected_file: 0,
+            paint_stamps: Vec::new(),
             revision_reveal_token: 0,
+            candidate_reveal_token: 0,
             pending_revision_reveal: false,
             sidebar_scroll_offset: 0.0,
             file_tree_scroll_offset: 0.0,
@@ -831,31 +950,71 @@ impl TabState {
             source: SourceState::default(),
             source_tree_cache: Default::default(),
             pending_description_edit: None,
-            pending_detail_copy: None,
             revision_multi_selection: Vec::new(),
             pending_commit: false,
             changes: Default::default(),
             history: Default::default(),
             graph_preview: Default::default(),
             cmdline: Default::default(),
+            find_debounce: Default::default(),
+            preview_debounce: Default::default(),
+            forge: Default::default(),
+            plugins: Default::default(),
+            remote: None,
+            notes: Default::default(),
+            description_whole: None,
+            waiting: Default::default(),
+        }
+    }
+
+    /// A never-loaded tab for `repository` on `host`. Nothing of it is read
+    /// here: its default revset comes with the server's answer, and becomes
+    /// the tab's when no `revset` was saved for it.
+    pub(crate) fn unloaded_remote(
+        repository: Repository,
+        host: diffui_core::remote::HostId,
+        revset: Option<String>,
+    ) -> Self {
+        let wants_default_revset = revset.is_none();
+        let mut state = Self::unloaded(None, Some(revset.unwrap_or_default()));
+        state.repository = Some(repository);
+        state.remote = Some(remote::RemoteTab {
+            host,
+            wants_default_revset,
+            ..Default::default()
+        });
+        state
+    }
+
+    /// The repository's root on this disk: `None` when there is no
+    /// repository, or it is on another machine.
+    pub(crate) fn local_root(&self) -> Option<&Path> {
+        match (&self.repository, &self.remote) {
+            (Some(repository), None) => Some(&repository.root),
+            _ => None,
         }
     }
 
     /// A never-loaded GitHub-PR tab: a `Session` whose source is the PR. No
     /// local repository, so the watcher/snapshot/mutation machinery stays off
     /// and `ensure_active_loaded` routes to the streaming PR load.
-    fn unloaded_pr() -> Self {
+    pub(crate) fn unloaded_pr() -> Self {
         Self::unloaded(None, Some(String::new()))
     }
 
     /// The state shown when no repository is open at all. `Session::empty` is
-    /// `Loaded` so `view()` shows the empty state rather than a loading
+    /// `Loaded` so the window shows the empty state rather than a loading
     /// indicator.
     pub(crate) fn empty() -> Self {
         Self {
             session: Session::empty(),
             ..Self::unloaded(None, Some(String::new()))
         }
+    }
+
+    /// [`Self::default_revset`], or nothing before the tab first loads.
+    pub(crate) fn default_revset(&self) -> &str {
+        self.default_revset.as_deref().unwrap_or_default()
     }
 
     /// Finish the activity wrapping this tab's in-flight graph (re)load, if one
@@ -868,6 +1027,7 @@ impl TabState {
     ) {
         if let Some(id) = self.pending_load_activity.take() {
             self.activities.finish(id, status, result);
+            self.activities.fold_repeated_failure(id);
         }
     }
 
@@ -882,15 +1042,11 @@ impl TabState {
                 .as_ref()
                 .map(|view| std::slice::from_ref(&view.file))
                 .unwrap_or(&[]),
-            MainView::History => &[],
+            MainView::History | MainView::Notes => &[],
         }
     }
 }
 
-/// The default revset for a freshly-opened repo of `vcs`, before any persisted
-/// value is applied: jj shows `all()` (every visible head's ancestry — the
-/// current hardcoded behavior); git falls back to its `git log` default (the
-/// current branch's history), expressed as an empty range.
 /// The revset a freshly-opened repo starts on when nothing is persisted for it.
 /// jj mirrors `jj log` (the user's `revsets.log`, or jj's default); git keeps
 /// its empty default (the backend's own "current branch" view).
@@ -904,7 +1060,7 @@ fn default_revset(repository: &Repository) -> String {
 /// Revset presets for the caret menu, as `(label, expression)`. jj uses
 /// revset functions and can be configured with `[[revset_presets]]` (see
 /// [`config`]); git uses `git log` revision-range shortcuts. Shared by the
-/// native macOS menu and the iced fallback so they stay in sync.
+/// native macOS menu and the overlay fallback so they stay in sync.
 pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
     let builtin: &[(&str, &str)] = match vcs {
         Some(Vcs::Git) => &[("All branches", "--all"), ("Current", "HEAD")],
@@ -933,16 +1089,38 @@ pub(crate) fn revset_presets(vcs: Option<Vcs>) -> Vec<(String, String)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
-/// What a tab views: a local repository, or a GitHub pull request fetched
-/// through the `gh` CLI. Equality is identity — it's what de-duplicates opens.
+/// What a tab views: a repository, here or on another machine, or a pull
+/// (merge) request read through its forge's provider. Equality is identity —
+/// it's what de-duplicates opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TabSource {
     Repo {
         vcs: Vcs,
         /// Repository root, used to de-duplicate opens and key the watcher.
+        /// With a `host`, a path on that machine: nothing on this disk, and
+        /// never to be joined, canonicalized or looked at here.
         root: PathBuf,
+        /// The machine the repository is on, when it isn't this one (see
+        /// `crate::remote`).
+        host: Option<diffui_core::remote::HostId>,
     },
-    GitHubPr(github::PrSpec),
+    ForgePr(diffui_core::forge::ForgePr),
+    /// A patch, or two files or folders compared: no repository behind it.
+    Diff(diffui_core::patch::DiffInput),
+}
+
+impl TabSource {
+    /// What the tab is, as `ctl state` and the `repo.kind` when-key name
+    /// it: "jj", "git", "pr", "patch" or "compare".
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Repo { vcs: Vcs::Jj, .. } => "jj",
+            Self::Repo { .. } => "git",
+            Self::ForgePr(_) => "pr",
+            Self::Diff(diffui_core::patch::DiffInput::Patch(_)) => "patch",
+            Self::Diff(diffui_core::patch::DiffInput::Compare { .. }) => "compare",
+        }
+    }
 }
 
 /// One open tab: its identity + display metadata, plus the per-tab state it
@@ -951,7 +1129,7 @@ pub(crate) enum TabSource {
 pub(crate) struct Tab {
     pub(crate) id: TabId,
     /// Dimmed prefix in the tab label — the repo root's parent directory, or
-    /// the PR's GitHub org.
+    /// the PR's owner or group.
     pub(crate) owner: String,
     /// Emphasized name — the repo directory, or `repo#123` for a PR.
     pub(crate) name: String,
@@ -960,13 +1138,42 @@ pub(crate) struct Tab {
 }
 
 impl Tab {
-    /// The local repository root, or `None` for a GitHub-PR tab. Persistence
-    /// and the recent-repos list key off this, so PR tabs (session-only for
-    /// now) drop out of both naturally.
+    /// The repository's root on this disk: `None` for a pull request, a
+    /// patch, and a repository on another machine. Whatever reads or runs
+    /// something in the working tree goes through this.
     pub(crate) fn root(&self) -> Option<&Path> {
         match &self.source {
-            TabSource::Repo { root, .. } => Some(root),
-            TabSource::GitHubPr(_) => None,
+            TabSource::Repo {
+                root, host: None, ..
+            } => Some(root),
+            TabSource::Repo { host: Some(_), .. } | TabSource::ForgePr(_) | TabSource::Diff(_) => {
+                None
+            }
+        }
+    }
+
+    /// Where a remote tab's repository is.
+    pub(crate) fn remote_target(&self) -> Option<diffui_core::remote::RemoteTarget> {
+        match &self.source {
+            TabSource::Repo {
+                root,
+                host: Some(host),
+                ..
+            } => Some(diffui_core::remote::RemoteTarget {
+                host: host.clone(),
+                path: root.to_string_lossy().into_owned(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// What the session, the recent list and the saved layouts know a
+    /// repository tab by: its root, or `host:root`. `None` for the tabs that
+    /// are session-only (a pull request, a patch).
+    pub(crate) fn key(&self) -> Option<String> {
+        match self.remote_target() {
+            Some(target) => Some(target.to_string()),
+            None => Some(self.root()?.to_string_lossy().into_owned()),
         }
     }
 
@@ -974,6 +1181,14 @@ impl Tab {
     /// what the actor's events are attributed to.
     pub(crate) fn open_spec(&self) -> diffui_core::OpenSpec {
         match &self.source {
+            TabSource::Repo {
+                root,
+                host: Some(host),
+                ..
+            } => diffui_core::OpenSpec::Remote {
+                host: host.clone(),
+                path: root.to_string_lossy().into_owned(),
+            },
             TabSource::Repo { root, .. } => diffui_core::OpenSpec::Local {
                 root: root.clone(),
                 scope: self
@@ -983,7 +1198,8 @@ impl Tab {
                     .map(|repository| repository.scope.clone())
                     .unwrap_or_default(),
             },
-            TabSource::GitHubPr(spec) => diffui_core::OpenSpec::GitHubPr(spec.clone()),
+            TabSource::ForgePr(spec) => diffui_core::OpenSpec::ForgePr(spec.clone()),
+            TabSource::Diff(input) => diffui_core::OpenSpec::Diff(input.clone()),
         }
     }
 
@@ -992,74 +1208,115 @@ impl Tab {
     }
 }
 
-/// The jobs a tab issued whose results it routes itself. The projection owns
-/// the graph/diff/snapshot/mutation slots; these are the ones with nowhere in
-/// the session to fold into — a preview, a source-browser read, a fetch. Each
-/// is one slot, so a superseded result is dropped by the same comparison.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PendingJobs {
-    /// The draft simulation in flight, if any.
-    pub(crate) preview: Option<JobId>,
-    /// The source browser's tree listing, and which revision it lists.
-    pub(crate) tree: Option<(JobId, RevisionSelection)>,
-    /// The source browser's file read, and which path it reads.
-    pub(crate) file: Option<(JobId, String)>,
+/// What a tab waits on a job for, holding what it needs to finish it. The
+/// projection owns the graph/diff/snapshot/mutation slots; these are the jobs
+/// with nowhere in the session to fold into.
+#[derive(Debug, Clone)]
+pub(crate) enum Pending {
+    /// The draft simulation.
+    Preview,
+    /// The forecast a rebase onto trunk waits on, holding that rebase.
+    TrunkRebase(mutations::MutationOp),
+    /// The source browser's tree listing, of this revision.
+    Tree(RevisionSelection),
+    /// The source browser's file read, of this path.
+    File(String),
     /// A fetch, with the activity row showing it and the target it names.
-    pub(crate) fetch: Option<(JobId, activity::ActivityId, FetchTarget)>,
+    Fetch(activity::ActivityId, FetchTarget),
     /// The mutation the actor is running, with everything the frontend must
     /// remember to finish (or retry) it.
-    pub(crate) mutation: Option<(JobId, PendingMutation)>,
+    Mutation(PendingMutation),
     /// A backwards-bookmark-move check, holding the mutation it gates.
-    pub(crate) bookmark_check: Option<(JobId, PendingMutation)>,
-    /// The forecast a rebase onto trunk waits on, holding that rebase.
-    pub(crate) trunk_rebase: Option<(JobId, mutations::MutationOp)>,
-    /// Full file sources requested for background syntax highlighting, keyed
-    /// by job: `(document id, file index)`.
-    pub(crate) file_pairs: HashMap<JobId, (u64, usize)>,
-    /// The command line's revset resolutions in flight.
-    pub(crate) cmdline: HashSet<JobId>,
-    /// The revset field's check in flight.
-    pub(crate) revset_field: Option<JobId>,
-    /// Passthrough jj CLI runs, with their activity rows.
-    pub(crate) cli: HashMap<JobId, activity::ActivityId>,
+    BookmarkCheck(PendingMutation),
+    /// A file's full sources for background syntax highlighting: the
+    /// document id and the file's index in it.
+    FilePair(u64, usize),
+    /// One of the command line's revsets.
+    CommandRevset(String),
+    /// One of a headless jj line's revsets.
+    LineRevset(cmdline::LineId, String),
+    /// The revset field's check of this revset.
+    RevsetField(String),
+    /// A passthrough jj CLI run, with its activity row. Its output streams,
+    /// so each batch puts it back.
+    Cli(activity::ActivityId),
+    /// A `Copy → Author / Committer / Description` waiting on the revision
+    /// header, with the in-memory value to copy if that never comes.
+    DetailCopy(DetailField, String),
+    /// A pull-request dialog's or submission's question.
+    Forge(forge_dialog::ForgeQuery),
+    /// The palette's search of all history, for this needle.
+    CommitSearch(String),
 }
 
-impl PendingJobs {
-    /// Whether one of these slots is waiting on `job`.
-    pub(crate) fn owns(&self, job: JobId) -> bool {
-        self.preview == Some(job)
-            || self.tree.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.file.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.fetch.as_ref().is_some_and(|(id, ..)| *id == job)
-            || self.mutation.as_ref().is_some_and(|(id, _)| *id == job)
-            || self
-                .bookmark_check
-                .as_ref()
-                .is_some_and(|(id, _)| *id == job)
-            || self.trunk_rebase.as_ref().is_some_and(|(id, _)| *id == job)
-            || self.file_pairs.contains_key(&job)
-            || self.cmdline.contains(&job)
-            || self.revset_field == Some(job)
-            || self.cli.contains_key(&job)
+impl Pending {
+    /// Whether the tab waits on one job of this kind at a time, so a new one
+    /// supersedes the last.
+    fn is_slot(&self) -> bool {
+        !matches!(
+            self,
+            Self::FilePair(..)
+                | Self::CommandRevset(_)
+                | Self::LineRevset(..)
+                | Self::Cli(_)
+                | Self::Forge(_)
+        )
+    }
+}
+
+/// The jobs a tab issued whose results it routes itself, by job.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JobTable(HashMap<JobId, Pending>);
+
+impl JobTable {
+    /// Wait on `job` for `pending`. Returns the job this one supersedes: the
+    /// one of the same kind, for a kind held one at a time. Its result is
+    /// dropped when it lands, and the caller may cancel it.
+    pub(crate) fn issue(&mut self, job: JobId, pending: Pending) -> Option<JobId> {
+        let superseded = pending
+            .is_slot()
+            .then(|| self.find(|held| same_kind(held, &pending)))
+            .flatten();
+        if let Some(old) = superseded {
+            self.0.remove(&old);
+        }
+        self.0.insert(job, pending);
+        superseded
     }
 
-    /// Release whichever slot `job` holds — the cancelled-job path, where
-    /// there is no result to apply but the slot must not stay stuck.
-    pub(crate) fn clear(&mut self, job: JobId) {
-        if self.preview == Some(job) {
-            self.preview = None;
-        }
-        self.tree.take_if(|(id, _)| *id == job);
-        self.file.take_if(|(id, _)| *id == job);
-        self.fetch.take_if(|(id, ..)| *id == job);
-        self.mutation.take_if(|(id, _)| *id == job);
-        self.bookmark_check.take_if(|(id, _)| *id == job);
-        self.trunk_rebase.take_if(|(id, _)| *id == job);
-        self.file_pairs.remove(&job);
-        self.cmdline.remove(&job);
-        self.revset_field.take_if(|id| *id == job);
-        self.cli.remove(&job);
+    /// Stop waiting on `job`, handing back what it was for.
+    pub(crate) fn take(&mut self, job: JobId) -> Option<Pending> {
+        self.0.remove(&job)
     }
+
+    pub(crate) fn owns(&self, job: JobId) -> bool {
+        self.0.contains_key(&job)
+    }
+
+    /// A job held for something `wanted` picks.
+    pub(crate) fn find(&self, wanted: impl Fn(&Pending) -> bool) -> Option<JobId> {
+        self.0
+            .iter()
+            .find_map(|(job, pending)| wanted(pending).then_some(*job))
+    }
+
+    /// Stop waiting on whichever job `wanted` picks, handing it back.
+    pub(crate) fn take_where(
+        &mut self,
+        wanted: impl Fn(&Pending) -> bool,
+    ) -> Option<(JobId, Pending)> {
+        let job = self.find(wanted)?;
+        self.take(job).map(|pending| (job, pending))
+    }
+
+    /// The mutation the actor is running: one at a time per tab.
+    pub(crate) fn mutation(&self) -> Option<JobId> {
+        self.find(|pending| matches!(pending, Pending::Mutation(_)))
+    }
+}
+
+fn same_kind(a: &Pending, b: &Pending) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 /// Transient state of the open-repository path dialog.
@@ -1078,9 +1335,20 @@ pub(crate) struct OpenRepoDialog {
     /// The folder a read is in flight for, so typing within it doesn't
     /// queue another.
     pub(crate) listing_pending: Option<PathBuf>,
-    /// The highlighted suggestion; `None` until the arrows pick one, so a
-    /// plain Enter still opens what was typed.
+    /// The highlighted suggestion (or recent, while the recents show);
+    /// `None` until the arrows pick one, so a plain Enter still opens what
+    /// was typed.
     pub(crate) selected: Option<usize>,
+    /// What the typed path was found to be, for the status line. May lag the
+    /// path for a beat; see [`path_browse::Probe`].
+    pub(crate) probe: Option<path_browse::Probe>,
+    /// The machine the path is on, when it isn't this one.
+    pub(crate) host: Option<diffui_core::remote::HostId>,
+    /// The link to that machine, held while the prompt is open: its folder
+    /// listings share one connection, which the opened tab then takes over.
+    pub(crate) link: Option<diffui_core::remote::HostLink>,
+    /// The hosts are listed instead of folders, to pick where the path is.
+    pub(crate) picking_host: bool,
 }
 
 impl OpenRepoDialog {
@@ -1088,7 +1356,10 @@ impl OpenRepoDialog {
     /// browse (empty, a PR reference, relative) or no folder has been read
     /// yet, and the recents show instead.
     pub(crate) fn suggestions(&self) -> Option<(path_browse::Query, Vec<&path_browse::Entry>)> {
-        let query = path_browse::Query::parse(&self.path)?;
+        if self.picking_host {
+            return None;
+        }
+        let query = self.query()?;
         let listing = self.listing.as_ref()?;
         if listing.dir == query.dir {
             let matches = query.matches(listing);
@@ -1096,6 +1367,12 @@ impl OpenRepoDialog {
         }
         let listed = self.listed_query.as_ref()?;
         Some((listed.clone(), listed.matches(listing)))
+    }
+
+    /// The path, split where completion happens, as a path on the machine
+    /// being browsed.
+    pub(crate) fn query(&self) -> Option<path_browse::Query> {
+        path_browse::Query::parse_on(&self.path, self.host.is_some())
     }
 }
 
@@ -1111,9 +1388,8 @@ pub(crate) use diffui_core::{LoadStatus, Session};
 /// (which the sidebar resolves from the current file tree) into view on the
 /// next render. The scroll itself is a no-op when the file list is closed — the
 /// sidebar passes `None` as the reveal target in that case.
-fn scroll_sidebar_to_file(ui: &mut Diffui) -> Task<Message> {
+fn scroll_sidebar_to_file(ui: &mut Diffui) {
     ui.sidebar_file_reveal_token = ui.sidebar_file_reveal_token.wrapping_add(1);
-    Task::none()
 }
 
 /// Map a sidebar row key back to the app's revision selection enum.
@@ -1122,53 +1398,6 @@ fn selection_from_key(key: &revision_list::RowSelectionKey) -> RevisionSelection
         revision_list::RowSelectionKey::WorkingCopy => RevisionSelection::WorkingCopy,
         revision_list::RowSelectionKey::Commit(id) => RevisionSelection::Commit(id.clone()),
     }
-}
-
-/// Welcome screen shown whenever no repository is open: a fresh launch with
-/// nothing to restore (including from the macOS/Spotlight launcher, where cwd is
-/// `/`), or after the last tab is closed. It is the open prompt itself — the
-/// same card ⌘O raises over a tab, inline and focused, with the recent
-/// repositories — under the wordmark, then a few tips.
-/// Only an explicit `--path` that failed to resolve surfaces an error; the
-/// session and cwd fallbacks resolve silently to this screen instead.
-fn empty_state<'a>(ui: &'a Diffui, theme: ThemeSpec) -> Element<'a, Message> {
-    // The wordmark alone is the identity: big enough to anchor the page.
-    let identity = text("Diffui")
-        .size(text_size::DISPLAY)
-        .color(theme.text)
-        .font(emphasis_font(ui.config.ui_font, Weight::Semibold));
-    let mut body = column![identity]
-        .spacing(theme::space::XXL)
-        .align_x(alignment::Horizontal::Center);
-
-    // A `Failed` status can now only come from an explicit `--path` (the session
-    // and cwd fallbacks resolve silently), so it's always worth surfacing.
-    if let LoadStatus::Failed(error) = &ui.active().session.status {
-        body = body.push(
-            text(format!("Couldn't open repository: {error}"))
-                .size(text_size::UI)
-                .color(theme.removed_text)
-                .font(ui.config.ui_font),
-        );
-    }
-
-    // `update` keeps the prompt's state alive whenever no tab is open.
-    if let Some(dialog) = ui.open_repo_dialog() {
-        body = body.push(tab_bar::open_repo_card(ui, theme, dialog));
-    }
-    body = body.push(shortcuts::welcome_hints(ui, theme));
-
-    // Optically centered: a touch above the true middle, where a centered
-    // block reads as centered rather than as sinking.
-    container(body)
-        .center_x(Length::Fill)
-        .height(Length::Fill)
-        .align_y(alignment::Vertical::Center)
-        .padding(Padding {
-            bottom: theme::space::XXL * 3.0,
-            ..Padding::ZERO
-        })
-        .into()
 }
 
 /// Split a repository root into a dimmed `owner` (the parent directory name)
@@ -1204,21 +1433,30 @@ fn lower_menu_to_native(
                 id: 0,
                 enabled: false,
                 subtitle: reason.clone(),
+                symbol: None,
             },
             MenuEntry::Item {
                 label,
                 detail,
                 command,
                 arg,
+                icon,
                 ..
             } => {
                 let id = picks.len() as u32;
-                picks.push((*command, arg.clone()));
+                picks.push((command.clone(), arg.clone()));
                 let label = match detail {
                     Some(detail) => format!("{label}  ·  {detail}"),
                     None => label.clone(),
                 };
-                MenuItem::entry(label, id)
+                let symbol = (*icon == Some(icons::SPARKLES)).then_some("sparkles");
+                MenuItem::Entry {
+                    label,
+                    id,
+                    enabled: true,
+                    subtitle: None,
+                    symbol,
+                }
             }
             MenuEntry::Submenu { label, items } => {
                 MenuItem::submenu(label.clone(), lower_menu_to_native(items, picks))
@@ -1303,7 +1541,16 @@ pub(crate) fn expand_user_path(input: &str) -> PathBuf {
 /// clickable links in an activity's captured remote output (e.g. a GitHub
 /// "create a pull request" URL). Fire-and-forget — a failure to launch is
 /// non-fatal and silently ignored.
-fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
+    // A test opens nothing: it reads what would have been opened.
+    #[cfg(test)]
+    if true {
+        harness::OPENED_URLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(url.to_owned());
+        return;
+    }
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");
@@ -1327,6 +1574,11 @@ fn open_url(url: &str) {
         c
     };
     let _ = command.spawn();
+}
+
+/// Put `text` on the system clipboard.
+pub(crate) fn write_clipboard(text: String, cx: &mut gpui_kit::App) {
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
 }
 
 /// Sort key for ordering a bookmark by how close its `target` commit sits to a
@@ -1374,70 +1626,6 @@ fn current_file_diff_text(ui: &Diffui) -> Option<String> {
         }
     }
     Some(out)
-}
-
-/// One repository's actor and its event stream.
-///
-/// Spawning the actor *inside* the subscription is what bounds its lifetime:
-/// iced keeps the subscription alive while a tab names it and drops it when the
-/// last one closes, and dropping the stream shuts the actor down with it. The
-/// first event carries the command sender back to the app.
-// `&OpenSpec` (not `OpenSpec`) is required: `Subscription::run_with` keys on
-// `D = OpenSpec` and hands the builder a `fn(&D)`.
-#[allow(clippy::ptr_arg)]
-fn open_repository(spec: &diffui_core::OpenSpec) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
-    diffui_core::repo::open(spec.clone())
-        .map(|event| Message::Repo(Box::new(event)))
-        .boxed()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{expand_user_path, repo_label};
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn repo_label_splits_owner_and_name() {
-        assert_eq!(
-            repo_label(Path::new("/Users/me/code/diffui")),
-            ("code".to_owned(), "diffui".to_owned())
-        );
-        // A root-level repo has no usable parent name → empty owner.
-        assert_eq!(
-            repo_label(Path::new("/diffui")),
-            (String::new(), "diffui".to_owned())
-        );
-        // A bare relative name likewise yields no owner.
-        assert_eq!(
-            repo_label(Path::new("repo")),
-            (String::new(), "repo".to_owned())
-        );
-    }
-
-    #[test]
-    fn expand_user_path_passes_through_non_tilde() {
-        assert_eq!(
-            expand_user_path("/abs/path/repo"),
-            PathBuf::from("/abs/path/repo")
-        );
-        assert_eq!(
-            expand_user_path("relative/repo"),
-            PathBuf::from("relative/repo")
-        );
-        // A tilde mid-path is not a home shortcut and must be left intact.
-        assert_eq!(expand_user_path("/etc/we~rd"), PathBuf::from("/etc/we~rd"));
-    }
-
-    #[test]
-    fn expand_user_path_expands_leading_tilde() {
-        // Only assert when HOME is available (it is in normal test runs);
-        // skip otherwise rather than mutate process-global env.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            assert_eq!(expand_user_path("~"), home);
-            assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
-        }
-    }
 }
 
 /// Memory profile for a real jj load: retained store size vs the transient
@@ -1510,5 +1698,54 @@ mod mem_profile {
         eprintln!("=============================================\n");
 
         drop((store, graph));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_user_path, repo_label};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn repo_label_splits_owner_and_name() {
+        assert_eq!(
+            repo_label(Path::new("/Users/me/code/diffui")),
+            ("code".to_owned(), "diffui".to_owned())
+        );
+        // A root-level repo has no usable parent name → empty owner.
+        assert_eq!(
+            repo_label(Path::new("/diffui")),
+            (String::new(), "diffui".to_owned())
+        );
+        // A bare relative name likewise yields no owner.
+        assert_eq!(
+            repo_label(Path::new("repo")),
+            (String::new(), "repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn expand_user_path_passes_through_non_tilde() {
+        assert_eq!(
+            expand_user_path("/abs/path/repo"),
+            PathBuf::from("/abs/path/repo")
+        );
+        assert_eq!(
+            expand_user_path("relative/repo"),
+            PathBuf::from("relative/repo")
+        );
+        // A tilde mid-path is not a home shortcut and must be left intact.
+        assert_eq!(expand_user_path("/etc/we~rd"), PathBuf::from("/etc/we~rd"));
+    }
+
+    #[test]
+    fn expand_user_path_expands_leading_tilde() {
+        // Only assert when HOME is available (it is in normal test runs);
+        // skip otherwise rather than mutate process-global env.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            assert_eq!(expand_user_path("~"), home);
+            assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
+        }
     }
 }

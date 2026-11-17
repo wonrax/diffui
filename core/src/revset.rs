@@ -18,7 +18,7 @@ use crate::model::{BookmarksInfo, CommitStore};
 
 /// What the caller needs a revset to resolve to, so the actor can refuse it
 /// the way the jj command taking it would.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RevsetExpect {
     /// Any number of commits, none included (`jj log -r`, `jj rebase -s`).
     #[default]
@@ -32,7 +32,7 @@ pub enum RevsetExpect {
 }
 
 /// One revset to parse and resolve against the current repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevsetQuery {
     pub revset: String,
     /// At most this many commit ids come back; the count is still exact up to
@@ -67,7 +67,7 @@ pub const DEFAULT_MATCH_LIMIT: usize = 2_000;
 pub const COUNT_CAP: usize = 100_000;
 
 /// A revset that resolved.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevsetMatch {
     /// Commit ids (hex), newest first, at most [`RevsetQuery::limit`] of them.
     pub commits: Vec<String>,
@@ -90,7 +90,7 @@ impl RevsetMatch {
 }
 
 /// Why a revset didn't parse or resolve, in jj's words.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevsetError {
     /// One line, jj's wording ("Function `foo` doesn't exist").
     pub message: String,
@@ -145,7 +145,7 @@ pub fn union_revsets(revsets: &[String]) -> String {
 // ── the symbol snapshot ─────────────────────────────────────────────────
 
 /// A `[revset-aliases]` entry, jj's defaults included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevsetAlias {
     pub name: String,
     /// `None` for a symbol alias, the parameter names for a function alias
@@ -166,7 +166,7 @@ impl RevsetAlias {
 
 /// What revset completion knows beyond the graph and the bookmark table,
 /// reported by each graph load (see [`crate::repo::GraphTail`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevsetSymbols {
     /// Sorted by name, then arity.
     pub aliases: Vec<RevsetAlias>,
@@ -208,7 +208,7 @@ const ONE_REVSET: &[Arg] = &[Arg::Revset];
 const ONE_FREE: &[Arg] = &[Arg::Free];
 const NONE: &[Arg] = &[];
 
-/// jj-lib 0.45.1's built-in revset functions (`BUILTIN_FUNCTION_MAP`), with
+/// jj-lib 0.47.1's built-in revset functions (`BUILTIN_FUNCTION_MAP`), with
 /// the one-line gist of jj's docs. Keep in sync when bumping jj-lib.
 const FUNCTIONS: &[Function] = &[
     f("parents", "x, [depth]", "Parents of x", REVSET_DEPTH),
@@ -1203,6 +1203,7 @@ mod tests {
             shortest_change_id_len: Some(2),
             description: title.to_owned(),
             author: "a".to_owned(),
+            author_timestamp: None,
             has_description: true,
             is_empty: None,
             has_conflict: false,

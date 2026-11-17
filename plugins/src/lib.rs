@@ -1,0 +1,273 @@
+//! Script plugins for diffui: everything about running one except app state.
+//!
+//! A plugin is a directory with a `plugin.toml` ([`Manifest`]) and an ES
+//! module, JavaScript or TypeScript (types are erased in place, nothing is
+//! compiled). [`Plugin::spawn`] gives it a thread of its own with a QuickJS
+//! context that has no ambient authority: the script reaches the world only
+//! through the `"diffui"` module, and each function there is checked against
+//! the manifest's permissions.
+//!
+//! - `http`, `exec`, `auth`, `kv`, `console` and `config` are served here.
+//! - Repository reads, jj commands and UI slots are [`protocol::HostCall`]s,
+//!   forwarded to the app's [`Host`].
+//! - The app drives a plugin with [`protocol::PluginCall`]s through
+//!   [`Plugin::call`]: run a command, ask the forge, AI or transport
+//!   provider, deliver an event.
+//!
+//! Plugin code never runs on the caller's thread and nothing here blocks it:
+//! every result arrives through a callback or a [`Host`] method.
+//!
+//! The script-side contract is `assets/diffui.d.ts` ([`TYPES`]).
+
+mod actor;
+mod builtin;
+mod host;
+mod js;
+mod manifest;
+mod memory;
+pub mod protocol;
+pub mod secrets;
+mod typescript;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+
+use actor::{Actor, Status, ToActor, lock};
+pub use host::{
+    Host, LogLevel, LogLine, PluginError, PluginEvent, PluginState, Registration, Reply,
+};
+pub use js::{JsError, ThrownForgeError};
+pub use manifest::{
+    API_VERSION, AiClaim, CommandDecl, ConfigField, ConfigKind, Diagnostic, FORGE_HOSTS,
+    ForgeClaim, ForgeTerm, HOSTS, HostPattern, JjAccess, MANIFEST_FILE, Manifest, MenuPlace,
+    PER_HOST, Permissions, SecretField, TransportClaim,
+};
+use protocol::PluginCall;
+
+/// The plugins diffui ships, embedded when it is built from `bundled/<id>/`:
+/// each id with its files (`plugin.toml` and the modules) by path relative to
+/// the plugin's directory. Run one with [`Manifest::bundled`].
+pub const BUNDLED: &[(&str, &[(&str, &str)])] = include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
+
+/// The type definitions of the plugin API, for `diffui plugin init` to write
+/// next to a new plugin and for the agent docs.
+pub const TYPES: &str = include_str!("../assets/diffui.d.ts");
+
+/// What a plugin is started with, beyond its manifest.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// The user's `[plugins.<id>]` table. The script sees it as `config`,
+    /// over the manifest's schema defaults; its `token_cmd`, an argv,
+    /// answers `auth.token`.
+    pub config: toml::Table,
+    /// Where `kv` keeps this plugin's `<id>.json`.
+    pub data_dir: PathBuf,
+    pub limits: Limits,
+    /// Where its `secret` settings are kept ([`secrets::store`] in the app).
+    /// `None`: it has none, and `auth.token` asks no git credential helper.
+    pub secrets: Option<Arc<dyn secrets::SecretStore>>,
+}
+
+/// The bounds a plugin runs inside.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Heap the script may hold. Passing it fails the plugin.
+    pub memory: usize,
+    /// Script stack depth, in bytes. Passing it is a `RangeError` the script
+    /// can catch.
+    pub stack: usize,
+    /// How long the script may run without returning to its event loop
+    /// (awaiting counts as returning). Passing it fails the plugin.
+    pub turn: Duration,
+    /// How long the main module's top level may take, awaits included.
+    pub load: Duration,
+    /// How long a forge method may take to settle.
+    pub forge_call: Duration,
+    /// How long an AI provider's `complete` may go without sending text
+    /// (a command-line agent prints its reply only at the end).
+    pub ai_call: Duration,
+    /// `http.fetch`'s timeout unless the script passes `timeoutMs`.
+    pub http_timeout: Duration,
+    /// `exec`'s timeout unless the script passes `timeoutMs`.
+    pub exec_timeout: Duration,
+    /// The largest response body, or output of one `exec` stream, in bytes.
+    pub max_response: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            memory: 64 * 1024 * 1024,
+            stack: 512 * 1024,
+            turn: Duration::from_millis(500),
+            load: Duration::from_secs(10),
+            forge_call: Duration::from_secs(60),
+            ai_call: Duration::from_secs(600),
+            http_timeout: Duration::from_secs(60),
+            exec_timeout: Duration::from_secs(300),
+            max_response: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// A running plugin. Dropping it stops the script.
+pub struct Plugin {
+    manifest: Arc<Manifest>,
+    status: Arc<Mutex<Status>>,
+    to: Sender<ToActor>,
+    next_call: AtomicU64,
+    /// The hosts it claims beyond its manifest's, which `{forge.hosts}`
+    /// lets it reach. Shared with its thread.
+    forge_hosts: Arc<Mutex<Vec<HostPattern>>>,
+}
+
+/// One call into a plugin, for [`Plugin::abort`].
+pub type CallId = u64;
+
+impl Plugin {
+    /// Start the plugin on its own thread and begin loading its main module.
+    /// Returns at once; [`PluginEvent::Loaded`] or [`PluginEvent::Failed`]
+    /// reaches `host` when loading ends. Calls made before then wait for it.
+    pub fn spawn(manifest: Manifest, options: Options, host: Arc<dyn Host>) -> Plugin {
+        let manifest = Arc::new(manifest);
+        let status = Arc::new(Mutex::new(Status {
+            state: PluginState::Loading,
+            log: Default::default(),
+        }));
+        let (to, inbox) = mpsc::channel();
+        let forge_hosts = Arc::new(Mutex::new(Vec::new()));
+        // Room for the script's stack limit plus the engine's own frames.
+        let stack = options.limits.stack + 1024 * 1024;
+        let actor = {
+            let (manifest, status, own) = (manifest.clone(), status.clone(), to.clone());
+            let reach = forge_hosts.clone();
+            move || Actor::new(manifest, options, host, status, inbox, own, reach).run()
+        };
+        let spawned = std::thread::Builder::new()
+            .name(format!("plugin-{}", manifest.id))
+            .stack_size(stack)
+            .spawn(actor);
+        if let Err(error) = spawned {
+            lock(&status).state = PluginState::Failed(format!("no thread for the plugin: {error}"));
+        }
+        Plugin {
+            manifest,
+            status,
+            to,
+            next_call: AtomicU64::new(1),
+            forge_hosts,
+        }
+    }
+
+    /// Every host the plugin claims as a forge beyond its manifest's
+    /// patterns (its `hosts()` answer, the user's `hosts`, the hosts it has
+    /// a token for). With `{forge.hosts}` under `[permissions] http` it may
+    /// reach them and ask `auth.token` for them.
+    pub fn set_forge_hosts(&self, hosts: Vec<HostPattern>) {
+        *lock(&self.forge_hosts) = hosts;
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn state(&self) -> PluginState {
+        lock(&self.status).state.clone()
+    }
+
+    /// What the plugin logged, oldest first: its `console` output, uncaught
+    /// errors with their stacks, and why it failed. The last few hundred
+    /// lines are kept; all of it also goes to `tracing`.
+    pub fn log(&self) -> Vec<LogLine> {
+        lock(&self.status).log.iter().cloned().collect()
+    }
+
+    /// Call into the script. `reply` runs on the plugin's thread when the
+    /// handler settles, with its JSON result read as `T` (the reply type
+    /// named on the [`PluginCall`] variant, or `serde_json::Value`).
+    pub fn call<T: DeserializeOwned>(
+        &self,
+        call: PluginCall,
+        reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
+    ) -> CallId {
+        self.send_call(call, None, reply)
+    }
+
+    /// [`Self::call`] for a method that streams ([`ForgeCall::streams`], an
+    /// AI provider's `complete`):
+    /// `on_part` runs on the plugin's thread with the parts the script sends,
+    /// a batch at a time (the ones that came while the last batch was being
+    /// taken in), before `reply`. The script waits for each batch's
+    /// [`Reply`] before it sends another, so answer it once the parts are
+    /// taken in (that is the backpressure), or reject it to make the script
+    /// stop.
+    ///
+    /// [`ForgeCall::streams`]: protocol::ForgeCall::streams
+    pub fn call_streaming<T: DeserializeOwned>(
+        &self,
+        call: PluginCall,
+        on_part: impl FnMut(Vec<serde_json::Value>, Reply) + Send + 'static,
+        reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
+    ) -> CallId {
+        self.send_call(call, Some(Box::new(on_part)), reply)
+    }
+
+    /// Give up on a call: the script's handler sees its `signal` abort (which
+    /// reaches the `exec` and `http` calls it passed it to), and the call's
+    /// reply is [`PluginError::Gone`] unless it already settled.
+    pub fn abort(&self, id: CallId) {
+        let _ = self.to.send(ToActor::Abort { id });
+    }
+
+    fn send_call<T: DeserializeOwned>(
+        &self,
+        call: PluginCall,
+        parts: Option<actor::PartFn>,
+        reply: impl FnOnce(Result<T, PluginError>) + Send + 'static,
+    ) -> CallId {
+        let id = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let what = match &call {
+            PluginCall::Forge { call, .. } => call.method(),
+            PluginCall::Ai { call } => call.method(),
+            PluginCall::Transport { call } => call.method(),
+            PluginCall::Command { .. } | PluginCall::Event { .. } => "the handler",
+        };
+        let typed = move |result: Result<serde_json::Value, PluginError>| {
+            reply(result.and_then(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    PluginError::BadReply(format!("{what} returned the wrong shape: {error}"))
+                })
+            }));
+        };
+        let sent = self.to.send(ToActor::Call {
+            id,
+            call: Box::new(call),
+            parts,
+            reply: Box::new(typed),
+        });
+        if let Err(mpsc::SendError(ToActor::Call { reply, .. })) = sent {
+            reply(Err(PluginError::Failed("its thread is gone".into())));
+        }
+        id
+    }
+
+    /// Throw the script's context away and load the plugin's files again,
+    /// under the same manifest and options. Calls that were out fail with
+    /// [`PluginError::Gone`]; a failed plugin gets a fresh start. A changed
+    /// `plugin.toml` needs a new [`Plugin`] instead, because the app has to
+    /// look at its permissions first.
+    pub fn reload(&self) {
+        let _ = self.to.send(ToActor::Reload);
+    }
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let _ = self.to.send(ToActor::Shutdown);
+    }
+}

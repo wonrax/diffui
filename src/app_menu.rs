@@ -1,64 +1,260 @@
-//! The application menu bar (macOS): App / File / Edit / View / Revision /
-//! Window / Help, built from the command registry so every item runs the same
-//! command a key or the palette would, and shows the chord the keymap
-//! actually binds. The AppKit side (and why command items never fire on
-//! their own key equivalents) is in [`crate::macos_native`].
+//! The application menus: File / Edit / View / Revision / Help, built from the
+//! command registry so every item runs the same command a key or the palette
+//! would, and shows the chord the keymap actually binds.
 //!
-//! Elsewhere this is a no-op: there is no global menu bar to fill.
+//! On macOS they fill the global menu bar, between the App and Window menus
+//! only AppKit has; the AppKit side (and why command items never fire on their
+//! own key equivalents) is in [`crate::macos_native`]. Elsewhere there is no
+//! global menu bar, so the same tree opens as an overlay menu from the tab
+//! strip's ☰ button ([`overlay`]).
 
-use iced::{Subscription, Task};
+use crate::Cx;
+use crate::Diffui;
+use crate::commands::CommandArg;
+use crate::commands::CommandId;
 
-use crate::commands::{CommandArg, CommandId, REGISTRY};
-use crate::{Diffui, Message};
+/// One row of an application menu, before it's lowered to an AppKit item or
+/// an overlay [`crate::menu::MenuEntry`].
+enum Row {
+    /// A command under its registry label, or under `title` where a menu
+    /// words it differently.
+    Command {
+        id: &'static str,
+        title: Option<&'static str>,
+    },
+    Separator,
+    Submenu {
+        title: &'static str,
+        rows: Vec<Row>,
+    },
+    /// Cut / Copy / Paste / Select All. AppKit needs them in the menu to hand
+    /// the keys to the focused field; elsewhere the field hears them itself.
+    Clipboard,
+}
+
+struct Menu {
+    title: &'static str,
+    rows: Vec<Row>,
+}
+
+fn registered(id: &'static str) -> Row {
+    Row::Command { id, title: None }
+}
+
+fn titled(title: &'static str, id: &'static str) -> Row {
+    Row::Command {
+        id,
+        title: Some(title),
+    }
+}
+
+/// The menus every platform shows, in order, Help aside: macOS puts its
+/// Window menu between them and [`help_menu`].
+fn document_menus() -> Vec<Menu> {
+    use Row::Separator as SEP;
+    vec![
+        Menu {
+            title: "File",
+            rows: vec![
+                registered("repo.open-dialog"),
+                registered("tab.close"),
+                SEP,
+                registered("repo.refresh"),
+                registered("repo.fetch"),
+                registered("repo.push"),
+            ],
+        },
+        Menu {
+            title: "Edit",
+            rows: vec![
+                titled("Undo Last Operation", "repo.undo"),
+                titled("Redo Last Undone Operation", "repo.redo"),
+                SEP,
+                Row::Clipboard,
+                SEP,
+                titled("Find in Diff\u{2026}", "find.open"),
+                titled("Command Palette\u{2026}", "palette.toggle"),
+            ],
+        },
+        Menu {
+            title: "View",
+            rows: vec![
+                registered("view.toggle-wrap"),
+                registered("view.toggle-split"),
+                SEP,
+                registered("view.diff"),
+                registered("view.source"),
+                registered("activity.toggle"),
+                SEP,
+                registered("history.op-log"),
+                registered("history.evolog"),
+                registered("file.history.current"),
+                registered("source.toggle-annotate"),
+                SEP,
+                Row::Submenu {
+                    title: "Theme",
+                    rows: vec![
+                        titled("System", "theme.system"),
+                        titled("Light", "theme.light"),
+                        titled("Dark", "theme.dark"),
+                        titled("High Contrast", "theme.contrast"),
+                    ],
+                },
+            ],
+        },
+        Menu {
+            title: "Revision",
+            rows: vec![
+                registered("revision.commit"),
+                registered("revision.new-child"),
+                registered("revision.new.start"),
+                registered("revision.edit"),
+                registered("revision.edit-description"),
+                SEP,
+                registered("revision.rebase.start"),
+                registered("revision.rebase.descendants.start"),
+                registered("revision.rebase.branch.start"),
+                registered("revision.rebase.onto-trunk"),
+                registered("revision.squash.start"),
+                registered("revision.squash-into-parent"),
+                registered("revision.merge.start"),
+                registered("revision.duplicate"),
+                registered("revision.duplicate.start"),
+                registered("revision.parallelize.start"),
+                registered("revision.absorb"),
+                SEP,
+                registered("revision.abandon"),
+                SEP,
+                registered("bookmark.create"),
+                registered("revision.push-change"),
+                SEP,
+                registered("compare.with"),
+                registered("revision.browse-source"),
+            ],
+        },
+    ]
+}
+
+fn help_menu() -> Menu {
+    Menu {
+        title: "Help",
+        rows: vec![registered("help.shortcuts")],
+    }
+}
+
+/// The ☰ menu: one flyout per application menu, then Settings, which macOS
+/// keeps in its App menu.
+pub(crate) fn overlay(ui: &Diffui) -> Vec<crate::menu::MenuEntry> {
+    use crate::menu::MenuEntry;
+    let mut root: Vec<MenuEntry> = document_menus()
+        .into_iter()
+        .chain([help_menu()])
+        .map(|menu| MenuEntry::Submenu {
+            label: menu.title.to_owned(),
+            items: overlay_rows(ui, &menu.rows),
+        })
+        .collect();
+    root.push(MenuEntry::Separator);
+    root.extend(overlay_rows(
+        ui,
+        &[titled("Settings\u{2026}", "app.settings")],
+    ));
+    root
+}
+
+fn overlay_rows(ui: &Diffui, rows: &[Row]) -> Vec<crate::menu::MenuEntry> {
+    use crate::menu::MenuEntry;
+    let mut entries = Vec::new();
+    for row in rows {
+        match row {
+            Row::Command { id, title } => {
+                let mut entry = ui.menu_item(id, CommandArg::None);
+                if let (
+                    Some(title),
+                    MenuEntry::Item { label, .. } | MenuEntry::Disabled { label, .. },
+                ) = (title, &mut entry)
+                {
+                    *label = (*title).to_owned();
+                }
+                entries.push(entry);
+            }
+            // A row left out (the clipboard's) mustn't leave two in a row.
+            Row::Separator => {
+                if !matches!(entries.last(), None | Some(MenuEntry::Separator)) {
+                    entries.push(MenuEntry::Separator);
+                }
+            }
+            Row::Submenu { title, rows } => entries.push(MenuEntry::Submenu {
+                label: (*title).to_owned(),
+                items: overlay_rows(ui, rows),
+            }),
+            Row::Clipboard => {}
+        }
+    }
+    entries
+}
 
 impl Diffui {
-    /// A menu-bar pick: `tag` is the command's position in the registry.
-    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32) -> Task<Message> {
-        match REGISTRY.get(tag as usize) {
-            Some(command) => self.run_command(command.id, CommandArg::None),
-            None => Task::none(),
+    /// A menu-bar pick: `tag` names the command through [`tag_of`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_menu_bar_pick(&mut self, tag: u32, cx: &mut Cx) {
+        if let Some(id) = command_of(tag) {
+            self.run_command(&id, CommandArg::None, cx)
         }
     }
 }
 
-/// The menu bar's clicks, as messages.
-pub(crate) fn subscription() -> Subscription<Message> {
+/// Starts the loop that turns menu-bar clicks into commands.
+pub(crate) fn start(cx: &mut Cx) {
     #[cfg(target_os = "macos")]
     {
-        Subscription::run(crate::macos_native::menu_bar_picks).map(Message::MenuBar)
+        use futures::StreamExt as _;
+        let mut picks = crate::macos_native::menu_bar_picks();
+        cx.spawn(async move |this, cx| {
+            while let Some(tag) = picks.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.act(cx, |this, cx| this.on_menu_bar_pick(tag, cx));
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        Subscription::none()
-    }
+    let _ = cx;
 }
 
-/// Install the menu bar. Called once the window is open, after winit has put
-/// up its default one.
+/// Install the menu bar. Called once the window is open. Why this isn't GPUI's
+/// `cx.set_menus` is in [`crate::macos_native`].
 pub(crate) fn install(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let menus = mac::menus(ui);
         mac::record_bar_tags(&menus);
         crate::macos_native::install_menu_bar(&menus);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     let _ = ui;
 }
 
 /// Tell the menu bar which of its commands can't run in the state `ui` is in
 /// now, so their items are greyed when a menu opens. Cheap enough to run
 /// after every update: a predicate per bar command, no repository reads.
+#[cfg_attr(test, allow(unused_variables))]
 pub(crate) fn refresh_availability(ui: &Diffui) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let unavailable = mac::bar_tags()
             .iter()
             .copied()
             .filter(|tag| {
-                REGISTRY
-                    .get(*tag as usize)
-                    .is_some_and(|command| (command.enabled)(ui, &CommandArg::None).is_err())
+                command_of(*tag).is_none_or(|id| {
+                    ui.registry
+                        .get(&id)
+                        .is_none_or(|command| command.enabled(ui, &CommandArg::None).is_err())
+                })
             })
             .collect();
         crate::macos_native::set_unavailable_bar_commands(unavailable);
@@ -67,68 +263,51 @@ pub(crate) fn refresh_availability(ui: &Diffui) {
     let _ = ui;
 }
 
-/// Open `config.toml` in the user's text editor, creating it (with a pointer
-/// to what can go in it) when there isn't one yet. Behind Settings… in the
-/// app menu and "Open settings file" in the palette.
-pub(crate) fn open_config_file() -> Task<Message> {
-    let Some(path) = crate::config::config_path() else {
-        return Task::none();
-    };
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+/// Every id a menu item's tag has stood for, the tag being the position.
+/// Handed out on first use and never reused, so a tag the bar was built with
+/// still names its command after the registry is rebuilt.
+static TAG_IDS: std::sync::Mutex<Vec<CommandId>> = std::sync::Mutex::new(Vec::new());
+
+/// The tag a menu item for `id` carries.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn tag_of(id: &str) -> u32 {
+    let mut tags = TAG_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = match tags.iter().position(|tagged| *tagged == id) {
+        Some(index) => index,
+        None => {
+            tags.push(id.into());
+            tags.len() - 1
         }
-        let _ = std::fs::write(&path, CONFIG_TEMPLATE);
-    }
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .spawn();
-    #[cfg(not(target_os = "macos"))]
-    let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-    Task::none()
+    };
+    index as u32
 }
 
-const CONFIG_TEMPLATE: &str = "\
-# diffui settings. Read at launch; restart diffui after editing.
-#
-# theme = \"System\"        # System | Light | Dark | Contrast
-# ui_font = \"Inter\"
-# mono_font = \"JetBrains Mono\"
-# code_font_size = 12
-#
-# [keys.base]
-# \"file.next\" = \"n\"      # rebind; \"none\" unbinds. Ids are listed by `?`.
-#
-# [[revset_presets]]
-# name = \"My stack\"
-# revset = \"trunk()..@\"
-";
-
-/// The registry position of `id`, which is what a menu item's tag carries.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn tag_of(id: CommandId) -> Option<u32> {
-    REGISTRY
-        .iter()
-        .position(|command| command.id == id)
-        .map(|index| index as u32)
+/// The command `tag` stands for.
+#[cfg(target_os = "macos")]
+fn command_of(tag: u32) -> Option<CommandId> {
+    let tags = TAG_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tags.get(tag as usize).cloned()
 }
 
 #[cfg(target_os = "macos")]
+// Tests never install the bar, so nothing there asks for its tags.
+#[cfg_attr(test, allow(dead_code))]
 mod mac {
     use objc2::sel;
 
-    use super::tag_of;
+    use super::{Menu, Row, document_menus, help_menu, tag_of};
     use crate::Diffui;
-    use crate::commands::{self, CommandId, Context};
+    use crate::commands::Context;
     use crate::keymap::{Chord, ChordKey};
     use crate::macos_native::{BarItem, BarMenu, BarRole, KeyEquivalent};
-    use iced::keyboard::key::Named;
 
     /// The chord the keymap binds `id` to in the base context, as an AppKit
     /// key equivalent, when AppKit can spell it.
-    fn key_for(ui: &Diffui, id: CommandId) -> Option<KeyEquivalent> {
+    fn key_for(ui: &Diffui, id: &str) -> Option<KeyEquivalent> {
         let chord = ui.keymap.chord_for(Context::Base, id)?;
         key_equivalent(chord)
     }
@@ -137,14 +316,14 @@ mod mac {
         let key = match &chord.key {
             ChordKey::Char(c) => c.clone(),
             ChordKey::Named(named) => match named {
-                Named::Enter => "\r".to_owned(),
-                Named::Escape => "\u{1b}".to_owned(),
-                Named::Tab => "\t".to_owned(),
-                Named::Space => " ".to_owned(),
-                Named::ArrowUp => "\u{f700}".to_owned(),
-                Named::ArrowDown => "\u{f701}".to_owned(),
-                Named::ArrowLeft => "\u{f702}".to_owned(),
-                Named::ArrowRight => "\u{f703}".to_owned(),
+                crate::keys::Named::Enter => "\r".to_owned(),
+                crate::keys::Named::Escape => "\u{1b}".to_owned(),
+                crate::keys::Named::Tab => "\t".to_owned(),
+                crate::keys::Named::Space => " ".to_owned(),
+                crate::keys::Named::ArrowUp => "\u{f700}".to_owned(),
+                crate::keys::Named::ArrowDown => "\u{f701}".to_owned(),
+                crate::keys::Named::ArrowLeft => "\u{f702}".to_owned(),
+                crate::keys::Named::ArrowRight => "\u{f703}".to_owned(),
                 _ => return None,
             },
         };
@@ -157,20 +336,21 @@ mod mac {
         })
     }
 
-    fn command(ui: &Diffui, title: &str, id: CommandId) -> BarItem {
+    fn command(ui: &Diffui, title: &str, id: &str) -> BarItem {
         BarItem::Command {
             title: title.to_owned(),
-            tag: tag_of(id).unwrap_or(u32::MAX),
+            tag: tag_of(id),
             key: key_for(ui, id),
         }
     }
 
     /// A command under its registry (palette) label.
-    fn registered(ui: &Diffui, id: CommandId) -> BarItem {
-        let title = commands::command(id)
-            .map(|command| command.palette_label())
-            .unwrap_or(id);
-        command(ui, title, id)
+    fn registered(ui: &Diffui, id: &str) -> BarItem {
+        let title = ui.registry.get(id).map_or_else(
+            || id.to_owned(),
+            |command| command.palette_label.to_string(),
+        );
+        command(ui, &title, id)
     }
 
     fn standard(title: &str, action: objc2::runtime::Sel, key: Option<(&str, bool)>) -> BarItem {
@@ -226,139 +406,84 @@ mod mac {
         }
     }
 
-    pub(super) fn menus(ui: &Diffui) -> Vec<BarMenu> {
-        let app_name = "Diffui";
-        let sep = || BarItem::Separator;
-        vec![
-            BarMenu {
-                title: app_name.to_owned(),
-                role: BarRole::App,
-                items: vec![
-                    standard(
-                        &format!("About {app_name}"),
-                        sel!(orderFrontStandardAboutPanel:),
-                        None,
-                    ),
-                    sep(),
-                    command(ui, "Settings\u{2026}", "app.open-config"),
-                    sep(),
-                    standard(&format!("Hide {app_name}"), sel!(hide:), Some(("h", false))),
-                    standard(
-                        "Hide Others",
-                        sel!(hideOtherApplications:),
-                        Some(("h", true)),
-                    ),
-                    standard("Show All", sel!(unhideAllApplications:), None),
-                    sep(),
-                    standard(
-                        &format!("Quit {app_name}"),
-                        sel!(terminate:),
-                        Some(("q", false)),
-                    ),
-                ],
-            },
-            BarMenu {
-                title: "File".to_owned(),
-                role: BarRole::Plain,
-                items: vec![
-                    registered(ui, "repo.open-dialog"),
-                    registered(ui, "tab.close"),
-                    sep(),
-                    registered(ui, "repo.refresh"),
-                    registered(ui, "repo.fetch"),
-                    registered(ui, "repo.push"),
-                ],
-            },
-            BarMenu {
-                title: "Edit".to_owned(),
-                role: BarRole::Plain,
-                items: vec![
-                    command(ui, "Undo Last Operation", "repo.undo"),
-                    command(ui, "Redo Last Undone Operation", "repo.redo"),
-                    sep(),
+    /// The shared [`super::Row`]s as AppKit items.
+    fn lower(ui: &Diffui, rows: &[Row]) -> Vec<BarItem> {
+        let mut items = Vec::new();
+        for row in rows {
+            match row {
+                Row::Command {
+                    id,
+                    title: Some(title),
+                } => items.push(command(ui, title, id)),
+                Row::Command { id, title: None } => items.push(registered(ui, id)),
+                Row::Separator => items.push(BarItem::Separator),
+                Row::Submenu { title, rows } => items.push(BarItem::Submenu {
+                    title: (*title).to_owned(),
+                    items: lower(ui, rows),
+                }),
+                Row::Clipboard => items.extend([
                     edit_key("Cut", "x"),
                     edit_key("Copy", "c"),
                     edit_key("Paste", "v"),
                     edit_key("Select All", "a"),
-                    sep(),
-                    command(ui, "Find in Diff\u{2026}", "find.open"),
-                    command(ui, "Command Palette\u{2026}", "palette.toggle"),
-                ],
-            },
-            BarMenu {
-                title: "View".to_owned(),
-                role: BarRole::Plain,
-                items: vec![
-                    registered(ui, "view.toggle-wrap"),
-                    registered(ui, "view.toggle-split"),
-                    sep(),
-                    registered(ui, "view.diff"),
-                    registered(ui, "view.source"),
-                    registered(ui, "activity.toggle"),
-                    sep(),
-                    registered(ui, "history.op-log"),
-                    registered(ui, "history.evolog"),
-                    registered(ui, "file.history.current"),
-                    registered(ui, "source.toggle-annotate"),
-                    sep(),
-                    BarItem::Submenu {
-                        title: "Theme".to_owned(),
-                        items: vec![
-                            command(ui, "System", "theme.system"),
-                            command(ui, "Light", "theme.light"),
-                            command(ui, "Dark", "theme.dark"),
-                            command(ui, "High Contrast", "theme.contrast"),
-                        ],
-                    },
-                ],
-            },
-            BarMenu {
-                title: "Revision".to_owned(),
-                role: BarRole::Plain,
-                items: vec![
-                    registered(ui, "revision.commit"),
-                    registered(ui, "revision.new-child"),
-                    registered(ui, "revision.new.start"),
-                    registered(ui, "revision.edit"),
-                    registered(ui, "revision.edit-description"),
-                    sep(),
-                    registered(ui, "revision.rebase.start"),
-                    registered(ui, "revision.rebase.descendants.start"),
-                    registered(ui, "revision.rebase.branch.start"),
-                    registered(ui, "revision.rebase.onto-trunk"),
-                    registered(ui, "revision.squash.start"),
-                    registered(ui, "revision.squash-into-parent"),
-                    registered(ui, "revision.merge.start"),
-                    registered(ui, "revision.duplicate"),
-                    registered(ui, "revision.duplicate.start"),
-                    registered(ui, "revision.parallelize.start"),
-                    registered(ui, "revision.absorb"),
-                    sep(),
-                    registered(ui, "revision.abandon"),
-                    sep(),
-                    registered(ui, "bookmark.create"),
-                    registered(ui, "revision.push-change"),
-                    sep(),
-                    registered(ui, "compare.with"),
-                    registered(ui, "revision.browse-source"),
-                ],
-            },
-            BarMenu {
-                title: "Window".to_owned(),
-                role: BarRole::Windows,
-                items: vec![
-                    standard("Minimize", sel!(performMiniaturize:), Some(("m", false))),
-                    standard("Zoom", sel!(performZoom:), None),
-                    sep(),
-                    standard("Bring All to Front", sel!(arrangeInFront:), None),
-                ],
-            },
-            BarMenu {
-                title: "Help".to_owned(),
-                role: BarRole::Help,
-                items: vec![registered(ui, "help.shortcuts")],
-            },
-        ]
+                ]),
+            }
+        }
+        items
+    }
+
+    pub(super) fn menus(ui: &Diffui) -> Vec<BarMenu> {
+        let app_name = "Diffui";
+        let sep = || BarItem::Separator;
+        let bar_menu = |menu: Menu, role: BarRole| BarMenu {
+            title: menu.title.to_owned(),
+            role,
+            items: lower(ui, &menu.rows),
+        };
+        let mut menus = vec![BarMenu {
+            title: app_name.to_owned(),
+            role: BarRole::App,
+            items: vec![
+                standard(
+                    &format!("About {app_name}"),
+                    sel!(orderFrontStandardAboutPanel:),
+                    None,
+                ),
+                sep(),
+                command(ui, "Settings\u{2026}", "app.settings"),
+                sep(),
+                standard(&format!("Hide {app_name}"), sel!(hide:), Some(("h", false))),
+                standard(
+                    "Hide Others",
+                    sel!(hideOtherApplications:),
+                    Some(("h", true)),
+                ),
+                standard("Show All", sel!(unhideAllApplications:), None),
+                sep(),
+                standard(
+                    &format!("Quit {app_name}"),
+                    sel!(terminate:),
+                    Some(("q", false)),
+                ),
+            ],
+        }];
+        menus.extend(
+            document_menus()
+                .into_iter()
+                .map(|menu| bar_menu(menu, BarRole::Plain)),
+        );
+        menus.push(BarMenu {
+            title: "Window".to_owned(),
+            role: BarRole::Windows,
+            items: vec![
+                standard("Minimize", sel!(performMiniaturize:), Some(("m", false))),
+                standard("Zoom", sel!(performZoom:), None),
+                sep(),
+                standard("Bring All to Front", sel!(arrangeInFront:), None),
+            ],
+        });
+        menus.push(bar_menu(help_menu(), BarRole::Help));
+        menus
     }
 }
 
@@ -385,7 +510,9 @@ mod tests {
             walk(&menu.items, &mut tags);
         }
         assert!(tags.len() > 20);
-        assert!(tags.iter().all(|tag| REGISTRY.get(*tag as usize).is_some()));
+        assert!(tags.iter().all(|tag| {
+            super::command_of(*tag).is_some_and(|id| ui.registry.get(&id).is_some())
+        }));
     }
 
     #[test]

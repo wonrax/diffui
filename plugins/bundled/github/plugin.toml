@@ -1,0 +1,43 @@
+# GitHub (github.com or a GitHub Enterprise Server), through the `gh` CLI or
+# a token. Bundled with diffui; Settings → Accounts → GitHub picks how each
+# host signs in, and `diffui plugin eject github` copies it out to edit.
+id = "github"
+name = "GitHub"
+version = "1.1.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+# The API of github.com, and of every host this forge claims (a GitHub
+# Enterprise Server's own /api/v3), for the hosts signed in with a token.
+http = ["api.github.com", "{forge.hosts}"]
+exec = [["{config.program}"]]
+# GH_HOST is set for gh; the tokens are read the way gh reads them.
+env = ["GH_HOST", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+# The hosts gh is signed in to, from its own list, found the way gh finds it.
+read = ["${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/gh}/hosts.yml"]
+
+[provides.forge]
+# github.com, and any host with a `github` label (github.acme.com). The hosts
+# gh is signed in to and the hosts with a token come from `hosts()`.
+hosts = ["github.com", "github.*", "*.github.*"]
+cli = "gh"
+default_host = "github.com"
+host_env = "GH_HOST"
+pull_request_path = "{owner}/{name}/pull/{number}"
+
+[config.schema]
+auth = { type = "enum", values = ["auto", "cli", "token"], default = "auto", per_host = true, label = "Sign in with", hint = "Auto uses gh where it is signed in, else a token." }
+program = { type = "path", default = "gh", label = "The gh program" }
+api_url = { type = "string", per_host = true, label = "API address", hint = "Only for a server whose API isn't at https://<host>/api/v3." }
+
+# A personal access token per host. Classic: the `repo` scope. Fine-grained:
+# read access to metadata, contents, commit statuses and checks, and read
+# and write access to pull requests.
+[config.schema.token]
+type = "secret"
+per_host = true
+label = "Token"
+page = "https://{host}/settings/tokens/new?scopes={scopes}&description=diffui"
+scopes = ["repo"]
+env = { "github.com" = ["GH_TOKEN", "GITHUB_TOKEN"], "*.ghe.com" = ["GH_TOKEN", "GITHUB_TOKEN"], "*" = ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] }

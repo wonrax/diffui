@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cli::{CliInvocation, CliLine};
+use crate::commit_search::CommitHit;
 use crate::history::{HistoryRequest, HistoryResponse, OperationEntry};
 use crate::model::{
     BookmarksInfo, BranchStatus, DiffBase, DiffDocument, DiffFile, DiffRequest, RevisionDetails,
@@ -23,14 +24,17 @@ use crate::preview_graph::PostOpGraph;
 use crate::repository::{FetchOutcome, FetchTarget, RepositorySnapshot};
 use crate::resolve::{ConflictFile, MergeToolInvocation};
 use crate::revset::{RevsetError, RevsetMatch, RevsetQuery, RevsetSymbols};
-use crate::session::RefreshOrigin;
+use crate::session::{RefreshMode, RefreshOrigin};
 use crate::source_browse::{SourceEntry, SourceFileLoad};
 
 /// Identity of an open repository: the workspace root for a local repository,
-/// the `owner/repo#number` reference for a GitHub pull request. One actor per
+/// the `owner/repo#number` reference for a GitHub pull request, `host:path`
+/// for a repository on another machine. One actor per
 /// id — see [`repo_id`](super::repo_id) for why this is per workspace rather
 /// than per `.jj/repo`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RepoId(pub String);
 
 impl fmt::Display for RepoId {
@@ -46,7 +50,19 @@ impl fmt::Display for RepoId {
 /// Unique process-wide, not per session: two sessions over different
 /// repositories would otherwise both be waiting on "job 3", and an event would
 /// have no way to say which one it answers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct JobId(pub u64);
 
 impl JobId {
@@ -62,7 +78,7 @@ impl JobId {
 /// replaces runtime downcasts to per-capability traits: a frontend reads the
 /// flags to grey out an action instead of dispatching it and catching
 /// [`RepoError::Unsupported`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities {
     /// Has a commit graph and a working copy to snapshot (jj, git).
     pub graph: bool,
@@ -86,13 +102,14 @@ pub struct Capabilities {
 /// the frontend needs to tell "the revset doesn't parse" (keep the graph, show
 /// the revset error) from "this commit is immutable" (offer the override) from
 /// "the walk died" (fail the tab), and prose can't be matched on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RepoError {
     /// The user's revset failed to parse or resolve.
     Revset(String),
     Io(String),
-    /// The workspace's checkout is behind the repo and recovery failed.
-    StaleWorkspace,
+    /// The workspace's checkout is stale and was left alone (or recovering
+    /// it failed): what to tell the user, with the jj command that fixes it.
+    StaleWorkspace(String),
     /// The working-copy lock could not be taken.
     Lock,
     /// The op refused to rewrite an immutable commit; `short_id` names it so
@@ -106,9 +123,18 @@ pub enum RepoError {
     /// `jj git push`'s commit checks refused the push; the rejection lists
     /// each commit and carries the request for a rerun with allowances.
     PushRejected(Box<crate::push::PushRejection>),
+    /// An undo or revert would take back a push, which jj-cli warns about:
+    /// only the local record of the remote rolls back. `summary` names the
+    /// push, so the frontend can confirm and rerun with the guard off.
+    UndoesPush {
+        summary: String,
+    },
     /// The actor panicked while running the command. It dropped whatever it
     /// had loaded and keeps serving, so the next command starts clean.
     Crashed(String),
+    /// The repository is on another machine and the connection to it is
+    /// gone. [`Payload::Disconnected`] says why, once, for the whole tab.
+    Disconnected,
 }
 
 impl fmt::Display for RepoError {
@@ -116,14 +142,16 @@ impl fmt::Display for RepoError {
         match self {
             Self::Revset(message) => write!(f, "{message}"),
             Self::Io(message) => write!(f, "{message}"),
-            Self::StaleWorkspace => {
-                f.write_str("the working copy is stale and could not be recovered automatically")
-            }
+            Self::StaleWorkspace(message) => f.write_str(message),
             Self::Lock => f.write_str("another process holds the working-copy lock"),
             Self::Immutable { short_id } => write!(f, "{short_id} is immutable"),
             Self::Unsupported => f.write_str("this repository does not support that operation"),
             Self::Other(message) => write!(f, "{message}"),
             Self::PushRejected(rejection) => write!(f, "{rejection}"),
+            Self::UndoesPush { summary } => {
+                write!(f, "undoing \u{201c}{summary}\u{201d} undoes a push")
+            }
+            Self::Disconnected => f.write_str("the connection to the repository's host was lost"),
             Self::Crashed(message) => write!(
                 f,
                 "This repository's worker crashed: {message}. See the log \
@@ -137,7 +165,7 @@ impl std::error::Error for RepoError {}
 
 /// What a preview simulates. Separate from [`MutationOp`] because a preview
 /// resolves the same inputs without ever writing an operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PreviewRequest {
     Rebase {
         mode: RebaseSourceMode,
@@ -172,7 +200,7 @@ pub enum PreviewRequest {
 /// Work asked of a repository. Every variant that does work carries a
 /// [`JobId`]; the actor answers each with exactly one terminal event
 /// (`Failed`, `Cancelled`, or the variant's own success).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Walk `revset` and stream the rows back as `Batch` events.
     LoadGraph {
@@ -188,11 +216,13 @@ pub enum Command {
         /// already expanded, kept expanded across a reload.
         expand: Vec<String>,
     },
-    /// Fold the on-disk tree into `@`. `origin` rides along untouched so the
-    /// projection knows how much to reload when the fingerprint moves.
+    /// Bring `@` up to date with the disk, as `disk` says. `origin` rides
+    /// along untouched so the projection knows how much to reload when the
+    /// fingerprint moves.
     Snapshot {
         job: JobId,
         origin: RefreshOrigin,
+        disk: DiskSync,
     },
     Mutate {
         job: JobId,
@@ -202,6 +232,9 @@ pub enum Command {
         /// visible there is a stale row and follows its change; one already
         /// hidden there was picked as is and stays that commit.
         seen_op: Option<String>,
+        /// The change id of `@` as the sender's rows show it. A target that
+        /// names `@` is refused when `@` has moved to another change since.
+        seen_wc: Option<String>,
     },
     Preview {
         job: JobId,
@@ -306,6 +339,16 @@ pub enum Command {
         job: JobId,
         request: DiffRequest,
     },
+    /// Score every visible commit against `needle` ([`crate::commit_search`])
+    /// and answer the best [`crate::commit_search::MAX_HITS`] as
+    /// [`Payload::CommitsFound`], each saying whether `revset` (the log's)
+    /// holds it. Walks all history, so it runs off the actor and polls its
+    /// cancel; a newer query cancels the one before.
+    SearchCommits {
+        job: JobId,
+        needle: String,
+        revset: String,
+    },
     /// Run the jj CLI in the workspace root (a typed command diffui doesn't
     /// run itself). Output streams back as [`Payload::CliOutput`], then
     /// [`Payload::CliExited`]; a cancel kills the child. Serialized with
@@ -313,6 +356,13 @@ pub enum Command {
     RunCli {
         job: JobId,
         invocation: CliInvocation,
+    },
+    /// How the app keeps up with the disk. Jobless and answered by nothing:
+    /// it only sets whether a stale checkout is updated without being asked
+    /// (see [`DiskSync::Fold`]). Ignored by backends without a working copy
+    /// to update.
+    SetRefreshMode {
+        mode: RefreshMode,
     },
     /// Ask the actor to stop `job`. A cancelled job reports
     /// [`Payload::Cancelled`] and never its success event, so the caller's
@@ -324,7 +374,7 @@ pub enum Command {
 
 impl Command {
     /// The job this command runs under, or `None` for `Cancel` (which names
-    /// someone else's job).
+    /// someone else's job) and `SetRefreshMode` (which is no work at all).
     pub fn job(&self) -> Option<JobId> {
         match self {
             Self::LoadGraph { job, .. }
@@ -346,14 +396,46 @@ impl Command {
             | Self::ExpandFile { job, .. }
             | Self::ResolveRevset { job, .. }
             | Self::ResolveDiff { job, .. }
+            | Self::SearchCommits { job, .. }
             | Self::RunCli { job, .. } => Some(*job),
-            Self::Cancel { .. } => None,
+            Self::Cancel { .. } | Self::SetRefreshMode { .. } => None,
         }
     }
 }
 
+/// What a [`Command::Snapshot`] does with the disk. Only jj has a snapshot to
+/// take; git and pull requests read every variant as a plain refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DiskSync {
+    /// Look without writing: whether the disk has edits `@` doesn't hold and
+    /// whether the checkout is stale. No snapshot, no stale update.
+    Check,
+    /// Fold the disk into `@`. A stale checkout is updated when jj's
+    /// `snapshot.auto-update-stale` is set or the app's mode is
+    /// [`RefreshMode::Auto`], and left alone otherwise.
+    Fold,
+    /// Fold the disk into `@` and update a stale checkout whatever the mode:
+    /// the user pressed Refresh.
+    Sync,
+}
+
+/// How the disk stands against `@`, as the last snapshot found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskState {
+    /// The disk has edits `@` doesn't hold yet. Only a [`DiskSync::Check`]
+    /// leaves any behind.
+    pub edits: bool,
+    /// The checkout is stale and was left alone: jj's message, naming the
+    /// command that updates it.
+    pub stale: Option<String>,
+    /// The stale checkout is one a [`DiskSync::Sync`] can't update either:
+    /// the operation it was synced at is gone, or the workspace was
+    /// forgotten. Only the command in `stale` gets out of it.
+    pub stuck: bool,
+}
+
 /// The tail of a graph walk: what only the completed walk knows.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GraphTail {
     /// `(row index, is_empty)` for the single-parent commits the walk resolved
     /// in its final pass. Merges and roots stay unknown (see
@@ -395,11 +477,13 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Payload {
     /// The actor is up. The only variant that isn't plain data: `handle` is a
     /// channel sender, which is how the in-process bootstrap works. Across a
-    /// process boundary this is where a connect handshake would go.
+    /// process boundary the connect handshake stands in for it (see
+    /// [`crate::remote`]), so it never goes on the wire.
+    #[serde(skip)]
     Ready {
         handle: super::RepoHandle,
         capabilities: Capabilities,
@@ -412,6 +496,25 @@ pub enum Payload {
         job: JobId,
         tail: GraphTail,
     },
+    /// What a [`Command::LoadGraph`] answers for a source without a graph
+    /// (a pull request): its header and its steps, whole, in place of
+    /// [`Self::Batch`]es and [`Self::GraphLoaded`].
+    Outline {
+        job: JobId,
+        outline: crate::model::Outline,
+    },
+    /// The next files of a diff that arrives in pieces (a pull request's,
+    /// downloaded as it is shown), with the totals as far as they are known.
+    /// Any number of these come before the job's [`Self::DiffLoaded`], whose
+    /// document holds only the files after the last part, and the final
+    /// totals.
+    DiffPart {
+        job: JobId,
+        files: Vec<DiffFile>,
+        total_additions: usize,
+        total_deletions: usize,
+    },
+    /// A diff, or the end of one that came in [`Self::DiffPart`]s.
     DiffLoaded {
         job: JobId,
         revision: RevisionSelection,
@@ -425,6 +528,9 @@ pub enum Payload {
         /// The skipped-large-file warning, when the snapshot hit one. Surfaced
         /// once here because the snapshot prologue is single now.
         warnings: Vec<String>,
+        /// What the snapshot left between the disk and `@`; the default for
+        /// backends without a snapshot.
+        disk: DiskState,
     },
     MutationDone {
         job: JobId,
@@ -512,6 +618,13 @@ pub enum Payload {
     /// `jj workspace update-stale`. Edits on disk were snapshotted first.
     /// Unsolicited: it rides alongside the snapshot or mutation that hit it.
     StaleWorkingCopyRecovered,
+    /// The jj checkout is stale and was left alone (the update-stale policy
+    /// is off, or the operation it was synced at is gone), so the graph shows
+    /// the repo at head.
+    /// Sent once per distinct state, not on every refresh.
+    StaleWorkingCopy {
+        message: String,
+    },
     ConflictInfoLoaded {
         job: JobId,
         revision: RevisionSelection,
@@ -542,6 +655,12 @@ pub enum Payload {
         revision: RevisionSelection,
         base: DiffBase,
     },
+    /// The answer to a [`Command::SearchCommits`]: the best matches, best
+    /// first.
+    CommitsFound {
+        job: JobId,
+        hits: Vec<CommitHit>,
+    },
     /// Output of a [`Command::RunCli`], in order. Not terminal.
     CliOutput {
         job: JobId,
@@ -560,6 +679,21 @@ pub enum Payload {
     Cancelled {
         job: JobId,
     },
+    /// A repository on another machine is being reached: the last thing the
+    /// transport's program said, for something to show while it works. Made
+    /// on the app's side, so never on the wire.
+    #[serde(skip)]
+    Connecting {
+        detail: Option<String>,
+    },
+    /// The repository's host can't be reached, went away, or has no
+    /// repository at the path. Every job still out has been failed with
+    /// [`RepoError::Disconnected`], and every later one will be. Getting it
+    /// back is opening the repository again. Made on the app's side.
+    #[serde(skip)]
+    Disconnected {
+        error: crate::remote::ConnectError,
+    },
 }
 
 impl Payload {
@@ -567,6 +701,8 @@ impl Payload {
         match self {
             Self::Batch { job, .. }
             | Self::GraphLoaded { job, .. }
+            | Self::Outline { job, .. }
+            | Self::DiffPart { job, .. }
             | Self::DiffLoaded { job, .. }
             | Self::SnapshotDone { job, .. }
             | Self::MutationDone { job, .. }
@@ -587,6 +723,7 @@ impl Payload {
             | Self::History { job, .. }
             | Self::RevsetResolved { job, .. }
             | Self::DiffResolved { job, .. }
+            | Self::CommitsFound { job, .. }
             | Self::CliOutput { job, .. }
             | Self::CliExited { job, .. }
             | Self::Failed { job, .. }
@@ -595,7 +732,10 @@ impl Payload {
             | Self::OpHeadChanged { .. }
             | Self::WorkingCopyChanged
             | Self::RepositoryChanged
-            | Self::StaleWorkingCopyRecovered => None,
+            | Self::StaleWorkingCopyRecovered
+            | Self::StaleWorkingCopy { .. }
+            | Self::Connecting { .. }
+            | Self::Disconnected { .. } => None,
         }
     }
 
@@ -614,6 +754,9 @@ impl Payload {
                 | Self::WorkingCopyChanged
                 | Self::RepositoryChanged
                 | Self::StaleWorkingCopyRecovered
+                | Self::StaleWorkingCopy { .. }
+                | Self::Connecting { .. }
+                | Self::Disconnected { .. }
         )
     }
 }
@@ -623,6 +766,15 @@ impl Payload {
 pub enum OpenSpec {
     /// A local jj or git repository at this workspace root.
     Local { root: PathBuf, scope: PathBuf },
-    /// A GitHub pull request, streamed through the `gh` CLI.
-    GitHubPr(crate::github::PrSpec),
+    /// A pull (or merge) request on a forge, streamed through its provider.
+    ForgePr(crate::forge::ForgePr),
+    /// A patch, or two folders or files compared: a diff with no
+    /// repository behind it.
+    Diff(crate::patch::DiffInput),
+    /// The repository at or above `path` on another machine, served by the
+    /// `diffui-serve` there (see [`crate::remote`]).
+    Remote {
+        host: crate::remote::HostId,
+        path: String,
+    },
 }

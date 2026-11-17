@@ -4,7 +4,7 @@
 //! [`JjCli::parse`]:
 //!
 //! 1. shell-style tokenising ([`tokenize`]), keeping byte spans;
-//! 2. alias and default-command expansion, as jj-cli 0.45.1 does it, from
+//! 2. alias and default-command expansion, as jj-cli 0.47.1 does it, from
 //!    the user's `[aliases]` and `ui.default-command` ([`CliConfig`]);
 //! 3. validation against jj-cli's own clap tree
 //!    (`jj_cli::commands::default_app()`), so flags, defaults and errors are

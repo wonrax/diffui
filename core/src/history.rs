@@ -10,7 +10,7 @@ use crate::model::{DiffDocument, RevisionDetails, RevisionSelection};
 /// Work a history view asks of the repository actor. Rides in
 /// [`Command::History`](crate::repo::Command::History) so the whole family
 /// costs the protocol one variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HistoryRequest {
     /// Stream up to `limit` operations, newest first, as
     /// [`Payload::OpLogBatch`](crate::repo::Payload::OpLogBatch) events.
@@ -31,7 +31,7 @@ pub enum HistoryRequest {
 }
 
 /// What a [`HistoryRequest::Diff`] compares. Commit ids are full hex.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HistoryDiffTarget {
     /// The commit against its parents, like `jj show`.
     Commit { commit_id: String },
@@ -42,7 +42,7 @@ pub enum HistoryDiffTarget {
 }
 
 /// The terminal answer to a [`HistoryRequest`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HistoryResponse {
     /// The op-log stream finished. `truncated` when it stopped at the limit
     /// with older operations left unread.
@@ -60,7 +60,7 @@ pub enum HistoryResponse {
 }
 
 /// One operation in the log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationEntry {
     /// Full hex id.
     pub id: String,
@@ -94,7 +94,7 @@ impl OperationEntry {
 }
 
 /// A commit as a history view lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitBrief {
     pub commit_id: String,
     pub change_id: String,
@@ -120,7 +120,7 @@ impl CommitBrief {
 }
 
 /// How an operation touched one commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CommitChangeKind {
     /// New, with no predecessor.
     Created,
@@ -130,7 +130,7 @@ pub enum CommitChangeKind {
     Abandoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChangedCommit {
     pub kind: CommitChangeKind,
     /// The new version, or the abandoned one.
@@ -160,7 +160,7 @@ impl ChangedCommit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RefKind {
     WorkingCopy,
     Bookmark,
@@ -170,7 +170,7 @@ pub enum RefKind {
 
 /// A named pointer an operation moved. `from`/`to` list the commits on each
 /// side — empty means absent, more than one means conflicted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefChange {
     pub kind: RefKind,
     /// `name`, `name@remote`, or `workspace@` for a working copy.
@@ -180,7 +180,7 @@ pub struct RefChange {
 }
 
 /// What [`HistoryRequest::ShowOperation`] found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationChanges {
     pub operation: OperationEntry,
     /// Newest first, as `jj op show` lists them.
@@ -194,7 +194,7 @@ pub struct OperationChanges {
 }
 
 /// One version of a change, newest first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvologEntry {
     pub commit: CommitBrief,
     /// The operation that wrote this version, when the op log still records it.
@@ -212,7 +212,7 @@ impl EvologEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationRef {
     pub id: String,
     pub summary: String,
@@ -226,7 +226,7 @@ impl OperationRef {
 }
 
 /// Per-line origins of a file, `jj file annotate`-style.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileAnnotation {
     pub revision: RevisionSelection,
     pub path: String,
@@ -271,6 +271,12 @@ pub fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(timestamp))
         .ok()
         .map(|time| time.timestamp_millis())
+}
+
+/// `millis` as a signature timestamp (`%Y-%m-%d %H:%M:%S %z`), in UTC.
+pub fn timestamp_from_millis(millis: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S %z").to_string())
 }
 
 /// A signature timestamp for people, in the offset it was made in:

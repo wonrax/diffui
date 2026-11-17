@@ -10,7 +10,7 @@ use crate::partial::DiffSelection;
 use crate::resolve::ConflictResolution;
 
 /// Which commits a rebase moves, relative to the picked source revisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RebaseSourceMode {
     /// Only the picked revisions (`jj rebase -r`) — their descendants stay
     /// behind, re-parented across the hole.
@@ -31,7 +31,7 @@ pub enum RebaseSourceMode {
 
 /// Where moved (or duplicated) commits land relative to a target revision.
 /// Mirrors `jj rebase`'s `-d` / `-A` / `-B` and the combined `-A x -B y`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Destination {
     /// New children of the target (`jj rebase -d`); the target's existing
     /// children are unaffected.
@@ -46,21 +46,26 @@ pub enum Destination {
         parent: RevisionSelection,
         child: RevisionSelection,
     },
+    /// New children of `trunk()` as it resolves when the op runs
+    /// (`jj rebase -o 'trunk()'`), not as the last graph walk saw it.
+    Trunk,
 }
 
 impl Destination {
     /// The revision the destination is anchored on — what target-mode
-    /// highlights and preview summaries name.
-    pub fn anchor(&self) -> &RevisionSelection {
+    /// highlights and preview summaries name. `None` for [`Self::Trunk`],
+    /// which only names a revision once it runs.
+    pub fn anchor(&self) -> Option<&RevisionSelection> {
         match self {
-            Self::Onto(target) | Self::After(target) | Self::Before(target) => target,
-            Self::Between { parent, .. } => parent,
+            Self::Onto(target) | Self::After(target) | Self::Before(target) => Some(target),
+            Self::Between { parent, .. } => Some(parent),
+            Self::Trunk => None,
         }
     }
 }
 
 /// Where a squash folds its source into.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SquashTarget {
     /// The source's single parent (`jj squash` with no `--into`). Errors on a
     /// merge commit — an explicit destination is required there.
@@ -70,7 +75,7 @@ pub enum SquashTarget {
 
 /// A revision mutation. Targets are `RevisionSelection`s so the working-copy
 /// case (which has no stable change-id) stays representable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MutationOp {
     /// Create a new child commit of `parent` and move `@` onto it (`jj new`).
     New { parent: RevisionSelection },
@@ -106,8 +111,11 @@ pub enum MutationOp {
     /// Copy `target` onto its own parents (`jj duplicate`).
     Duplicate { target: RevisionSelection },
     /// Move `from`'s hunks into the mutable ancestors that last touched those
-    /// lines (`jj absorb --from`).
-    Absorb { from: RevisionSelection },
+    /// lines (`jj absorb --from`), only those of `paths` when it's not empty.
+    Absorb {
+        from: RevisionSelection,
+        paths: Vec<String>,
+    },
     /// Point local bookmark `name` at `to`, creating it if needed
     /// (`jj bookmark set -r <to> <name>`). With `push_remote`, the same
     /// transaction then pushes the bookmark there (`jj git push -b <name>`)
@@ -232,8 +240,36 @@ pub enum MutationOp {
     RevertOperation { operation_id: String },
 }
 
+impl MutationOp {
+    /// Undo, redo and the op-log restores: they put back views and rewrite
+    /// nothing the immutable guard covers. Their `allow_immutable` is the
+    /// confirmation of undoing a push instead, never `--ignore-immutable`.
+    pub fn restores_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::Undo { .. }
+                | Self::Redo
+                | Self::RestoreOperation { .. }
+                | Self::RevertOperation { .. }
+        )
+    }
+
+    /// Whether it sends anything to a remote.
+    pub fn pushes(&self) -> bool {
+        matches!(
+            self,
+            Self::Push(_)
+                | Self::PushBookmark { .. }
+                | Self::MoveBookmark {
+                    push_remote: Some(_),
+                    ..
+                }
+        )
+    }
+}
+
 /// User-facing summary of a successful mutation — becomes the status message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MutationOutcome {
     pub message: String,
     /// Whether the mutation moved `@` (new/edit/abandon). Bookmark ops leave the
@@ -252,11 +288,14 @@ pub struct MutationOutcome {
     /// activity row's per-op "Undo" uses to revert exactly this mutation
     /// (not just the latest op).
     pub operation_id: Option<String>,
+    /// The bookmarks a push named, in order, the ones it generated for
+    /// `--change` included. Empty for anything but a push.
+    pub bookmarks: Vec<String>,
 }
 
 /// What a draft simulation produced — the op bar renders the kind-specific
 /// summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DraftSimulation {
     Rebase(RebasePreview),
     Merge(MergePreview),
@@ -266,7 +305,7 @@ pub enum DraftSimulation {
 }
 
 /// Predicted outcome of a squash draft (whole revisions or picked changes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SquashPreview {
     /// Whether the sources end up empty and abandoned.
     pub abandons_sources: bool,
@@ -276,7 +315,7 @@ pub struct SquashPreview {
 }
 
 /// Predicted outcome of a new-change or duplicate draft.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InsertPreview {
     /// Commits created.
     pub created: u32,
@@ -289,7 +328,7 @@ pub struct InsertPreview {
 
 /// Predicted outcome of a merge draft: which paths the merged tree would
 /// leave conflicted — see `jj::preview_merge`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergePreview {
     /// Repo-relative conflicted paths, capped — see `truncated`.
     pub conflicts: Vec<String>,
@@ -298,7 +337,7 @@ pub struct MergePreview {
 }
 
 /// Predicted outcome of a rebase draft — see `jj::preview_rebase`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RebasePreview {
     /// Commits in the moved set.
     pub moved: u32,

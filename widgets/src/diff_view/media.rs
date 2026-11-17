@@ -1,14 +1,15 @@
-//! Image previews inside the diff: a block per image or SVG file, drawn in
-//! place of its rows. Before and after sit side by side (one column for an
-//! added or deleted file) on a checkerboard so transparency reads, fitted to
-//! the pane without scaling past 1:1, each captioned with its dimensions and
-//! size.
+//! Image previews inside the diff: a block per image or SVG file, drawn in place of
+//! its rows. Before and after sit side by side (one column for an added or deleted
+//! file) on a checkerboard so transparency reads, fitted to the pane without scaling
+//! past 1:1, each captioned with its dimensions and size.
 
-use iced::advanced::{image, renderer, text};
-use iced::{Border, Color, Point, Rectangle, Shadow};
+use std::sync::Arc;
 
-use super::{DiffView, TextRenderParams, centered_text_y};
+use super::layout::View;
+use super::paint::Plan;
+use crate::geometry::Rectangle;
 use crate::scrollbar;
+use crate::theme::Color;
 
 /// Inset of the previews from the block's edges.
 const PADDING: f32 = 16.0;
@@ -16,15 +17,15 @@ const PADDING: f32 = 16.0;
 const COLUMN_GAP: f32 = 24.0;
 /// Space between the tallest preview and the captions under it.
 const CAPTION_GAP: f32 = 8.0;
-/// A preview never stands taller than this: a long screenshot would
-/// otherwise be a scroll of its own.
+/// A preview never stands taller than this: a long screenshot would otherwise be a
+/// scroll of its own.
 const MAX_HEIGHT: f32 = 560.0;
 /// The frame of a side whose pixels can't be read.
 const PLACEHOLDER: (f32, f32) = (160.0, 96.0);
 /// Side of one checkerboard square.
 const CHECKER_CELL: f32 = 8.0;
 
-/// A file's preview, drawn in place of its rows (see [`DiffView::media`]).
+/// A file's preview, drawn in place of its rows (see [`super::DiffProps::media`]).
 #[derive(Debug, Clone)]
 pub struct Media {
     /// `None` for an added file.
@@ -45,7 +46,7 @@ pub struct MediaSide {
 pub enum MediaImage {
     /// Decoding off the UI thread; the frame already has its final size.
     Loading,
-    Ready(image::Handle),
+    Ready(Arc<gpui_kit::RenderImage>),
     /// No pixels to show: unreadable, too large, or the decode failed.
     Unavailable,
 }
@@ -118,8 +119,8 @@ pub(super) fn layout(media: &Media, viewport_width: f32, caption_height: f32) ->
     }
 }
 
-/// The caption under one side: its dimensions and size, and for the after
-/// side of a change, how the size moved.
+/// The caption under one side: its dimensions and size, and for the after side of a
+/// change, how the size moved.
 fn caption(side: &MediaSide, other: Option<&MediaSide>) -> (String, Option<(String, bool)>) {
     let size = diffui_core::media::format_size(side.size);
     let text = match side.dimensions {
@@ -133,198 +134,135 @@ fn caption(side: &MediaSide, other: Option<&MediaSide>) -> (String, Option<(Stri
     (text, delta)
 }
 
-impl<Message> DiffView<'_, Message> {
-    pub(super) fn media_of(&self, file: usize) -> Option<&Media> {
-        self.media.get(file)?.as_ref()
-    }
+fn intersect(a: Rectangle, b: Rectangle) -> Option<Rectangle> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    (right > x && bottom > y).then_some(Rectangle {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
+}
 
-    /// Draw `media`'s block with its top at screen-y `top`.
-    pub(super) fn draw_media<Renderer>(
-        &self,
-        renderer: &mut Renderer,
-        media: &Media,
-        top: f32,
-        bounds: Rectangle,
-    ) where
-        Renderer: text::Renderer + image::Renderer<Handle = image::Handle>,
-    {
-        let layout = layout(media, bounds.width, self.metrics.row_height);
-        // Opaque over the gutter chrome: a preview has no line numbers.
-        self.draw_background(
-            renderer,
-            bounds.x,
-            top,
-            bounds.width,
-            layout.height,
-            self.palette.panel,
-        );
-        let both = media.before.is_some() && media.after.is_some();
-        for placed in &layout.frames {
-            let (side, other) = if placed.side == 0 {
-                (media.before.as_ref(), None)
-            } else {
-                (media.after.as_ref(), media.before.as_ref())
-            };
-            let Some(side) = side else { continue };
-            let frame = Rectangle {
-                x: bounds.x + placed.frame.x,
-                y: top + placed.frame.y,
-                ..placed.frame
-            };
-            let column = Rectangle {
-                x: bounds.x + placed.column.x,
-                y: top,
-                width: placed.column.width,
-                height: layout.height,
-            };
-            self.draw_frame(renderer, side, frame, bounds);
-
-            let caption_top = top + layout.caption_y;
-            let text_y = centered_text_y(
-                caption_top,
-                self.metrics.row_height,
-                self.metrics.row_height,
-            ) + self.metrics.text_y_pad;
-            let clip = column.intersection(&bounds).unwrap_or(column);
-            let mut x = column.x;
-            let mut piece = |renderer: &mut Renderer, content: &str, color: Color| {
-                self.draw_text(
-                    renderer,
-                    content,
-                    TextRenderParams {
-                        width: self.text_width(content),
-                        height: self.metrics.row_height,
-                        position: Point::new(x, text_y),
-                        color,
-                        clip_bounds: clip,
-                        wrapping: text::Wrapping::None,
-                    },
-                );
-                x += (content.chars().count() as f32 + 2.0) * self.metrics.char_width;
-            };
-            if both {
-                let label = if placed.side == 0 { "Before" } else { "After" };
-                piece(renderer, label, self.palette.text);
-            }
-            let (text, delta) = caption(side, other);
-            piece(renderer, &text, self.palette.text_muted);
-            if let Some((delta, grew)) = delta {
-                let color = if grew {
-                    self.palette.addition_text
-                } else {
-                    self.palette.deletion_text
-                };
-                piece(renderer, &delta, color);
-            }
-        }
-    }
-
-    /// One side's preview: a hairline frame, the checkerboard, and the
-    /// pixels over it once they're decoded.
-    fn draw_frame<Renderer>(
-        &self,
-        renderer: &mut Renderer,
-        side: &MediaSide,
-        frame: Rectangle,
-        bounds: Rectangle,
-    ) where
-        Renderer: text::Renderer + image::Renderer<Handle = image::Handle>,
-    {
-        let Some(visible) = frame.intersection(&bounds) else {
-            return;
+/// Draw `media`'s block with its top at screen-y `top`.
+pub(super) fn draw(view: &View<'_>, plan: &mut Plan, media: &Media, top: f32, bounds: Rectangle) {
+    let palette = &view.props.palette;
+    let row_height = view.metrics.row_height;
+    let laid = layout(media, bounds.width, row_height);
+    // Opaque over the gutter chrome: a preview has no line numbers.
+    plan.rect(bounds.x, top, bounds.width, laid.height, palette.panel);
+    let both = media.before.is_some() && media.after.is_some();
+    for placed in &laid.frames {
+        let (side, other) = if placed.side == 0 {
+            (media.before.as_ref(), None)
+        } else {
+            (media.after.as_ref(), media.before.as_ref())
         };
-        // The hairline sits just outside the pixels, so a 1:1 preview keeps
-        // every one of them.
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: Rectangle {
-                    x: frame.x - 1.0,
-                    y: frame.y - 1.0,
-                    width: frame.width + 2.0,
-                    height: frame.height + 2.0,
-                },
-                border: Border {
-                    color: self.palette.border,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            },
-            Color::TRANSPARENT,
-        );
-        self.draw_checkerboard(renderer, frame, visible);
-        match &side.image {
-            MediaImage::Ready(handle) => renderer.draw_image(
-                image::Image {
-                    handle: handle.clone(),
-                    filter_method: image::FilterMethod::Linear,
-                    rotation: iced::Radians(0.0),
-                    border_radius: Default::default(),
-                    opacity: 1.0,
-                },
-                frame,
-                bounds,
-            ),
-            MediaImage::Loading => {}
-            MediaImage::Unavailable => {
-                let label = "No preview";
-                let width = self.text_width(label);
-                self.draw_text(
-                    renderer,
-                    label,
-                    TextRenderParams {
-                        width,
-                        height: self.metrics.row_height,
-                        position: Point::new(
-                            frame.x + ((frame.width - width) / 2.0).max(0.0) + 8.0,
-                            centered_text_y(frame.y, frame.height, self.metrics.row_height)
-                                + self.metrics.text_y_pad,
-                        ),
-                        color: self.palette.text_muted,
-                        clip_bounds: visible,
-                        wrapping: text::Wrapping::None,
-                    },
-                );
-            }
+        let Some(side) = side else { continue };
+        let frame = Rectangle {
+            x: bounds.x + placed.frame.x,
+            y: top + placed.frame.y,
+            ..placed.frame
+        };
+        let column = Rectangle {
+            x: bounds.x + placed.column.x,
+            y: top,
+            width: placed.column.width,
+            height: laid.height,
+        };
+        draw_frame(view, plan, side, frame, bounds);
+
+        let text_y = top + laid.caption_y + view.metrics.text_y_pad;
+        let clip = intersect(column, bounds).unwrap_or(column);
+        let mut x = column.x;
+        let mut piece = |plan: &mut Plan, content: &str, color: Color| {
+            view.code_line(plan, content, x, text_y, color, clip);
+            x += (content.chars().count() as f32 + 2.0) * view.metrics.char_width;
+        };
+        if both {
+            let label = if placed.side == 0 { "Before" } else { "After" };
+            piece(plan, label, palette.text);
+        }
+        let (text, delta) = caption(side, other);
+        piece(plan, &text, palette.text_muted);
+        if let Some((delta, grew)) = delta {
+            let color = if grew {
+                palette.addition_text
+            } else {
+                palette.deletion_text
+            };
+            piece(plan, &delta, color);
         }
     }
+}
 
-    /// Two-tone squares behind the pixels, painted only where `visible`.
-    fn draw_checkerboard<Renderer>(
-        &self,
-        renderer: &mut Renderer,
-        frame: Rectangle,
-        visible: Rectangle,
-    ) where
-        Renderer: renderer::Renderer,
-    {
-        let light = self.palette.panel;
-        let dark = mix(self.palette.panel, self.palette.text, 0.08);
-        self.draw_background(
-            renderer,
-            visible.x,
-            visible.y,
-            visible.width,
-            visible.height,
-            light,
-        );
-        let first_row = ((visible.y - frame.y) / CHECKER_CELL).floor().max(0.0) as usize;
-        let last_row = ((visible.y + visible.height - frame.y) / CHECKER_CELL).ceil() as usize;
-        let columns = (frame.width / CHECKER_CELL).ceil() as usize;
-        for row in first_row..last_row {
-            let y = frame.y + row as f32 * CHECKER_CELL;
-            for column in (row % 2..columns).step_by(2) {
-                let x = frame.x + column as f32 * CHECKER_CELL;
-                let cell = Rectangle {
-                    x,
-                    y,
-                    width: CHECKER_CELL.min(frame.x + frame.width - x),
-                    height: CHECKER_CELL.min(frame.y + frame.height - y),
-                };
-                if let Some(cell) = cell.intersection(&visible) {
-                    self.draw_background(renderer, cell.x, cell.y, cell.width, cell.height, dark);
-                }
+/// One side's preview: a hairline frame, the checkerboard, and the pixels over it
+/// once they're decoded.
+fn draw_frame(
+    view: &View<'_>,
+    plan: &mut Plan,
+    side: &MediaSide,
+    frame: Rectangle,
+    bounds: Rectangle,
+) {
+    let Some(visible) = intersect(frame, bounds) else {
+        return;
+    };
+    let palette = &view.props.palette;
+    // The hairline sits just outside the pixels, so a 1:1 preview keeps every one of
+    // them.
+    plan.outline(
+        Rectangle {
+            x: frame.x - 1.0,
+            y: frame.y - 1.0,
+            width: frame.width + 2.0,
+            height: frame.height + 2.0,
+        },
+        palette.border,
+    );
+    draw_checkerboard(view, plan, frame, visible);
+    match &side.image {
+        MediaImage::Ready(image) => plan.image(frame, Arc::clone(image), bounds),
+        MediaImage::Loading => {}
+        MediaImage::Unavailable => {
+            let label = "No preview";
+            let width = view.text_width(label);
+            view.code_line(
+                plan,
+                label,
+                frame.x + ((frame.width - width) / 2.0).max(0.0) + 8.0,
+                frame.y + (frame.height - view.metrics.row_height) / 2.0 + view.metrics.text_y_pad,
+                palette.text_muted,
+                visible,
+            );
+        }
+    }
+}
+
+/// Two-tone squares behind the pixels, painted only where `visible`.
+fn draw_checkerboard(view: &View<'_>, plan: &mut Plan, frame: Rectangle, visible: Rectangle) {
+    let palette = &view.props.palette;
+    let light = palette.panel;
+    let dark = mix(palette.panel, palette.text, 0.08);
+    plan.rect(visible.x, visible.y, visible.width, visible.height, light);
+    let first_row = ((visible.y - frame.y) / CHECKER_CELL).floor().max(0.0) as usize;
+    let last_row = ((visible.y + visible.height - frame.y) / CHECKER_CELL).ceil() as usize;
+    let columns = (frame.width / CHECKER_CELL).ceil() as usize;
+    for row in first_row..last_row {
+        let y = frame.y + row as f32 * CHECKER_CELL;
+        for column in (row % 2..columns).step_by(2) {
+            let x = frame.x + column as f32 * CHECKER_CELL;
+            let cell = Rectangle {
+                x,
+                y,
+                width: CHECKER_CELL.min(frame.x + frame.width - x),
+                height: CHECKER_CELL.min(frame.y + frame.height - y),
+            };
+            if let Some(cell) = intersect(cell, visible) {
+                plan.rect(cell.x, cell.y, cell.width, cell.height, dark);
             }
         }
     }

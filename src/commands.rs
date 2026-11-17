@@ -29,84 +29,75 @@ use crate::revops::{self, RevopsAction};
 use crate::theme::ThemePreference;
 use crate::{DetailField, Diffui, MainView, mutations};
 
-/// A command's stable identity. A string so it survives in a config file and
-/// in the persisted palette recents without a hand-written mapping table.
-pub(crate) type CommandId = &'static str;
+mod registry;
+pub(crate) use registry::{CommandId, Disabled, Entry, GROUPS, Handler, Registry};
 
-/// Where a command's keys are live. The mode stack decides which context the
-/// keyboard is in; a command only resolves in the contexts it lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum Context {
+/// Declares [`Context`] once: each variant with the name it goes by in
+/// `config.toml`'s `[keys.<name>]`, and [`Context::ALL`] from the same list.
+macro_rules! contexts {
+    ($( $(#[$meta:meta])* $Variant:ident = $name:literal, )*) => {
+        /// Where a command's keys are live. The mode stack decides which
+        /// context the keyboard is in; a command only resolves in the
+        /// contexts it lists.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub(crate) enum Context {
+            $( $(#[$meta])* $Variant, )*
+        }
+
+        impl Context {
+            /// Every context, for iteration in tests and config parsing.
+            pub(crate) const ALL: &'static [Context] = &[$( Context::$Variant, )*];
+
+            /// The name this context goes by in `config.toml`'s
+            /// `[keys.<name>]`.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $( Context::$Variant => $name, )*
+                }
+            }
+        }
+    };
+}
+
+contexts! {
     /// No overlay: the graph, the diff, the tabs.
-    Base,
-    Palette,
-    Find,
-    Confirm,
-    Description,
+    Base = "base",
+    Palette = "palette",
+    Find = "find",
+    Confirm = "confirm",
+    Description = "description",
     /// Target mode — picking a rebase/squash/merge destination.
-    Draft,
-    Menu,
-    OpenRepo,
-    ActivityPopover,
+    Draft = "draft",
+    Menu = "menu",
+    OpenRepo = "open-repo",
+    ActivityPopover = "activity",
     /// The bookmark-name prompt.
-    Prompt,
+    Prompt = "prompt",
     /// The keyboard-shortcut cheat sheet.
-    Shortcuts,
+    Shortcuts = "shortcuts",
+    /// The settings dialog.
+    Settings = "settings",
     /// Line-select mode in the diff pane.
-    Lines,
+    Lines = "lines",
     /// The split prompt's two description editors.
-    Split,
+    Split = "split",
     /// The credential prompt git or ssh raised.
-    Credential,
+    Credential = "credential",
     /// A jj CLI run's output panel.
-    Output,
+    Output = "output",
     /// The conflict marker editor.
-    ConflictEdit,
+    ConflictEdit = "conflict-edit",
+    /// The create / update pull request dialog.
+    PullRequest = "pull-request",
+    /// Submit stack's preview.
+    StackSubmit = "submit-stack",
+    /// The dialog that asks whether a plugin may run.
+    PluginPermission = "plugin-permission",
+    /// A reply to a review note.
+    NoteReply = "note-reply",
 }
 
 impl Context {
-    /// Every context, for iteration in tests and config parsing.
-    pub(crate) const ALL: &'static [Context] = &[
-        Context::Base,
-        Context::Palette,
-        Context::Find,
-        Context::Confirm,
-        Context::Description,
-        Context::Draft,
-        Context::Menu,
-        Context::OpenRepo,
-        Context::ActivityPopover,
-        Context::Prompt,
-        Context::Shortcuts,
-        Context::Lines,
-        Context::Split,
-        Context::Credential,
-        Context::Output,
-        Context::ConflictEdit,
-    ];
-
-    /// The name this context goes by in `config.toml`'s `[keys.<name>]`.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Context::Base => "base",
-            Context::Palette => "palette",
-            Context::Find => "find",
-            Context::Confirm => "confirm",
-            Context::Description => "description",
-            Context::Draft => "draft",
-            Context::Menu => "menu",
-            Context::OpenRepo => "open-repo",
-            Context::ActivityPopover => "activity",
-            Context::Prompt => "prompt",
-            Context::Shortcuts => "shortcuts",
-            Context::Lines => "lines",
-            Context::Split => "split",
-            Context::Credential => "credential",
-            Context::Output => "output",
-            Context::ConflictEdit => "conflict-edit",
-        }
-    }
-
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Context::ALL
             .iter()
@@ -208,9 +199,9 @@ pub(crate) fn require(condition: bool, reason: Reason) -> Availability {
     if condition { Ok(()) } else { Err(reason) }
 }
 
-/// One registry row.
+/// One built-in row. [`Registry`] makes an [`Entry`] of each.
 pub(crate) struct Command {
-    pub(crate) id: CommandId,
+    pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) hint: &'static str,
     pub(crate) contexts: &'static [Context],
@@ -245,57 +236,27 @@ impl std::fmt::Debug for Command {
     }
 }
 
-/// Look a command up by id. `None` for an id that no longer exists — a stale
-/// keymap entry or a persisted palette recent, both of which are ignored
-/// rather than fatal.
-pub(crate) fn command(id: &str) -> Option<&'static Command> {
-    REGISTRY.iter().find(|command| command.id == id)
-}
-
-/// The commands the palette offers in `scope`, in registry order, each with
-/// its `enabled` verdict against the arg it would run with.
-pub(crate) fn palette_commands(
-    ui: &Diffui,
-    scope: PaletteScope,
-    arg: &CommandArg,
-) -> Vec<(&'static Command, Availability)> {
-    REGISTRY
-        .iter()
-        .filter(|command| {
-            command.palette == scope
-                || (command.palette == PaletteScope::RevisionVerb
-                    && matches!(scope, PaletteScope::Root | PaletteScope::Revision))
-        })
-        .map(|command| (command, (command.enabled)(ui, arg)))
-        .collect()
-}
-
-impl Command {
-    /// The label a palette row shows. Most commands use their menu label;
-    /// the revision verbs are spelled for a menu that already says what they
-    /// are (`Rebase ▸ Onto…`), which reads as nothing on its own in a list.
-    pub(crate) fn palette_label(&self) -> &'static str {
-        match self.id {
-            "revision.edit" => "Edit revision",
-            "revision.rebase.start" => "Rebase onto\u{2026}",
-            "revision.rebase.descendants.start" => "Rebase with descendants onto\u{2026}",
-            "revision.rebase.branch.start" => "Rebase whole branch onto\u{2026}",
-            "revision.rebase.onto-trunk" => "Rebase onto trunk",
-            "revision.squash.start" => "Squash into\u{2026}",
-            "revision.squash-into-parent" => "Squash into parent",
-            "revision.abandon" => "Abandon\u{2026}",
-            "repo.fetch" => "Fetch all remotes",
-            "bookmark.track" => "Track remote bookmark",
-            "bookmark.delete" => "Delete bookmark",
-            _ => self.label,
-        }
-    }
-}
-
 // ── Shared predicates ───────────────────────────────────────────────────────
 
 fn lines_action(message: crate::changes::LineMsg) -> Action {
     Action::Changes(crate::changes::ChangesMsg::Lines(message))
+}
+
+/// A font menu row's family, `None` being the platform's `default`.
+fn font_arg(arg: CommandArg, default: crate::theme::Font) -> Option<Option<String>> {
+    let CommandArg::Text(family) = arg else {
+        return None;
+    };
+    Some((family != default.family).then_some(family))
+}
+
+fn font_unlocked(ui: &Diffui, key: crate::config::Key) -> Availability {
+    require(!ui.config.locked.contains(key), "Set in config.toml")
+}
+
+/// A Submit stack preview action.
+fn stack_action(action: crate::forge_dialog::StackAction) -> Action {
+    Action::Forge(crate::forge_dialog::ForgeAction::Stack(action))
 }
 
 fn always(_: &Diffui, _: &CommandArg) -> Availability {
@@ -309,6 +270,8 @@ pub(crate) mod reason {
     pub(crate) const NOT_JJ: Reason = "Needs a jj repository";
     pub(crate) const GONE: Reason = "Revision is no longer in the log";
     pub(crate) const NO_REPOSITORY: Reason = "No local repository in this tab";
+    /// For what reads or runs something in the working tree.
+    pub(crate) const REMOTE: Reason = "The repository is on another machine";
     pub(crate) const NO_FILE: Reason = "No file selected";
     pub(crate) const NO_REMOTES: Reason = "No git remotes";
     pub(crate) const NO_LOCAL_BOOKMARK: Reason = "No local bookmark here";
@@ -319,11 +282,7 @@ pub(crate) mod reason {
 /// Whether the row a command names is still in the loaded graph. A menu built
 /// before a reload can otherwise act on a commit the reload hid.
 fn row_present(ui: &Diffui, selection: &RevisionSelection) -> bool {
-    let commits = &ui.active().session.commits;
-    match selection {
-        RevisionSelection::WorkingCopy => commits.working_copy().is_some(),
-        RevisionSelection::Commit(hex) => commits.find_by_commit_id(hex).is_some(),
-    }
+    ui.active().session.commits.find(selection).is_some()
 }
 
 /// A mutation is offered when the backend supports one (jj only) and every
@@ -391,6 +350,19 @@ fn has_local_bookmark(ui: &Diffui, arg: &CommandArg) -> Availability {
 }
 
 /// Picking changes out of the diff: the reason `changes::editable` is false.
+/// The diff on screen is one jj change, which notes can go on.
+fn on_a_change(ui: &Diffui) -> Availability {
+    require(crate::notes::app::available(ui), reason::NOT_JJ)?;
+    require(
+        ui.active().main_view == MainView::Diff,
+        "Only in the diff view",
+    )?;
+    require(
+        crate::notes::app::shown_change(ui.active()).is_some(),
+        "Only on one revision's own diff",
+    )
+}
+
 fn can_pick_changes(ui: &Diffui) -> Availability {
     let tab = ui.active();
     require(tab.session.capabilities.mutate, reason::NOT_JJ)?;
@@ -610,10 +582,7 @@ fn result_row<'a>(ui: &'a Diffui, arg: &CommandArg) -> Option<diffui_core::RowVi
                 .revision()
                 .cloned()
                 .unwrap_or_else(|| ui.active().session.selected_revision.clone());
-            match selection {
-                RevisionSelection::WorkingCopy => commits.working_copy(),
-                RevisionSelection::Commit(hex) => commits.find_by_commit_id(&hex),
-            }
+            commits.find(&selection)
         }
     }
 }
@@ -647,7 +616,14 @@ pub(crate) static REGISTRY: &[Command] = &[
         contexts: &[Context::Base],
         chords: &["cmd+r"],
         mac_chords: &[],
-        enabled: can_read_graph,
+        enabled: |ui, _arg| {
+            require(
+                ui.tabs
+                    .get(ui.active)
+                    .is_some_and(|tab| tab.actions().refresh),
+                "Nothing to read again in this tab",
+            )
+        },
         build: |_ui, _arg| Some(Action::Refresh),
         palette: PaletteScope::Root,
     },
@@ -692,6 +668,58 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "review.step.next",
+        label: "Next commit",
+        hint: "Scope the pull request's diff to its next commit",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Review(crate::review::ReviewAction::Step { by: 1 })),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "review.step.previous",
+        label: "Previous commit",
+        hint: "Scope the pull request's diff to its previous commit",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Review(crate::review::ReviewAction::Step { by: -1 })),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "review.show-all-changes",
+        label: "Show all changes",
+        hint: "Scope the pull request's diff back to all of it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().scope().is_some(),
+                "Only a pull request has commits to step through",
+            )
+        },
+        build: |_ui, _arg| {
+            Some(Action::Review(crate::review::ReviewAction::Scope(
+                crate::review::Scope::All,
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "theme.system",
         label: "Theme: System",
         hint: "Follow OS appearance",
@@ -733,6 +761,28 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::SetTheme(ThemePreference::HighContrast)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "refresh.auto",
+        label: "Refresh: Automatic",
+        hint: "Snapshot edits and update a stale working copy as they happen",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::SetRefreshMode(diffui_core::RefreshMode::Auto)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "refresh.manual",
+        label: "Refresh: Manual",
+        hint: "Leave snapshots and stale updates to the Refresh button",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::SetRefreshMode(diffui_core::RefreshMode::Manual)),
         palette: PaletteScope::Root,
     },
     Command {
@@ -784,6 +834,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |_ui, _arg| Some(Action::Redo),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "repo.update-stale",
+        label: "Update stale working copy",
+        hint: "Put the latest working copy on disk (jj workspace update-stale)",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: can_mutate,
+        build: |_ui, _arg| Some(Action::UpdateStaleWorkingCopy),
         palette: PaletteScope::Root,
     },
     Command {
@@ -901,10 +962,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         enabled: |ui, _arg| require(ui.active().repository.is_some(), reason::NO_REPOSITORY),
         build: |ui, arg| {
             let path = arg.path()?;
-            let repository = ui.active().repository.as_ref()?;
-            Some(Action::Copy(
-                repository.root.join(path).display().to_string(),
-            ))
+            let tab = ui.active();
+            let repository = tab.repository.as_ref()?;
+            Some(Action::Copy(match tab.remote {
+                // A path over there, in its own spelling: never joined with
+                // this machine's separator.
+                Some(_) => format!(
+                    "{}/{path}",
+                    repository.root.to_string_lossy().trim_end_matches('/')
+                ),
+                None => repository.root.join(path).display().to_string(),
+            }))
         },
         palette: PaletteScope::Hidden,
     },
@@ -1086,8 +1154,12 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: can_mutate,
         build: |ui, arg| {
-            target_revision(ui, &arg)
-                .map(|from| Action::Mutate(mutations::MutationOp::Absorb { from }))
+            target_revision(ui, &arg).map(|from| {
+                Action::Mutate(mutations::MutationOp::Absorb {
+                    from,
+                    paths: Vec::new(),
+                })
+            })
         },
         palette: PaletteScope::RevisionVerb,
     },
@@ -1182,17 +1254,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         chords: &["esc"],
         mac_chords: &[],
         enabled: always,
-        // Esc backs out of whatever is on: the marks first, then a
-        // comparison.
+        // Esc backs out of whatever is on: the picks first, then the
+        // marks, then a comparison.
         build: |ui, _arg| {
-            Some(
-                if ui.active().revision_multi_selection.is_empty() && crate::compare::comparing(ui)
-                {
-                    Action::Compare(CompareAction::Exit)
-                } else {
-                    Action::ClearMultiSelection
-                },
-            )
+            Some(if crate::changes::has_selection(ui) {
+                Action::Changes(crate::changes::ChangesMsg::Clear)
+            } else if ui.active().revision_multi_selection.is_empty()
+                && crate::compare::comparing(ui)
+            {
+                Action::Compare(CompareAction::Exit)
+            } else {
+                Action::ClearMultiSelection
+            })
         },
         palette: PaletteScope::Hidden,
     },
@@ -1936,6 +2009,24 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "palette.leave-command-line",
+        label: "Back to commands",
+        hint: "Leave the empty command line for the palette's search",
+        contexts: &[Context::Palette],
+        chords: &["backspace"],
+        mac_chords: &[],
+        enabled: always,
+        // Only an empty line: Backspace anywhere else edits it.
+        build: |ui, _arg| {
+            let empty = ui
+                .palette()
+                .and_then(|state| state.top())
+                .is_some_and(|column| column.query == crate::cmdline::PREFIX);
+            (ui.command_line().is_some() && empty).then_some(Action::CommandLine(CmdAction::Leave))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "palette.back",
         label: "Back",
         hint: "Pop the rightmost palette column",
@@ -2032,6 +2123,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "repo.open-clipboard-patch",
+        label: "Open the clipboard as a patch",
+        hint: "Show the diff on the clipboard in a new tab",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::OpenClipboardPatch),
+        palette: PaletteScope::Root,
+    },
+    Command {
         id: "repo.close-dialog",
         label: "Close dialog",
         hint: "Dismiss the open-repository dialog",
@@ -2065,6 +2167,17 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Hidden,
     },
     Command {
+        id: "repo.remove-recent",
+        label: "Remove from recents",
+        hint: "Forget the highlighted recent repository",
+        contexts: &[Context::OpenRepo],
+        chords: &["ctrl+backspace"],
+        mac_chords: &["cmd+backspace"],
+        enabled: always,
+        build: |ui, _arg| ui.open_repo_selected_recent().map(Action::RemoveRecentRepo),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "repo.complete-folder",
         label: "Complete folder",
         hint: "Complete the path into the highlighted folder",
@@ -2079,12 +2192,18 @@ pub(crate) static REGISTRY: &[Command] = &[
         id: "confirm.accept",
         label: "Confirm",
         hint: "Run the mutation the dialog is holding",
-        // Deliberately chordless: the dialog gates an operation the jj CLI
-        // itself refuses, so it takes a click rather than a stray Enter.
+        // Enter for a routine confirm (a push). One that destroys or
+        // overrides something the jj CLI refuses takes a click, not a stray
+        // Enter.
         contexts: &[Context::Confirm],
-        chords: &[],
+        chords: &["enter"],
         mac_chords: &[],
-        enabled: always,
+        enabled: |ui, _arg| {
+            require(
+                ui.confirm().is_some_and(|dialog| dialog.look.routine),
+                "Click to confirm a destructive change",
+            )
+        },
         build: |_ui, _arg| Some(Action::ConfirmAccept),
         palette: PaletteScope::Hidden,
     },
@@ -2231,6 +2350,44 @@ pub(crate) static REGISTRY: &[Command] = &[
         mac_chords: &[],
         enabled: always,
         build: |_ui, _arg| Some(Action::ToggleSplit),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.toggle-revisions",
+        label: "Toggle the revisions sidebar",
+        hint: "Show or hide the revision list beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+1"],
+        // ⌥ composes 1 into `¡` on a US layout, and the key event can carry that.
+        mac_chords: &["alt+cmd+1", "alt+cmd+\u{a1}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )?;
+            require(
+                ui.active_steps() != crate::review::Steps::None,
+                "This tab has nothing to step through",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleHistoryPanel),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.toggle-changed-files",
+        label: "Toggle the changed files",
+        hint: "Show or hide the changed-file tree beside the diff",
+        contexts: &[Context::Base],
+        chords: &["alt+cmd+2"],
+        // ⌥2 composes into `™` on a US layout.
+        mac_chords: &["alt+cmd+2", "alt+cmd+\u{2122}"],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only the Diff view hides its panels",
+            )
+        },
+        build: |_ui, _arg| Some(Action::ToggleFilesPanel),
         palette: PaletteScope::Root,
     },
     Command {
@@ -2611,6 +2768,208 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
+        id: "notes.next",
+        label: "Next note or conflict",
+        hint: "Scroll to the next open review note, pull request comment or conflict in the diff",
+        contexts: &[Context::Base],
+        chords: &["]"],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only in the diff view",
+            )?;
+            require(
+                !crate::notes::app::spots(ui).is_empty(),
+                "No open note or conflict in this diff",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::Step(1))),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.previous",
+        label: "Previous note or conflict",
+        hint: "Scroll to the previous open review note, pull request comment or conflict in the diff",
+        contexts: &[Context::Base],
+        chords: &["["],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.active().main_view == MainView::Diff,
+                "Only in the diff view",
+            )?;
+            require(
+                !crate::notes::app::spots(ui).is_empty(),
+                "No open note or conflict in this diff",
+            )
+        },
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::Step(-1))),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "view.notes",
+        label: "Show review notes",
+        hint: "Every note agents left in this repository, to filter and clean up",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(crate::notes::app::view_available(ui), reason::NOT_JJ)?;
+            require(
+                ui.active().main_view != MainView::Notes,
+                "Already showing the notes",
+            )
+        },
+        build: |_ui, _arg| Some(Action::SetMainView(MainView::Notes)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.add-change",
+        label: "Add a note on this change",
+        hint: "Write feedback on the change on screen, for the agent or to copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Change,
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.add-line",
+        label: "Add a note on the cursor line",
+        hint: "Write feedback on the line under the keyboard's cursor",
+        contexts: &[Context::Lines],
+        chords: &["n"],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            on_a_change(ui)?;
+            require(
+                ui.active()
+                    .line_select()
+                    .and_then(|select| select.cursor())
+                    .is_some(),
+                "Move the line cursor first",
+            )
+        },
+        build: |ui, _arg| {
+            let line = ui.active().line_select()?.cursor()?;
+            Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::Line(crate::diff_view::LinePress {
+                    line,
+                    extend: false,
+                    one_side: false,
+                }),
+            )))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.add-file",
+        label: "Add a note on this file",
+        hint: "Write feedback on the file, for the agent or to copy",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            on_a_change(ui)?;
+            require(matches!(arg, CommandArg::Path(_)), "Needs a file")
+        },
+        build: |_ui, arg| match arg {
+            CommandArg::Path(path) => Some(Action::Notes(crate::notes::NotesMsg::StartNote(
+                crate::notes::NoteTarget::File(path.clone()),
+            ))),
+            _ => None,
+        },
+        palette: PaletteScope::File,
+    },
+    Command {
+        id: "notes.copy",
+        label: "Copy this change's notes",
+        hint: "Its open review notes as Markdown, to paste into an agent's prompt",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::CopyChange {
+                resolved: false,
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.copy-all",
+        label: "Copy this change's notes, resolved too",
+        hint: "Every review note on it as Markdown, resolved ones included",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| on_a_change(ui),
+        build: |_ui, _arg| {
+            Some(Action::Notes(crate::notes::NotesMsg::CopyChange {
+                resolved: true,
+            }))
+        },
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.filter",
+        label: "Filter the review notes",
+        hint: "Which notes the Notes view lists",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            require(crate::notes::app::view_available(ui), reason::NOT_JJ)?;
+            require(matches!(arg, CommandArg::Text(_)), "Needs a filter")
+        },
+        build: |_ui, arg| match arg {
+            CommandArg::Text(name) => Some(Action::Notes(crate::notes::NotesMsg::FilterNamed(
+                name.clone(),
+            ))),
+            _ => None,
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "notes.toggle-resolved",
+        label: "Show or hide resolved notes",
+        hint: "Resolved review notes stay in the diff, folded, or leave it",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| require(crate::notes::app::available(ui), reason::NOT_JJ),
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::ToggleResolved)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "notes.reply.send",
+        label: "Send reply",
+        hint: "Post the reply under its note",
+        contexts: &[Context::NoteReply],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::SendReply)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "notes.reply.cancel",
+        label: "Cancel reply",
+        hint: "Close the reply field, dropping the draft",
+        contexts: &[Context::NoteReply],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Notes(crate::notes::NotesMsg::CancelReply)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
         id: "conflict.region.next",
         label: "Next conflict region",
         hint: "Move to the next conflict region in the diff",
@@ -2845,15 +3204,103 @@ pub(crate) static REGISTRY: &[Command] = &[
         palette: PaletteScope::Root,
     },
     Command {
-        id: "app.open-config",
-        label: "Open settings file",
-        hint: "Edit config.toml (fonts, theme, keys, revset presets)",
+        id: "app.settings",
+        label: "Settings\u{2026}",
+        hint: "Theme, refresh, fonts and code text",
         contexts: &[Context::Base],
         chords: &["cmd+,"],
         mac_chords: &[],
         enabled: always,
-        build: |_ui, _arg| Some(Action::OpenConfigFile),
+        build: |_ui, _arg| Some(Action::OpenSettings),
         palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.reveal-config",
+        label: if cfg!(target_os = "macos") {
+            "Reveal config.toml in Finder"
+        } else {
+            "Reveal config.toml"
+        },
+        hint: "Keys and revset presets are set there, and it wins over Settings",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| {
+            require(
+                ui.config_files.exists(crate::config::ConfigFile::Config),
+                "No config.toml",
+            )
+        },
+        build: |_ui, _arg| Some(Action::RevealConfigFile(crate::config::ConfigFile::Config)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "app.reload-commands",
+        label: "Reload keys and commands",
+        hint: "Read config.toml's [keys] and [[commands]] again",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::ReloadCommands),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "settings.close",
+        label: "Close settings",
+        hint: "Dismiss the settings",
+        contexts: &[Context::Settings],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::CloseSettings),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.ui-font",
+        label: "Set UI font",
+        hint: "The family chrome and lists are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::UiFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::UiFont(
+                font_arg(arg, crate::theme::Font::DEFAULT)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.mono-font",
+        label: "Set mono font",
+        hint: "The family code and ids are set in",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| font_unlocked(ui, crate::config::Key::MonoFont),
+        build: |_ui, arg| {
+            Some(Action::ChangeSetting(crate::config::Setting::MonoFont(
+                font_arg(arg, crate::theme::Font::MONOSPACE)?,
+            )))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "settings.ai-provider",
+        label: "Set AI provider",
+        hint: "Where AI commands send the diff",
+        contexts: &[Context::Settings],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, _arg| require(!ui.ai_choice().1, "Set in config.toml"),
+        build: |_ui, arg| {
+            let CommandArg::Text(choice) = arg else {
+                return None;
+            };
+            Some(Action::Ai(crate::ai::AiAction::SetProvider(choice)))
+        },
+        palette: PaletteScope::Hidden,
     },
     Command {
         id: "shortcuts.close",
@@ -3000,6 +3447,195 @@ pub(crate) static REGISTRY: &[Command] = &[
         build: |ui, _arg| Some(Action::ExpandFile(ui.active().selected_file)),
         palette: PaletteScope::Root,
     },
+    // ── Pull requests ───────────────────────────────────────────────────
+    Command {
+        id: "forge.create",
+        label: "Create pull request",
+        hint: "Open a pull request for this bookmark or revision, pushing it first",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::can_create(ui, arg)
+        },
+        build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.update",
+        label: "Update pull request",
+        hint: "Change the pull request's base, title or description, pushing first",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::can_update(ui, arg)
+        },
+        build: |_ui, arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Open(arg))),
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.submit-stack",
+        label: "Submit stack\u{2026}",
+        hint: "Preview a pull request for each bookmark from trunk to here, based on the one \
+               below, then push and open or update them",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: |ui, arg| {
+            can_mutate(ui, arg)?;
+            crate::forge::can_submit_stack(ui, arg)
+        },
+        build: |_ui, arg| {
+            Some(Action::Forge(
+                crate::forge_dialog::ForgeAction::SubmitStack(arg),
+            ))
+        },
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.open",
+        label: "Open pull request",
+        hint: "Open the pull request in the browser",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_pull_request,
+        build: crate::forge::open_in_browser,
+        palette: PaletteScope::RevisionVerb,
+    },
+    Command {
+        id: "forge.open-tab",
+        label: "Open pull request as tab",
+        hint: "Review the pull request in a tab of its own",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::can_open_tab,
+        build: crate::forge::open_as_tab,
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.copy-url",
+        label: "Copy pull request URL",
+        hint: "Copy the pull request's address",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_pull_request,
+        build: crate::forge::copy_url,
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.refresh",
+        label: "Refresh pull requests",
+        hint: "Ask the forge again for the bookmarks' pull requests and checks",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: crate::forge::has_forge,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Refresh)),
+        palette: PaletteScope::Root,
+    },
+    Command {
+        id: "forge.dialog-submit",
+        label: "Create or update",
+        hint: "Push, then create or update the pull request as the dialog says",
+        contexts: &[Context::PullRequest],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Submit)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.dialog-cancel",
+        label: "Cancel",
+        hint: "Close the pull request dialog",
+        contexts: &[Context::PullRequest],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Forge(crate::forge_dialog::ForgeAction::Cancel)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-confirm",
+        label: "Submit",
+        hint: "Push the stack and open or update its pull requests as previewed",
+        contexts: &[Context::StackSubmit],
+        chords: &["cmd+enter"],
+        mac_chords: &[],
+        enabled: |ui, _arg| match ui.stack_dialog().map(|dialog| dialog.blocked()) {
+            Some(None) => Ok(()),
+            Some(Some(why)) => Err(why),
+            None => Err("Submit stack isn't open"),
+        },
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::Confirm)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-cancel",
+        label: "Cancel",
+        hint: "Close Submit stack; once submitted, the submission goes on",
+        contexts: &[Context::StackSubmit],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::Close)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-next-field",
+        label: "Next field",
+        hint: "Move to the next title or description, opening its pull request",
+        contexts: &[Context::StackSubmit],
+        chords: &["tab"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(stack_action(crate::forge_dialog::StackAction::NextField)),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "forge.stack-previous-field",
+        label: "Previous field",
+        hint: "Move to the previous title or description",
+        contexts: &[Context::StackSubmit],
+        chords: &["shift+tab"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| {
+            Some(stack_action(
+                crate::forge_dialog::StackAction::PreviousField,
+            ))
+        },
+        palette: PaletteScope::Hidden,
+    },
+    // ── Plugins ─────────────────────────────────────────────────────────
+    Command {
+        id: "plugin.dont-allow",
+        label: "Don't allow",
+        hint: "Refuse the plugin the permissions it asks for",
+        contexts: &[Context::PluginPermission],
+        chords: &["esc"],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Plugin(crate::plugins::PluginAction::Answer(false))),
+        palette: PaletteScope::Hidden,
+    },
+    Command {
+        id: "app.reveal-plugins",
+        label: "Reveal plugins folder",
+        hint: "Show the folder plugins are installed in",
+        contexts: &[Context::Base],
+        chords: &[],
+        mac_chords: &[],
+        enabled: always,
+        build: |_ui, _arg| Some(Action::Plugin(crate::plugins::PluginAction::Reveal(None))),
+        palette: PaletteScope::Root,
+    },
 ];
 
 fn can_compare(ui: &Diffui, arg: &CommandArg) -> Availability {
@@ -3059,7 +3695,7 @@ mod tests {
 
     #[test]
     fn revision_verbs_have_jj_style_keys() {
-        let map = crate::keymap::Keymap::build(&Default::default()).0;
+        let map = crate::keymap::Keymap::build(&Registry::builtin(), &Default::default()).0;
         for (key, id) in [
             ("n", "revision.new-child"),
             ("e", "revision.edit"),
@@ -3069,7 +3705,11 @@ mod tests {
             ("S", "revision.squash-into-parent"),
         ] {
             let chord = crate::keymap::Chord::parse(key).expect("a parsable chord");
-            assert_eq!(map.resolve(Context::Base, &chord), Some(id), "{key}");
+            assert_eq!(
+                map.resolve(Context::Base, &chord).as_deref(),
+                Some(id),
+                "{key}"
+            );
         }
     }
 
@@ -3079,13 +3719,14 @@ mod tests {
     fn only_an_unaimed_abandon_asks_first() {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
-        let abandon = command("revision.abandon").expect("registered");
+        let registry = Registry::builtin();
+        let abandon = registry.get("revision.abandon").expect("registered");
         assert!(matches!(
-            (abandon.build)(&ui, CommandArg::None),
+            abandon.build(&ui, CommandArg::None),
             Some(Action::ConfirmMutation(_))
         ));
         assert!(matches!(
-            (abandon.build)(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
+            abandon.build(&ui, CommandArg::Revision(RevisionSelection::WorkingCopy)),
             Some(Action::Mutate(_))
         ));
     }
@@ -3098,19 +3739,26 @@ mod tests {
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
         ui.tabs[0].state.session.capabilities.mutate = true;
         for scope in [PaletteScope::Root, PaletteScope::Revision] {
-            let ids: Vec<CommandId> = palette_commands(&ui, scope, &CommandArg::None)
+            let ids: Vec<CommandId> = ui
+                .registry
+                .palette_commands(&ui, scope, &CommandArg::None)
                 .iter()
-                .map(|(command, _)| command.id)
+                .map(|(command, _)| command.id.clone())
                 .collect();
             for id in ["revision.new-child", "revision.edit", "revision.abandon"] {
-                assert!(ids.contains(&id), "{id} missing from {scope:?}");
+                assert!(
+                    ids.iter().any(|known| *known == id),
+                    "{id} missing from {scope:?}"
+                );
             }
         }
-        let files: Vec<CommandId> = palette_commands(&ui, PaletteScope::File, &CommandArg::None)
+        let files: Vec<CommandId> = ui
+            .registry
+            .palette_commands(&ui, PaletteScope::File, &CommandArg::None)
             .iter()
-            .map(|(command, _)| command.id)
+            .map(|(command, _)| command.id.clone())
             .collect();
-        assert!(!files.contains(&"revision.abandon"));
+        assert!(!files.iter().any(|id| *id == "revision.abandon"));
     }
 
     /// A command that can't run stays in the palette with why.
@@ -3118,27 +3766,31 @@ mod tests {
     fn unavailable_commands_carry_their_reason() {
         let mut ui = crate::tabs::tests::app();
         crate::tabs::tests::push_tab(&mut ui, "/tmp/repo");
-        let verdict = |ui: &Diffui, id: CommandId| {
-            palette_commands(ui, PaletteScope::Root, &CommandArg::None)
+        let verdict = |ui: &Diffui, id: &str| {
+            ui.registry
+                .palette_commands(ui, PaletteScope::Root, &CommandArg::None)
                 .into_iter()
                 .find(|(command, _)| command.id == id)
                 .map(|(_, availability)| availability)
         };
-        assert_eq!(verdict(&ui, "revision.edit"), Some(Err(reason::NOT_JJ)));
+        assert_eq!(
+            verdict(&ui, "revision.edit"),
+            Some(Err(reason::NOT_JJ.into()))
+        );
         assert_eq!(
             verdict(&ui, "compare.exit"),
-            Some(Err(reason::NOT_COMPARING))
+            Some(Err(reason::NOT_COMPARING.into()))
         );
         assert_eq!(verdict(&ui, "theme.dark"), Some(Ok(())));
 
         ui.tabs[0].state.session.capabilities.mutate = true;
         assert_eq!(verdict(&ui, "revision.edit"), Some(Ok(())));
         assert_eq!(
-            (command("revision.edit").unwrap().enabled)(
+            ui.registry.get("revision.edit").unwrap().enabled(
                 &ui,
                 &CommandArg::Revision(RevisionSelection::Commit("gone".to_owned()))
             ),
-            Err(reason::GONE)
+            Err(reason::GONE.into())
         );
     }
 
@@ -3147,7 +3799,7 @@ mod tests {
     #[test]
     fn default_chords_do_not_collide_within_a_context() {
         for context in Context::ALL {
-            let mut seen: Vec<(crate::keymap::Chord, CommandId)> = Vec::new();
+            let mut seen: Vec<(crate::keymap::Chord, &str)> = Vec::new();
             for command in REGISTRY {
                 if !command.contexts.contains(context) {
                     continue;

@@ -49,7 +49,8 @@ fn fixture(test: &str) -> Fixture {
             if id.bytes().all(|b| b == b'0') {
                 continue;
             }
-            found.insert(full_description(root, &id), id);
+            // Newline-terminated, as jj stores every description.
+            found.insert(full_description(root, &id).trim_end().to_owned(), id);
         }
         found
     };

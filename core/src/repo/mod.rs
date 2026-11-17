@@ -17,10 +17,12 @@
 //! the last tab closing take the actor with it.
 
 pub(crate) mod cancel;
+mod diff_actor;
 mod git_actor;
 mod jj_actor;
 mod pr_actor;
 pub mod protocol;
+mod remote_actor;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -31,11 +33,11 @@ use futures::Stream;
 use tokio::sync::mpsc;
 
 pub use cancel::CancelFlag;
-use cancel::CancelRegistry;
+use cancel::{CancelRegistry, JobTicket};
 pub use jj_actor::{canonical_selection, rewritten_targets};
 pub use protocol::{
-    Capabilities, Command, Event, GraphTail, JobId, OpenSpec, Payload, PreviewRequest, RepoError,
-    RepoId,
+    Capabilities, Command, DiskState, DiskSync, Event, GraphTail, JobId, OpenSpec, Payload,
+    PreviewRequest, RepoError, RepoId,
 };
 
 use crate::repository::{Repository, Vcs};
@@ -103,6 +105,53 @@ pub(crate) async fn catch_panic<F: Future>(work: F) -> Result<F::Output, String>
         })
 }
 
+/// Run one command's job, the part every actor shares: register its cancel
+/// flag, answer `Cancelled` without starting when a cancel got there first,
+/// and turn an error or a panic into `Failed`. `work` gets the job's ticket;
+/// dropping it ends the job, so work that detaches onto a thread of its own
+/// moves the ticket there and sends its own terminal event.
+///
+/// Returns whether `work` panicked, so an actor holding loaded state can drop
+/// what the panic may have left half-updated.
+pub(crate) async fn run_job<Fut>(
+    jobs: &Jobs,
+    job: JobId,
+    span: tracing::Span,
+    emit: impl Fn(Payload),
+    work: impl FnOnce(JobTicket) -> Fut,
+) -> bool
+where
+    Fut: Future<Output = Result<(), RepoError>>,
+{
+    use tracing::Instrument as _;
+    let ticket = JobTicket::begin(jobs, job);
+    // A caller that supersedes its own work sends the cancel right behind the
+    // replacement, so on a busy actor most superseded jobs are cancelled before
+    // their turn. Running them anyway queued one full diff per row an arrow
+    // key passed.
+    if ticket.flag().is_cancelled() {
+        drop(ticket);
+        emit(Payload::Cancelled { job });
+        return false;
+    }
+    match catch_panic(work(ticket)).instrument(span.clone()).await {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
+            span.in_scope(|| tracing::warn!(%error, "command failed"));
+            emit(Payload::Failed { job, error });
+            false
+        }
+        Err(message) => {
+            span.in_scope(|| tracing::error!("command panicked: {message}"));
+            emit(Payload::Failed {
+                job,
+                error: RepoError::Crashed(message),
+            });
+            true
+        }
+    }
+}
+
 /// Test-only fault injection: make the next command an actor runs for a
 /// repository panic, so the recovery path can be exercised end to end.
 #[cfg(feature = "fault-injection")]
@@ -133,7 +182,8 @@ pub mod fault {
 pub(crate) enum Envelope {
     Run {
         repository: Repository,
-        command: Command,
+        /// Boxed: a mutation's command is far larger than the control traffic.
+        command: Box<Command>,
     },
     Watch(WatchBatch),
     Shutdown,
@@ -158,10 +208,8 @@ pub(crate) async fn route_commands(
     jobs: Jobs,
 ) {
     while let Some(envelope) = commands.recv().await {
-        if let Envelope::Run {
-            command: Command::Cancel { job },
-            ..
-        } = &envelope
+        if let Envelope::Run { command, .. } = &envelope
+            && let Command::Cancel { job } = command.as_ref()
         {
             if let Ok(mut jobs) = jobs.lock() {
                 jobs.cancel(*job);
@@ -183,6 +231,20 @@ pub struct RepoHandle {
     repository: Repository,
     capabilities: Capabilities,
     tx: mpsc::UnboundedSender<Envelope>,
+    remote: Option<Arc<RemoteRepository>>,
+}
+
+/// What the app knows about a repository on another machine, from the
+/// server's answer to opening it.
+#[derive(Debug)]
+pub struct RemoteRepository {
+    pub host: crate::remote::HostId,
+    pub info: Arc<crate::remote::HostInfo>,
+    /// The root, kind and scope there, and what the app can't read from
+    /// here: jj's default revset and the git remotes.
+    pub opened: crate::remote::Opened,
+    /// Kept so the stream stays up while a tab holds the handle.
+    pub link: crate::remote::HostLink,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -203,8 +265,15 @@ impl RepoHandle {
         self.capabilities
     }
 
+    /// The repository's root, kind and scope. For one on another machine
+    /// ([`Self::remote`]) the root is a path *there*: nothing on this disk.
     pub fn repository(&self) -> &Repository {
         &self.repository
+    }
+
+    /// Where the repository is, when it isn't on this machine.
+    pub fn remote(&self) -> Option<&RemoteRepository> {
+        self.remote.as_deref()
     }
 
     /// The same actor, addressed with a different path scope. Two tabs can
@@ -221,7 +290,7 @@ impl RepoHandle {
     pub fn send(&self, command: Command) {
         let _ = self.tx.send(Envelope::Run {
             repository: self.repository.clone(),
-            command,
+            command: Box::new(command),
         });
     }
 }
@@ -261,10 +330,9 @@ impl Drop for RepoEvents {
 pub fn repo_id(spec: &OpenSpec) -> RepoId {
     match spec {
         OpenSpec::Local { root, .. } => RepoId(root.to_string_lossy().into_owned()),
-        OpenSpec::GitHubPr(pr) => RepoId(match &pr.host {
-            Some(host) => format!("{host}/{}/{}#{}", pr.owner, pr.repo, pr.number),
-            None => format!("{}/{}#{}", pr.owner, pr.repo, pr.number),
-        }),
+        OpenSpec::ForgePr(pr) => RepoId(pr.key()),
+        OpenSpec::Diff(input) => RepoId(input.key()),
+        OpenSpec::Remote { host, path } => RepoId(format!("{host}:{path}")),
     }
 }
 
@@ -286,7 +354,10 @@ fn capabilities_for(spec: &OpenSpec) -> Capabilities {
             fetch: true,
             ..Capabilities::default()
         },
-        OpenSpec::GitHubPr(_) => Capabilities::default(),
+        // A remote repository's come with the server's answer.
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) | OpenSpec::Remote { .. } => {
+            Capabilities::default()
+        }
     }
 }
 
@@ -323,17 +394,41 @@ impl std::fmt::Debug for SettingsSource {
 /// Spawn the actor for `spec` and return its event stream. The first event is
 /// [`Payload::Ready`], which carries the command sender — everything else the
 /// frontend needs travels as protocol data.
-pub fn open(spec: OpenSpec) -> RepoEvents {
-    open_with(spec, SettingsSource::Layered)
+/// A pull request is served by its forge's provider among `forges`, a
+/// repository on another machine over that host's link among `hosts`. Such a
+/// repository's `Ready` comes once its server has answered, not at once.
+pub fn open(
+    spec: OpenSpec,
+    forges: &crate::forge::Forges,
+    hosts: &crate::remote::Hosts,
+) -> RepoEvents {
+    open_with(spec, SettingsSource::Layered, forges, hosts)
 }
 
 /// [`open`], with the jj configuration named rather than discovered. Only a
 /// test needs this; see [`SettingsSource`].
-pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
+pub fn open_with(
+    spec: OpenSpec,
+    settings: SettingsSource,
+    forges: &crate::forge::Forges,
+    hosts: &crate::remote::Hosts,
+) -> RepoEvents {
     let id = repo_id(&spec);
     let capabilities = capabilities_for(&spec);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Envelope>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+    let spec = match spec {
+        OpenSpec::Remote { host, path } => {
+            let link = hosts.link(&host);
+            remote_actor::spawn(id, link, path, cmd_rx, cmd_tx.clone(), event_tx);
+            return RepoEvents {
+                rx: event_rx,
+                shutdown: cmd_tx,
+            };
+        }
+        local => local,
+    };
 
     let repository = match &spec {
         OpenSpec::Local { root, scope } => Repository {
@@ -341,9 +436,9 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
             vcs: if is_jj(root) { Vcs::Jj } else { Vcs::Git },
             scope: scope.clone(),
         },
-        // A PR has no local checkout; the placeholder keeps `RepoHandle` one
-        // shape across every kind of source.
-        OpenSpec::GitHubPr(_) => Repository {
+        // A PR or a patch has no local checkout; the placeholder keeps
+        // `RepoHandle` one shape across every kind of source.
+        OpenSpec::ForgePr(_) | OpenSpec::Diff(_) | OpenSpec::Remote { .. } => Repository {
             root: PathBuf::new(),
             vcs: Vcs::Git,
             scope: PathBuf::new(),
@@ -355,6 +450,7 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         repository,
         capabilities,
         tx: cmd_tx.clone(),
+        remote: None,
     };
     let _ = event_tx.send(Event::new(
         id.clone(),
@@ -371,7 +467,12 @@ pub fn open_with(spec: OpenSpec, settings: SettingsSource) -> RepoEvents {
         OpenSpec::Local { root, .. } => {
             git_actor::spawn(id, root, cmd_rx, cmd_tx.clone(), event_tx)
         }
-        OpenSpec::GitHubPr(pr) => pr_actor::spawn(id, pr, cmd_rx, event_tx),
+        OpenSpec::ForgePr(pr) => {
+            let provider = forges.provider(pr.kind);
+            pr_actor::spawn(id, pr, provider, cmd_rx, event_tx)
+        }
+        OpenSpec::Diff(input) => diff_actor::spawn(id, input, cmd_rx, cmd_tx.clone(), event_tx),
+        OpenSpec::Remote { .. } => unreachable!("opened above"),
     }
 
     RepoEvents {

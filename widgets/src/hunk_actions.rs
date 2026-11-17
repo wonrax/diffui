@@ -1,26 +1,29 @@
 //! Buttons riding a diff hunk's header strip, right-aligned: what a conflict
 //! region's take-a-side controls are drawn with. A file strip under a file's
-//! header carries the same buttons for the whole file, after ghost tools
-//! that follow its own text. The diff view is one custom widget, so these
-//! are painted and hit-tested by it rather than being iced buttons; this
-//! module holds their model and geometry, and paints them in the button
-//! colours the caller resolves from the theme.
+//! header carries the same buttons for the whole file, after ghost tools that
+//! follow its own text. The diff view is one custom element, so these are painted
+//! and hit-tested by it rather than being kit buttons; this module holds their
+//! model and geometry, and the diff's painter draws them in the button colours the
+//! caller resolves from the theme.
 
-use iced::advanced::{renderer, text};
-use iced::{Border, Color, Font, Pixels, Point, Rectangle, Shadow, Size, alignment};
+use std::rc::Rc;
 
+use gpui_kit::{App, Window};
+
+use crate::geometry::{Point, Rectangle};
 use crate::measure;
+use crate::theme::{Color, Font};
 use crate::typography::TextBox;
 
 /// Inset of a label inside its button, and the gap between buttons.
-const PAD_X: f32 = 8.0;
-const GAP: f32 = 6.0;
+pub(crate) const PAD_X: f32 = 8.0;
+pub(crate) const GAP: f32 = 6.0;
 /// Space kept between a strip's own header text and the first button.
 const LEAD_GAP: f32 = 16.0;
 /// Tallest a button gets; the strip's height minus a margin below that.
 const MAX_HEIGHT: f32 = 24.0;
 /// Width of the bar marking the focused strip at its left edge.
-const FOCUS_BAR: f32 = 3.0;
+pub(crate) const FOCUS_BAR: f32 = 3.0;
 
 /// One run of a button's label.
 #[derive(Debug, Clone)]
@@ -35,6 +38,19 @@ pub struct Run {
 #[derive(Debug, Clone)]
 pub struct Button {
     pub runs: Vec<Run>,
+    pub tone: Tone,
+}
+
+/// How a button is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tone {
+    /// Filled and outlined: a conflict region's take-a-side buttons.
+    #[default]
+    Raised,
+    /// Nothing at rest, a wash on hover: a hunk's pick actions.
+    Ghost,
+    /// Switched on: the accent fill (a picked hunk's "Picked").
+    On,
 }
 
 /// The buttons of one hunk header.
@@ -47,6 +63,8 @@ pub struct Row {
     /// A word before the buttons ("Take").
     pub lead: Option<Run>,
     pub buttons: Vec<Button>,
+    /// Shown only while the cursor is on the hunk, or while it's picked.
+    pub hover: bool,
 }
 
 /// A ghost button (no fill or border at rest) following a file strip's
@@ -80,38 +98,91 @@ pub struct Style {
     pub ghost_hover_fill: Color,
     pub border: Color,
     pub focus: Color,
+    /// An [`Tone::On`] button's fill.
+    pub on_fill: Color,
     pub radius: f32,
 }
 
+/// Where a press on a file strip's button goes: `(strip, button)`.
+pub type OnPress = Rc<dyn Fn(&(usize, usize), &mut Window, &mut App)>;
+/// The buttons on hunk `(file, hunk)`'s header, if it has any. Built when the
+/// header is laid out, painted or hit, so only headers on screen pay for them.
+pub type BuildRow = Rc<dyn Fn(usize, usize, &App) -> Option<Row>>;
+/// Where a press on a hunk header's button goes: `(file, hunk, button)`.
+pub type OnHunkPress = Rc<dyn Fn(&(usize, usize, usize), &mut Window, &mut App)>;
+
 /// Hunk-strip buttons for a diff view, and where their presses go.
-pub struct HunkActions<'a, Message> {
-    /// Sorted by `(file, hunk)`.
-    pub rows: Vec<Row>,
+pub struct HunkActions {
+    pub rows: BuildRow,
     pub style: Style,
-    /// `(row, button)` of a press to the message it sends.
-    pub on_press: Box<dyn Fn(usize, usize) -> Message + 'a>,
+    pub on_press: OnHunkPress,
     /// Sorted by `file`.
     pub files: Vec<FileStrip>,
-    /// `(strip, button)` of a press on a file strip, its tools counted
-    /// before its row's buttons.
-    pub on_file_press: Box<dyn Fn(usize, usize) -> Message + 'a>,
+    /// `(strip, button)` of a press on a file strip, its tools counted before its
+    /// row's buttons.
+    pub on_file_press: OnPress,
     /// Scroll this `(file, hunk)` into view whenever the token changes.
     pub reveal: Option<(usize, usize, u64)>,
 }
 
-impl<Message> HunkActions<'_, Message> {
-    /// The row for `(file, hunk)`, by index.
-    pub fn row(&self, file: usize, hunk: usize) -> Option<usize> {
-        self.rows
-            .binary_search_by(|row| (row.file, row.hunk).cmp(&(file, hunk)))
-            .ok()
-    }
-
+impl HunkActions {
     /// The strip under `file`'s header, by index.
     pub fn file_strip(&self, file: usize) -> Option<usize> {
         self.files
             .binary_search_by(|strip| strip.file.cmp(&file))
             .ok()
+    }
+
+    /// One set of strips holding both `self`'s and `other`'s, each press still
+    /// reaching the producer that made its row. Two producers never put a row on
+    /// the same hunk or a strip under the same file. `self`'s style wins.
+    pub fn merge(self, other: HunkActions) -> HunkActions {
+        let (first_rows, second_rows) = (self.rows, other.rows);
+        let rows: BuildRow = {
+            let (first, second) = (first_rows.clone(), second_rows.clone());
+            Rc::new(move |file, hunk, cx| first(file, hunk, cx).or_else(|| second(file, hunk, cx)))
+        };
+        let (first_press, second_press) = (self.on_press, other.on_press);
+        let on_press: OnHunkPress = Rc::new(move |&(file, hunk, button), window, cx| {
+            if first_rows(file, hunk, cx).is_some() {
+                first_press(&(file, hunk, button), window, cx);
+            } else if second_rows(file, hunk, cx).is_some() {
+                second_press(&(file, hunk, button), window, cx);
+            }
+        });
+        let mut tagged: Vec<(FileStrip, bool, usize)> = self
+            .files
+            .into_iter()
+            .enumerate()
+            .map(|(index, strip)| (strip, false, index))
+            .chain(
+                other
+                    .files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, strip)| (strip, true, index)),
+            )
+            .collect();
+        tagged.sort_by_key(|(strip, ..)| strip.file);
+        let (files, map): (Vec<FileStrip>, Vec<(bool, usize)>) = tagged
+            .into_iter()
+            .map(|(strip, second, index)| (strip, (second, index)))
+            .unzip();
+        let (first_file, second_file) = (self.on_file_press, other.on_file_press);
+        let on_file_press: OnPress = Rc::new(move |&(at, button), window, cx| {
+            if let Some(&(other, index)) = map.get(at) {
+                let press = if other { &second_file } else { &first_file };
+                press(&(index, button), window, cx);
+            }
+        });
+        HunkActions {
+            rows,
+            style: self.style,
+            on_press,
+            files,
+            on_file_press,
+            reveal: self.reveal.or(other.reveal),
+        }
     }
 }
 
@@ -231,7 +302,7 @@ pub struct Placed {
     pub compact: bool,
 }
 
-fn run_width(run: &Run, size: f32) -> f32 {
+pub(crate) fn run_width(run: &Run, size: f32) -> f32 {
     measure::line_width(&run.text, size, run.font)
 }
 
@@ -282,44 +353,6 @@ pub fn place(
         .collect()
 }
 
-/// Paint `row`'s lead word before its first button, and its focus bar
-/// (when focused) over the strip's left edge.
-pub fn draw_row<Renderer: text::Renderer>(
-    renderer: &mut Renderer,
-    row: &Row,
-    placed: &[Placed],
-    style: &Style,
-    strip: Rectangle,
-    clip: Rectangle,
-) {
-    if let (Some(lead), Some(first)) = (&row.lead, placed.first()) {
-        let width = run_width(lead, style.size);
-        draw_run(
-            renderer,
-            lead,
-            Point::new(first.rect.x - GAP - width, baseline(row, style, first.rect)),
-            first.rect,
-            style.size,
-            clip,
-        );
-    }
-    if !row.focused {
-        return;
-    }
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: Rectangle {
-                width: FOCUS_BAR,
-                ..strip
-            },
-            border: Border::default(),
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        style.focus,
-    );
-}
-
 /// The baseline every run of `row` sits on when its buttons are `rect`
 /// tall: the one that optically centres the row's tallest caps in the
 /// button, so mono ids and UI-font words read as one line.
@@ -339,100 +372,9 @@ fn is_glyph(run: &Run) -> bool {
     run.font == crate::icons::ICON_FONT
 }
 
-/// Paint one placed tool of a file strip, its text on `baseline` (the
-/// strip's row's).
-pub fn draw_tool<Renderer: text::Renderer>(
-    renderer: &mut Renderer,
-    tool: &Tool,
-    placed: &Placed,
-    style: &Style,
-    baseline: f32,
-    hovered: bool,
-    clip: Rectangle,
-) {
-    let rect = placed.rect;
-    if hovered && tool.enabled {
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: rect,
-                border: Border {
-                    radius: style.radius.into(),
-                    ..Border::default()
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            },
-            style.ghost_hover_fill,
-        );
-    }
-    draw_runs(renderer, &tool.runs, placed, style, baseline, clip);
-}
-
-/// Paint one placed button of `row`.
-pub fn draw_button<Renderer: text::Renderer>(
-    renderer: &mut Renderer,
-    row: &Row,
-    button: &Button,
-    placed: &Placed,
-    style: &Style,
-    hovered: bool,
-    clip: Rectangle,
-) {
-    let rect = placed.rect;
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds: rect,
-            border: Border {
-                width: 1.0,
-                color: style.border,
-                radius: style.radius.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        if hovered {
-            style.hover_fill
-        } else {
-            style.fill
-        },
-    );
-    draw_runs(
-        renderer,
-        &button.runs,
-        placed,
-        style,
-        baseline(row, style, rect),
-        clip,
-    );
-}
-
-/// A placed button's label runs, from its inset on, on `baseline`.
-fn draw_runs<Renderer: text::Renderer>(
-    renderer: &mut Renderer,
-    runs: &[Run],
-    placed: &Placed,
-    style: &Style,
-    baseline: f32,
-    clip: Rectangle,
-) {
-    let runs = if placed.compact { &runs[..1] } else { runs };
-    let mut x = placed.rect.x + PAD_X;
-    for run in runs {
-        draw_run(
-            renderer,
-            run,
-            Point::new(x, baseline),
-            placed.rect,
-            style.size,
-            clip,
-        );
-        x += run_width(run, style.size);
-    }
-}
-
 /// Where a run's line box starts, `height` tall, for its baseline to land
 /// on `baseline`; an icon's, for it to centre on `center_y` instead.
-fn run_top(run: &Run, size: f32, height: f32, baseline: f32, center_y: f32) -> f32 {
+pub(crate) fn run_top(run: &Run, size: f32, height: f32, baseline: f32, center_y: f32) -> f32 {
     let line = TextBox::new(run.font, size, height);
     let baseline = if is_glyph(run) {
         line.baseline_for_center(center_y)
@@ -442,41 +384,10 @@ fn run_top(run: &Run, size: f32, height: f32, baseline: f32, center_y: f32) -> f
     baseline - line.baseline()
 }
 
-/// One run, left-aligned at `at.x` with its baseline on `at.y`, in a line
-/// box as tall as `button` and centred on it if it's an icon.
-fn draw_run<Renderer: text::Renderer>(
-    renderer: &mut Renderer,
-    run: &Run,
-    at: Point,
-    button: Rectangle,
-    size: f32,
-    clip: Rectangle,
-) {
-    let width = run_width(run, size);
-    let height = button.height;
-    renderer.fill_text(
-        text::Text {
-            content: run.text.clone(),
-            bounds: Size::new(width + 1.0, height),
-            size: Pixels(size),
-            line_height: text::LineHeight::Absolute(Pixels(height)),
-            font: run.font,
-            align_x: text::Alignment::Left,
-            align_y: alignment::Vertical::Top,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::None,
-            hint_factor: None,
-        },
-        Point::new(at.x, run_top(run, size, height, at.y, button.center_y())),
-        run.color,
-        clip,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Size;
 
     fn row(labels: &[&[&str]]) -> Row {
         Row {
@@ -492,22 +403,26 @@ mod tests {
                         .map(|text| Run {
                             text: (*text).to_owned(),
                             font: Font::DEFAULT,
-                            color: Color::BLACK,
+                            color: crate::theme::WHITE,
                         })
                         .collect(),
+                    tone: Tone::Raised,
                 })
                 .collect(),
+            hover: false,
         }
     }
 
     fn style() -> Style {
+        let white = crate::theme::WHITE;
         Style {
             size: 12.0,
-            fill: Color::WHITE,
-            hover_fill: Color::WHITE,
-            ghost_hover_fill: Color::WHITE,
-            border: Color::BLACK,
-            focus: Color::BLACK,
+            fill: white,
+            hover_fill: white,
+            ghost_hover_fill: white,
+            border: white,
+            focus: white,
+            on_fill: white,
             radius: 7.0,
         }
     }
@@ -533,7 +448,7 @@ mod tests {
         row.lead = Some(Run {
             text: "Take".to_owned(),
             font: Font::DEFAULT,
-            color: Color::BLACK,
+            color: crate::theme::WHITE,
         });
         let style = style();
         let rect = Rectangle::new(Point::new(0.0, 100.0), Size::new(200.0, 24.0));

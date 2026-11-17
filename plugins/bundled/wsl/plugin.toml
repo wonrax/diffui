@@ -1,0 +1,25 @@
+# Repositories inside WSL, from diffui on Windows. Each distribution is
+# offered as a host by its name; Settings → Hosts (or a [hosts.<name>] table
+# in config.toml) sets its server or user. diffui starts `wsl.exe` and
+# talks to the diffui-serve it runs inside; nothing is copied into the
+# distribution. Bundled with diffui; `diffui plugin eject wsl` copies it out
+# to edit.
+id = "wsl"
+name = "WSL"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+exec = [["{config.program}"]]
+env = ["WSLENV", "WSL_UTF8", "DIFFUI_SERVE"]
+
+[provides.transport]
+# What Explorer and a dropped folder call a path inside a distribution.
+local_roots = ['\\wsl.localhost\', '\\wsl$\']
+
+[config.schema]
+program = { type = "path", default = "wsl.exe", label = "The wsl program" }
+distribution = { type = "string", label = "Distribution", hint = "Empty uses the host's name.", per_host = true }
+user = { type = "string", label = "User", hint = "Empty uses the distribution's default user.", per_host = true }
+login_shell = { type = "boolean", default = true, label = "Start the server from a login shell", hint = "So the PATH your shell's profile sets (cargo, nix) applies.", per_host = true }

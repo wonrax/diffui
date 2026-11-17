@@ -53,26 +53,66 @@
             hash = "sha256-z1/E2D58HdqxnRY94Jb3h/h+/mFQSQmqRpQ09h71Hi4=";
           };
 
-          diffui = pkgs.rustPlatform.buildRustPackage {
-            pname = "diffui";
-            inherit version;
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                base = baseNameOf path;
+              in
+              !builtins.elem base [
+                "target"
+                "result"
+                ".direnv"
+                ".jj"
+              ];
+          };
 
-            src = lib.cleanSourceWith {
-              src = ./.;
-              filter =
-                path: type:
-                let
-                  base = baseNameOf path;
-                in
-                base != "target" && base != "result" && base != ".direnv";
-            };
+          # The commit a build is made from, which `diffui-serve --version`
+          # reports and a host's `server` setting can pin with `{rev}`. Empty
+          # for a dirty tree: there is no commit to name.
+          rev = self.rev or "";
+
+          # The far end of a repository on another machine (see
+          # core/src/remote): the core alone, so it needs none of the GUI's
+          # libraries. `nix run .#diffui-serve` is a `server` setting that
+          # works on NixOS.
+          diffui-serve = pkgs.rustPlatform.buildRustPackage {
+            pname = "diffui-serve";
+            inherit version src;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
-              # iced is pulled from git in Cargo.toml; let nix fetch by the
-              # commits already pinned in Cargo.lock instead of forcing us to
-              # maintain an outputHashes table.
-              allowBuiltinFetchGit = true;
+            };
+
+            cargoBuildFlags = [
+              "-p"
+              "diffui-serve"
+            ];
+
+            buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
+
+            doCheck = false;
+
+            HIGHLIGHTS_WASM_PATH = highlightsWasm;
+            WABT_DIR = pkgs.wabt;
+            SIMDE_DIR = pkgs.simde;
+            DIFFUI_REV = rev;
+
+            meta = {
+              description = "The server end of diffui's remote repositories";
+              homepage = "https://github.com/wonrax/diffui";
+              mainProgram = "diffui-serve";
+              platforms = lib.platforms.unix;
+            };
+          };
+
+          diffui = pkgs.rustPlatform.buildRustPackage {
+            pname = "diffui";
+            inherit version src;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
             };
 
             nativeBuildInputs = [
@@ -95,6 +135,7 @@
             HIGHLIGHTS_WASM_PATH = highlightsWasm;
             WABT_DIR = pkgs.wabt;
             SIMDE_DIR = pkgs.simde;
+            DIFFUI_REV = rev;
 
             # Linux: wrap for the runtime libs and install the XDG desktop entry
             # (+ icon) so launchers/app grids list it, not just the CLI. macOS:
@@ -144,7 +185,7 @@
           # on PATH too, so the bare name resolves.
           #
           # `startupWMClass` must match the Wayland `app_id` / X11 `WM_CLASS`
-          # the window actually reports, which is set in `src/chrome.rs`. That's
+          # the window actually reports, which is set in `src/root.rs`. That's
           # what lets a compositor tie a live window back to this entry, so the
           # taskbar and alt-tab pick up the name and icon from here rather than
           # showing an anonymous window.
@@ -227,11 +268,17 @@
           packages = {
             default = diffui;
             diffui = diffui;
+            diffui-serve = diffui-serve;
           };
 
           apps.default = {
             type = "app";
             program = "${diffui}/bin/diffui";
+          };
+
+          apps.diffui-serve = {
+            type = "app";
+            program = "${diffui-serve}/bin/diffui-serve";
           };
 
           devShells.default = pkgs.mkShell {
@@ -256,6 +303,10 @@
             buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin darwinBuildInputs;
 
             RUST_BACKTRACE = "1";
+            # The jj the app's tests build their fixture repo with
+            # (`fixtures/make-fixture.sh`): it has to match the app's jj-lib.
+            # Only named here, not put on PATH, so the shell's `jj` stays yours.
+            JJ = "${pkgs.jujutsu}/bin/jj";
             WABT_DIR = pkgs.wabt;
             SIMDE_DIR = pkgs.simde;
 
@@ -288,10 +339,6 @@
                   unset rustflags_var
                 fi
                 unset apple_ld
-              ''
-              + ''
-                export ICED_BACKEND="''${ICED_BACKEND:-wgpu}"
-                export WGPU_POWER_PREF="''${WGPU_POWER_PREF:-none}"
               '';
           };
 
@@ -303,6 +350,7 @@
     // {
       overlays.default = final: prev: {
         diffui = self.packages.${final.system}.default;
+        diffui-serve = self.packages.${final.system}.diffui-serve;
       };
     };
 }

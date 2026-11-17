@@ -1,0 +1,9 @@
+--- old/notes.txt	2024-01-02 10:04:00
++++ new/notes.txt	2024-01-02 10:04:00
+@@ -1,4 +1,5 @@
+ one
+-two
++2
+ three
+ four
++five

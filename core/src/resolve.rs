@@ -15,7 +15,8 @@
 //! shipped `[merge-tools]`). Ported, because jj-cli runs the tool itself with
 //! a `Ui`, inside the command (check against jj-cli on a bump):
 //! - `merge_tool_from_settings` ports `MergeEditor::from_settings`
-//!   (`cli/src/merge_tools/mod.rs`), minus `:builtin`, which needs a terminal.
+//!   (`cli/src/merge_tools/mod.rs`), minus `:builtin` and `:editor`, which
+//!   need a terminal.
 //! - `jj::resolve::prepare_merge_tool` and [`MergeToolInvocation::run`] port
 //!   `run_mergetool_external_single_file` (`cli/src/merge_tools/external.rs`).
 
@@ -30,7 +31,7 @@ use jj_lib::settings::UserSettings;
 use crate::model::RevisionSelection;
 
 /// How to resolve one conflicted path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictResolution {
     /// Take side `n` (0-based) of the conflict as the file's content —
     /// `jj resolve --tool :ours` is `Side(0)`, `:theirs` is `Side(1)`.
@@ -57,7 +58,7 @@ pub enum ConflictResolution {
 }
 
 /// A term of a conflict to take, 0-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictPick {
     Side(usize),
     Base(usize),
@@ -66,7 +67,7 @@ pub enum ConflictPick {
 /// One term of a conflict, labeled the way jj labels it in conflict markers
 /// (`nlqwxzwn 7dd24e73 "description"`), or `side #n` / `base #n` when the
 /// conflict carries no labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictTerm {
     pub label: String,
     /// The path doesn't exist on this term (one side deleted the file).
@@ -74,7 +75,7 @@ pub struct ConflictTerm {
 }
 
 /// A conflicted path in a revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConflictFile {
     pub path: String,
     /// The conflict's sides (jj's "adds"), in marker order: side 1 is what
@@ -127,7 +128,7 @@ pub fn hunk_conflict_region(hunk: &crate::model::DiffHunkView) -> Option<(usize,
 /// A prepared merge-tool run: the input files are written, the arguments
 /// interpolated. [`run`](Self::run) blocks until the tool exits, so call it
 /// off the UI thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeToolInvocation {
     /// The configured name (`vscode`, `meld`…), for messages.
     pub tool: String,
@@ -207,7 +208,9 @@ impl MergeToolSpec {
 
 /// Terminal-only tools: a GUI app has no terminal to run them in.
 fn terminal_tool(name: &str, program: &str) -> bool {
-    matches!(name, "vimdiff" | ":builtin")
+    // `:editor` (jj 0.47) edits the conflict markers in `ui.editor`, which
+    // jj runs in the terminal it was started from.
+    matches!(name, "vimdiff" | ":builtin" | ":editor")
         || matches!(
             std::path::Path::new(program)
                 .file_name()
@@ -301,7 +304,7 @@ mod tests {
             )
             .expect("parse"),
         );
-        UserSettings::from_config(config).expect("settings")
+        UserSettings::from_config_and_home_dir(config, None).expect("settings")
     }
 
     #[test]
@@ -362,6 +365,11 @@ mod tests {
         );
         assert!(
             merge_tool_from_settings(&settings("ui.merge-editor = \":builtin\""))
+                .unwrap_err()
+                .contains("terminal")
+        );
+        assert!(
+            merge_tool_from_settings(&settings("ui.merge-editor = \":editor\""))
                 .unwrap_err()
                 .contains("terminal")
         );

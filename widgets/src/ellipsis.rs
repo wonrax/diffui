@@ -1,17 +1,16 @@
 //! One line of rich text cut to the width it gets, ending in an ellipsis.
 //!
-//! iced's rich text takes an `Ellipsis` but never applies it (only plain text
-//! hands it to the shaper), so a line of mixed fonts, a title with a mono
-//! bookmark in it or a highlighted command, ran on past its box. [`Line`]
-//! measures its spans with [`crate::measure`] and cuts them itself, and can
-//! say whether it had to, so a row offers the rest only when there is more.
+//! [`Line`] measures its spans with [`crate::measure`] and can say whether it
+//! has to cut, so a row offers the rest only when there is more. The cut itself
+//! is done here rather than by GPUI's `text_ellipsis` when a width is known, and
+//! by GPUI when it isn't ([`Line::view`]).
 
 use std::borrow::Cow;
 
-use iced::widget::text::{Rich, Span, Wrapping};
-use iced::widget::{responsive, text};
-use iced::{Color, Element, Font, Length};
+use gpui_kit::prelude::*;
+use gpui_kit::{Div, Hsla, SharedString, StyledText, TextRun, div, px};
 
+use crate::theme::{Color, Font};
 use crate::width_memo::WidthMemo;
 
 /// How far over its width a line may measure and still count as fitting:
@@ -27,9 +26,57 @@ thread_local! {
     static WIDTHS: WidthMemo = WidthMemo::default();
 }
 
+/// A run of a [`Line`] with its own font or colour.
+#[derive(Debug, Clone)]
+pub struct Span<'a> {
+    pub text: Cow<'a, str>,
+    pub font: Option<Font>,
+    pub color: Option<Color>,
+}
+
+impl<'a> Span<'a> {
+    pub fn new(text: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            text: text.into(),
+            font: None,
+            color: None,
+        }
+    }
+
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = Some(font);
+        self
+    }
+
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+}
+
+/// `spans` as one styled text in a base font and colour. Size, wrapping and
+/// width are the container's.
+pub fn rich_text(spans: &[Span<'_>], font: Font, color: Color) -> StyledText {
+    let mut content = String::new();
+    let mut runs = Vec::with_capacity(spans.len());
+    for span in spans {
+        content.push_str(&span.text);
+        runs.push(TextRun {
+            len: span.text.len(),
+            font: span.font.unwrap_or(font).gpui(),
+            color: Hsla::from(span.color.unwrap_or(color)),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    runs.retain(|run| run.len > 0);
+    StyledText::new(SharedString::from(content)).with_runs(runs)
+}
+
 /// Spans in a base font, size and colour, drawn on one line cut to fit, or
 /// in full.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Line<'a> {
     spans: Vec<Span<'a>>,
     font: Font,
@@ -78,7 +125,7 @@ impl<'a> Line<'a> {
 
     /// One line, newlines read as spaces, cut with an ellipsis where it
     /// doesn't fit `width`.
-    pub fn cut<Message: 'a>(&self, width: f32) -> Rich<'a, (), Message> {
+    pub fn cut(&self, width: f32) -> Div {
         let mut spans = self.single();
         if let Some((index, keep)) = self.cut_point(width) {
             spans.truncate(index + 1);
@@ -89,28 +136,35 @@ impl<'a> Line<'a> {
             last.text = Cow::Owned(kept);
             spans.push(ellipsis);
         }
-        self.rich(spans).wrapping(Wrapping::None)
+        self.frame()
+            .whitespace_nowrap()
+            .child(rich_text(&spans, self.font, self.color))
     }
 
     /// The whole text, wrapping wherever it is laid out.
-    pub fn wrapped<Message: 'a>(&self) -> Rich<'a, (), Message> {
-        self.rich(self.spans.clone())
-            .wrapping(Wrapping::WordOrGlyph)
+    pub fn wrapped(&self) -> Div {
+        self.frame()
+            .child(rich_text(&self.spans, self.font, self.color))
     }
 
-    /// [`Line::cut`] at whatever width the line is given: it fills its
-    /// row's free space.
-    pub fn view<Message: 'a>(self) -> Element<'a, Message> {
-        responsive(move |size| self.cut::<Message>(size.width))
-            .height(Length::Shrink)
-            .into()
+    /// One line at whatever width it is given: it fills its row's free space
+    /// and GPUI cuts it, ellipsis included.
+    pub fn view(self) -> Div {
+        self.frame()
+            .w_full()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(rich_text(&self.single(), self.font, self.color))
     }
 
-    fn rich<Message: 'a>(&self, spans: Vec<Span<'a>>) -> Rich<'a, (), Message> {
-        text::Rich::with_spans(spans)
-            .font(self.font)
-            .size(self.size)
-            .color(self.color)
+    fn frame(&self) -> Div {
+        div()
+            .font(self.font.gpui())
+            .text_size(px(self.size))
+            .text_color(self.color)
     }
 
     /// The spans with each newline (and the blank space around it) read as
@@ -129,9 +183,7 @@ impl<'a> Line<'a> {
     }
 
     fn measure(&self, span: &Span<'_>, content: &str) -> f32 {
-        let font = span.font.unwrap_or(self.font);
-        let size = span.size.map_or(self.size, |size| size.0);
-        text_width(content, size, font)
+        text_width(content, self.size, span.font.unwrap_or(self.font))
     }
 
     fn cut_point(&self, width: f32) -> Option<(usize, usize)> {
@@ -150,6 +202,126 @@ impl<'a> Line<'a> {
 /// measure with: for sizing what sits beside a [`Line`].
 pub fn text_width(content: &str, size: f32, font: Font) -> f32 {
     WIDTHS.with(|widths| widths.width(content, size, font))
+}
+
+/// Plain `content` cut at its end so it and an ellipsis fit `width`; borrowed
+/// back when it fits.
+pub fn cut_end<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    let measure = |_: usize, part: &str| text_width(part, size, font);
+    match cut_point(&[content], width, measure, |_| {
+        text_width(ELLIPSIS, size, font)
+    }) {
+        None => Cow::Borrowed(content),
+        Some((_, keep)) => Cow::Owned(format!("{}{ELLIPSIS}", content[..keep].trim_end())),
+    }
+}
+
+/// Plain `content` cut at its start so an ellipsis and it fit `width`, keeping
+/// its end (a path's nearest directories); borrowed back when it fits.
+pub fn cut_start<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    start_cut(
+        content,
+        width,
+        |part| text_width(part, size, font),
+        text_width(ELLIPSIS, size, font),
+    )
+}
+
+fn start_cut<'a>(
+    content: &'a str,
+    width: f32,
+    measure: impl Fn(&str) -> f32,
+    ellipsis: f32,
+) -> Cow<'a, str> {
+    if measure(content) <= width + TOLERANCE {
+        return Cow::Borrowed(content);
+    }
+    let room = width + TOLERANCE - ellipsis;
+    let starts: Vec<usize> = content
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain([content.len()])
+        .collect();
+    // The earliest start, on a char boundary, whose rest fits the room.
+    let (mut low, mut high) = (0, starts.len() - 1);
+    while low < high {
+        let mid = (low + high) / 2;
+        if measure(&content[starts[mid]..]) <= room {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Cow::Owned(format!("{ELLIPSIS}{}", content[starts[low]..].trim_start()))
+}
+
+/// Plain `content` cut in the middle so it and an ellipsis fit `width`, keeping
+/// both its start and its end (a file's extension, a compacted chain's leaf).
+pub fn cut_middle<'a>(content: &'a str, width: f32, size: f32, font: Font) -> Cow<'a, str> {
+    middle_cut(
+        content,
+        width,
+        |part| text_width(part, size, font),
+        text_width(ELLIPSIS, size, font),
+    )
+}
+
+fn middle_cut<'a>(
+    content: &'a str,
+    width: f32,
+    measure: impl Fn(&str) -> f32,
+    ellipsis: f32,
+) -> Cow<'a, str> {
+    if measure(content) <= width + TOLERANCE {
+        return Cow::Borrowed(content);
+    }
+    let room = width + TOLERANCE - ellipsis;
+    let bytes: Vec<usize> = content
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain([content.len()])
+        .collect();
+    let chars = bytes.len() - 1;
+    let head_of = |kept: usize| &content[..bytes[kept]];
+    let tail_of = |kept: usize| &content[bytes[chars - kept]..];
+    // Split by width rather than by chars, so a run of narrow letters (`file.txt`)
+    // keeps what it has room for: the narrower side takes the next char, the start
+    // on a tie, and the other side goes on when that one doesn't fit.
+    let (mut head, mut tail) = (0, 0);
+    let (mut head_width, mut tail_width) = (0.0, 0.0);
+    while head + tail < chars {
+        let grown_head = measure(head_of(head + 1));
+        let grown_tail = measure(tail_of(tail + 1));
+        let head_fits = grown_head + tail_width <= room;
+        let tail_fits = head_width + grown_tail <= room;
+        if head_fits && (head_width <= tail_width || !tail_fits) {
+            head += 1;
+            head_width = grown_head;
+        } else if tail_fits {
+            tail += 1;
+            tail_width = grown_tail;
+        } else {
+            break;
+        }
+    }
+    // A cut against an extension's dot reads as four dots (`fra….rs`): give the
+    // tail the char before the dot, paying from the start if it has to.
+    if tail_of(tail).starts_with('.') && tail + 1 + head <= chars {
+        let grown_tail = measure(tail_of(tail + 1));
+        let mut kept = head;
+        while kept > 1 && measure(head_of(kept)) + grown_tail > room {
+            kept -= 1;
+        }
+        if measure(head_of(kept)) + grown_tail <= room {
+            head = kept;
+            tail += 1;
+        }
+    }
+    Cow::Owned(format!(
+        "{}{ELLIPSIS}{}",
+        head_of(head).trim_end_matches('.'),
+        tail_of(tail)
+    ))
 }
 
 /// `text` with each run of whitespace holding a line break turned into one
@@ -283,7 +455,7 @@ mod tests {
             ],
             Font::MONOSPACE,
             11.0,
-            Color::BLACK,
+            crate::theme::BLACK,
         );
         assert!(line.is_multiline());
         let single: String = line
@@ -295,6 +467,46 @@ mod tests {
         // One line is as wide as the folded text, and a narrow room cuts it.
         assert!(line.fits(10_000.0));
         assert!(!line.fits(20.0));
+    }
+
+    #[test]
+    fn a_start_cut_keeps_the_end() {
+        let count = |text: &str| text.chars().count() as f32;
+        assert_eq!(start_cut("src/", 4.0, count, 1.0), "src/");
+        assert_eq!(start_cut("abc/def/ghi/", 6.0, count, 1.0), "…/ghi/");
+        assert_eq!(start_cut("abc/def/ghi/", 7.0, count, 1.0), "…f/ghi/");
+        // No room for anything but the ellipsis.
+        assert_eq!(start_cut("abcdefghij", 0.5, count, 1.0), "…");
+        // Multi-byte chars stay whole.
+        assert_eq!(start_cut("ééééé", 3.0, count, 1.0), "…éé");
+    }
+
+    #[test]
+    fn a_middle_cut_keeps_both_ends() {
+        let count = |text: &str| text.chars().count() as f32;
+        assert_eq!(middle_cut("main.rs", 7.0, count, 1.0), "main.rs");
+        assert_eq!(middle_cut("abcdefghij", 7.0, count, 1.0), "abc…hij");
+        assert_eq!(middle_cut("abcdefghij", 6.0, count, 1.0), "abc…ij");
+        // No room for anything but the ellipsis.
+        assert_eq!(middle_cut("abcdefghij", 0.5, count, 1.0), "…");
+        // Multi-byte chars stay whole.
+        assert_eq!(middle_cut("ééééééééé", 4.0, count, 1.0), "éé…é");
+    }
+
+    #[test]
+    fn a_middle_cut_stays_off_an_extensions_dot() {
+        let count = |part: &str| part.chars().count() as f32;
+        // Even split would give `abc….txt`.
+        assert_eq!(middle_cut("abcdefgh.txt", 9.0, count, 1.0), "abc…h.txt");
+        // A dot at the end of the start goes.
+        assert_eq!(middle_cut("a.bcdefgh", 4.0, count, 1.0), "a…h");
+    }
+
+    #[test]
+    fn a_middle_cut_splits_by_width() {
+        // `i` is a third as wide as the rest: the narrow tail keeps more chars.
+        let thin = |part: &str| part.chars().map(|c| if c == 'i' { 1.0 } else { 3.0 }).sum();
+        assert_eq!(middle_cut("wwwwwwwwiiiiii", 15.0, thin, 3.0), "ww…iiiiii");
     }
 
     #[test]

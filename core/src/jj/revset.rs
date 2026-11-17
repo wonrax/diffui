@@ -3,7 +3,7 @@
 //! resolved to commit ids with jj's single-revision and no-gaps rules, and
 //! turned into the two trees of a range diff (`jj diff -r REVSET`).
 //!
-//! Ported from jj-cli 0.45.1, because jj-cli's versions need its command
+//! Ported from jj-cli 0.47.1, because jj-cli's versions need its command
 //! helper. Check each against its source on a jj bump:
 //! - `RevsetScope::range`: `cmd_diff`'s gap check and trees
 //!   (`cli/src/commands/diff.rs`).
@@ -18,12 +18,14 @@ use futures::StreamExt as _;
 use jj_lib::{
     backend::CommitId,
     commit::Commit,
+    config::ConfigGetResultExt as _,
+    id_prefix::IdPrefixContext,
     merged_tree::MergedTree,
     object_id::ObjectId as _,
     ref_name::WorkspaceName,
     repo::{ReadonlyRepo, Repo as _},
     revset::{
-        ResolvedRevsetExpression, RevsetExpression, RevsetParseError, RevsetParseErrorKind,
+        ResolvedRevset, RevsetExpression, RevsetParseError, RevsetParseErrorKind,
         RevsetResolutionError, SymbolResolver, UserRevsetExpression,
     },
     rewrite::merge_commit_trees,
@@ -48,7 +50,7 @@ pub(crate) struct RevsetScope<'a> {
     pub repo_root: &'a Path,
 }
 
-impl RevsetScope<'_> {
+impl<'a> RevsetScope<'a> {
     /// Parse `src` the way the graph walk does: the same aliases, the same
     /// `@`, and an empty revset or `all()` meaning everything.
     pub fn parse(&self, src: &str) -> Result<Arc<UserRevsetExpression>, RevsetError> {
@@ -72,24 +74,27 @@ impl RevsetScope<'_> {
         &self,
         src: &str,
         expression: &Arc<UserRevsetExpression>,
-    ) -> Result<Arc<ResolvedRevsetExpression>, RevsetError> {
+    ) -> Result<ResolvedRevset<'a>, RevsetError> {
+        let id_prefixes =
+            id_prefix_context(self.repo_root, self.repo.settings(), self.workspace_name);
         let resolver = SymbolResolver::new(
             self.repo,
             &[] as &[Box<dyn jj_lib::revset::SymbolResolverExtension>],
-        );
+        )
+        .with_id_prefix_context(&id_prefixes);
         expression
             .resolve_user_expression(self.repo, &resolver)
             .map_err(|error| resolution_error(src, error))
     }
 
     /// The commit ids `expression` evaluates to, newest first.
-    async fn ids(
+    pub(crate) async fn ids(
         &self,
         src: &str,
         expression: &Arc<UserRevsetExpression>,
     ) -> Result<Vec<CommitId>, RevsetError> {
         let resolved = self.resolve(src, expression)?;
-        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let revset = resolved.evaluate().map_err(evaluation_error)?;
         let mut ids = Vec::new();
         let mut stream = revset.stream();
         while let Some(id) = stream.next().await {
@@ -108,7 +113,7 @@ impl RevsetScope<'_> {
     ) -> Result<Members, RevsetError> {
         let working_copy = self.repo.view().get_wc_commit_id(self.workspace_name);
         let resolved = self.resolve(src, expression)?;
-        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let revset = resolved.evaluate().map_err(evaluation_error)?;
         let mut members = Members::default();
         let mut stream = revset.stream();
         while let Some(id) = stream.next().await {
@@ -134,7 +139,7 @@ impl RevsetScope<'_> {
             .range(&expression.heads())
             .minus(expression);
         let resolved = self.resolve(src, &gaps)?;
-        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let revset = resolved.evaluate().map_err(evaluation_error)?;
         let first = revset.stream().next().await;
         match first {
             None => Ok(()),
@@ -171,7 +176,7 @@ impl RevsetScope<'_> {
         }
         let revset = match self
             .resolve(src, &expression)
-            .and_then(|resolved| resolved.evaluate(self.repo).map_err(evaluation_error))
+            .and_then(|resolved| resolved.evaluate().map_err(evaluation_error))
         {
             Ok(revset) => revset,
             Err(error) => return Some(Err(error)),
@@ -214,7 +219,7 @@ impl RevsetScope<'_> {
     async fn single(&self, src: &str) -> Result<Commit, RevsetError> {
         let expression = self.parse(src)?;
         let resolved = self.resolve(src, &expression)?;
-        let revset = resolved.evaluate(self.repo).map_err(evaluation_error)?;
+        let revset = resolved.evaluate().map_err(evaluation_error)?;
         // Two is all it takes to know there are too many.
         let ids: Vec<CommitId> = revset
             .stream()
@@ -233,7 +238,7 @@ impl RevsetScope<'_> {
     }
 
     /// The two trees of `jj diff -r src` and what the set holds, following
-    /// jj-cli 0.45.1's `cmd_diff`: refuse a set with gaps, then diff the
+    /// jj-cli 0.47.1's `cmd_diff`: refuse a set with gaps, then diff the
     /// merged parents of its roots against its merged heads.
     pub async fn range(&self, src: &str) -> Result<ResolvedRange> {
         let expression = self.parse(src)?;
@@ -355,6 +360,34 @@ pub(crate) struct ResolvedRange {
     pub from: MergedTree,
     pub to: MergedTree,
     pub info: DiffRange,
+}
+
+/// jj-cli's id prefix context: change and commit id prefixes are
+/// disambiguated within `revsets.short-prefixes` (else `revsets.log`) first,
+/// so a prefix `jj log` shows as unique is the one shown and resolved here
+/// too. A setting that doesn't parse disambiguates over the whole repo, where
+/// jj would refuse to run.
+pub(super) fn id_prefix_context(
+    repo_root: &Path,
+    settings: &UserSettings,
+    workspace_name: &WorkspaceName,
+) -> IdPrefixContext {
+    let context = IdPrefixContext::new(Arc::default());
+    let text = settings
+        .get_string("revsets.short-prefixes")
+        .optional()
+        .transpose()
+        .unwrap_or_else(|| settings.get_string("revsets.log"));
+    let Ok(text) = text else {
+        return context;
+    };
+    if text.trim().is_empty() {
+        return context;
+    }
+    match parse_revset_raw(repo_root, settings, workspace_name, &text) {
+        Ok(Ok(expression)) => context.disambiguate_within(expression),
+        _ => context,
+    }
 }
 
 /// jj-cli's `resolve_single_rev` wording.
@@ -599,7 +632,8 @@ mod tests {
     use super::*;
 
     fn parse(src: &str) -> RevsetError {
-        let settings = UserSettings::from_config(StackedConfig::with_defaults()).unwrap();
+        let settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None).unwrap();
         let trimmed = src.trim();
         let lead = src.len() - src.trim_start().len();
         let error = parse_revset_raw(
@@ -617,10 +651,7 @@ mod tests {
     fn syntax_errors_point_at_the_position() {
         let error = parse("trunk()|foo(");
         assert_eq!(error.message, "Syntax error");
-        assert_eq!(
-            error.hint.as_deref(),
-            Some("Expected <strict_identifier> or <expression>")
-        );
+        assert_eq!(error.hint.as_deref(), Some("Expected <argument>"));
         assert_eq!(error.span, Some(12..12));
         let error = parse("x &");
         assert_eq!(error.span, Some(3..3));
@@ -652,7 +683,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let settings = UserSettings::from_config(config).unwrap();
+        let settings = UserSettings::from_config_and_home_dir(config, None).unwrap();
         let error = parse_revset_raw(
             Path::new("/tmp"),
             &settings,

@@ -21,12 +21,13 @@ use std::time::Instant;
 
 use crate::graph_layout::{GraphLayout, LaneFoldState};
 use crate::model::{
-    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, DiffRequest, LoadProgress,
-    RevisionDetails, RevisionSelection, StreamRow,
+    BookmarksInfo, BranchStatus, CommitStore, DiffBase, DiffDocument, DiffFile, DiffRequest,
+    LoadProgress, RevisionDetails, RevisionSelection, StreamRow,
 };
 use crate::mutations::{MutationOp, MutationOutcome};
 use crate::repo::{
-    Capabilities, Command, Event, JobId, Payload, PreviewRequest, RepoError, RepoId,
+    Capabilities, Command, DiskState, DiskSync, Event, JobId, Payload, PreviewRequest, RepoError,
+    RepoId,
 };
 use crate::repository::{FetchTarget, RepositorySnapshot};
 use crate::revset::{
@@ -43,11 +44,35 @@ pub struct CachedDiff {
     pub details: Option<RevisionDetails>,
 }
 
+/// The diff switch in flight.
+#[derive(Debug, Clone)]
+struct DiffJob {
+    id: JobId,
+    /// The revision and the base it was asked for.
+    revision: RevisionSelection,
+    base: DiffBase,
+    /// Parts of it have landed ([`Payload::DiffPart`]): the document on
+    /// screen is this diff as far as it has come, and nobody else's.
+    streaming: bool,
+}
+
 /// Files with more diff rows than this are left uncoloured.
 pub const HIGHLIGHT_MAX_ROWS: usize = 10_000;
 
+/// How a repository keeps up with the disk. `Auto` folds every edit into `@`
+/// as it lands and brings a stale checkout up to date on its own; `Manual`
+/// writes nothing in the background, only noticing that the disk has edits
+/// `@` doesn't hold or that the checkout went stale, and leaves both to the
+/// refresh button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RefreshMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
 /// What triggered a repository refresh — decides how much we reload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RefreshOrigin {
     /// The filesystem watcher (a working-tree file edit). It ignores `.jj`/
     /// `.git`, so the change is always a working-copy tree edit — topology is
@@ -234,6 +259,9 @@ pub struct Session {
     /// (so our own snapshot writes don't trigger a re-walk).
     pub repository_snapshot: Option<RepositorySnapshot>,
     pub revision_details: Option<RevisionDetails>,
+    /// What a source without a graph (a pull request) loaded in its place:
+    /// its header and its steps. `None` for a repository.
+    pub outline: Option<crate::model::Outline>,
     /// Working-copy branch summary (nearest local bookmark + ahead/behind) for
     /// the sidebar footer. `None` until a load resolves it.
     pub branch_status: Option<BranchStatus>,
@@ -270,6 +298,9 @@ pub struct Session {
     pub revset: String,
     /// Parked documents for sources that flip between several (PR tabs).
     pub pr_diffs: HashMap<String, CachedDiff>,
+    /// The document on screen is what a diff cut off between its parts left:
+    /// empty, and no revision's diff, so it is never parked as one.
+    document_cut: bool,
     /// Identity of the displayed document. Background per-file results carry
     /// it so they route to the session still showing that document.
     pub document_id: u64,
@@ -281,14 +312,22 @@ pub struct Session {
     /// `Focus` subsumes `Watcher`) so it runs once the current work finishes
     /// rather than racing it (a second wc snapshot thrashes jj's lock).
     pub pending_refresh: Option<RefreshOrigin>,
+    /// The held refresh is the Refresh button's ([`Self::sync_disk`]), so it
+    /// must not run as a plain snapshot.
+    pending_sync: bool,
+    /// How background refreshes treat the disk. See [`Self::set_refresh_mode`].
+    refresh_mode: RefreshMode,
+    /// The disk against `@`, as the last snapshot left it.
+    disk: DiskState,
 
     // ── inflight slots ──────────────────────────────────────────────────
     graph_job: Option<GraphJob>,
-    /// The diff switch in flight: the revision and the base it was asked for.
-    diff_job: Option<(JobId, RevisionSelection, DiffBase)>,
+    diff_job: Option<DiffJob>,
     snapshot_job: Option<(JobId, RefreshOrigin)>,
     /// The sweep in flight, with the graph job whose rows it addresses.
     empty_status_job: Option<(JobId, JobId)>,
+    /// The rows the sweep has yet to ask about, sent a chunk at a time.
+    empty_status_queue: Vec<(usize, String)>,
     /// The job of the graph currently on screen — the identity a background
     /// per-row result is checked against.
     graph_version: Option<JobId>,
@@ -361,7 +400,7 @@ impl Session {
     /// frontend picks which tab an arriving event is for.
     pub fn owns_job(&self, job: JobId) -> bool {
         self.graph_job.as_ref().is_some_and(|load| load.id == job)
-            || self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job)
+            || self.diff_job.as_ref().is_some_and(|diff| diff.id == job)
             || self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job)
             || self.empty_status_job.is_some_and(|(id, _)| id == job)
             || self.mutation_job == Some(job)
@@ -381,11 +420,17 @@ impl Session {
     /// flight. The toolbar's progress line reads it; so does the guard that
     /// keeps a cold load's initial `@` diff from overwriting a palette jump.
     pub fn diff_pending(&self) -> Option<&RevisionSelection> {
-        self.diff_job.as_ref().map(|(_, revision, _)| revision)
+        self.diff_job.as_ref().map(|diff| &diff.revision)
     }
 
     pub fn diff_in_flight(&self) -> bool {
         self.diff_job.is_some()
+    }
+
+    /// Whether the document on screen is a diff still arriving in parts, so
+    /// more files are about to join it.
+    pub fn diff_streaming(&self) -> bool {
+        self.diff_job.as_ref().is_some_and(|diff| diff.streaming)
     }
 
     /// Whether a graph load is streaming into the live store right now. The
@@ -431,6 +476,15 @@ impl Session {
         effects
     }
 
+    /// Read a source without a graph again: its outline, then the diff on
+    /// screen. Nothing parked from before is reused.
+    pub fn reload(&mut self) -> Vec<Effect> {
+        self.pr_diffs.clear();
+        let mut effects = self.load_graph(false);
+        effects.extend(self.load_diff(self.selected_revision.clone()));
+        effects
+    }
+
     /// Start a diff load for `revision`, superseding any switch already in
     /// flight.
     ///
@@ -442,6 +496,9 @@ impl Session {
         if !self.capabilities.graph
             && let Some(cached) = self.pr_diffs.remove(&document_key(&revision))
         {
+            // Whatever was still loading would land on top of this one, or
+            // go on streaming into it.
+            let mut effects = self.cancel_diff();
             self.park_displayed_document();
             self.document = cached.document;
             self.revision_details = cached.details;
@@ -449,18 +506,22 @@ impl Session {
             self.selected_commit_index = self.find_selected_commit_index();
             // An instant swap lands no event, so the follow-ups a `DiffLoaded`
             // would have produced are issued here.
-            return vec![Effect::RepaintDocument, Effect::RevealSelection];
+            effects.extend(self.drop_expand_jobs());
+            effects.extend([Effect::RepaintDocument, Effect::RevealSelection]);
+            return effects;
         }
-        let mut effects = Vec::new();
-        if let Some((job, ..)) = self.diff_job.take() {
-            effects.push(Effect::Send(Command::Cancel { job }));
-        }
+        let mut effects = self.cancel_diff();
         let job = self.next_job();
         let base = self.diff_base.clone();
         if revision != self.selected_revision || base != self.document_base {
             self.expanded_paths.clear();
         }
-        self.diff_job = Some((job, revision.clone(), base.clone()));
+        self.diff_job = Some(DiffJob {
+            id: job,
+            revision: revision.clone(),
+            base: base.clone(),
+            streaming: false,
+        });
         self.loading_since = Some(Instant::now());
         effects.push(Effect::Send(Command::LoadDiff {
             job,
@@ -480,10 +541,7 @@ impl Session {
             .files
             .iter()
             .any(|file| file.path == path && file.collapsed.is_some());
-        if !self.capabilities.compare
-            || !collapsed
-            || self.expand_jobs.iter().any(|(_, pending)| pending == path)
-        {
+        if !collapsed || self.expand_jobs.iter().any(|(_, pending)| pending == path) {
             return Vec::new();
         }
         let job = self.next_job();
@@ -497,6 +555,37 @@ impl Session {
             base: self.document_base.clone(),
             path: path.to_owned(),
         })]
+    }
+
+    /// Give up the diff switch in flight, if there is one.
+    fn cancel_diff(&mut self) -> Vec<Effect> {
+        let Some(diff) = self.diff_job.take() else {
+            return Vec::new();
+        };
+        let mut effects = vec![Effect::Send(Command::Cancel { job: diff.id })];
+        effects.extend(self.drop_partial_document(&diff));
+        effects
+    }
+
+    /// `diff` ended before its last part: what did arrive is half a diff, and
+    /// goes rather than be read, or parked, as its revision's whole one.
+    fn drop_partial_document(&mut self, diff: &DiffJob) -> Option<Effect> {
+        diff.streaming.then(|| {
+            self.document = DiffDocument::default();
+            self.revision_details = None;
+            self.document_cut = true;
+            Effect::RepaintDocument
+        })
+    }
+
+    /// Cancel the expands asked of the document being replaced. Their files
+    /// belong to another revision, and one landing on the new document would
+    /// be spliced in at the same path (a lockfile changes in most commits).
+    fn drop_expand_jobs(&mut self) -> Vec<Effect> {
+        self.expand_jobs
+            .drain(..)
+            .map(|(job, _)| Effect::Send(Command::Cancel { job }))
+            .collect()
     }
 
     fn on_file_expanded(
@@ -766,6 +855,18 @@ impl Session {
         )
     }
 
+    /// Search all history for `needle` ([`Command::SearchCommits`]), each hit
+    /// saying whether the log's revset holds it.
+    pub fn search_commits(&mut self, needle: &str) -> (JobId, Vec<Effect>) {
+        let job = self.next_job();
+        let command = Command::SearchCommits {
+            job,
+            needle: needle.to_owned(),
+            revset: self.revset.clone(),
+        };
+        (job, vec![Effect::Send(command)])
+    }
+
     /// Revset completion over this session's graph, bookmarks and aliases.
     /// `history` is the caller's previously used revsets, newest first.
     pub fn revset_completer<'a>(&'a self, history: &'a [String]) -> RevsetCompleter<'a> {
@@ -791,20 +892,61 @@ impl Session {
                     .is_none_or(|range| range.includes_working_copy)
     }
 
-    /// Fold the working copy into `@`. Coalesces instead of racing when
-    /// something is already in flight: a second snapshot thrashes jj's lock,
-    /// and the in-flight work's terminal event drains what was held.
+    /// A background refresh: fold the working copy into `@` in
+    /// [`RefreshMode::Auto`], only look at it in [`RefreshMode::Manual`].
+    /// Coalesces instead of racing when something is already in flight: a
+    /// second snapshot thrashes jj's lock, and the in-flight work's terminal
+    /// event drains what was held.
     pub fn snapshot(&mut self, origin: RefreshOrigin) -> Vec<Effect> {
+        let disk = match self.refresh_mode {
+            RefreshMode::Auto => DiskSync::Fold,
+            RefreshMode::Manual => DiskSync::Check,
+        };
+        self.request_snapshot(origin, disk)
+    }
+
+    /// The Refresh button: fold the disk into `@` and update a stale checkout
+    /// whatever the mode, with a full reload. Held behind work in flight like
+    /// [`Self::snapshot`], and never downgraded to a plain snapshot there.
+    pub fn sync_disk(&mut self) -> Vec<Effect> {
+        self.request_snapshot(RefreshOrigin::Focus, DiskSync::Sync)
+    }
+
+    fn request_snapshot(&mut self, origin: RefreshOrigin, disk: DiskSync) -> Vec<Effect> {
         if !self.capabilities.graph {
             return Vec::new();
         }
         if self.busy() {
             self.pending_refresh = Some(coalesce_refresh(self.pending_refresh, origin));
+            self.pending_sync |= disk == DiskSync::Sync;
             return Vec::new();
         }
         let job = self.next_job();
         self.snapshot_job = Some((job, origin));
-        vec![Effect::Send(Command::Snapshot { job, origin })]
+        vec![Effect::Send(Command::Snapshot { job, origin, disk })]
+    }
+
+    pub fn refresh_mode(&self) -> RefreshMode {
+        self.refresh_mode
+    }
+
+    /// Whether the disk has edits `@` doesn't hold and whether the checkout
+    /// is stale, as the last snapshot found them.
+    pub fn disk(&self) -> &DiskState {
+        &self.disk
+    }
+
+    /// Switch how background refreshes treat the disk. The actor is told
+    /// either way (it decides whether a mutation or a fetch may update a
+    /// stale checkout), and switching to `Auto` catches up on whatever
+    /// `Manual` left pending.
+    pub fn set_refresh_mode(&mut self, mode: RefreshMode) -> Vec<Effect> {
+        self.refresh_mode = mode;
+        let mut effects = vec![Effect::Send(Command::SetRefreshMode { mode })];
+        if mode == RefreshMode::Auto && (self.disk.edits || self.disk.stale.is_some()) {
+            effects.extend(self.snapshot(RefreshOrigin::Focus));
+        }
+        effects
     }
 
     /// Run `op`. The actor serializes mutations on its own thread, so there is
@@ -824,6 +966,10 @@ impl Session {
                 op,
                 allow_immutable,
                 seen_op: self.graph_fingerprint.clone(),
+                seen_wc: self
+                    .commits
+                    .working_copy()
+                    .map(|row| row.change_id().to_owned()),
             })],
         )
     }
@@ -870,6 +1016,12 @@ impl Session {
         self.graph_version
     }
 
+    /// The jj operation the graph on screen was loaded at (its id, hex), or
+    /// `None` before a graph has loaded and in a git repository.
+    pub fn graph_operation(&self) -> Option<&str> {
+        self.graph_fingerprint.as_deref()
+    }
+
     /// Cancel the graph load in flight, if any. A superseded walk that runs to
     /// completion competes for the same disk as the walk that replaced it.
     fn cancel_graph(&mut self) -> Vec<Effect> {
@@ -892,6 +1044,13 @@ impl Session {
             Payload::Ready { .. } => Vec::new(),
             Payload::Batch { job, rows } => self.on_batch(job, rows),
             Payload::GraphLoaded { job, tail } => self.on_graph_loaded(job, tail),
+            Payload::Outline { job, outline } => self.on_outline(job, outline),
+            Payload::DiffPart {
+                job,
+                files,
+                total_additions,
+                total_deletions,
+            } => self.on_diff_part(job, files, total_additions, total_deletions),
             Payload::DiffLoaded {
                 job,
                 revision,
@@ -903,13 +1062,17 @@ impl Session {
                 origin,
                 snapshot,
                 warnings,
-            } => self.on_snapshot(job, origin, snapshot, warnings),
+                disk,
+            } => self.on_snapshot(job, origin, snapshot, warnings, disk),
             Payload::MutationDone { job, outcome } => self.on_mutation(job, outcome),
             Payload::FileExpanded { job, path, file } => self.on_file_expanded(job, path, file),
             Payload::EmptyStatus { job, updates } => self.on_empty_status(job, updates),
-            Payload::Progress { loaded, total, .. } => {
-                self.commit_progress.set_total(total);
-                self.commit_progress.set_loaded(loaded);
+            // A fetch's or a push's progress is the frontend's to show.
+            Payload::Progress { job, loaded, total } => {
+                if self.graph_job.as_ref().is_some_and(|load| load.id == job) {
+                    self.commit_progress.set_total(total);
+                    self.commit_progress.set_loaded(loaded);
+                }
                 Vec::new()
             }
             Payload::WorkingCopyChanged => self.snapshot(RefreshOrigin::Watcher),
@@ -925,6 +1088,20 @@ impl Session {
                     Effect::Activity(Activity::Note(NOTICE.to_owned())),
                 ]
             }
+            Payload::StaleWorkingCopy { message } => vec![
+                Effect::Activity(Activity::Toast {
+                    repo,
+                    title: "Working copy is stale".to_owned(),
+                    body: message.clone(),
+                }),
+                Effect::Activity(Activity::Note(message)),
+            ],
+            // A source with no graph to snapshot (a compare of folders) has
+            // only its diff to load again.
+            Payload::RepositoryChanged if !self.capabilities.graph => {
+                self.pr_diffs.clear();
+                self.load_diff(self.selected_revision.clone())
+            }
             Payload::RepositoryChanged => self.snapshot(RefreshOrigin::Focus),
             Payload::OpHeadChanged { fingerprint } => self.on_op_head(&fingerprint),
             Payload::DiffResolved {
@@ -934,8 +1111,9 @@ impl Session {
             } => self.on_diff_resolved(job, revision, base),
             Payload::Failed { job, error } => self.on_failed(repo, job, error),
             Payload::Cancelled { job } => {
-                self.clear_slot(job);
-                self.drain_pending_refresh()
+                let mut effects = self.clear_slot(job);
+                effects.extend(self.drain_pending_refresh());
+                effects
             }
             // Results the frontend routes by job on its own (previews, source
             // browsing, file pairs, details, fetch): the projection has no
@@ -953,7 +1131,11 @@ impl Session {
             | Payload::OpLogBatch { .. }
             | Payload::History { .. }
             | Payload::CliOutput { .. }
-            | Payload::CliExited { .. } => Vec::new(),
+            | Payload::CliExited { .. }
+            | Payload::CommitsFound { .. } => Vec::new(),
+            // A host's link coming up or going down is the frontend's to
+            // show; the jobs it took with it fail one by one.
+            Payload::Connecting { .. } | Payload::Disconnected { .. } => Vec::new(),
             Payload::RevsetResolved { job, result, .. } => self.on_span_checked(job, result),
         }
     }
@@ -996,11 +1178,11 @@ impl Session {
     }
 
     fn on_graph_loaded(&mut self, job: JobId, tail: crate::repo::GraphTail) -> Vec<Effect> {
-        let Some(load) = self.graph_job.take().filter(|load| load.id == job) else {
-            // Not ours: put back whatever was there.
+        let Some(load) = self.graph_job.take_if(|load| load.id == job) else {
             return Vec::new();
         };
         let swapped = load.staging.is_some();
+        let was_found = self.selected_commit_index.is_some();
         // The change the selected row stands for, read off the store about to
         // be replaced: a rewrite gives the commit a new id, and the selection
         // should follow the change rather than fall off the graph.
@@ -1024,13 +1206,13 @@ impl Session {
         if tail.root_commit_id.is_some() {
             self.root_commit_id = tail.root_commit_id;
         }
+        // Not cached: the walk works these out again every time, and the
+        // cache only answers for the rows a walk leaves unknown.
         for (index, empty) in tail.empty_updates {
             // A shorter store must never be indexed past its end.
             if index >= self.commits.len() {
                 continue;
             }
-            let commit_id = self.commits.row(index).commit_id().to_owned();
-            self.empty_cache.insert(commit_id, empty);
             self.commits.set_is_empty(index, empty);
         }
         // The stream ended: the graph is what it is, even when it held no rows
@@ -1053,9 +1235,87 @@ impl Session {
         if followed && !self.diff_in_flight() {
             let revision = self.selected_revision.clone();
             effects.extend(self.load_diff(revision));
+        } else if !was_found && self.selected_commit_index.is_some() {
+            // A revision picked before its row loaded (a history search's
+            // hit, mid-walk) has a row now: bring it into view.
+            effects.push(Effect::RevealSelection);
         }
         effects.extend(self.resolve_empty_status());
         effects.extend(self.drain_pending_refresh());
+        effects
+    }
+
+    /// A source without a graph loaded: its outline stands where the graph
+    /// would, and the load is over.
+    fn on_outline(&mut self, job: JobId, outline: crate::model::Outline) -> Vec<Effect> {
+        if self.graph_job.take_if(|load| load.id == job).is_none() {
+            return Vec::new();
+        }
+        self.outline = Some(outline);
+        self.graph_version = Some(job);
+        self.status = LoadStatus::Loaded;
+        self.loading_since = None;
+        self.repaint_version = self.repaint_version.wrapping_add(1);
+        let mut effects = vec![Effect::Activity(Activity::LoadFinished {
+            ok: true,
+            detail: None,
+        })];
+        effects.extend(self.drain_pending_refresh());
+        effects
+    }
+
+    /// The next files of the diff in flight. The first part starts the
+    /// document, as a whole diff landing would; later ones join it. The slot
+    /// stays taken until the job's `DiffLoaded`.
+    fn on_diff_part(
+        &mut self,
+        job: JobId,
+        files: Vec<DiffFile>,
+        total_additions: usize,
+        total_deletions: usize,
+    ) -> Vec<Effect> {
+        let Some(diff) = self.diff_job.as_mut().filter(|diff| diff.id == job) else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        if !std::mem::replace(&mut diff.streaming, true) {
+            let (revision, base) = (diff.revision.clone(), diff.base.clone());
+            effects = self.replace_document(revision, base, None);
+        }
+        self.document.files.extend(files);
+        self.document.total_additions = total_additions;
+        self.document.total_deletions = total_deletions;
+        // A forge sends files in git's order, so a later part can hold a file
+        // the tree lists before one already here.
+        self.document.sort_in_tree_order();
+        effects.push(Effect::RepaintDocument);
+        effects
+    }
+
+    /// Make room for the diff of `revision` against `base`: the document it
+    /// replaces is parked or dropped, and the selection moves to it.
+    fn replace_document(
+        &mut self,
+        revision: RevisionSelection,
+        base: DiffBase,
+        details: Option<RevisionDetails>,
+    ) -> Vec<Effect> {
+        // A reload of the revision on screen replaces its document; parking
+        // the old one would leave it to be flipped back to later.
+        if !self.capabilities.graph && revision != self.selected_revision {
+            self.park_displayed_document();
+        }
+        let mut effects = Vec::new();
+        if revision != self.selected_revision || base != self.document_base {
+            effects.extend(self.drop_expand_jobs());
+        }
+        self.selected_revision = revision;
+        self.document_base = base;
+        self.status = LoadStatus::Loaded;
+        self.document = DiffDocument::default();
+        self.document_cut = false;
+        self.revision_details = details;
+        self.selected_commit_index = self.find_selected_commit_index();
         effects
     }
 
@@ -1066,10 +1326,18 @@ impl Session {
         document: DiffDocument,
         details: Option<RevisionDetails>,
     ) -> Vec<Effect> {
-        let Some((_, _, base)) = self.diff_job.take_if(|(id, ..)| *id == job) else {
+        let Some(diff) = self.diff_job.take_if(|diff| diff.id == job) else {
             return Vec::new();
         };
+        let base = diff.base;
         self.loading_since = None;
+        let mut document = document;
+        if diff.streaming {
+            // The parts are on screen; these are the files after the last.
+            let mut files = std::mem::take(&mut self.document.files);
+            files.append(&mut document.files);
+            document.files = files;
+        }
 
         // A working-copy diff is the definitive emptiness signal for `@` (files
         // present ⇒ not empty), so an edit flips the chip without a re-walk.
@@ -1085,20 +1353,17 @@ impl Session {
                     .all(|file| file.status == crate::model::DiffFileStatus::Conflicted)
             });
 
-        if !self.capabilities.graph {
-            self.park_displayed_document();
-        }
+        let mut effects = if diff.streaming {
+            self.revision_details = details;
+            Vec::new()
+        } else {
+            self.replace_document(revision, base, details)
+        };
         // Every backend's document lands here, so this is the one place that
         // makes file order mean the same thing to the diff view, the tree and
         // next/previous file.
-        let mut document = document;
         document.sort_in_tree_order();
-        self.selected_revision = revision;
-        self.document_base = base;
-        self.status = LoadStatus::Loaded;
         self.document = document;
-        self.revision_details = details;
-        self.selected_commit_index = self.find_selected_commit_index();
         if let Some(empty) = wc_empty
             && self.capabilities.graph
             && let Some(index) = self.selected_commit_index
@@ -1107,7 +1372,7 @@ impl Session {
             self.repaint_version = self.repaint_version.wrapping_add(1);
         }
 
-        let mut effects = vec![Effect::RepaintDocument];
+        effects.push(Effect::RepaintDocument);
         effects.extend(self.drain_pending_refresh());
         effects
     }
@@ -1118,11 +1383,13 @@ impl Session {
         origin: RefreshOrigin,
         snapshot: RepositorySnapshot,
         warnings: Vec<String>,
+        disk: DiskState,
     ) -> Vec<Effect> {
         if self.snapshot_job.as_ref().map(|(id, _)| *id) != Some(job) {
             return Vec::new();
         }
         self.snapshot_job = None;
+        self.disk = disk;
         let mut effects: Vec<Effect> = warnings
             .into_iter()
             .map(|note| Effect::Activity(Activity::Note(note)))
@@ -1165,8 +1432,16 @@ impl Session {
         };
         // A snapshot under an edited mid-stack commit rebased its children:
         // every one of them has a new id, and the rows still name the old
-        // ones, which no mutation can act on any more.
-        let origin = if external_op || snapshot.rewrote_descendants {
+        // ones, which no mutation can act on any more. A git working copy
+        // that turned clean or dirty gains or loses its graph row.
+        let dirty_flipped = matches!(
+            (
+                reflected.and_then(|s| s.working_copy_dirty),
+                snapshot.working_copy_dirty
+            ),
+            (Some(before), Some(now)) if before != now
+        );
+        let origin = if external_op || snapshot.rewrote_descendants || dirty_flipped {
             RefreshOrigin::Focus
         } else {
             origin
@@ -1232,8 +1507,13 @@ impl Session {
         };
         self.empty_status_job = None;
         // The graph these row indices address has since been replaced.
-        if Some(graph) != self.graph_version || updates.is_empty() {
+        if Some(graph) != self.graph_version {
+            self.empty_status_queue.clear();
             return Vec::new();
+        }
+        let next = self.next_empty_status_chunk();
+        if updates.is_empty() {
+            return next.into_iter().collect();
         }
         for &(index, empty) in &updates {
             if index >= self.commits.len() {
@@ -1244,7 +1524,7 @@ impl Session {
             self.commits.set_is_empty(index, empty);
         }
         self.repaint_version = self.repaint_version.wrapping_add(1);
-        Vec::new()
+        next.into_iter().collect()
     }
 
     fn on_op_head(&mut self, fingerprint: &str) -> Vec<Effect> {
@@ -1271,21 +1551,31 @@ impl Session {
         let failed_compare = self
             .diff_job
             .as_ref()
-            .is_some_and(|(id, _, base)| *id == job && base.is_compare());
+            .is_some_and(|diff| diff.id == job && diff.base.is_compare());
         let failed_range = self
             .diff_job
             .as_ref()
-            .is_some_and(|(id, _, base)| *id == job && base.range().is_some());
+            .is_some_and(|diff| diff.id == job && diff.base.range().is_some());
         let failed_resolve = self.diff_resolve_job == Some(job);
         // A mutation's failure is reported by whoever started it (an immutable
         // rejection turns into an offer, not a toast), so only the slot is
         // cleared here.
         let owned_mutation = self.mutation_job == Some(job);
-        self.clear_slot(job);
+        let mut effects = self.clear_slot(job);
         self.loading_since = None;
+        if error == RepoError::Disconnected {
+            // The host went away under the job. What is on screen stays, and
+            // the frontend says so once for the tab rather than per job.
+            if owned_graph {
+                effects.push(Effect::Activity(Activity::LoadFinished {
+                    ok: false,
+                    detail: None,
+                }));
+            }
+            return effects;
+        }
         let message = error.to_string();
 
-        let mut effects = Vec::new();
         if owned_graph {
             // Only a graph load failing means the tab has nothing to show. An
             // operation failing leaves the graph exactly where it was, so it
@@ -1324,19 +1614,22 @@ impl Session {
     }
 
     /// Clear whichever slot `job` owns. Called from every terminal event, so a
-    /// failure or a cancel can never strand a slot.
-    fn clear_slot(&mut self, job: JobId) {
+    /// failure or a cancel can never strand a slot. A diff that was cut off
+    /// between its parts takes what it had shown with it.
+    fn clear_slot(&mut self, job: JobId) -> Vec<Effect> {
+        let mut effects = Vec::new();
         if self.graph_job.as_ref().is_some_and(|load| load.id == job) {
             self.graph_job = None;
         }
-        if self.diff_job.as_ref().is_some_and(|(id, ..)| *id == job) {
-            self.diff_job = None;
+        if let Some(diff) = self.diff_job.take_if(|diff| diff.id == job) {
+            effects.extend(self.drop_partial_document(&diff));
         }
         if self.snapshot_job.as_ref().is_some_and(|(id, _)| *id == job) {
             self.snapshot_job = None;
         }
         if self.empty_status_job.is_some_and(|(id, _)| id == job) {
             self.empty_status_job = None;
+            self.empty_status_queue.clear();
         }
         if self.mutation_job == Some(job) {
             self.mutation_job = None;
@@ -1348,6 +1641,7 @@ impl Session {
             self.span_job = None;
         }
         self.expand_jobs.retain(|(id, _)| *id != job);
+        effects
     }
 
     /// Run a refresh coalesced while the session was busy, now that it is idle.
@@ -1359,7 +1653,9 @@ impl Session {
         if self.busy() {
             return Vec::new();
         }
+        let sync = std::mem::take(&mut self.pending_sync);
         match self.pending_refresh.take() {
+            Some(origin) if sync => self.request_snapshot(origin, DiskSync::Sync),
             Some(origin) => self.snapshot(origin),
             None => Vec::new(),
         }
@@ -1373,6 +1669,9 @@ impl Session {
     fn park_displayed_document(&mut self) {
         const PARKED_DIFF_CAP: usize = 16;
 
+        if std::mem::take(&mut self.document_cut) {
+            return;
+        }
         let key = document_key(&self.selected_revision);
         self.pr_diffs.insert(
             key,
@@ -1540,25 +1839,34 @@ impl Session {
         if had_cached {
             self.repaint_version = self.repaint_version.wrapping_add(1);
         }
-        if targets.is_empty() {
-            return Vec::new();
-        }
+        self.empty_status_queue = targets;
+        let mut effects = Vec::new();
         if let Some((job, _)) = self.empty_status_job.take() {
-            return vec![
-                Effect::Send(Command::Cancel { job }),
-                self.start_empty_status(targets),
-            ];
+            effects.push(Effect::Send(Command::Cancel { job }));
         }
-        vec![self.start_empty_status(targets)]
+        effects.extend(self.next_empty_status_chunk());
+        effects
     }
 
-    fn start_empty_status(&mut self, targets: Vec<(usize, String)>) -> Effect {
+    /// Ask about the next few queued rows. A sweep goes out a chunk per
+    /// command, so a diff or a load asked for meanwhile waits behind one
+    /// chunk rather than behind thousands of parent-tree merges.
+    fn next_empty_status_chunk(&mut self) -> Option<Effect> {
+        const CHUNK: usize = 64;
+
+        if self.empty_status_queue.is_empty() {
+            return None;
+        }
+        let rest = self
+            .empty_status_queue
+            .split_off(CHUNK.min(self.empty_status_queue.len()));
+        let targets = std::mem::replace(&mut self.empty_status_queue, rest);
         let job = self.next_job();
         let graph = self
             .graph_version
             .expect("empty status is only resolved for a graph that finished loading");
         self.empty_status_job = Some((job, graph));
-        Effect::Send(Command::EmptyStatus { job, targets })
+        Some(Effect::Send(Command::EmptyStatus { job, targets }))
     }
 }
 
@@ -1586,6 +1894,7 @@ mod tests {
                 shortest_change_id_len: Some(8),
                 description: format!("row {index}"),
                 author: "someone".to_owned(),
+                author_timestamp: None,
                 has_description: true,
                 is_empty: None,
                 has_conflict: false,
@@ -1604,6 +1913,56 @@ mod tests {
             },
             frame: LaneFrame::solo(),
         }
+    }
+
+    /// A revision picked before the walk reached it (a history search's hit,
+    /// opened mid-load) is revealed once its row is in; a refresh of a
+    /// selection that had its row all along doesn't scroll to it again.
+    #[test]
+    fn a_selection_whose_row_lands_late_is_revealed() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/late-row".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let load = |session: &mut Session, progressive: bool| {
+            let job = session
+                .load_graph(progressive)
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::Send(Command::LoadGraph { job, .. }) => Some(*job),
+                    _ => None,
+                })
+                .expect("a graph load");
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::Batch {
+                    job,
+                    rows: (0..3).map(row).collect(),
+                },
+            ));
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::GraphLoaded {
+                    job,
+                    tail: crate::repo::GraphTail::default(),
+                },
+            ))
+        };
+        session.selected_revision = RevisionSelection::Commit("commit0002".to_owned());
+        let effects = load(&mut session, true);
+        assert_eq!(session.selected_commit_index, Some(2));
+        let reveals = |effects: &[Effect]| {
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RevealSelection))
+        };
+        assert!(reveals(&effects), "{effects:?}");
+
+        // A refresh keeps the rows up until the new ones land.
+        let effects = load(&mut session, false);
+        assert!(!reveals(&effects), "{effects:?}");
     }
 
     /// Folding a walk one batch at a time must land exactly where folding it in
@@ -1655,6 +2014,60 @@ mod tests {
         }
     }
 
+    /// The empty-status sweep goes out a chunk at a time, the next chunk on
+    /// each answer, so whatever the user asks for meanwhile waits behind one
+    /// chunk rather than the whole sweep.
+    #[test]
+    fn the_empty_status_sweep_goes_out_in_chunks() {
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/sweep".into(),
+            scope: Default::default(),
+        });
+        let mut session = Session::unloaded(String::new());
+        session.capabilities.graph = true;
+        let job = session
+            .load_graph(true)
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Send(Command::LoadGraph { job, .. }) => Some(*job),
+                _ => None,
+            })
+            .expect("a graph load");
+        session.apply(Event::new(
+            repo.clone(),
+            Payload::Batch {
+                job,
+                rows: (0..150).map(row).collect(),
+            },
+        ));
+        let mut effects = session.apply(Event::new(
+            repo.clone(),
+            Payload::GraphLoaded {
+                job,
+                tail: crate::repo::GraphTail::default(),
+            },
+        ));
+        let mut sizes = Vec::new();
+        while let Some((job, targets)) = effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::EmptyStatus { job, targets }) => Some((*job, targets.clone())),
+            _ => None,
+        }) {
+            sizes.push(targets.len());
+            let updates = targets.iter().map(|(index, _)| (*index, false)).collect();
+            effects = session.apply(Event::new(
+                repo.clone(),
+                Payload::EmptyStatus { job, updates },
+            ));
+        }
+        assert_eq!(sizes, [64, 64, 22]);
+        assert!(
+            session
+                .commits
+                .iter()
+                .all(|row| row.is_empty() == Some(false))
+        );
+    }
+
     /// The diff view walks `document.files` and the changed-files tree lists
     /// directories first, so a document left in the backend's path order reads
     /// differently in the two panes — and "next file" skips around the tree.
@@ -1669,6 +2082,7 @@ mod tests {
             deletions: 0,
             collapsed: None,
             blob: None,
+            mode_change: None,
         };
         let mut session = Session::unloaded(String::new());
         let job = session
@@ -1831,6 +2245,7 @@ mod tests {
                 origin: RefreshOrigin::Focus,
                 snapshot: at_b,
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         assert!(
@@ -1899,6 +2314,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         assert!(
@@ -1959,6 +2375,118 @@ mod tests {
         assert_eq!(
             coalesce_refresh(Some(RefreshOrigin::Focus), RefreshOrigin::Watcher),
             RefreshOrigin::Focus
+        );
+    }
+
+    // ── refresh mode ────────────────────────────────────────────────────
+
+    fn jj_session() -> Session {
+        let mut session = Session::unloaded("all()".to_owned());
+        session.capabilities = Capabilities {
+            graph: true,
+            mutate: true,
+            ..Capabilities::default()
+        };
+        // What every snapshot below lands at, so none of them reloads and
+        // leaves the session busy.
+        session.repository_snapshot = Some(RepositorySnapshot::default());
+        session
+    }
+
+    /// The snapshot `effects` sends: its job and what it does with the disk.
+    fn sent_snapshot(effects: &[Effect]) -> Option<(JobId, DiskSync)> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::Send(Command::Snapshot { job, disk, .. }) => Some((*job, *disk)),
+            _ => None,
+        })
+    }
+
+    fn land_snapshot(session: &mut Session, job: JobId, disk: DiskState) -> Vec<Effect> {
+        session.apply(Event::new(
+            test_repo(),
+            Payload::SnapshotDone {
+                job,
+                origin: RefreshOrigin::Focus,
+                snapshot: RepositorySnapshot::default(),
+                warnings: Vec::new(),
+                disk,
+            },
+        ))
+    }
+
+    #[test]
+    fn the_mode_picks_what_a_background_snapshot_does() {
+        let mut session = jj_session();
+        let (job, disk) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        assert_eq!(disk, DiskSync::Fold);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        session.set_refresh_mode(RefreshMode::Manual);
+        let (job, disk) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        assert_eq!(disk, DiskSync::Check);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        let (_, disk) = sent_snapshot(&session.sync_disk()).unwrap();
+        assert_eq!(disk, DiskSync::Sync, "Refresh syncs in either mode");
+    }
+
+    #[test]
+    fn a_refresh_held_behind_work_is_not_lost_or_downgraded() {
+        let mut session = jj_session();
+        session.set_refresh_mode(RefreshMode::Manual);
+        let (busy, _) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+
+        assert!(session.sync_disk().is_empty(), "held while a snapshot runs");
+        assert!(session.snapshot(RefreshOrigin::Watcher).is_empty());
+        let edits = DiskState {
+            edits: true,
+            ..DiskState::default()
+        };
+        let effects = land_snapshot(&mut session, busy, edits.clone());
+        assert_eq!(session.disk(), &edits);
+        let (job, disk) = sent_snapshot(&effects).expect("the held refresh runs");
+        assert_eq!(disk, DiskSync::Sync, "a watcher tick doesn't downgrade it");
+
+        let effects = land_snapshot(&mut session, job, DiskState::default());
+        assert_eq!(session.disk(), &DiskState::default());
+        assert!(sent_snapshot(&effects).is_none(), "and runs only once");
+    }
+
+    #[test]
+    fn switching_to_auto_catches_up_on_what_manual_left() {
+        let mut session = jj_session();
+        let effects = session.set_refresh_mode(RefreshMode::Manual);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Command::SetRefreshMode {
+                mode: RefreshMode::Manual
+            })]
+        ));
+        let (job, _) = sent_snapshot(&session.snapshot(RefreshOrigin::Watcher)).unwrap();
+        land_snapshot(
+            &mut session,
+            job,
+            DiskState {
+                stale: Some("stale".to_owned()),
+                ..DiskState::default()
+            },
+        );
+
+        let effects = session.set_refresh_mode(RefreshMode::Auto);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Send(Command::SetRefreshMode {
+                mode: RefreshMode::Auto
+            }))
+        ));
+        let (job, disk) = sent_snapshot(&effects).expect("the pending state is folded");
+        assert_eq!(disk, DiskSync::Fold);
+        land_snapshot(&mut session, job, DiskState::default());
+
+        let effects = session.set_refresh_mode(RefreshMode::Auto);
+        assert!(
+            sent_snapshot(&effects).is_none(),
+            "nothing pending, no snapshot"
         );
     }
 
@@ -2097,6 +2625,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ));
         let (_, revision, base) = sent_diff(&effects).expect("the comparison reloads");
@@ -2185,6 +2714,7 @@ mod tests {
                     ..Default::default()
                 },
                 warnings: Vec::new(),
+                disk: Default::default(),
             },
         ))
     }
@@ -2356,6 +2886,230 @@ mod tests {
         assert_eq!(inserts, ["wip & mine()", "wip"]);
     }
 
+    // ── a diff in parts ─────────────────────────────────────────────────
+
+    /// A session on a source that streams its diff: a pull request, which
+    /// has no graph and parks the documents it flips between.
+    fn streamed_session() -> (Session, RepoId) {
+        let repo = RepoId("github.com/o/r#7".to_owned());
+        (Session::unloaded(String::new()), repo)
+    }
+
+    fn files(paths: &[&str]) -> Vec<DiffFile> {
+        paths
+            .iter()
+            .map(|path| DiffFile {
+                collapsed: None,
+                ..collapsed_file(path)
+            })
+            .collect()
+    }
+
+    fn part(paths: &[&str], job: JobId, totals: (usize, usize)) -> Payload {
+        Payload::DiffPart {
+            job,
+            files: files(paths),
+            total_additions: totals.0,
+            total_deletions: totals.1,
+        }
+    }
+
+    fn whole(paths: &[&str], job: JobId, revision: RevisionSelection) -> Payload {
+        Payload::DiffLoaded {
+            job,
+            revision,
+            document: DiffDocument {
+                files: files(paths),
+                total_additions: 7,
+                total_deletions: 3,
+                range: None,
+            },
+            details: None,
+        }
+    }
+
+    fn shown(session: &Session) -> Vec<&str> {
+        session
+            .document
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect()
+    }
+
+    fn repaints(effects: &[Effect]) -> bool {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RepaintDocument))
+    }
+
+    fn cancels(effects: &[Effect], job: JobId) -> bool {
+        effects.iter().any(
+            |effect| matches!(effect, Effect::Send(Command::Cancel { job: sent }) if *sent == job),
+        )
+    }
+
+    /// Parts show as they land and the load stays in flight; the last message
+    /// brings the rest. Every file is there, in the tree's order, under the
+    /// final totals.
+    #[test]
+    fn a_diff_in_parts_lands_every_file_in_tree_order() {
+        let (mut session, repo) = streamed_session();
+        let effects = session.load_diff(RevisionSelection::WorkingCopy);
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+
+        let effects = session.apply(Event::new(
+            repo.clone(),
+            part(&["README.md", "src/lib.rs"], job, (100, 10)),
+        ));
+        assert!(repaints(&effects));
+        assert!(session.diff_in_flight() && session.owns_job(job));
+        assert_eq!(session.status, LoadStatus::Loaded);
+        assert_eq!(shown(&session), ["src/lib.rs", "README.md"]);
+        assert_eq!(session.document.total_additions, 100);
+
+        // A later part holds a file the tree lists before ones already here.
+        let effects = session.apply(Event::new(
+            repo.clone(),
+            part(&["src/nested/a.rs"], job, (100, 10)),
+        ));
+        assert!(repaints(&effects));
+        assert_eq!(
+            shown(&session),
+            ["src/nested/a.rs", "src/lib.rs", "README.md"]
+        );
+        session.apply(Event::new(
+            repo.clone(),
+            part(&["tests/t.rs"], job, (100, 10)),
+        ));
+        assert!(session.diff_in_flight());
+
+        let effects = session.apply(Event::new(
+            repo,
+            whole(&["a.rs"], job, RevisionSelection::WorkingCopy),
+        ));
+        assert!(repaints(&effects));
+        assert!(!session.diff_in_flight());
+        assert_eq!(
+            shown(&session),
+            [
+                "src/nested/a.rs",
+                "src/lib.rs",
+                "tests/t.rs",
+                "README.md",
+                "a.rs"
+            ]
+        );
+        assert_eq!(
+            (
+                session.document.total_additions,
+                session.document.total_deletions
+            ),
+            (7, 3)
+        );
+        assert_eq!(session.selected_revision, RevisionSelection::WorkingCopy);
+    }
+
+    /// A diff superseded between its parts is cancelled and what it had shown
+    /// goes: it is not the new revision's, and half of it must not be parked
+    /// as the old one's. What still arrives for it is dropped.
+    #[test]
+    fn a_stale_jobs_parts_are_dropped() {
+        let (mut session, repo) = streamed_session();
+        let effects = session.load_diff(commit("aaa"));
+        let (stale, ..) = sent_diff(&effects).expect("a diff load");
+        session.apply(Event::new(repo.clone(), part(&["a.rs"], stale, (1, 0))));
+        assert_eq!(shown(&session), ["a.rs"]);
+
+        let effects = session.load_diff(commit("bbb"));
+        let (job, ..) = sent_diff(&effects).expect("a diff load");
+        assert!(
+            cancels(&effects, stale) && repaints(&effects),
+            "{effects:?}"
+        );
+        assert!(session.document.files.is_empty());
+
+        for late in [
+            part(&["b.rs"], stale, (2, 0)),
+            whole(&["c.rs"], stale, commit("aaa")),
+        ] {
+            assert!(session.apply(Event::new(repo.clone(), late)).is_empty());
+            assert!(session.document.files.is_empty());
+            assert!(session.owns_job(job));
+        }
+
+        session.apply(Event::new(repo, whole(&["z.rs"], job, commit("bbb"))));
+        assert_eq!(shown(&session), ["z.rs"]);
+        assert_eq!(session.selected_revision, commit("bbb"));
+        assert!(
+            !session.pr_diffs.contains_key("aaa"),
+            "half of aaa was parked"
+        );
+    }
+
+    /// A stream that is cancelled or fails between its parts leaves no
+    /// document: the files that came are not the revision's diff, and asking
+    /// again loads it again.
+    #[test]
+    fn a_diff_cut_off_between_its_parts_leaves_nothing() {
+        for failed in [false, true] {
+            let (mut session, repo) = streamed_session();
+            let effects = session.load_diff(RevisionSelection::WorkingCopy);
+            let (job, ..) = sent_diff(&effects).expect("a diff load");
+            session.apply(Event::new(repo.clone(), part(&["a.rs"], job, (1, 0))));
+
+            let end = if failed {
+                Payload::Failed {
+                    job,
+                    error: RepoError::Other("the connection dropped".to_owned()),
+                }
+            } else {
+                Payload::Cancelled { job }
+            };
+            let effects = session.apply(Event::new(repo, end));
+            assert!(repaints(&effects), "{effects:?}");
+            assert!(!session.diff_in_flight());
+            assert!(session.document.files.is_empty());
+            assert!(session.pr_diffs.is_empty());
+
+            let effects = session.load_diff(RevisionSelection::WorkingCopy);
+            assert!(sent_diff(&effects).is_some(), "served from a half document");
+        }
+    }
+
+    /// Flipping to a parked document while another diff streams stops the
+    /// stream: its later parts would land in the document flipped to.
+    #[test]
+    fn flipping_to_a_parked_diff_stops_the_stream() {
+        let (mut session, repo) = streamed_session();
+        let load = |session: &mut Session, revision: RevisionSelection| {
+            let effects = session.load_diff(revision);
+            sent_diff(&effects).expect("a diff load").0
+        };
+        let job = load(&mut session, commit("aaa"));
+        session.apply(Event::new(
+            repo.clone(),
+            whole(&["a.rs"], job, commit("aaa")),
+        ));
+        let streaming = load(&mut session, commit("bbb"));
+        session.apply(Event::new(repo.clone(), part(&["b.rs"], streaming, (1, 0))));
+        assert_eq!(shown(&session), ["b.rs"]);
+
+        let effects = session.load_diff(commit("aaa"));
+        assert!(sent_diff(&effects).is_none(), "aaa was parked");
+        assert!(cancels(&effects, streaming), "{effects:?}");
+        assert!(!session.diff_in_flight());
+        assert_eq!(shown(&session), ["a.rs"]);
+        assert!(
+            !session.pr_diffs.contains_key("bbb"),
+            "half of bbb was parked"
+        );
+
+        let late = session.apply(Event::new(repo, part(&["c.rs"], streaming, (2, 0))));
+        assert!(late.is_empty());
+        assert_eq!(shown(&session), ["a.rs"]);
+    }
+
     // ── size caps ───────────────────────────────────────────────────────
 
     fn collapsed_file(path: &str) -> crate::model::DiffFile {
@@ -2371,6 +3125,7 @@ mod tests {
             deletions: 0,
             collapsed: Some(crate::model::DiffCollapse::LargeFile),
             blob: None,
+            mode_change: None,
         }
     }
 
@@ -2442,6 +3197,62 @@ mod tests {
             Some(Vec::new()),
             "another revision starts collapsed"
         );
+    }
+
+    /// An expand asked of one revision must not land on the next one's
+    /// document, where the same path is another file's diff.
+    #[test]
+    fn an_expand_outlived_by_its_document_is_dropped() {
+        let mut session = compare_session();
+        let repo = crate::repo::repo_id(&crate::repo::OpenSpec::Local {
+            root: "/tmp/caps".into(),
+            scope: Default::default(),
+        });
+        let land = |session: &mut Session, revision: &str| {
+            let effects = session.load_diff(commit(revision));
+            let (job, ..) = sent_diff(&effects).expect("a diff load");
+            session.apply(Event::new(
+                repo.clone(),
+                Payload::DiffLoaded {
+                    job,
+                    revision: commit(revision),
+                    document: DiffDocument {
+                        files: vec![collapsed_file("Cargo.lock")],
+                        total_additions: 5_000,
+                        total_deletions: 0,
+                        range: None,
+                    },
+                    details: None,
+                },
+            ))
+        };
+        land(&mut session, "aaa");
+        let effects = session.expand_file("Cargo.lock");
+        let [Effect::Send(Command::ExpandFile { job: expand, .. })] = effects.as_slice() else {
+            panic!("expected an ExpandFile, got {effects:?}");
+        };
+        let expand = *expand;
+
+        let effects = land(&mut session, "bbb");
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::Send(Command::Cancel { job }) if *job == expand)
+            ),
+            "{effects:?}"
+        );
+        assert!(!session.owns_job(expand));
+        let mut aaa = collapsed_file("Cargo.lock");
+        aaa.collapsed = None;
+        let effects = session.apply(Event::new(
+            repo,
+            Payload::FileExpanded {
+                job: expand,
+                path: "Cargo.lock".to_owned(),
+                file: Some(aaa),
+            },
+        ));
+        assert!(effects.is_empty());
+        assert!(session.document.files[0].collapsed.is_some());
     }
 
     #[test]

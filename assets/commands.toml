@@ -1,0 +1,94 @@
+# The commands diffui ships as [[commands]] rows, read exactly like the ones
+# in config.toml. A config.toml row with the same id and `override = true`
+# replaces one.
+
+[[commands]]
+id = "file.open-in-editor"
+label = "Open in editor"
+hint = "Open the file at this line in your editor"
+group = "Changes"
+when = "file"
+menu = ["file", "palette"]
+edit = "{path}"
+
+[[commands]]
+id = "ai.describe"
+label = "Generate description"
+hint = "Ask your AI provider to describe this revision"
+group = "Revisions"
+when = "ai && repo.mutate && revision.selected"
+menu = ["revision", "palette"]
+agent = """Write a jj change description for the diff you are given. Match the \
+style of these recent descriptions from the same repository, separated by \
+lines of ---:
+
+{recent_descriptions}
+
+Reply with the description only: a subject line, then a blank line and a body \
+if the change needs one. No code fences, no commentary."""
+stdin = "{diff}"
+output = "description"
+
+[[commands]]
+id = "ai.pr-description"
+label = "Generate pull request title and description"
+hint = "Ask your AI provider to write the pull request for this stack"
+group = "Revisions"
+when = "ai && repo.mutate && repo.forge && revision.selected"
+menu = ["revision", "palette"]
+agent = """Write a pull request title and description for the changes you are \
+given: the descriptions of the stack's revisions, oldest first and separated \
+by lines of ---, then their combined diff.
+
+Reply with the title on the first line, a blank line, then the description: \
+what changes and why, and anything a reviewer should look at first. Keep it \
+short; use Markdown lists where they help. No commentary."""
+stdin = """{stack_descriptions}
+{stack_diff}"""
+output = "pr"
+
+[[commands]]
+id = "ai.bookmark-name"
+label = "Suggest bookmark name"
+hint = "Ask your AI provider for a bookmark name for this revision"
+group = "Bookmarks"
+when = "ai && repo.mutate && revision.selected"
+menu = ["revision", "palette"]
+agent = """Suggest a bookmark (branch) name for the change you are given: its \
+description, then its diff. Lowercase words joined by dashes, two to five \
+of them, saying what the change does. Reply with the name only."""
+stdin = """{description}
+{diff}"""
+output = "bookmark"
+
+[[commands]]
+id = "ai.explain"
+label = "Explain this change"
+hint = "Ask your AI provider what this revision does"
+group = "Revisions"
+when = "ai && revision.selected"
+menu = ["revision", "palette"]
+agent = """Explain the change you are given (its description, then its diff) to \
+someone about to review it. Start with one sentence on what it does, then \
+the parts that matter and how they fit, by file where it helps. Markdown, \
+short paragraphs and lists."""
+stdin = """{description}
+{diff}"""
+output = "panel"
+
+[[commands]]
+id = "ai.review"
+label = "Review this change"
+hint = "Ask your AI provider for likely bugs and risky spots in this revision"
+group = "Revisions"
+when = "ai && revision.selected"
+menu = ["revision", "palette"]
+agent = """Review the change you are given (its description, then its diff). \
+List likely bugs, risky spots and missing cases, the most serious first. \
+Write each as one Markdown list item that starts with its file and line in \
+the new version in backticks, then a colon and why it matters, like this: \
+- `src/lib.rs:40-52`: the lock is taken twice. Leave out style. If nothing \
+stands out, say so in one line, not a list."""
+stdin = """{description}
+{diff}"""
+output = "notes"

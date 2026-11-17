@@ -1,0 +1,22 @@
+# A forge plugin for tests: the whole provider, pull request tab included,
+# against `testforge-cli.sh` (set as `program` in its settings). Never
+# bundled; tests install it in the plugins folder or as a bundled stand-in.
+id = "testforge"
+name = "Test forge"
+version = "1.0.0"
+api = 0
+main = "main.js"
+
+[permissions]
+exec = [["{config.program}"]]
+env = ["TESTFORGE_HOST"]
+
+[provides.forge]
+hosts = ["testforge.invalid", "*.testforge.*"]
+cli = "testforge"
+default_host = "testforge.invalid"
+host_env = "TESTFORGE_HOST"
+pull_request_path = "{owner}/{name}/pull/{number}"
+
+[config.schema]
+program = { type = "string", default = "testforge", label = "The testforge program" }

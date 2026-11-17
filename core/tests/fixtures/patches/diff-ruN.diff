@@ -1,0 +1,28 @@
+diff -ruN old/notes.txt new/notes.txt
+--- old/notes.txt	2024-01-02 10:04:00
++++ new/notes.txt	2024-01-02 10:04:00
+@@ -1,4 +1,5 @@
+ one
+-two
++2
+ three
+ four
++five
+diff -ruN old/src/added.rs new/src/added.rs
+--- old/src/added.rs	1970-01-01 08:00:00
++++ new/src/added.rs	2024-01-02 10:04:00
+@@ -0,0 +1 @@
++pub fn added() {}
+diff -ruN old/src/gone.rs new/src/gone.rs
+--- old/src/gone.rs	2024-01-02 10:04:00
++++ new/src/gone.rs	1970-01-01 08:00:00
+@@ -1 +0,0 @@
+-gone
+diff -ruN old/src/main.rs new/src/main.rs
+--- old/src/main.rs	2024-01-02 10:04:00
++++ new/src/main.rs	2024-01-02 10:04:00
+@@ -1,3 +1,3 @@
+ fn main() {
+-    println!("hi");
++    println!("hello");
+ }

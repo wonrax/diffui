@@ -1,0 +1,14 @@
+[package]
+name = "diffui-serve"
+version = "0.1.0"
+edition = "2024"
+
+# The far end of a repository on another machine: diffui's core without the
+# app, so it builds and runs where there is no display. Its only dependency
+# is the core (no GPUI, no plugins).
+[dependencies]
+diffui-core = { path = "../core" }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1.44", features = ["io-util", "macros", "process", "rt", "time"] }

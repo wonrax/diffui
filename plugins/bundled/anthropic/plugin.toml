@@ -1,0 +1,27 @@
+# Anthropic's Messages API as diffui's AI, with an API key. Bundled with
+# diffui; Settings → AI picks it, and `diffui plugin eject anthropic` copies
+# it out to edit.
+id = "anthropic"
+name = "Anthropic"
+version = "1.0.0"
+api = 0
+main = "main.ts"
+
+[permissions]
+# The API's address, a setting so a proxy can stand in.
+http = ["{config.base_url}"]
+env = ["ANTHROPIC_API_KEY"]
+
+[provides.ai]
+ready = "api_key"
+model = "model"
+
+[config.schema]
+model = { type = "string", default = "claude-opus-5-5", label = "Model" }
+base_url = { type = "string", default = "https://api.anthropic.com", label = "API address", hint = "For a proxy: requests go to <address>/v1/messages." }
+
+[config.schema.api_key]
+type = "secret"
+label = "API key"
+hint = "From console.anthropic.com, or set ANTHROPIC_API_KEY."
+env = { "*" = ["ANTHROPIC_API_KEY"] }
