@@ -125,7 +125,7 @@ Everything is imported from `"diffui"`; `diffui.d.ts` has the signatures.
 | `http` | `http.fetch(url, init)`, shaped like `fetch`, to the allowed hosts |
 | `exec` | `exec(argv, options)`: no shell, an allowed argv prefix, `env` for allowed variables; `exec.stream(argv, options)` for output read a piece at a time with `for await`, then `await out.ended` for the exit |
 | `files` | `files.read(path)`: the text of a file `[permissions] read` lists, such as a CLI's own config |
-| `auth` | `auth.token(host, { git })`: a token variable, the stored token, the user's `token_cmd`, else `git credential fill` (not with `git: false`); never prompts. `auth.secret(key, { host })`, `auth.hosts()` |
+| `auth` | `auth.token(host, { git })`: a token variable, the stored token, the user's `token_cmd`, else `git credential fill` (not with `git: false`); never prompts. `auth.accounts(host)` names the user's other accounts on a host and `auth.token(host, { account })` is that one's token: a forge tries them for a repository its usual sign-in can't see. `auth.secret(key, { host })`, `auth.hosts()` |
 | `kv` | a small JSON store that survives restarts |
 | `config` | the plugin's settings |
 | `ui` | `ui.toast`, `ui.activity`, `ui.prompt.input` / `confirm` / `choose`, `ui.openUrl`, `ui.clipboard.write`, `ui.status.set` |

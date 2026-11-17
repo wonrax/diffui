@@ -48,18 +48,62 @@ pub fn account(plugin: &str, key: &str, host: Option<&str>) -> String {
     }
 }
 
-/// The hosts `plugin` has a token for, from the store's accounts.
-pub fn token_hosts(store: &dyn SecretStore, plugin: &str) -> Vec<String> {
+/// What `plugin` has a token for, from the store's accounts: each a host,
+/// or `host/name` for another account on it (see [`scope`]).
+pub fn token_scopes(store: &dyn SecretStore, plugin: &str) -> Vec<String> {
     let prefix = format!("{plugin}@");
-    let mut hosts: Vec<String> = store
+    let mut scopes: Vec<String> = store
         .accounts()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|account| account.strip_prefix(&prefix).map(str::to_string))
         .collect();
-    hosts.sort();
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+/// The hosts `plugin` has a token for, whether the host's own or another
+/// account's.
+pub fn token_hosts(store: &dyn SecretStore, plugin: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = token_scopes(store, plugin)
+        .iter()
+        .map(|scope| split_scope(scope).0.to_owned())
+        .collect();
     hosts.dedup();
     hosts
+}
+
+/// The other accounts `plugin` has a token for on `host`, by the names the
+/// user gave them.
+pub fn token_accounts(store: &dyn SecretStore, plugin: &str, host: &str) -> Vec<String> {
+    token_scopes(store, plugin)
+        .iter()
+        .filter_map(|scope| match split_scope(scope) {
+            (on, Some(name)) if on.eq_ignore_ascii_case(host) => Some(name.to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whose token it is, as its account in the store names it: `host` for the
+/// host's own sign-in, `host/name` for another account there. A name is
+/// whatever the user calls it ("work"), kept in lower case. It says nothing
+/// about which repositories the account can see: the forge finds that out.
+pub fn scope(host: &str, name: Option<&str>) -> String {
+    match name.and_then(|name| name.split('/').find(|part| !part.trim().is_empty())) {
+        Some(name) => format!("{host}/{}", name.trim().to_ascii_lowercase()),
+        None => host.to_owned(),
+    }
+}
+
+/// A [`scope`] back as its host and the other account's name.
+pub fn split_scope(scope: &str) -> (&str, Option<&str>) {
+    match scope.split_once('/') {
+        Some((host, name)) if !name.is_empty() => (host, Some(name)),
+        Some((host, _)) => (host, None),
+        None => (scope, None),
+    }
 }
 
 /// The store this process uses: see the module docs for which.
@@ -305,6 +349,31 @@ mod tests {
         store.delete("github@github.com").unwrap();
         assert_eq!(store.get("github@github.com").unwrap(), None);
         assert_eq!(token_hosts(&store, "github"), ["github.acme.com"]);
+
+        // Another account's token is its host's too, under its name.
+        store
+            .set(
+                &account(
+                    "github",
+                    "token",
+                    Some(&scope("github.com", Some(" Work "))),
+                ),
+                "t",
+            )
+            .unwrap();
+        assert_eq!(
+            token_scopes(&store, "github"),
+            ["github.acme.com", "github.com/work"]
+        );
+        assert_eq!(
+            token_hosts(&store, "github"),
+            ["github.acme.com", "github.com"]
+        );
+        assert_eq!(token_accounts(&store, "github", "GitHub.com"), ["work"]);
+        assert!(token_accounts(&store, "github", "github.acme.com").is_empty());
+        assert_eq!(split_scope("github.com/work"), ("github.com", Some("work")));
+        assert_eq!(split_scope("github.com"), ("github.com", None));
+        assert_eq!(scope("github.com", Some("")), "github.com");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

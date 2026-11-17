@@ -12,7 +12,11 @@ over a byte stream.
   updates anything there. Build it from a diffui checkout on that machine
   (`cargo install --path serve`, or `nix build .#diffui-serve`); on macOS and
   Linux the app's own `diffui serve` does the same job. `diffui-serve
-  --version` prints the protocol it speaks.
+  --version` prints the protocol it speaks. It can also be built elsewhere
+  and copied over by hand: a static musl build
+  (`cargo zigbuild --release -p diffui-serve --target aarch64-unknown-linux-musl`,
+  with `WABT_DIR` and `SIMDE_DIR` set as for the app) runs on any Linux of
+  that architecture, NixOS included.
 - **Both ends speak the same protocol.** The version is a number that moves
   only when the two can no longer talk, not with every release. When they
   differ, the tab says which is which: update the older end.
@@ -33,15 +37,15 @@ server = ["~/.cargo/bin/diffui-serve"]
 env = { JJ_CONFIG = "/home/me/.config/jj/work.toml" }
 
 [hosts.dev]
-command = ["docker", "exec", "-i", "dev"]   # instead of a transport: any program whose stdio reaches the machine
+command = ["docker", "exec", "-i", "dev", "diffui-serve"]   # instead of a transport: the whole command, run as written
 ```
 
 | Key | Meaning |
 |---|---|
 | `transport` | The plugin that reaches the host. Its per-host settings are the table's other keys. |
-| `command` | Instead of a transport: the words of a program to start here. The server's words are appended to it; a word holding `{server}` gets the server as one shell-quoted line instead (`["ssh", "box", "exec {server}"]`). |
-| `server` | The server over there, as a word or a list of words. Default `diffui-serve`, found on the `PATH` a login shell gets. `{rev}` and `{version}` are the app's commit and version, so a command that fetches a build fetches the matching one: `["nix", "run", "github:OWNER/diffui/{rev}#diffui-serve", "--"]`. `{rev}` needs an app built knowing its commit (the flake's package does). |
-| `env` | Environment for the server. |
+| `command` | Instead of a transport: the whole command to start here, as words, ending in what runs `diffui-serve` there (`["docker", "exec", "-i", "dev", "diffui-serve"]`). It is run as written; its input and output are the connection. `{rev}` and `{version}` work in it. |
+| `server` | With a transport: the server over there, as a word or a list of words. Default `diffui-serve`, found on the `PATH` a login shell gets. `{rev}` and `{version}` are the app's commit and version, so a command that fetches a build fetches the matching one: `["nix", "run", "github:OWNER/diffui/{rev}#diffui-serve", "--"]`. `{rev}` needs an app built knowing its commit (the flake's package does). |
+| `env` | With a transport: environment for the server. With `command`: environment for the command itself, on this machine (`DOCKER_HOST`, `KUBECONFIG`); a variable for the far side goes in the command (`docker exec -e NAME=value …`). |
 
 Transports also find hosts on their own: `wsl` lists the installed
 distributions, `ssh` the `Host`s of `~/.ssh/config`. Such a host needs no

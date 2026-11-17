@@ -980,7 +980,7 @@ have no scene; see src/toolbar.rs and plugins/bundled/github for what differs.
 ### `settings-dialog`
 
 - Window: 1440x900, light
-- State: The settings dialog over the window, every row editable.
+- State: The settings dialog over the window: the sections down its left side, General selected, every row editable.
 - Steps: Press cmd+,.
 
 ### `settings-dialog-dark`
@@ -998,8 +998,8 @@ have no scene; see src/toolbar.rs and plugins/bundled/github for what differs.
 ### `settings-hosts`
 
 - Window: 1440x900, light
-- State: The settings dialog's Hosts group: a row per host with how it is reached and what runs there, then the field that adds one.
-- Steps: Launch with two `[hosts]` tables, press cmd+,.
+- State: Settings, Hosts: a row per host with how it is reached and what runs there, then the field that adds one.
+- Steps: Launch with two `[hosts]` tables, press cmd+,, click Hosts.
 
 ### `settings-host-page`
 
@@ -1525,14 +1525,14 @@ section of `assets/agent/SKILL.md`). New in the port.
 ### `plugins-account`
 
 - Window: 1440x900, light
-- State: GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.
-- Steps: Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.
+- State: GitHub's page in Settings: github.com signed in with gh, under it a second account named work with its paste field, a company host set to a token, then the rows that add a host or an account and its settings.
+- Steps: Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Accounts, and add an account named work.
 
 ### `settings-ai`
 
 - Window: 1440x900, light
 - State: Settings, AI: the provider pop-up set to Anthropic, then Claude Code and Codex not installed, Anthropic in use with its key saved and a passed Test, and OpenAI-compatible with no key. Each row has Test and a pencil.
-- Steps: Launch with Anthropic picked and its key saved; open Settings, Test Anthropic and scroll to AI.
+- Steps: Launch with Anthropic picked and its key saved; open Settings, click AI and Test Anthropic.
 
 ### `plugins-ai-models`
 
@@ -1592,7 +1592,7 @@ section of `assets/agent/SKILL.md`). New in the port.
 
 - Window: 1440x900, light
 - State: Settings, Plugins: one running, one that failed with where, one not allowed, each with its folder, actions and toggle; then the plugins folder.
-- Steps: Launch with three plugins (two allowed, one refused); press cmd+, and scroll to Plugins.
+- Steps: Launch with three plugins (two allowed, one refused); press cmd+, and click Plugins.
 
 ### `plugins-settings-dark`
 

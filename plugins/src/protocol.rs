@@ -250,6 +250,10 @@ pub enum ForgeCall {
     /// `token`, who that token belongs to. Reply: [`Account`].
     Account {
         host: String,
+        /// Ask about another of the user's accounts on the host, by the
+        /// name they gave it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<Secret>,
     },

@@ -163,6 +163,8 @@ pub(crate) enum Action {
     /// A font or code text setting from the settings dialog: applied now and
     /// saved.
     ChangeSetting(crate::config::Setting),
+    /// Show a section of the settings dialog.
+    SettingsSection(crate::settings::Section),
     SetMainView(MainView),
 
     // ── Tabs ────────────────────────────────────────────────────────────

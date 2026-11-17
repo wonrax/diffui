@@ -1,5 +1,5 @@
 # GitHub (github.com or a GitHub Enterprise Server), through the `gh` CLI or
-# a token. Bundled with diffui; Settings → Plugins → GitHub picks how each
+# a token. Bundled with diffui; Settings → Accounts → GitHub picks how each
 # host signs in, and `diffui plugin eject github` copies it out to edit.
 id = "github"
 name = "GitHub"

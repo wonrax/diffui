@@ -794,7 +794,9 @@ export class AiError extends Error {
 
 export const auth = freezeDeep({
   token(host, options = {}) {
-    return call("auth.token", { host: String(host), git: options.git !== false });
+    const args = { host: String(host), git: options.git !== false };
+    if (options.account != null) args.account = String(options.account);
+    return call("auth.token", args);
   },
   async secret(key, options = {}) {
     const args = { key: String(key) };
@@ -803,6 +805,9 @@ export const auth = freezeDeep({
   },
   hosts() {
     return call("auth.hosts", {});
+  },
+  accounts(host) {
+    return call("auth.accounts", { host: String(host) });
   },
 });
 
@@ -922,6 +927,7 @@ async function askForge(id, repo, request, signal) {
       return forgeProvider.hosts();
     case "account": {
       const options = request.token == null ? {} : { token: request.token };
+      if (request.account != null) options.account = request.account;
       return forgeProvider.account(request.host, Object.freeze(options));
     }
     case "view":

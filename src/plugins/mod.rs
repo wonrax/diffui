@@ -60,7 +60,7 @@ pub(crate) use cli::client_main;
 pub(crate) use events::TabPlugins;
 #[cfg(test)]
 pub(crate) use forge::bundled_kind;
-pub(crate) use page::{PageAction, PluginPage, page_overlay};
+pub(crate) use page::{PageAction, PluginPage, accounts_group, page_pane};
 #[cfg(all(test, unix))]
 pub(crate) use query::READ_ONLY;
 #[cfg(test)]

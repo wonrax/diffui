@@ -12,31 +12,38 @@ use std::path::Path;
 
 use diffui_core::RefreshMode;
 
-use crate::commands::{CommandArg, Context};
+use crate::commands::CommandArg;
 use crate::config::{
     CODE_BASELINE_OFFSET, CODE_FONT_SIZE, CODE_LINE_HEIGHT, ConfigFile, Key, Setting,
 };
 use crate::geometry::Rectangle;
 use crate::modes::{Mode, ModeKind};
-use crate::overlay_kit::{self, DIALOG_PAD};
+use crate::overlay_kit;
 use crate::prose::Prose;
 use crate::theme::{self, Font, ThemePreference, text_size};
 use crate::typography;
 use crate::ui::{self, Look, Segment, Segmented, Tip as _};
 use crate::{Action, Cx, Diffui, icons, menu};
 
-const CARD_WIDTH: f32 = 560.0;
+/// The dialog: a sidebar of sections and the pane of the one selected. As
+/// large as the window allows, up to this.
+const CARD_WIDTH: f32 = 980.0;
+const CARD_HEIGHT: f32 = 760.0;
+const SIDEBAR_WIDTH: f32 = 212.0;
+const SECTION_ROW: f32 = 32.0;
+/// The pane's inset, and the room above the sidebar's title.
+const PANE_PAD: f32 = 32.0;
+/// The pane's title: the section, or the page open in it.
+const PAGE_TITLE: f32 = 20.0;
+/// Between a group's heading and its card, on top of the heading's own.
+pub(crate) const HEADING_GAP: f32 = theme::space::SM;
 const ROW_HEIGHT: f32 = 44.0;
 /// A row with a line of explanation under its name, wrapped to two lines.
 pub(crate) const HINT_ROW_HEIGHT: f32 = 64.0;
 /// A row's inset inside its group's card, and its divider's.
 pub(crate) const ROW_INSET: f32 = theme::space::LG;
 /// Between one group's card and the next group's heading.
-const GROUP_GAP: f32 = theme::space::XL;
-/// The dialog's title, footer and insets around the groups.
-const DIALOG_HEAD: f32 = 146.0;
-/// Room a parse error's banner takes: a line, a wrapped error, its gap.
-const BANNER_HEIGHT: f32 = 88.0;
+const GROUP_GAP: f32 = theme::space::XXL;
 /// A pop-up button's label is cut with an ellipsis past this.
 const SELECT_TEXT_MAX: f32 = 180.0;
 const REVEAL_TIP: &str = if cfg!(target_os = "macos") {
@@ -49,6 +56,13 @@ const REVEAL_TIP: &str = if cfg!(target_os = "macos") {
 const MULTI_CLICK_MS: std::ops::RangeInclusive<f32> = 150.0..=1000.0;
 
 impl Diffui {
+    /// Show `section`, leaving whatever page was open in the pane.
+    pub(crate) fn show_settings_section(&mut self, section: Section) {
+        self.close_host_page();
+        self.plugins.page = None;
+        self.settings_section = section;
+    }
+
     pub(crate) fn open_settings(&mut self) {
         self.refresh_ai_keys();
         // It replaces the transient overlays rather than stacking over them:
@@ -194,29 +208,217 @@ fn stepped(value: f32, step: f32, steps: f32, range: &std::ops::RangeInclusive<f
 pub(crate) fn build_overlay(
     ui: &Diffui,
     look: Look,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Cx,
 ) -> AnyElement {
     if ui.mode(ModeKind::Settings).is_none() {
         return div().into_any_element();
     }
-    if let Some(page) = crate::host_page::page_overlay(ui, look, _window, cx) {
-        return page;
-    }
-    if let Some(page) = crate::plugins::page_overlay(ui, look, _window, cx) {
-        return page;
-    }
-    let Look { theme, .. } = look;
-    let config = ui.config;
-    let locked = |key: Key| config.locked.contains(key);
+    let Look { theme, font, .. } = look;
+    // A page opened from a section (a host's, a plugin's) takes the pane.
+    let pane = match crate::host_page::page_pane(ui, look, window, cx) {
+        Some(pane) => pane,
+        None => match crate::plugins::page_pane(ui, look, window, cx) {
+            Some(pane) => pane,
+            None => section_pane(ui, look, window, cx),
+        },
+    };
 
-    // The list scrolls out to the card's right edge, so the bar sits where
-    // every other scroll view's does; the inset moves inside.
-    let mut body = div().flex().flex_col().w_full().pr(px(DIALOG_PAD));
-    let mut errors = 0;
+    let title_font = theme::emphasis_font(font, gpui_kit::FontWeight::SEMIBOLD);
+    // The sidebar is a panel of its own down the card's left side: the
+    // dialog's name, its sections, and at the bottom the two files.
+    let corner = theme::radius::inner(theme::radius::MODAL, theme::HAIRLINE);
+    let sections = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .px(px(theme::space::MD))
+        .gap(px(theme::space::XXS))
+        .children(Section::ALL.into_iter().map(|section| {
+            let selected = ui.settings_section == section;
+            let ink = if selected {
+                theme.text
+            } else {
+                theme.muted_text
+            };
+            ui::list_row(
+                ui::ListRow::new(SECTION_ROW, theme::space::MD),
+                selected,
+                theme,
+            )
+            .id(("settings-section", section as usize))
+            .gap(px(theme::space::MD))
+            .child(icons::icon(section.icon(), ui::ICON_SIZE, ink))
+            .child(typography::line(
+                section.label(),
+                font,
+                text_size::BODY,
+                ink,
+            ))
+            .on_click(Diffui::on_action(Action::SettingsSection(section), cx))
+        }));
+    let files = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .w_full()
+        .px(px(theme::space::LG))
+        .pb(px(theme::space::LG))
+        .gap(px(theme::space::SM))
+        .child(file_button(ui, look, ConfigFile::Settings, cx))
+        .child(file_button(ui, look, ConfigFile::Config, cx));
+    let sidebar = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w(px(SIDEBAR_WIDTH))
+        .h_full()
+        .overflow_hidden()
+        .border_r_1()
+        .border_color(theme.border)
+        .child(crate::squircle::background(
+            crate::squircle::Fill::new(crate::squircle::Corners {
+                top_left: corner,
+                top_right: 0.0,
+                bottom_right: 0.0,
+                bottom_left: corner,
+            })
+            .background(overlay_kit::inset_fill(theme)),
+            0.0,
+        ))
+        .child(
+            div()
+                .px(px(theme::space::XL))
+                .pt(px(PANE_PAD))
+                .pb(px(theme::space::LG))
+                .child(typography::line(
+                    "Settings",
+                    title_font,
+                    text_size::TITLE,
+                    theme.text,
+                )),
+        )
+        .child(sections)
+        .child(div().flex_1())
+        .child(files);
+
+    // The pane: what it is in large type (a section, or a page opened from
+    // one with the way back), then its rows.
+    let (title, back) = match pane.page {
+        Some((title, back)) => (title, Some(back)),
+        None => (Prose::from(ui.settings_section.label()), None),
+    };
+    let close = look
+        .icon_button("settings-close", icons::CLOSE, theme.muted_text)
+        .tip("Close")
+        .on_click(Diffui::on_action(Action::CloseSettings, cx));
+    let header = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .w_full()
+        .gap(px(theme::space::MD))
+        .pl(px(PANE_PAD))
+        .pr(px(theme::space::XL))
+        .pt(px(theme::space::XL))
+        .pb(px(theme::space::LG))
+        .children(back.map(|back| {
+            look.icon_button("settings-page-back", icons::ARROW_LEFT, theme.muted_text)
+                .tip("Back")
+                .on_click(Diffui::on_action(back, cx))
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(PAGE_TITLE))
+                .child(title.view(
+                    Look {
+                        font: title_font,
+                        ..look
+                    },
+                    theme.text,
+                )),
+        )
+        .children(pane.actions)
+        .child(close);
+    // The pane scrolls out to the card's right edge, so the bar sits where
+    // every other scroll view's does; the inset is inside its body.
+    let content = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .child(header)
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(ui::scrollable(pane.scroll, pane.body)),
+        );
+    // A card this tall sits in the middle of the window: hung from the top
+    // like the short dialogs, it would leave all its spare room below.
+    let room = ui.window_size.height - 4.0 * theme::space::XXL;
+    let height = room.clamp(360.0, CARD_HEIGHT);
+    let top = ((ui.window_size.height - height) / 2.0).max(theme::space::XXL);
+    let width = (ui.window_size.width - 4.0 * theme::space::XXL).clamp(640.0, CARD_WIDTH);
+    let card = theme::surface(div(), theme::Elevation::Modal, theme)
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .flex_row()
+        .child(sidebar)
+        .child(content);
+    let dismiss = Diffui::on_action::<()>(Action::CloseSettings, cx);
+    ui::modal("settings-dialog", card, top, move |window, cx| {
+        dismiss(&(), window, cx)
+    })
+    .into_any_element()
+}
+
+/// What the dialog's right side shows: a section's groups, or a page
+/// opened from one.
+pub(crate) struct Pane {
+    /// A page's name and the action that leaves it. `None` for a section.
+    pub(crate) page: Option<(Prose, Action)>,
+    /// Buttons at the end of a page's header.
+    pub(crate) actions: Vec<AnyElement>,
+    /// The scroll view's id: each pane keeps its own place.
+    pub(crate) scroll: &'static str,
+    pub(crate) body: gpui_kit::Div,
+}
+
+/// A pane's body: a column out to the scroll bar's inset.
+pub(crate) fn pane_body() -> gpui_kit::Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .px(px(PANE_PAD))
+        .pb(px(PANE_PAD))
+}
+
+/// A sentence at the top of a section, saying what its rows are.
+fn lede(look: Look, text: &'static str) -> impl IntoElement {
+    let Look { theme, font, .. } = look;
+    div()
+        .w_full()
+        .pb(px(theme::space::LG))
+        .font(font.gpui())
+        .text_size(px(text_size::BODY))
+        .line_height(px(text_size::BODY * 1.5))
+        .text_color(theme.muted_text)
+        .child(text)
+}
+
+/// The pane of the section the sidebar has selected.
+fn section_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Pane {
+    let mut body = pane_body();
     for file in [ConfigFile::Config, ConfigFile::Settings] {
         if let Some(error) = ui.config_files.error(file) {
-            errors += 1;
             body = body.child(
                 div().pb(px(theme::space::LG)).child(overlay_kit::callout(
                     &Prose::new()
@@ -228,6 +430,52 @@ pub(crate) fn build_overlay(
             );
         }
     }
+    let section = ui.settings_section;
+    let body = match section {
+        Section::General => general(ui, look, body, cx),
+        Section::Hosts => body
+            .child(lede(
+                look,
+                "Machines you open repositories on. Each runs diffui-serve, which diffui never \
+                 installs for you.",
+            ))
+            .child(card(
+                look,
+                crate::host_page::settings_group(ui, look, window, cx),
+            )),
+        Section::Accounts => body
+            .child(lede(
+                look,
+                "Who you are on each forge, for pull requests. A host can have more than one \
+                 account: a repository uses whichever of them can see it.",
+            ))
+            .child(card(look, crate::plugins::accounts_group(ui, look, cx))),
+        Section::Ai => body
+            .child(lede(
+                look,
+                "What a command that asks an agent sends its prompt to.",
+            ))
+            .child(card(look, crate::ai::settings_group(ui, look, cx))),
+        Section::Plugins => body
+            .child(lede(
+                look,
+                "Scripts that add forges, AI providers, transports and commands.",
+            ))
+            .child(card(look, crate::plugins::settings_group(ui, look, cx))),
+    };
+    Pane {
+        page: None,
+        actions: Vec::new(),
+        scroll: section.scroll_id(),
+        body,
+    }
+}
+
+/// The General section: how the app looks, how code is set, how it behaves.
+fn general(ui: &Diffui, look: Look, body: gpui_kit::Div, cx: &mut Cx) -> gpui_kit::Div {
+    let Look { theme, .. } = look;
+    let config = ui.config;
+    let locked = |key: Key| config.locked.contains(key);
 
     let themes = [
         (ThemePreference::System, "System"),
@@ -367,71 +615,85 @@ pub(crate) fn build_overlay(
         ),
     ];
 
-    // Refresh and Baseline offset carry a line of explanation.
-    let hinted_rows = 2.0;
-    let (plugins, plugins_height) = crate::plugins::settings_group(ui, look, cx);
-    let plugin_rows = plugins.len();
-    // Every AI row is a hinted row's height.
-    let ai = crate::ai::settings_group(ui, look, cx);
-    let ai_rows = ai.len();
-    let (hosts, hosts_height) = crate::host_page::settings_group(ui, look, _window, cx);
-    let host_rows = hosts.len();
-    let groups = [
-        ("Appearance", appearance),
-        ("Code", code_rows),
-        ("Behaviour", behaviour),
-        ("Hosts", hosts),
-        ("AI", ai),
-        ("Plugins", plugins),
+    body.child(group(look, "Appearance", false, appearance))
+        .child(group(look, "Code", true, code_rows))
+        .child(group(look, "Behaviour", true, behaviour))
+}
+
+/// A section of the dialog, by its row in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Section {
+    #[default]
+    General,
+    Accounts,
+    Hosts,
+    Ai,
+    Plugins,
+}
+
+impl Section {
+    const ALL: [Section; 5] = [
+        Section::General,
+        Section::Accounts,
+        Section::Hosts,
+        Section::Ai,
+        Section::Plugins,
     ];
-    let count = groups.len() as f32;
-    let rows = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>()
-        - plugin_rows
-        - ai_rows
-        - host_rows;
-    for (index, (title, rows)) in groups.into_iter().enumerate() {
-        body = body.child(group(look, title, index > 0, rows));
+
+    fn label(self) -> &'static str {
+        match self {
+            Section::General => "General",
+            Section::Accounts => "Accounts",
+            Section::Hosts => "Hosts",
+            Section::Ai => "AI",
+            Section::Plugins => "Plugins",
+        }
     }
 
-    // As tall as the groups, so nothing scrolls on a usual window; a parse
-    // error's banner (or a long list of plugins) may push the last rows
-    // under the fold.
-    let content = DIALOG_HEAD
-        + count * (overlay_kit::GROUP_HEIGHT + 2.0 * theme::HAIRLINE)
-        + (count - 1.0) * GROUP_GAP
-        + rows as f32 * (ROW_HEIGHT + theme::HAIRLINE)
-        + hinted_rows * (HINT_ROW_HEIGHT - ROW_HEIGHT)
-        + plugins_height
-        + plugin_rows as f32 * theme::HAIRLINE
-        + hosts_height
-        + host_rows as f32 * theme::HAIRLINE
-        + ai_rows as f32 * (HINT_ROW_HEIGHT + theme::HAIRLINE)
-        + errors as f32 * BANNER_HEIGHT;
-    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
-        .min(content)
-        .max(240.0);
-    let card = overlay_kit::Dialog::new(&Prose::from("Settings"), look)
-        .width(CARD_WIDTH)
-        .height(height)
-        .child(
-            div()
-                .size_full()
-                .child(ui::scrollable("settings-list", body)),
-        )
-        .bound_hint(ui, Context::Settings, &["settings.close"], "Close")
-        .buttons([
-            file_button(ui, look, ConfigFile::Settings, cx),
-            file_button(ui, look, ConfigFile::Config, cx),
-        ])
-        .build();
-    let dismiss = Diffui::on_action::<()>(Action::CloseSettings, cx);
-    ui::modal(
-        "settings-dialog",
-        card,
-        crate::toolbar::modal_top(),
-        move |window, cx| dismiss(&(), window, cx),
-    )
-    .into_any_element()
+    fn icon(self) -> &'static str {
+        match self {
+            Section::General => icons::SETTINGS,
+            Section::Accounts => icons::CIRCLE_USER,
+            Section::Hosts => icons::SERVER,
+            Section::Ai => icons::SPARKLES,
+            Section::Plugins => icons::PUZZLE,
+        }
+    }
+
+    fn scroll_id(self) -> &'static str {
+        match self {
+            Section::General => "settings-general",
+            Section::Accounts => "settings-accounts",
+            Section::Hosts => "settings-hosts",
+            Section::Ai => "settings-ai",
+            Section::Plugins => "settings-plugins",
+        }
+    }
+}
+
+/// Rows split by inset hairlines in one card, with no heading: for a
+/// section that is one list.
+fn card(look: Look, rows: Vec<AnyElement>) -> impl IntoElement {
+    let Look { theme, .. } = look;
+    let count = rows.len();
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .border_1()
+        .border_color(theme::TRANSPARENT);
+    for (index, row) in rows.into_iter().enumerate() {
+        card = card.child(row);
+        if index + 1 < count {
+            card = card.child(
+                div()
+                    .mx(px(ROW_INSET))
+                    .h(px(theme::HAIRLINE))
+                    .bg(theme.border),
+            );
+        }
+    }
+    theme::squircle(card, theme::radius::CARD, None, Some(theme.border))
 }
 
 /// A titled card of rows split by inset hairlines, set off from the group
@@ -462,7 +724,11 @@ fn group(look: Look, title: &'static str, after: bool, rows: Vec<AnyElement>) ->
         .flex_col()
         .w_full()
         .when(after, |group| group.pt(px(GROUP_GAP)))
-        .child(overlay_kit::group_heading(title, look))
+        .child(
+            div()
+                .pb(px(HEADING_GAP))
+                .child(overlay_kit::group_heading(title, look)),
+        )
         .child(card)
 }
 
@@ -489,7 +755,15 @@ pub(crate) fn hinted_row(
         .flex_1()
         .min_w_0()
         .gap(px(theme::space::SM))
-        .child(typography::line(name, font, text_size::BODY, theme.text).text_ellipsis());
+        .child(
+            typography::line(
+                name,
+                theme::emphasis_font(font, gpui_kit::FontWeight::MEDIUM),
+                text_size::BODY,
+                theme.text,
+            )
+            .text_ellipsis(),
+        );
     if locked {
         label = label.child(
             div()

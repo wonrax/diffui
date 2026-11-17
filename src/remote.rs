@@ -85,12 +85,14 @@ pub(crate) struct HostConfig {
     pub(crate) name: String,
     /// The transport plugin that reaches it, by id.
     pub(crate) transport: Option<String>,
-    /// Instead of a transport: the command whose stdio is the stream, with
-    /// the server appended (or put where a word says `{server}`).
+    /// Instead of a transport: the whole command whose stdio is the stream,
+    /// run as written. It ends in whatever is `diffui-serve` over there;
+    /// `server` is a transport's, and isn't added to it.
     pub(crate) command: Option<Vec<String>>,
     /// The server over there. Empty: [`DEFAULT_SERVER`].
     pub(crate) server: Vec<String>,
-    /// The server's environment.
+    /// The server's environment. For a host reached by a command: the
+    /// command's own, on this machine.
     pub(crate) env: BTreeMap<String, String>,
     /// The transport's per-host settings, as written: every key of the
     /// table that isn't one of diffui's own.
@@ -132,13 +134,17 @@ fn read_host(name: &str, mut table: toml::Table, problems: &mut Vec<String>) -> 
         let command = words(value).filter(|command| !command.is_empty());
         if command.is_none() {
             problem(
-                "command must be a list of words, like [\"docker\", \"exec\", \"-i\", \"dev\"]",
+                "command must be a list of words, like [\"docker\", \"exec\", \"-i\", \"dev\", \"diffui-serve\"]",
             );
         }
         command
     });
     if transport.is_some() && command.is_some() {
         problem("has both transport and command: command is used");
+    }
+    // A command is run as written, so it already says what the server is.
+    if command.is_some() && table.contains_key("server") {
+        problem("server is a transport's: with command, the command says what the server is");
     }
     let server = table
         .remove("server")
@@ -433,60 +439,29 @@ fn fill_server(host: &str, server: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// One word for a POSIX shell. A leading `~/` stays the home folder.
-fn shell_quote(word: &str) -> String {
-    if let Some(rest) = word.strip_prefix("~/") {
-        return format!("\"$HOME\"/{}", shell_quote(rest));
-    }
-    let plain = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_/.:=@%+,-".contains(c));
-    if plain {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
+/// Whether an exit reads as "no such program".
+fn nothing_to_run(exit: &Exit) -> bool {
+    let said = exit.stderr.to_lowercase();
+    exit.code == Some(127)
+        || said.contains("command not found")
+        || said.contains(": not found")
+        || said.contains("no such file or directory")
 }
 
-/// A `command` host's whole command line: the command, then `env K=V …` and
-/// the server as further words. A command that goes through a shell says
-/// where the server goes with `{server}`, and gets it as one quoted line.
-fn command_argv(
-    command: &[String],
-    server: &[String],
-    env: &BTreeMap<String, String>,
-) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    if !env.is_empty() {
-        words.push("env".to_owned());
-        words.extend(env.iter().map(|(name, value)| format!("{name}={value}")));
-    }
-    words.extend(server.iter().cloned());
-    if command.iter().any(|word| word.contains("{server}")) {
-        let line = words
-            .iter()
-            .map(|word| shell_quote(word))
-            .collect::<Vec<_>>()
-            .join(" ");
-        command
-            .iter()
-            .map(|word| word.replace("{server}", &line))
-            .collect()
-    } else {
-        command.iter().cloned().chain(words).collect()
-    }
+/// [`missing_server`] for a host reached by a command, which names the
+/// server itself.
+fn missing_program(host: &str, exit: &Exit) -> Option<String> {
+    nothing_to_run(exit).then(|| {
+        format!(
+            "{host}'s command named a program that isn't there. Check where it says diffui-serve is."
+        )
+    })
 }
 
 /// The reading of an exit every transport shares: the far side had no such
 /// program.
 fn missing_server(host: &str, server: &[String], exit: &Exit) -> Option<String> {
-    let said = exit.stderr.to_lowercase();
-    let missing = exit.code == Some(127)
-        || said.contains("command not found")
-        || said.contains(": not found")
-        || said.contains("no such file or directory");
-    missing.then(|| {
+    nothing_to_run(exit).then(|| {
         format!(
             "{host} has no {} to run. Install diffui-serve there, or set this host's server to where it is.",
             server.first().map_or(DEFAULT_SERVER, String::as_str)
@@ -563,8 +538,10 @@ impl Connector for HostConnector {
                     Ok(in_process::launch())
                 }
                 Reach::Command(command) => Ok(Launch::Program {
-                    argv: command_argv(command, &server, &resolved.env),
-                    env: Vec::new(),
+                    argv: fill_server(&resolved.name, command)?,
+                    // The command's own environment: what reaches the far
+                    // side is up to the command.
+                    env: resolved.env.clone().into_iter().collect(),
                 }),
                 Reach::Transport { transport, options } => {
                     let host = transport_host(&resolved, options, server);
@@ -605,7 +582,10 @@ impl Connector for HostConnector {
                     return Some(explained);
                 }
             }
-            missing_server(&resolved.name, &server, &exit)
+            match &resolved.reach {
+                Reach::Command(_) => missing_program(&resolved.name, &exit),
+                Reach::Transport { .. } => missing_server(&resolved.name, &server, &exit),
+            }
         })
     }
 }
@@ -1023,8 +1003,7 @@ mod tests {
             env = { JJ_CONFIG = "/home/me/work.toml" }
 
             [hosts.dev]
-            command = ["docker", "exec", "-i", "dev"]
-            server = "/opt/diffui-serve"
+            command = ["docker", "exec", "-i", "dev", "/opt/diffui-serve"]
             "#,
         );
         let (hosts, problems) = read_hosts(&config);
@@ -1041,8 +1020,8 @@ mod tests {
         assert_eq!(work.options["distribution"].as_str(), Some("Ubuntu"));
 
         let dev = &hosts[0];
-        assert_eq!(dev.command.as_deref().unwrap().len(), 4);
-        assert_eq!(dev.server, ["/opt/diffui-serve"]);
+        assert_eq!(dev.command.as_deref().unwrap().len(), 5);
+        assert!(dev.server.is_empty());
     }
 
     #[test]
@@ -1063,27 +1042,29 @@ mod tests {
     }
 
     #[test]
-    fn a_command_host_gets_the_server_as_words_or_as_one_quoted_line() {
-        let env = BTreeMap::from([("K".to_owned(), "a b".to_owned())]);
-        let server = ["~/bin/diffui-serve".to_owned(), "it's".to_owned()];
-        let exec = ["docker", "exec", "-i", "dev"].map(str::to_owned);
+    fn a_command_host_is_its_command_and_says_so_about_a_server_or_env() {
+        let tables: HostTables = toml::from_str(
+            "[dev]\ncommand = [\"docker\", \"exec\", \"-i\", \"dev\", \"diffui-serve\"]\n\n\
+             [mixed]\ncommand = [\"x\"]\nserver = [\"y\"]\nenv = { A = \"1\" }\n",
+        )
+        .unwrap();
+        let (hosts, problems) = read_hosts(&tables);
         assert_eq!(
-            command_argv(&exec, &server, &BTreeMap::new()),
-            ["docker", "exec", "-i", "dev", "~/bin/diffui-serve", "it's"]
+            hosts[0].command.as_deref().unwrap(),
+            ["docker", "exec", "-i", "dev", "diffui-serve"]
         );
         assert_eq!(
-            command_argv(&exec, &server, &env)[4..6],
-            ["env".to_owned(), "K=a b".to_owned()]
-        );
-        let shell = ["ssh", "box", "exec {server}"].map(str::to_owned);
-        assert_eq!(
-            command_argv(&shell, &server, &env),
+            problems,
             [
-                "ssh",
-                "box",
-                "exec env 'K=a b' \"$HOME\"/bin/diffui-serve 'it'\\''s'"
+                "[hosts.mixed] server is a transport's: with command, the command says what the server is"
             ]
         );
+        let exit = |code, stderr: &str| Exit {
+            code,
+            stderr: stderr.to_owned(),
+        };
+        assert!(missing_program("dev", &exit(Some(127), "")).is_some());
+        assert_eq!(missing_program("dev", &exit(Some(1), "boom")), None);
     }
 
     #[test]

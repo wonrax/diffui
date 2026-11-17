@@ -95,6 +95,10 @@ pub(crate) struct Sources {
     pub env: Vec<String>,
     /// The store, and the account the host's token is under there.
     pub stored: Option<(Arc<dyn SecretStore>, String)>,
+    /// The store's account of another of the user's sign-ins on the host,
+    /// when the script asked for that one by name. Only it is looked at
+    /// then: its token, or none.
+    pub other: Option<String>,
     /// Ask git's credential helpers when nothing else has one.
     pub git: bool,
 }
@@ -115,6 +119,23 @@ pub(crate) fn token(
     cwd: &Path,
     cancel: &AtomicBool,
 ) -> Result<String, HostError> {
+    if let Some(account) = &sources.other {
+        let stored = match &sources.stored {
+            Some((store, _)) => store.get(account).map_err(|error| {
+                HostError::new("Error", format!("No token for {host}: {error}"))
+            })?,
+            None => None,
+        };
+        return stored
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                HostError::new(
+                    "NotFoundError",
+                    format!("No token for {host}: that account has none stored"),
+                )
+            });
+    }
     if let Some(token) = from_env(&sources.env) {
         return Ok(token);
     }
@@ -220,6 +241,7 @@ mod tests {
         let none = Sources {
             env: Vec::new(),
             stored: None,
+            other: None,
             git: true,
         };
         let token = token(
@@ -303,6 +325,7 @@ mod tests {
         let sources = |stored: bool| Sources {
             env: vec![var.clone()],
             stored: stored.then(|| (store.clone(), "forge@forge.test".to_string())),
+            other: None,
             git: false,
         };
         let cmd = ["echo", "from-cmd"].map(String::from);
@@ -320,6 +343,19 @@ mod tests {
         // SAFETY: the variable is this test's own.
         unsafe { std::env::set_var(&var, "from-env") };
         assert_eq!(ask(&sources(true), Some(&cmd)).unwrap(), "from-env");
+
+        // Another account asked for by name is its own token or nothing:
+        // never the host's, the variable's or the command's.
+        store.set("forge@forge.test/work", "for-work").unwrap();
+        let other = |name: &str| Sources {
+            other: Some(format!("forge@forge.test/{name}")),
+            ..sources(true)
+        };
+        assert_eq!(ask(&other("work"), Some(&cmd)).unwrap(), "for-work");
+        assert_eq!(
+            ask(&other("nobody"), Some(&cmd)).unwrap_err().name,
+            "NotFoundError"
+        );
         unsafe { std::env::remove_var(&var) };
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -317,6 +317,35 @@ fn a_connection_outlives_the_prompt_that_asked_for_it() {
     h.perform(Action::OpenRepoHost(None));
     h.settle();
     h.read(|ui| assert!(up(ui, "box")));
+
+    // Its row in Settings hangs up, and connects again.
+    h.perform(host(crate::host_page::HostAction::DisconnectFrom(
+        "box".to_owned(),
+    )));
+    h.read(|ui| assert!(state(ui, "box").is_none()));
+    h.perform(host(crate::host_page::HostAction::ConnectTo(
+        "box".to_owned(),
+    )));
+    h.wait_until("box to answer again", |ui| up(ui, "box"));
+}
+
+/// A command host's `env` is the command's own, where it is started.
+#[test]
+fn a_command_hosts_environment_is_its_commands_own() {
+    let mut h = open(
+        "[hosts.loud]\ncommand = [\"sh\", \"-c\", \"echo greeting is $GREETING >&2; exit 3\"]\nenv = { GREETING = \"hello\" }\n",
+    );
+    h.read(|ui| assert!(ui.remote.problems.is_empty(), "{:?}", ui.remote.problems));
+    h.act(|ui, cx| {
+        ui.host_link(&HostId("loud".to_owned()), cx);
+    });
+    h.wait_until("the command to end", |ui| {
+        matches!(state(ui, "loud"), Some(HostState::Failed(_)))
+    });
+    h.read(|ui| {
+        let transcript = ui.host_transcript(&HostId("loud".to_owned())).unwrap();
+        assert_eq!(transcript.output, "greeting is hello\n");
+    });
 }
 
 #[test]
@@ -335,7 +364,7 @@ fn a_failed_start_says_why_and_keeps_what_was_run_and_written() {
             unreachable!()
         };
         assert!(
-            why.starts_with("broken has no diffui-serve to run."),
+            why.starts_with("broken's command named a program that isn't there."),
             "{why}"
         );
         let transcript = ui.host_transcript(&HostId("broken".to_owned())).unwrap();
@@ -344,11 +373,12 @@ fn a_failed_start_says_why_and_keeps_what_was_run_and_written() {
         assert_eq!(ui.toasts.len(), 1, "the failure is said");
     });
 
-    // Trying again from its page starts over, and fails the same way.
-    h.perform(host(crate::host_page::HostAction::Open(
+    // Trying again from its row in Settings starts over, and fails the
+    // same way.
+    h.perform(Action::OpenSettings);
+    h.perform(host(crate::host_page::HostAction::ConnectTo(
         "broken".to_owned(),
     )));
-    h.perform(host(crate::host_page::HostAction::Connect));
     h.read(|ui| assert!(!matches!(state(ui, "broken"), Some(HostState::Failed(_)))));
     h.wait_until("the second start to fail", |ui| {
         matches!(state(ui, "broken"), Some(HostState::Failed(_)))
@@ -441,6 +471,15 @@ fn settings_makes_a_host_saves_what_is_typed_and_tests_it() {
         "{saved}"
     );
 
+    // Its settings changing lets go of a connection nothing uses: the next
+    // one is made the new way.
+    h.perform(host(HostAction::Draft {
+        key: "command".to_owned(),
+        text: "ssh devbox diffui-serve".to_owned(),
+    }));
+    h.perform(host(HostAction::Commit("command".to_owned())));
+    h.read(|ui| assert!(state(ui, "devbox").is_none()));
+
     // Removed, it is no host any more and the list is back.
     h.perform(host(HostAction::Remove));
     h.read(|ui| {
@@ -457,45 +496,41 @@ fn settings_makes_a_host_saves_what_is_typed_and_tests_it() {
 #[test]
 fn settings_adds_to_a_config_toml_host_and_resets_it() {
     use crate::host_page::HostAction;
-    let mut h = open(&config());
-    h.perform(host(HostAction::Open("box".to_owned())));
+    let mut h = open(&format!(
+        "{}\n[hosts.staging]\ntransport = \"ssh\"\ndestination = \"deploy@staging.acme.dev\"\n",
+        config()
+    ));
+    h.perform(host(HostAction::Open("staging".to_owned())));
     h.read(|ui| assert!(ui.mode(crate::ModeKind::Settings).is_some()));
     h.perform(host(HostAction::Draft {
-        key: "env".to_owned(),
-        text: "A=1".to_owned(),
+        key: "server".to_owned(),
+        text: "~/bin/diffui-serve".to_owned(),
     }));
     // Closing Settings leaves the page too.
     h.perform(Action::CloseSettings);
     let saved = settings_file(&mut h);
     assert!(
-        saved.contains("[hosts.box.env]\nA = \"1\"") || saved.contains("env = { A = \"1\" }"),
+        saved.contains("[hosts.staging]\nserver = [\"~/bin/diffui-serve\"]"),
         "{saved}"
     );
     h.read(|ui| {
-        let table = &ui.host_tables()["box"];
-        assert!(table.contains_key("command"), "config.toml's stays");
-        assert!(table.contains_key("env"));
+        let table = &ui.host_tables()["staging"];
+        assert!(table.contains_key("transport"), "config.toml's stays");
+        assert!(table.contains_key("server"));
         assert!(ui.remote.problems.is_empty(), "{:?}", ui.remote.problems);
     });
 
-    // It still opens, with what Settings added.
+    // Reset takes Settings' part away; the host is config.toml's again.
+    h.perform(host(HostAction::Open("staging".to_owned())));
+    h.perform(host(HostAction::Remove));
+    h.read(|ui| {
+        assert_eq!(ui.remote.page.as_ref().unwrap().name, "staging");
+        assert!(!ui.host_tables()["staging"].contains_key("server"));
+    });
+    assert!(!settings_file(&mut h).contains("hosts"));
+
+    // A host config.toml reaches by a command connects from its page.
     h.perform(host(HostAction::Open("box".to_owned())));
     h.perform(host(HostAction::Connect));
     h.wait_until("box to answer", |ui| up(ui, "box"));
-    // Its settings changing lets go of a connection nothing uses: the next
-    // one is made the new way.
-    h.perform(host(HostAction::Draft {
-        key: "env".to_owned(),
-        text: "A=2".to_owned(),
-    }));
-    h.perform(host(HostAction::Commit("env".to_owned())));
-    h.read(|ui| assert!(state(ui, "box").is_none()));
-
-    // Reset takes Settings' part away; the host is config.toml's again.
-    h.perform(host(HostAction::Remove));
-    h.read(|ui| {
-        assert_eq!(ui.remote.page.as_ref().unwrap().name, "box");
-        assert!(!ui.host_tables()["box"].contains_key("env"));
-    });
-    assert!(!settings_file(&mut h).contains("hosts"));
 }

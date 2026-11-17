@@ -380,6 +380,8 @@ pub(crate) struct Diffui {
     /// dialog changes a font — caching avoids re-shaping six strings on every
     /// render and on every drag tick of the resize handle.
     pub(crate) sidebar_min_width: f32,
+    /// The section the settings dialog shows.
+    pub(crate) settings_section: crate::settings::Section,
     /// Last window geometry seen from the compositor: inner (client) size and
     /// outer top-left position. Updated on `Opened`/`Resized`/`Moved` and
     /// written back — debounced — so the next launch restores it. Position is

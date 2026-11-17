@@ -56,7 +56,8 @@ Each distribution is offered as a host by its name (the chip in the open
 dialog, or `diffui Ubuntu:~/src/repo`). diffui starts
 `wsl.exe --distribution <name> --shell-type login` and looks for
 `diffui-serve` on the `PATH` a login shell gets there. Say where it is
-otherwise, in diffui's config.toml (`%XDG_CONFIG_HOME%\diffui\config.toml`,
+otherwise, in Settings → Hosts (the pencil on the distribution's row, Server)
+or in diffui's config.toml (`%XDG_CONFIG_HOME%\diffui\config.toml`,
 else `%HOME%\.config\diffui\config.toml`):
 
 ```toml

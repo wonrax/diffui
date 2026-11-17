@@ -41,6 +41,9 @@ one topic or none.
 - **A repository can be on another machine.** A tab opened as `host:/path`
   is served by `diffui-serve` (or `diffui serve`) running there; what reads
   or runs something in the working tree is off for it.
+- **Settings has sections**: General, Accounts (forge sign-ins), Hosts
+  (other machines), AI and Plugins. Name the section when you send the user
+  there.
 - **`diffui jj <args>` is the jj CLI diffui links (0.47.1).** Use it when the
   `jj` on the `PATH` is a different version and refuses the repository.
 
@@ -54,10 +57,10 @@ topics don't repeat them.
 |---|---|
 | `diffui skill notes` | You changed code in a jj repository the user reviews in diffui, or the user mentions diffui notes, replies, or pastes notes as Markdown. |
 | `diffui skill ctl` | diffui is open and the user wants you to show them a revision or repository there, run a jj command they can watch and undo, or run one of its commands. |
-| `diffui skill pull-requests` | The user wants a pull or merge request created, updated or stacked from diffui, or diffui shows no pull requests for a GitHub or GitLab remote (sign-in, tokens, Enterprise and self-hosted hosts). |
+| `diffui skill pull-requests` | The user wants a pull or merge request created, updated or stacked from diffui, or diffui shows no pull requests for a GitHub or GitLab remote (sign-in, tokens, a second account on one host, Enterprise and self-hosted hosts). |
 | `diffui skill commands` | The user wants a new command, menu item or shortcut in diffui, or a shipped one changed: `[[commands]]` rows, template variables, when-clauses, keys. |
 | `diffui skill ai` | The user asks which AI diffui's Generate and Review use, wants another provider or model, or an AI command is greyed out. |
 | `diffui skill plugin` | A `[[commands]]` row can't do the job (it needs logic, HTTP, events or a status item), you're writing or fixing a plugin, or one fails to load. |
 | `diffui skill forge-plugin` | diffui should show pull requests for a forge it doesn't know (Forgejo, Gitea, Bitbucket), or a forge plugin needs pull request tabs, review comments or sign-in. Read `plugin` first. |
-| `diffui skill remote` | The repository is on another machine (a server over ssh, WSL from Windows, a container): setting up a host in config.toml, where `diffui-serve` comes from, why a remote tab doesn't connect, or writing a transport plugin. |
+| `diffui skill remote` | The repository is on another machine (a server over ssh, WSL from Windows, a container): setting up a host (Settings → Hosts, or config.toml), where `diffui-serve` comes from, why a remote tab doesn't connect and where its output is, or writing a transport plugin. |
 | `diffui skill patches` | You want to show the user a diff that isn't a jj change (a patch, `git diff` output, two files or folders), or make diffui jj's or git's diff tool. |

@@ -44,14 +44,30 @@ another CLI binary, and `api_url` (per host) at a server whose API isn't at
 `https://<host>/api/v3` (GitHub) or `/api/v4` (GitLab). Tokens live in the
 macOS Keychain, never in a config file; `GH_TOKEN` / `GITHUB_TOKEN` /
 `GH_ENTERPRISE_TOKEN` / `GITLAB_TOKEN` are read the way the CLIs read them.
-Settings → Plugins → the plugin's pencil has an Account row per host. For
-scripts and agents, `diffui plugin auth <id>`:
+Settings → Accounts → the forge's pencil has a row per host. For scripts and
+agents, `diffui plugin auth <id>`:
 
 ```sh
 diffui plugin auth github --status                     # how github.com signs in, as whom
 printf %s "$TOKEN" | diffui plugin auth github --host github.acme.com --token-stdin
 diffui plugin auth gitlab --host gitlab.acme.org --sign-out
 ```
+
+A host can have more accounts than its own sign-in: a work account beside a
+personal one. "Another account" on that page names one ("work") and takes
+its token; from a terminal it is `--account`:
+
+```sh
+printf %s "$WORK_TOKEN" | diffui plugin auth github --account work --token-stdin
+diffui plugin auth github --account work --status
+```
+
+Nothing says which account a repository belongs to, and nothing needs to:
+the forge asks for the repository with the host's own sign-in first, then
+with each other account, and uses the first that can see it (remembered per
+repository). So a repository in an organisation the personal account can't
+see is reached with the work one, whoever owns it. When a repository shows
+no pull requests and the right account isn't set up, add it this way.
 
 `--token-stdin` keeps the token only once the forge says whose it is
 (`GET /user`). GitHub needs the `repo` scope (fine-grained: metadata,

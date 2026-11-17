@@ -149,22 +149,18 @@ fn status(found: &Found) -> (&'static str, Option<&str>) {
     }
 }
 
-/// The settings dialog's Plugins group: a row per plugin found, then the
-/// folder they live in, and how tall the rows are together.
-pub(crate) fn settings_group(ui: &Diffui, look: Look, cx: &mut Cx) -> (Vec<AnyElement>, f32) {
-    let mut height = ROW_HEIGHT;
+/// The settings dialog's Plugins section: a row per plugin found, then the
+/// folder they live in.
+pub(crate) fn settings_group(ui: &Diffui, look: Look, cx: &mut Cx) -> Vec<AnyElement> {
     let mut rows: Vec<AnyElement> = ui
         .plugins
         .found
         .iter()
         .enumerate()
-        .map(|(index, found)| {
-            height += row_height(found);
-            plugin_row(ui, look, index, found, cx)
-        })
+        .map(|(index, found)| plugin_row(ui, look, index, found, cx))
         .collect();
     rows.push(folder_row(ui, look, cx));
-    (rows, height)
+    rows
 }
 
 use crate::settings::{HINT_ROW_HEIGHT as ROW_HEIGHT, ROW_INSET};

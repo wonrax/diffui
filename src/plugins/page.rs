@@ -21,7 +21,7 @@ use diffui_plugins::{ConfigField, ConfigKind, Manifest, PER_HOST};
 use super::ai::program_found;
 use super::{FromPlugin, PluginAction, State};
 use crate::modes::ModeKind;
-use crate::overlay_kit::{self, DIALOG_PAD};
+use crate::overlay_kit;
 use crate::prose::Prose;
 use crate::theme::{self, text_size};
 use crate::typography;
@@ -127,6 +127,9 @@ pub(crate) enum PageAction {
     TokenPage { host: String },
     /// Add the typed host to the forge's `hosts` setting.
     AddHost,
+    /// Give the typed name (`work`, or `git.acme.com/work`) a row of its
+    /// own: another account on the host, with its own token.
+    AddAccount,
     /// Remove a host: from `hosts`, its per-host settings and its secrets.
     /// Unconfirmed, a host with a stored secret asks first.
     RemoveHost { host: String, confirmed: bool },
@@ -160,6 +163,7 @@ pub(super) fn draft_id(key: &str, host: Option<&str>) -> &'static str {
 }
 
 pub(super) const NEW_HOST: &str = "plugin-page-new-host";
+pub(crate) const NEW_ACCOUNT: &str = "plugin-page-new-account";
 
 /// `host`'s table under `per_host` in a `[plugins.<id>]` table.
 fn lookup_host<'a>(table: &'a toml::Table, host: &str) -> Option<&'a toml::Table> {
@@ -276,19 +280,44 @@ impl Diffui {
             .map(ToString::to_string)
             .filter(|host| !host.contains('*'))
             .collect();
-        hosts.extend(secrets::token_hosts(&*self.plugins.secrets, id));
+        // Another account on a host is a row of its own, under its host's.
+        let scopes = secrets::token_scopes(&*self.plugins.secrets, id);
+        hosts.extend(
+            scopes
+                .iter()
+                .map(|scope| secrets::split_scope(scope).0.to_owned()),
+        );
+        hosts.extend(scopes);
         if let Some(per_host) = config.get(PER_HOST).and_then(toml::Value::as_table) {
             hosts.extend(per_host.keys().cloned());
         }
         if let Some(page) = self.plugins.page.as_ref().filter(|page| page.id == id) {
             hosts.extend(page.extra.iter().cloned());
         }
-        hosts.sort();
-        hosts.dedup();
+        // An account someone is adding has its host's row too.
+        let of_extra: Vec<String> = hosts
+            .iter()
+            .map(|scope| secrets::split_scope(scope).0.to_owned())
+            .collect();
+        hosts.extend(of_extra);
         if let Some(default) = &forge.default_host {
-            hosts.retain(|host| host != default);
-            hosts.insert(0, default.clone());
+            hosts.push(default.clone());
         }
+        // The forge's own host first, each host followed by its other
+        // accounts.
+        let default = forge.default_host.as_deref();
+        hosts.sort_by(|a, b| {
+            let key = |scope: &str| {
+                let (host, other) = secrets::split_scope(scope);
+                (
+                    Some(host) != default,
+                    host.to_owned(),
+                    other.map(str::to_owned),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+        hosts.dedup();
         hosts
     }
 
@@ -299,6 +328,10 @@ impl Diffui {
                     self.open_settings();
                 }
                 self.close_host_page();
+                // Opened for a host, it is about signing in there.
+                if host.is_some() {
+                    self.settings_section = crate::settings::Section::Accounts;
+                }
                 let stored = self.plugins.secrets.accounts().unwrap_or_default();
                 self.plugins.page = Some(PluginPage {
                     id: id.clone(),
@@ -396,7 +429,7 @@ impl Diffui {
                 };
                 if let Some(url) = token_field(&manifest)
                     .and_then(|field| field.secret.as_ref())
-                    .and_then(|secret| secret.page_for(&host))
+                    .and_then(|secret| secret.page_for(secrets::split_scope(&host).0))
                 {
                     crate::open_url(&url);
                 }
@@ -428,6 +461,37 @@ impl Diffui {
                     hosts.push(toml::Value::String(host));
                 }
                 self.set_plugin_setting(diffui_plugins::HOSTS, None, Some(hosts.into()));
+            }
+            PageAction::AddAccount => {
+                let Some((page, manifest)) = self.page_manifest() else {
+                    return;
+                };
+                let typed = page.drafts.get(NEW_ACCOUNT).cloned().unwrap_or_default();
+                let typed = typed.trim().trim_matches('/');
+                // A name alone is an account on the forge's own host.
+                let (host, name) = match typed.split_once('/') {
+                    Some((host, name)) => (Some(host.to_ascii_lowercase()), name),
+                    None => (
+                        manifest
+                            .forge
+                            .as_ref()
+                            .and_then(|forge| forge.default_host.clone()),
+                        typed,
+                    ),
+                };
+                let (Some(host), false) = (host, name.trim().is_empty()) else {
+                    return self.push_error_toast(
+                        Prose::from("Not added"),
+                        "Say which host too, as host/name: git.acme.com/work",
+                    );
+                };
+                let scope = secrets::scope(&host, Some(name));
+                if let Some(page) = self.plugins.page.as_mut() {
+                    page.drafts.remove(NEW_ACCOUNT);
+                    if !page.extra.contains(&scope) {
+                        page.extra.push(scope);
+                    }
+                }
             }
             PageAction::RemoveHost { host, confirmed } => {
                 let Some((page, manifest)) = self.page_manifest() else {
@@ -755,11 +819,14 @@ impl Diffui {
         let to = self.plugins.to_app.clone();
         let checked = token.is_some();
         let (plugin_id, answered) = (id.to_owned(), host.clone());
+        // `host` is what the row is for: a host, or another account on it.
+        let (on, other) = secrets::split_scope(&host);
         plugin.call::<Account>(
             PluginCall::Forge {
                 repo: super::forge::no_repository(None),
                 call: ForgeCall::Account {
-                    host,
+                    host: on.to_owned(),
+                    account: other.map(str::to_owned),
                     token: token.map(Secret),
                 },
             },
@@ -844,16 +911,71 @@ impl Diffui {
     }
 }
 
-pub(crate) const CARD_WIDTH: f32 = 560.0;
 pub(crate) const FIELD_WIDTH: f32 = 240.0;
 
-/// The page, in place of the Settings list, while one is open.
-pub(crate) fn page_overlay(
+/// The settings dialog's Accounts section: a row per forge that signs in,
+/// naming the hosts and accounts it signs in to, with the pencil that
+/// opens them.
+pub(crate) fn accounts_group(ui: &Diffui, look: Look, cx: &mut Cx) -> Vec<AnyElement> {
+    let Look { theme, .. } = look;
+    ui.plugins
+        .found
+        .iter()
+        .enumerate()
+        .filter_map(|(index, found)| {
+            token_field(found.manifest.as_ref()?)?;
+            let scopes: Vec<String> = ui
+                .page_hosts(&found.id)
+                .iter()
+                .map(|scope| match secrets::split_scope(scope) {
+                    (host, Some(name)) => format!("{name} on {host}"),
+                    (host, None) => host.to_owned(),
+                })
+                .collect();
+            let said = if scopes.is_empty() {
+                "Turn the plugin on to sign in".to_owned()
+            } else {
+                scopes.join(" \u{b7} ")
+            };
+            let face = theme::radius::inner(theme::radius::CARD, theme::space::XXS);
+            let side = theme::control::COMPACT - 2.0 * theme::space::XXS;
+            let open = look
+                .icon_button(
+                    ("settings-accounts-open", index),
+                    icons::PENCIL,
+                    theme.muted_text,
+                )
+                .size(px(side))
+                .corner_radius(face)
+                .tip("Accounts")
+                .on_click(send(
+                    PageAction::Open {
+                        id: found.id.clone(),
+                        host: None,
+                    },
+                    cx,
+                ));
+            Some(row_shell(
+                HINT_ROW_HEIGHT,
+                label(
+                    look,
+                    &found.name,
+                    false,
+                    Some(caption(look, said, theme.muted_text)),
+                ),
+                ui::segmented(theme).child(open),
+            ))
+        })
+        .collect()
+}
+
+/// The open page, for the settings dialog's pane.
+pub(crate) fn page_pane(
     ui: &Diffui,
     look: Look,
     window: &mut Window,
     cx: &mut Cx,
-) -> Option<AnyElement> {
+) -> Option<crate::settings::Pane> {
     let page = ui.plugins.page.as_ref()?;
     let found = ui.plugins.get(&page.id)?;
     let manifest = found.manifest.clone()?;
@@ -866,22 +988,18 @@ pub(crate) fn page_overlay(
         .unwrap_or_default();
     let resolved = manifest.resolve_config(&config).0;
 
-    let mut body = div().flex().flex_col().w_full().pr(px(DIALOG_PAD));
-    let mut height = 0.0;
+    let mut body = crate::settings::pane_body();
     let mut first = true;
 
     if let Some(token) = token_field(&manifest) {
         let mut rows = Vec::new();
         for host in ui.page_hosts(&page.id) {
-            let (row, row_height) =
-                account_row(ui, look, page, &manifest, token, &host, &user, window, cx);
+            let row = account_row(ui, look, page, &manifest, token, &host, &user, window, cx);
             rows.push(row);
-            height += row_height;
         }
         rows.push(add_host_row(look, page, window, cx));
-        height += ROW_HEIGHT;
+        rows.push(add_account_row(look, page, window, cx));
         body = body.child(group(look, "Accounts", !first, rows));
-        height += GROUP_HEAD;
         first = false;
     }
 
@@ -892,7 +1010,6 @@ pub(crate) fn page_overlay(
             !first,
             vec![provider_row(ui, look, page, cx)],
         ));
-        height += HINT_ROW_HEIGHT + GROUP_HEAD;
         first = false;
     }
 
@@ -906,57 +1023,30 @@ pub(crate) fn page_overlay(
         let model_key = manifest.ai.as_ref().and_then(|ai| ai.model.as_deref());
         let mut rows: Vec<AnyElement> = Vec::new();
         for field in &fields {
-            height += HINT_ROW_HEIGHT;
             rows.push(setting_row(
                 ui, look, page, &manifest, field, &resolved, &user, window, cx,
             ));
             if page.picking && model_key == Some(field.key.as_str()) {
-                let (list, list_height) = model_list(look, page, &field.key, cx);
+                let list = model_list(look, page, &field.key, cx);
                 rows.push(list);
-                height += list_height;
             }
         }
         body = body.child(group(look, "Settings", !first, rows));
-        height += GROUP_HEAD;
     }
 
-    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
-        .min(height + DIALOG_HEAD)
-        .max(240.0);
-    let back = look
-        .button("plugin-page-back", "Back")
-        .on_click(Diffui::on_action(
+    Some(crate::settings::Pane {
+        page: Some((
+            Prose::from(found.name.clone()),
             Action::Plugin(PluginAction::Page(PageAction::Back)),
-            cx,
-        ));
-    let card = overlay_kit::Dialog::new(&Prose::from(found.name.clone()), look)
-        .width(CARD_WIDTH)
-        .height(height)
-        .child(div().size_full().child(ui::scrollable("plugin-page", body)))
-        .bound_hint(
-            ui,
-            crate::commands::Context::Settings,
-            &["settings.close"],
-            "Close",
-        )
-        .buttons([back.into_any_element()])
-        .build();
-    let dismiss = Diffui::on_action::<()>(Action::CloseSettings, cx);
-    Some(
-        ui::modal(
-            "settings-dialog",
-            card,
-            crate::toolbar::modal_top(),
-            move |window, cx| dismiss(&(), window, cx),
-        )
-        .into_any_element(),
-    )
+        )),
+        actions: Vec::new(),
+        scroll: "plugin-page",
+        body,
+    })
 }
 
 pub(crate) const ROW_HEIGHT: f32 = 44.0;
 const HINT_ROW_HEIGHT: f32 = crate::settings::HINT_ROW_HEIGHT;
-pub(crate) const GROUP_HEAD: f32 = overlay_kit::GROUP_HEIGHT + theme::space::XL;
-pub(crate) const DIALOG_HEAD: f32 = 146.0;
 const ROW_INSET: f32 = crate::settings::ROW_INSET;
 
 fn send(
@@ -997,8 +1087,12 @@ pub(crate) fn group(
         .flex()
         .flex_col()
         .w_full()
-        .when(after, |group| group.pt(px(theme::space::XL)))
-        .child(overlay_kit::group_heading(title, look))
+        .when(after, |group| group.pt(px(theme::space::XXL)))
+        .child(
+            div()
+                .pb(px(crate::settings::HEADING_GAP))
+                .child(overlay_kit::group_heading(title, look)),
+        )
         .child(card)
         .into_any_element()
 }
@@ -1018,7 +1112,13 @@ pub(crate) fn label(
         .min_w_0()
         .gap(px(theme::space::SM))
         .child(
-            typography::line(name.to_owned(), font, text_size::BODY, theme.text).text_ellipsis(),
+            typography::line(
+                name.to_owned(),
+                theme::emphasis_font(font, gpui_kit::FontWeight::MEDIUM),
+                text_size::BODY,
+                theme.text,
+            )
+            .text_ellipsis(),
         );
     if locked {
         title = title.child(
@@ -1168,7 +1268,7 @@ fn account_row(
     user: &toml::Table,
     window: &mut Window,
     cx: &mut Cx,
-) -> (AnyElement, f32) {
+) -> AnyElement {
     let Look { theme, mono, .. } = look;
     let config = ui.plugin_config(&page.id);
     let cli = manifest
@@ -1187,6 +1287,17 @@ fn account_row(
         match page.accounts.get(host) {
             None if ui.plugins.plugin(&page.id).is_none() => {
                 ("Turn the plugin on to sign in".to_owned(), theme.muted_text)
+            }
+            // An account just added: nothing to check until it has a token.
+            None if secrets::split_scope(host).1.is_some()
+                && !page
+                    .stored
+                    .contains(&secrets::account(&page.id, &token.key, Some(host))) =>
+            {
+                (
+                    "Tried for repositories the host's sign-in can't see".to_owned(),
+                    theme.muted_text,
+                )
             }
             None | Some(Check::Asking) => ("Checking…".to_owned(), theme.muted_text),
             Some(Check::Known(Account {
@@ -1212,6 +1323,13 @@ fn account_row(
             ),
         }
     };
+    // A row for another account on a host: its token is all there is to
+    // it.
+    let (on, other) = secrets::split_scope(host);
+    let shown = match other {
+        Some(name) => format!("{name} on {on}"),
+        None => host.to_owned(),
+    };
     let name = div()
         .flex()
         .flex_col()
@@ -1220,7 +1338,7 @@ fn account_row(
         .overflow_hidden()
         .gap(px(theme::space::XXS))
         .child(
-            typography::line(host.to_owned(), mono, text_size::BODY, theme.text)
+            typography::line(shown, mono, text_size::BODY, theme.text)
                 .overflow_hidden()
                 .text_ellipsis(),
         )
@@ -1228,6 +1346,7 @@ fn account_row(
     let methods = manifest
         .config
         .iter()
+        .filter(|_| other.is_none())
         .find(|field| field.per_host && field.kind == ConfigKind::Enum)
         .map(|field| {
             let locked = lookup(user, &field.key, Some(host)).is_some();
@@ -1292,7 +1411,11 @@ fn account_row(
             .gap(px(theme::space::MD))
             .child(div().flex_1().min_w_0().child(caption(
                 look,
-                "Remove this host and its saved token?",
+                if other.is_some() {
+                    "Remove this account and its saved token?"
+                } else {
+                    "Remove this host and its saved token?"
+                },
                 theme.text,
             )))
             .child(
@@ -1326,7 +1449,11 @@ fn account_row(
             .gap(px(theme::space::MD))
             .child(div().flex_1().min_w_0().child(caption(
                 look,
-                "A token is saved for this host",
+                if other.is_some() {
+                    "A token is saved for this account"
+                } else {
+                    "A token is saved for this host"
+                },
                 theme.muted_text,
             )))
             .child(
@@ -1398,7 +1525,7 @@ fn account_row(
             )
             .children(get)
     };
-    let row = div()
+    div()
         .flex()
         .flex_col()
         .w_full()
@@ -1407,11 +1534,45 @@ fn account_row(
         .gap(px(theme::space::SM))
         .child(top)
         .child(bottom)
-        .into_any_element();
-    (row, ACCOUNT_ROW_HEIGHT)
+        .into_any_element()
 }
 
-const ACCOUNT_ROW_HEIGHT: f32 = 88.0;
+/// A field to name another account on a host.
+fn add_account_row(look: Look, page: &PluginPage, window: &mut Window, cx: &mut Cx) -> AnyElement {
+    let typed = page.drafts.get(NEW_ACCOUNT).cloned().unwrap_or_default();
+    let label = label(
+        look,
+        "Another account",
+        false,
+        Some(caption(
+            look,
+            "Tried for repositories the host's sign-in can't see",
+            look.theme.subtle_text,
+        )),
+    );
+    let control = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::MD))
+        .child(text_field(
+            look,
+            NEW_ACCOUNT,
+            &typed,
+            "work",
+            false,
+            PageAction::AddAccount,
+            window,
+            cx,
+        ))
+        .child(
+            look.button("plugin-page-add-account", "Add")
+                .compact()
+                .disabled(typed.trim().is_empty())
+                .on_click(send(PageAction::AddAccount, cx)),
+        );
+    row_shell(ROW_HEIGHT + theme::space::MD, label, control)
+}
 
 /// A field to add a host the forge doesn't know yet.
 fn add_host_row(look: Look, page: &PluginPage, window: &mut Window, cx: &mut Cx) -> AnyElement {
@@ -1663,7 +1824,7 @@ const MODEL_ROW: f32 = 28.0;
 
 /// The provider's models under its model setting, narrowed by what is
 /// typed there: each one sets it.
-fn model_list(look: Look, page: &PluginPage, key: &str, cx: &mut Cx) -> (AnyElement, f32) {
+fn model_list(look: Look, page: &PluginPage, key: &str, cx: &mut Cx) -> AnyElement {
     let Look {
         theme, font, mono, ..
     } = look;
@@ -1740,16 +1901,14 @@ fn model_list(look: Look, page: &PluginPage, key: &str, cx: &mut Cx) -> (AnyElem
             }
         }
     }
-    let height = lines.len() as f32 * MODEL_ROW + 2.0 * theme::space::SM;
-    let list = div()
+    div()
         .flex()
         .flex_col()
         .w_full()
         .py(px(theme::space::SM))
         .px(px(ROW_INSET))
         .children(lines)
-        .into_any_element();
-    (list, height)
+        .into_any_element()
 }
 
 fn json_to_toml(value: &serde_json::Value) -> toml::Value {

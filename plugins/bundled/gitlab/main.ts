@@ -14,6 +14,7 @@ import {
   config,
   files,
   forge,
+  kv,
   type Account,
   type Checks,
   type FilePatch,
@@ -181,15 +182,68 @@ function methodFor(host: string): Promise<"cli" | "token"> {
   return method;
 }
 
-/** The API of `host` with its token. The `token` mode also takes git's credential. */
-async function apiFor(host: string, webUrl?: string): Promise<rest.Api> {
-  const token = await auth.token(host, { git: mode(host) === "token" }).catch(() => null);
+/**
+ * Which of the user's accounts reaches the project at `webUrl`: `undefined` for the host's own sign-in, else
+ * the name of another account there. Being able to see a project has nothing to do with owning it, so the
+ * project itself is asked for: with the host's sign-in first, then with each other account. The first that
+ * sees it is used, and kept across restarts when it is another account.
+ */
+const reaching = new Map<string, Promise<string | undefined>>();
+function accountFor(host: string, webUrl?: string): Promise<string | undefined> {
+  const project = webUrl === undefined ? undefined : /^[a-z]+:\/\/[^/]+\/(.+?)\/?$/i.exec(webUrl)?.[1];
+  if (project === undefined) return Promise.resolve(undefined);
+  const key = `${host}/${project}`.toLowerCase();
+  let found = reaching.get(key);
+  if (found === undefined) {
+    found = findAccount(host, project, webUrl, key);
+    reaching.set(key, found);
+  }
+  return found;
+}
+
+async function findAccount(host: string, project: string, webUrl: string | undefined, key: string) {
+  const others = await auth.accounts(host).catch(() => [] as string[]);
+  if (others.length === 0) return undefined;
+  const kept: unknown = await kv.get(`account:${key}`).catch(() => undefined);
+  if (typeof kept === "string" && others.includes(kept)) return kept;
+  if (await sees(host, project, webUrl, undefined)) return undefined;
+  for (const other of others) {
+    if (await sees(host, project, webUrl, other)) {
+      await kv.set(`account:${key}`, other).catch(() => {});
+      return other;
+    }
+  }
+  // Nobody sees it: the host's sign-in is the one to say so.
+  return undefined;
+}
+
+/** Whether `account` (the host's own sign-in when `undefined`) can see `project`. */
+async function sees(host: string, project: string, webUrl: string | undefined, account?: string) {
+  const path = `projects/${encodeURIComponent(project)}`;
+  try {
+    if (account !== undefined || (await methodFor(host)) === "token") {
+      await rest.call(await apiFor(host, webUrl, account), "GET", path);
+    } else {
+      await glab.api(host, [path]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The API of `host` with a token: `account`'s when one is named, else the host's own. The `token` mode also takes git's credential. */
+async function apiFor(host: string, webUrl?: string, account?: string): Promise<rest.Api> {
+  const git = mode(host) === "token" && account === undefined;
+  const token = await auth.token(host, { git, account }).catch(() => null);
   if (token === null) throw new ForgeError("auth", `No GitLab token for ${host}`, { host });
   return rest.apiOf(host, token, webUrl);
 }
 
-/** The API, when `host` is reached with a token; `null` for glab. */
+/** The API, when the project at `webUrl` on `host` is reached with a token; `null` for glab. */
 async function tokenApi(host: string, webUrl?: string): Promise<rest.Api | null> {
+  const account = await accountFor(host, webUrl);
+  if (account !== undefined) return apiFor(host, webUrl, account);
   return (await methodFor(host)) === "token" ? apiFor(host, webUrl) : null;
 }
 
@@ -206,8 +260,13 @@ async function getBig<T>(host: string, path: string, webUrl: string, signal: Abo
 }
 
 /** Who `host` knows the user as, and through what. */
-async function account(host: string, token?: string): Promise<Account> {
+async function account(host: string, token?: string, other?: string): Promise<Account> {
   if (token !== undefined) return { method: "token", login: await rest.login(rest.apiOf(host, token)) };
+  // Another account is its token's, or nothing.
+  if (other !== undefined) {
+    if (!(await auth.accounts(host)).includes(other.toLowerCase())) return { method: null, login: null };
+    return { method: "token", login: await rest.login(await apiFor(host, undefined, other)) };
+  }
   const method = await methodFor(host);
   try {
     if (method === "token") return { method, login: await rest.login(await apiFor(host)) };
@@ -402,7 +461,7 @@ forge.register({
     return diffs(pr, `${prProject(pr)}/merge_requests/${pr.number}/diffs`, signal);
   },
 
-  account(host, { token }) {
-    return account(host, token);
+  account(host, { token, account: other }) {
+    return account(host, token, other);
   },
 });

@@ -836,6 +836,12 @@ impl Actor {
             host: String,
             #[serde(default = "yes")]
             git: bool,
+            #[serde(default)]
+            account: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct AccountsOn {
+            host: String,
         }
         fn yes() -> bool {
             true
@@ -1009,9 +1015,12 @@ impl Actor {
                 );
             }
             "auth.token" => {
-                let TokenFor { host, git } = read(op, args)?;
+                let TokenFor { host, git, account } = read(op, args)?;
                 auth::check(&host, &self.reach())?;
-                let cached = format!("{host}\n{git}");
+                // Another of the user's sign-ins there, by its name.
+                let other =
+                    Some(secrets::scope(&host, account.as_deref())).filter(|scope| *scope != host);
+                let cached = format!("{}\n{git}", other.as_deref().unwrap_or(&host));
                 let fresh = lock(&self.tokens)
                     .get(&cached)
                     .filter(|(_, fetched)| fetched.elapsed() < TOKEN_TTL)
@@ -1029,6 +1038,8 @@ impl Actor {
                             stored: self.secrets.clone().map(|store| {
                                 (store, secrets::account(&manifest.id, "token", Some(&host)))
                             }),
+                            other: other
+                                .map(|scope| secrets::account(&manifest.id, "token", Some(&scope))),
                             // A scratch store means a scratch home: git's
                             // helpers would still reach the real Keychain.
                             git: git && self.secrets.as_ref().is_some_and(|store| store.is_real()),
@@ -1095,6 +1106,22 @@ impl Actor {
                             .get(&account)
                             .map(|value| json!(value))
                             .map_err(|error| HostError::new("Error", error))
+                    }),
+                );
+            }
+            "auth.accounts" => {
+                let AccountsOn { host } = read(op, args)?;
+                auth::check(&host, &self.reach())?;
+                let store = self.secrets.clone();
+                let plugin = manifest.id.clone();
+                self.spawn(
+                    id,
+                    Box::new(move || {
+                        Ok(json!(
+                            store
+                                .map(|store| secrets::token_accounts(&*store, &plugin, &host))
+                                .unwrap_or_default()
+                        ))
                     }),
                 );
             }

@@ -279,6 +279,7 @@ impl Diffui {
             svg_source: false,
             media: Default::default(),
             sidebar_min_width,
+            settings_section: Default::default(),
             window_size,
             window_position,
             window_display,
@@ -1163,6 +1164,7 @@ impl Diffui {
                 self.pop_mode(ModeKind::Shortcuts);
             }
             Action::OpenSettings => self.open_settings(),
+            Action::SettingsSection(section) => self.show_settings_section(section),
             Action::CloseSettings => {
                 self.pop_mode(ModeKind::Settings);
                 self.plugins.page = None;

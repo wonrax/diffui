@@ -69,6 +69,7 @@ fn account(forge: &ScriptForge, host: &str, token: Option<&str>) -> Result<Accou
             repo: super::forge::no_repository(None),
             call: ForgeCall::Account {
                 host: host.to_owned(),
+                account: None,
                 token: token.map(|token| Secret(token.to_owned())),
             },
         },
@@ -455,6 +456,103 @@ fn github_auto_takes_a_token_only_when_there_is_one() {
     assert_eq!(server.requests().len(), 1, "the API wasn't asked");
 }
 
+/// With more than one account on a host, a repository uses the one that can
+/// see it: the host's own sign-in when it can, else whichever other account
+/// can. Whose the repository is doesn't come into it.
+#[test]
+fn github_finds_the_account_that_can_see_a_repository() {
+    let server = Server::start_with(|request| {
+        let token = request
+            .header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_owned();
+        let pull = || Answer::json(200, rest_pull(5, "open", false));
+        match (
+            request.method.as_str(),
+            request.path.as_str(),
+            token.as_str(),
+        ) {
+            ("GET", "/api/v3/user", "personal") => Answer::json(200, json!({ "login": "octo" })),
+            ("GET", "/api/v3/user", "work") => {
+                Answer::json(200, json!({ "login": "octo-at-work" }))
+            }
+            // `mine/app`: only the personal account sees it. `client/app`,
+            // a repository neither account owns: only the work one.
+            ("GET", "/api/v3/repos/mine/app", "personal") => Answer::json(200, json!({ "id": 1 })),
+            ("GET", "/api/v3/repos/mine/app/pulls/5", "personal") => pull(),
+            ("GET", "/api/v3/repos/client/app", "work") => Answer::json(200, json!({ "id": 2 })),
+            ("GET", "/api/v3/repos/client/app/pulls/5", "work") => pull(),
+            _ => Answer::json(404, json!({ "message": "Not Found" })),
+        }
+    });
+    let host = server.host.clone();
+    let github = github(
+        &server,
+        store(
+            "gh-accounts",
+            &[
+                (&format!("github@{host}"), "personal"),
+                (&format!("github@{host}/work"), "work"),
+            ],
+        ),
+        Some("token"),
+    );
+    let view = |owner: &str| {
+        let pr = github
+            .claims(&format!("http://{host}/{owner}/app.git"))
+            .expect("claimed")
+            .pull_request(5);
+        block_on(github.view(pr))
+    };
+    view("mine").expect("the host's own sign-in sees it");
+    view("client").expect("the work account sees it");
+    // A repository nobody sees is the host's sign-in's to report.
+    assert!(matches!(
+        view("nobody").unwrap_err(),
+        ForgeError::NotFound { .. }
+    ));
+    // Asked once per repository, then the same account without asking.
+    view("client").expect("again");
+    let probes = |path: &str| {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.path == path)
+            .count()
+    };
+    assert_eq!(probes("/api/v3/repos/mine/app"), 1);
+    assert_eq!(probes("/api/v3/repos/client/app"), 2, "personal, then work");
+
+    // Each row of the page asks about its own account.
+    let asked = |account: Option<&str>| {
+        let (tell, told) = std::sync::mpsc::channel();
+        github.plugin().call::<Account>(
+            PluginCall::Forge {
+                repo: super::forge::no_repository(None),
+                call: ForgeCall::Account {
+                    host: host.clone(),
+                    account: account.map(str::to_owned),
+                    token: None,
+                },
+            },
+            move |result| {
+                let _ = tell.send(result.map_err(|error| error.to_string()));
+            },
+        );
+        told.recv().expect("answered").expect("asked")
+    };
+    assert_eq!(asked(None).login.as_deref(), Some("octo"));
+    assert_eq!(asked(Some("Work")).login.as_deref(), Some("octo-at-work"));
+    assert_eq!(
+        asked(Some("nobody")),
+        Account {
+            method: None,
+            login: None
+        }
+    );
+}
+
 #[test]
 fn github_account_says_whose_token_it_is() {
     let server = github_server();
@@ -809,6 +907,108 @@ fn a_token_pasted_in_settings_gets_badges() {
 }
 
 /// The page's state of `host`: listed, removable, and why it stays.
+/// "Another account" gives a host a second row with a token of its own,
+/// kept apart from the host's and removed on its own.
+#[test]
+fn another_account_gets_a_row_and_a_token_of_its_own_on_the_page() {
+    use super::PluginAction;
+    use super::page::{NEW_ACCOUNT, PageAction, draft_id};
+    use super::scenarios::{launch_on, wait_running};
+    use crate::Action;
+
+    let repo = crate::harness::fixture_repo();
+    let server =
+        Server::start_with(
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                _ if !authorized(request, "github") => {
+                    Answer::json(401, json!({ "message": "Bad credentials" }))
+                }
+                ("GET", "/api/v3/user") => Answer::json(200, json!({ "login": "octo-at-work" })),
+                _ => Answer::json(404, json!({ "message": "Not Found" })),
+            },
+        );
+    let host = server.host.clone();
+    let config = format!(
+        "[plugins.github]\nhosts = [\"{host}\"]\nprogram = \"/nonexistent/diffui-test/gh\"\n\n[plugins.github.per_host.\"{host}\"]\napi_url = \"http://{host}/api/v3\"\n"
+    );
+    let mut h = launch_on(&repo, &[], &config, "");
+    wait_running(&mut h, "github");
+    let page = |action| Action::Plugin(PluginAction::Page(action));
+    h.perform(page(PageAction::Open {
+        id: "github".into(),
+        host: None,
+    }));
+    let scope = format!("{host}/work");
+    h.perform(page(PageAction::Draft {
+        field: NEW_ACCOUNT,
+        text: format!(" {host}/Work "),
+    }));
+    h.perform(page(PageAction::AddAccount));
+    h.read(|ui| {
+        let rows = ui.page_hosts("github");
+        let at = rows.iter().position(|row| *row == host).expect("the host");
+        assert_eq!(rows.get(at + 1), Some(&scope), "under its host: {rows:?}");
+    });
+
+    h.perform(page(PageAction::Draft {
+        field: draft_id("token", Some(&scope)),
+        text: TOKEN.into(),
+    }));
+    h.perform(page(PageAction::SaveSecret {
+        key: "token".into(),
+        host: Some(scope.clone()),
+    }));
+    h.wait_until("the account's token to be kept", |ui| {
+        ui.plugins
+            .secrets
+            .get(&format!("github@{scope}"))
+            .is_ok_and(|kept| kept.as_deref() == Some(TOKEN))
+    });
+    h.wait_until("who the account is", |ui| {
+        ui.plugins
+            .page
+            .as_ref()
+            .is_some_and(|page| page.signed_in(&scope).as_deref() == Some("octo-at-work"))
+    });
+    h.read(|ui| {
+        assert!(
+            ui.plugins
+                .secrets
+                .get(&format!("github@{host}"))
+                .unwrap()
+                .is_none(),
+            "the host's own account is untouched"
+        );
+    });
+
+    // Removing it asks, since it deletes a token, then leaves the host.
+    h.perform(page(PageAction::RemoveHost {
+        host: scope.clone(),
+        confirmed: false,
+    }));
+    h.read(|ui| {
+        assert_eq!(
+            ui.plugins.page.as_ref().unwrap().removing(),
+            Some(scope.as_str())
+        )
+    });
+    h.perform(page(PageAction::RemoveHost {
+        host: scope.clone(),
+        confirmed: true,
+    }));
+    h.read(|ui| {
+        assert!(
+            ui.plugins
+                .secrets
+                .get(&format!("github@{scope}"))
+                .unwrap()
+                .is_none()
+        );
+        let rows = ui.page_hosts("github");
+        assert!(rows.contains(&host) && !rows.contains(&scope), "{rows:?}");
+    });
+}
+
 fn host_on_page(ui: &crate::Diffui, host: &str) -> (bool, bool, Option<String>) {
     let page = ui.plugins.page.as_ref().expect("the page");
     let manifest = ui

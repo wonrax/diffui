@@ -26,14 +26,10 @@ use diffui_plugins::{ConfigField, ConfigKind};
 use crate::config::HostTables;
 use crate::connections::HostState;
 use crate::modes::ModeKind;
-use crate::overlay_kit::{self, DIALOG_PAD};
-use crate::plugins::page::{
-    CARD_WIDTH, DIALOG_HEAD, FIELD_WIDTH, GROUP_HEAD, ROW_HEIGHT, caption, field_id, group, label,
-    row_shell,
-};
+use crate::plugins::page::{FIELD_WIDTH, ROW_HEIGHT, field_id, group, label, row_shell};
 use crate::prose::Prose;
 use crate::remote::{DEFAULT_SERVER, Transport, lock};
-use crate::settings::HINT_ROW_HEIGHT;
+use crate::settings::{HINT_ROW_HEIGHT, Pane, pane_body};
 use crate::theme::{self, text_size};
 use crate::typography::{self, Aligned};
 use crate::ui::{self, Look, Segment, Segmented, Tip as _};
@@ -84,6 +80,11 @@ pub(crate) enum HostAction {
     Connect,
     /// Hang up on the host, or stop reaching for it.
     Disconnect,
+    /// [`HostAction::Connect`] for a host by name, from its row in the
+    /// list.
+    ConnectTo(String),
+    /// [`HostAction::Disconnect`] for a host by name.
+    DisconnectFrom(String),
     /// Copy what was run to reach the host and what it wrote.
     CopyOutput,
 }
@@ -95,8 +96,11 @@ pub(crate) fn merged(settings: &HostTables, config: &HostTables) -> HostTables {
     for (name, over) in config {
         let table = merged.entry(name.clone()).or_default();
         // How a host is reached is one choice: config.toml's replaces
-        // Settings', and the settings that went with it.
-        if over.contains_key(TRANSPORT) || over.contains_key(COMMAND) {
+        // Settings', and the settings that went with it. A command says
+        // what the server is itself.
+        if over.contains_key(COMMAND) {
+            table.retain(|key, _| key == ENV);
+        } else if over.contains_key(TRANSPORT) {
             table.retain(|key, _| key == SERVER || key == ENV);
         }
         table.extend(over.clone());
@@ -203,6 +207,8 @@ impl Diffui {
             HostAction::Add => self.add_host(),
             HostAction::Remove => self.remove_host(),
             HostAction::Connect => self.connect_host(cx),
+            HostAction::ConnectTo(name) => self.connect_to(HostId(name), cx),
+            HostAction::DisconnectFrom(name) => self.disconnect_host(&HostId(name)),
             HostAction::Disconnect => {
                 if let Some(page) = self.remote.page.as_ref() {
                     self.disconnect_host(&HostId(page.name.clone()));
@@ -227,6 +233,7 @@ impl Diffui {
         }
         self.close_host_page();
         self.plugins.page = None;
+        self.settings_section = crate::settings::Section::Hosts;
         let by_command = self
             .host_tables()
             .get(&name)
@@ -355,7 +362,7 @@ impl Diffui {
             return;
         };
         let name = page.name.clone();
-        page.by_command = transport.is_none();
+        let was_command = std::mem::replace(&mut page.by_command, transport.is_none());
         page.drafts.clear();
         let mut table = self
             .config_files
@@ -363,7 +370,11 @@ impl Diffui {
             .get(&name)
             .cloned()
             .unwrap_or_default();
-        table.retain(|key, _| key == SERVER || key == ENV);
+        // The server and its environment carry over from one transport to
+        // another. A command says what the server is itself, and its
+        // environment is its own, here: neither is the other's.
+        let between_transports = transport.is_some() && !was_command;
+        table.retain(|key, _| between_transports && (key == SERVER || key == ENV));
         let found_by = lock(&self.remote.directory)
             .found_by(&name)
             .map(|(id, _)| id.to_owned());
@@ -432,8 +443,12 @@ impl Diffui {
         let Some(name) = self.remote.page.as_ref().map(|page| page.name.clone()) else {
             return;
         };
-        let host = HostId(name);
-        // A try that failed is tried anew; one that is up or coming stays.
+        self.connect_to(HostId(name), cx);
+    }
+
+    /// Connect to `host`. A try that failed is tried anew; a connection
+    /// that is up or coming stays.
+    fn connect_to(&mut self, host: HostId, cx: &mut Cx) {
         if matches!(self.host_state(&host), Some(HostState::Failed(_))) {
             self.disconnect_host(&host);
         }
@@ -506,13 +521,8 @@ impl Shown {
     }
 }
 
-/// The page, in place of the Settings list, while one is open.
-pub(crate) fn page_overlay(
-    ui: &Diffui,
-    look: Look,
-    window: &mut Window,
-    cx: &mut Cx,
-) -> Option<AnyElement> {
+/// The open page, for the settings dialog's pane.
+pub(crate) fn page_pane(ui: &Diffui, look: Look, window: &mut Window, cx: &mut Cx) -> Option<Pane> {
     let Look { theme, .. } = look;
     let page = ui.remote.page.as_ref()?;
     let name = page.name.clone();
@@ -542,8 +552,7 @@ pub(crate) fn page_overlay(
     let problem = directory.problem(&name);
     drop(directory);
 
-    let mut body = div().flex().flex_col().w_full().pr(px(DIALOG_PAD));
-    let mut height = 0.0;
+    let mut body = pane_body();
 
     // How it is reached.
     let reach_locked = shown.locked(TRANSPORT) || shown.locked(COMMAND);
@@ -580,7 +589,6 @@ pub(crate) fn page_overlay(
         label(look, "Reached over", reach_locked, None),
         reach,
     )];
-    height += ROW_HEIGHT;
     if page.by_command {
         rows.push(words_row(
             look,
@@ -588,12 +596,22 @@ pub(crate) fn page_overlay(
             &shown,
             COMMAND,
             "Command",
-            "A program whose input and output reach the host. {server} in it is where the server goes.",
-            "docker exec -i dev",
+            "The whole command, ending in what runs diffui-serve there. Its input and output are the connection.",
+            "docker exec -i dev diffui-serve",
             window,
             cx,
         ));
-        height += HINT_ROW_HEIGHT;
+        rows.push(words_row(
+            look,
+            page,
+            &shown,
+            ENV,
+            "Environment",
+            "Set for the command, on this machine. For one on the far side, write it in the command.",
+            "NAME=value",
+            window,
+            cx,
+        ));
     } else if let Some((_, transport)) = &shown.transport {
         for field in transport
             .manifest
@@ -602,20 +620,16 @@ pub(crate) fn page_overlay(
             .filter(|field| field.per_host && field.kind != ConfigKind::Secret)
         {
             rows.push(option_row(look, page, &shown, field, window, cx));
-            height += HINT_ROW_HEIGHT;
         }
     }
     let host = HostId(name.clone());
     let state = ui.host_state(&host);
     rows.push(connection_row(look, state.as_ref(), problem, cx));
-    height += HINT_ROW_HEIGHT;
     body = body.child(group(look, "Connection", false, rows));
-    height += GROUP_HEAD;
 
     // What reaching it ran and wrote: live while it comes up, and what is
     // left of a try that failed.
     if let Some(transcript) = ui.host_transcript(&host) {
-        height += output_height(&transcript) + GROUP_HEAD;
         body = body.child(group(
             look,
             "Output",
@@ -624,37 +638,35 @@ pub(crate) fn page_overlay(
         ));
     }
 
-    // What runs there.
-    let rows = vec![
-        words_row(
-            look,
-            page,
-            &shown,
-            SERVER,
-            "Command",
-            "The command that is diffui-serve there. diffui installs nothing.",
-            DEFAULT_SERVER,
-            window,
-            cx,
-        ),
-        words_row(
-            look,
-            page,
-            &shown,
-            ENV,
-            "Environment",
-            "Set for the server.",
-            "NAME=value",
-            window,
-            cx,
-        ),
-    ];
-    height += 2.0 * HINT_ROW_HEIGHT + GROUP_HEAD;
-    body = body.child(group(look, "Server", true, rows));
+    // What runs there, for a transport to start. A command names it itself.
+    if !page.by_command {
+        let rows = vec![
+            words_row(
+                look,
+                page,
+                &shown,
+                SERVER,
+                "Command",
+                "The command that is diffui-serve there. diffui installs nothing.",
+                DEFAULT_SERVER,
+                window,
+                cx,
+            ),
+            words_row(
+                look,
+                page,
+                &shown,
+                ENV,
+                "Environment",
+                "Set for the server.",
+                "NAME=value",
+                window,
+                cx,
+            ),
+        ];
+        body = body.child(group(look, "Server", true, rows));
+    }
 
-    let height = (ui.window_size.height - crate::toolbar::modal_top() - theme::space::XXL)
-        .min(height + DIALOG_HEAD)
-        .max(240.0);
     let saved = ui.config_files.hosts.contains_key(&name);
     // A host that is one without Settings' table goes back to how it was.
     let remove = look
@@ -662,35 +674,17 @@ pub(crate) fn page_overlay(
             "host-page-remove",
             if elsewhere { "Reset" } else { "Remove" },
         )
+        .compact()
         .disabled(!saved)
         .when(saved, |button| {
             button.on_click(send(HostAction::Remove, cx))
         });
-    let back = look
-        .button("host-page-back", "Back")
-        .on_click(send(HostAction::Back, cx));
-    let card = overlay_kit::Dialog::new(&Prose::new().path(name), look)
-        .width(CARD_WIDTH)
-        .height(height)
-        .child(div().size_full().child(ui::scrollable("host-page", body)))
-        .bound_hint(
-            ui,
-            crate::commands::Context::Settings,
-            &["settings.close"],
-            "Close",
-        )
-        .buttons([remove.into_any_element(), back.into_any_element()])
-        .build();
-    let dismiss = Diffui::on_action::<()>(Action::CloseSettings, cx);
-    Some(
-        ui::modal(
-            "settings-dialog",
-            card,
-            crate::toolbar::modal_top(),
-            move |window, cx| dismiss(&(), window, cx),
-        )
-        .into_any_element(),
-    )
+    Some(Pane {
+        page: Some((Prose::new().path(name), Action::Host(HostAction::Back))),
+        actions: vec![remove.into_any_element()],
+        scroll: "host-page",
+        body,
+    })
 }
 
 /// A locked setting's value: read, not typed.
@@ -892,42 +886,55 @@ fn connection_row(
         (None, Some(problem)) => (problem, theme.removed_text),
         (None, None) => ("Not connected.".to_owned(), theme.subtle_text),
     };
-    // One line, cut to fit; the whole of it is a hover away.
+    // All of it, wrapped: a failure's reason is what the page is for.
     let under = div()
-        .id("host-page-connection-said")
         .w_full()
         .min_w_0()
-        .tip(text.clone(), look)
-        .child(caption(look, text, ink))
+        .font(look.font.gpui())
+        .text_size(px(text_size::CAPTION))
+        .text_color(ink)
+        .child(text)
         .into_any_element();
-    let (word, action) = match state {
-        Some(HostState::Connecting { .. }) => ("Stop", HostAction::Disconnect),
-        Some(HostState::Up(_)) => ("Disconnect", HostAction::Disconnect),
-        Some(HostState::Failed(_)) => ("Try again", HostAction::Connect),
-        None => ("Connect", HostAction::Connect),
+    let (word, connects) = connect_word(state);
+    let action = if connects {
+        HostAction::Connect
+    } else {
+        HostAction::Disconnect
     };
     let button = look
         .button("host-page-connect", word)
         .compact()
         .on_click(send(action, cx));
-    row_shell(
-        HINT_ROW_HEIGHT,
-        label(look, "Connection", false, Some(under)),
-        button,
-    )
+    // As tall as what it says.
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .min_h(px(HINT_ROW_HEIGHT))
+        .px(px(crate::settings::ROW_INSET))
+        .py(px(theme::space::MD))
+        .gap(px(theme::space::XL))
+        .child(label(look, "Connection", false, Some(under)))
+        .child(div().flex().flex_none().child(button))
+        .into_any_element()
+}
+
+/// What the button that starts or ends a host's connection says for
+/// `state`, and whether it connects.
+fn connect_word(state: Option<&HostState>) -> (&'static str, bool) {
+    match state {
+        Some(HostState::Connecting { .. }) => ("Stop", false),
+        Some(HostState::Up(_)) => ("Disconnect", false),
+        Some(HostState::Failed(_)) => ("Try again", true),
+        None => ("Connect", true),
+    }
 }
 
 /// How many of the output's last lines the page shows. All of it is a Copy
 /// away.
-const OUTPUT_LINES: usize = 10;
+const OUTPUT_LINES: usize = 16;
 const OUTPUT_LINE: f32 = 18.0;
-
-/// How tall [`output_row`] is for `transcript`.
-fn output_height(transcript: &Transcript) -> f32 {
-    let lines = transcript.output.lines().count().min(OUTPUT_LINES)
-        + usize::from(transcript.command.is_some());
-    lines.max(1) as f32 * OUTPUT_LINE + 2.0 * theme::space::LG
-}
 
 /// What was run to reach the host and the end of what it wrote, in mono:
 /// what there is to go on when it doesn't come up.
@@ -971,7 +978,6 @@ fn output_row(look: Look, transcript: &Transcript, cx: &mut Cx) -> AnyElement {
         .flex_row()
         .items_start()
         .w_full()
-        .h(px(output_height(transcript)))
         .px(px(crate::settings::ROW_INSET))
         .py(px(theme::space::LG))
         .gap(px(theme::space::MD))
@@ -980,20 +986,19 @@ fn output_row(look: Look, transcript: &Transcript, cx: &mut Cx) -> AnyElement {
         .into_any_element()
 }
 
-/// The settings dialog's Hosts group: a row per host, then the field that
-/// adds one, and how tall the rows are together.
+/// The settings dialog's Hosts section: a row per host, then the field that
+/// adds one.
 pub(crate) fn settings_group(
     ui: &Diffui,
     look: Look,
     window: &mut Window,
     cx: &mut Cx,
-) -> (Vec<AnyElement>, f32) {
+) -> Vec<AnyElement> {
     let Look {
         theme, font, mono, ..
     } = look;
     let hosts = lock(&ui.remote.directory).rows();
     let tables = ui.host_tables();
-    let mut height = 0.0;
     let mut rows: Vec<AnyElement> = Vec::new();
     for (index, host) in hosts.iter().enumerate() {
         let mut name = vec![Aligned::text(
@@ -1062,12 +1067,32 @@ pub(crate) fn settings_group(
             .corner_radius(face)
             .tip("Settings")
             .on_click(send(HostAction::Open(host.name.clone()), cx));
+        // Connecting needs no trip into the page; a host that can't be
+        // reached as it is set says why instead.
+        let (word, connects) = connect_word(state.as_ref());
+        let action = if connects {
+            HostAction::ConnectTo(host.name.clone())
+        } else {
+            HostAction::DisconnectFrom(host.name.clone())
+        };
+        let connect = look
+            .button(("settings-host-connect", index), word)
+            .compact()
+            .disabled(host.problem.is_some())
+            .when(host.problem.is_none(), |button| {
+                button.on_click(send(action, cx))
+            });
         rows.push(row_shell(
             HINT_ROW_HEIGHT,
             label,
-            ui::segmented(theme).child(edit),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::MD))
+                .child(connect)
+                .child(ui::segmented(theme).child(edit)),
         ));
-        height += HINT_ROW_HEIGHT;
     }
 
     let typed = ui.remote.new_host.clone();
@@ -1101,8 +1126,7 @@ pub(crate) fn settings_group(
         ),
         add,
     ));
-    height += HINT_ROW_HEIGHT;
-    (rows, height)
+    rows
 }
 
 fn label_with_hint(look: Look, name: &str, hint: &str) -> gpui_kit::Div {
@@ -1154,12 +1178,12 @@ mod tests {
     fn config_tomls_way_to_reach_a_host_replaces_settings_and_its_settings() {
         let settings = HostTables::from([(
             "box".to_owned(),
-            table("transport = \"ssh\"\nport = 2222\nserver = [\"a\"]"),
+            table("transport = \"ssh\"\nport = 2222\nserver = [\"a\"]\nenv = { A = \"1\" }"),
         )]);
         let config = HostTables::from([("box".to_owned(), table("command = [\"docker\"]"))]);
         assert_eq!(
             merged(&settings, &config)["box"],
-            table("command = [\"docker\"]\nserver = [\"a\"]")
+            table("command = [\"docker\"]\nenv = { A = \"1\" }")
         );
     }
 

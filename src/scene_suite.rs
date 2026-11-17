@@ -1967,7 +1967,7 @@ fn all() -> Vec<Scene> {
     t.group("Settings");
     t.add(s(
         "settings-dialog",
-        "The settings dialog over the window, every row editable.",
+        "The settings dialog over the window: the sections down its left side, General selected, every row editable.",
         "Press cmd+,.",
         |c| {
             c.key("cmd+,");
@@ -2000,10 +2000,11 @@ fn all() -> Vec<Scene> {
     t.add(
         s(
             "settings-hosts",
-            "The settings dialog's Hosts group: a row per host with how it is reached and what runs there, then the field that adds one.",
-            "Launch with two `[hosts]` tables, press cmd+,.",
+            "Settings, Hosts: a row per host with how it is reached and what runs there, then the field that adds one.",
+            "Launch with two `[hosts]` tables, press cmd+,, click Hosts.",
             |c| {
                 c.key("cmd+,");
+                c.act(Action::SettingsSection(crate::settings::Section::Hosts));
             },
         )
         .config(REMOTE_HOSTS),
@@ -2909,17 +2910,30 @@ fn all() -> Vec<Scene> {
     t.add(
         s(
             "plugins-account",
-            "GitHub's page in Settings: github.com signed in with gh, a company host set to a token with the paste field, Get a token and Add, then its settings.",
-            "Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Plugins.",
+            "GitHub's page in Settings: github.com signed in with gh, under it a second account named work with its paste field, a company host set to a token, then the rows that add a host or an account and its settings.",
+            "Launch with github.acme.com added and set to a token; open GitHub's page from Settings, Accounts, and add an account named work.",
             |c| {
                 crate::harness::answer_forge(&[("api user --jq .login", "octo\n")]);
                 c.key("cmd+,");
+                c.act(Action::SettingsSection(crate::settings::Section::Accounts));
                 c.act(Action::Plugin(crate::plugins::PluginAction::Page(
                     crate::plugins::PageAction::Open {
                         id: "github".to_owned(),
                         host: None,
                     },
                 )));
+                c.h.wait_until("the accounts", |ui| {
+                    ui.plugins.page.as_ref().is_some_and(|page| page.settled())
+                });
+                for action in [
+                    crate::plugins::PageAction::Draft {
+                        field: crate::plugins::page::NEW_ACCOUNT,
+                        text: "work".to_owned(),
+                    },
+                    crate::plugins::PageAction::AddAccount,
+                ] {
+                    c.act(Action::Plugin(crate::plugins::PluginAction::Page(action)));
+                }
                 c.h.wait_until("the accounts", |ui| {
                     ui.plugins.page.as_ref().is_some_and(|page| page.settled())
                 });
@@ -2934,7 +2948,7 @@ fn all() -> Vec<Scene> {
         s(
             "settings-ai",
             "Settings, AI: the provider pop-up set to Anthropic, then Claude Code and Codex not installed, Anthropic in use with its key saved and a passed Test, and OpenAI-compatible with no key. Each row has Test and a pencil.",
-            "Launch with Anthropic picked and its key saved; open Settings, Test Anthropic and scroll to AI.",
+            "Launch with Anthropic picked and its key saved; open Settings, click AI and Test Anthropic.",
             |c| {
                 c.h.wait_until("the providers", |ui| ui.ai_answers("anthropic", "complete"));
                 c.key("cmd+,");
@@ -2943,8 +2957,7 @@ fn all() -> Vec<Scene> {
                         .tests
                         .insert("anthropic".to_owned(), crate::ai::Test::Replied("OK".to_owned()));
                 });
-                // Down to the AI group.
-                c.scroll(720.0, 450.0, -560.0);
+                c.act(Action::SettingsSection(crate::settings::Section::Ai));
             },
         )
         .config(AI_CONFIG)
@@ -3167,7 +3180,7 @@ fn all() -> Vec<Scene> {
         s(
             "plugins-settings",
             "Settings, Plugins: one running, one that failed with where, one not allowed, each with its folder, actions and toggle; then the plugins folder.",
-            "Launch with three plugins (two allowed, one refused); press cmd+, and scroll to Plugins.",
+            "Launch with three plugins (two allowed, one refused); press cmd+, and click Plugins.",
             plugins_in_settings,
         )
         .home(three_plugins)
@@ -3831,9 +3844,7 @@ fn plugins_loaded(c: &mut Ctx) {
 fn plugins_in_settings(c: &mut Ctx) {
     plugins_loaded(c);
     c.key("cmd+,");
-    // The group is the dialog's last: bring it up.
-    c.h.wheel(at(W / 2.0, H / 2.0), -600.0);
-    c.settle();
+    c.act(Action::SettingsSection(crate::settings::Section::Plugins));
 }
 
 /// The `config.toml` the declared-command scenes run with.

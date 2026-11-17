@@ -1,5 +1,5 @@
 # GitLab (gitlab.com, or a self-hosted GitLab), through the `glab` CLI's
-# `glab api` or a token. Bundled with diffui; Settings → Plugins → GitLab
+# `glab api` or a token. Bundled with diffui; Settings → Accounts → GitLab
 # picks how each host signs in, and `diffui plugin eject gitlab` copies it
 # out to edit.
 id = "gitlab"

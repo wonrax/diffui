@@ -485,6 +485,7 @@ pub(crate) mod tests {
             media: Default::default(),
             sidebar_file_cache: Default::default(),
             sidebar_min_width: 0.0,
+            settings_section: Default::default(),
             window_size: Size::new(1280.0, 800.0),
             window_position: None,
             window_display: None,

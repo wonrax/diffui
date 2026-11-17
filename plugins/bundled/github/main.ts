@@ -11,7 +11,7 @@
 // is handed to diffui a piece at a time as it arrives, and diffui shows each
 // file once its last hunk is in, so a huge PR paints progressively while the
 // download is still running.
-import { ForgeError, auth, config, exec, files, forge } from "diffui";
+import { ForgeError, auth, config, exec, files, forge, kv } from "diffui";
 import type {
   Account,
   Checks,
@@ -346,18 +346,71 @@ function storedToken(host: string): Promise<string | null> {
 }
 
 /**
- * The APIs of `host` with its token, for a host reached with one. The
- * `token` mode also takes git's credential for the host.
+ * Which of the user's accounts reaches the project at `webUrl`: `undefined` for the host's own sign-in, else
+ * the name of another account there (a work account beside a personal one). Nothing says which account a
+ * repository belongs to, and being able to see one has nothing to do with owning it, so the project itself is
+ * asked for: with the host's sign-in first, then with each other account. The first that sees it is used, and
+ * kept across restarts when it is another account.
  */
-async function apiFor(host: string, webUrl?: string): Promise<rest.Api> {
+const reaching = new Map<string, Promise<string | undefined>>();
+function accountFor(host: string, webUrl?: string): Promise<string | undefined> {
+  const project = webUrl === undefined ? undefined : /^[a-z]+:\/\/[^/]+\/([^/]+\/[^/]+)/i.exec(webUrl)?.[1];
+  if (project === undefined) return Promise.resolve(undefined);
+  const key = `${host}/${project}`.toLowerCase();
+  let found = reaching.get(key);
+  if (found === undefined) {
+    found = findAccount(host, project, webUrl, key);
+    reaching.set(key, found);
+  }
+  return found;
+}
+
+async function findAccount(host: string, project: string, webUrl: string | undefined, key: string) {
+  const others = await auth.accounts(host).catch(() => [] as string[]);
+  if (others.length === 0) return undefined;
+  const kept: unknown = await kv.get(`account:${key}`).catch(() => undefined);
+  if (typeof kept === "string" && others.includes(kept)) return kept;
+  if (await sees(host, project, webUrl, undefined)) return undefined;
+  for (const other of others) {
+    if (await sees(host, project, webUrl, other)) {
+      await kv.set(`account:${key}`, other).catch(() => {});
+      return other;
+    }
+  }
+  // Nobody sees it: the host's sign-in is the one to say so.
+  return undefined;
+}
+
+/** Whether `account` (the host's own sign-in when `undefined`) can see `project`. */
+async function sees(host: string, project: string, webUrl: string | undefined, account?: string) {
+  try {
+    if (account !== undefined || (await methodFor(host)) === "token") {
+      await rest.get(await apiFor(host, webUrl, account), `repos/${project}`);
+    } else {
+      await run(host, ["api", `repos/${project}`, "--jq", ".id"]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The APIs of `host` with a token: `account`'s when one is named, else the
+ * host's own, for a host reached with one. The `token` mode also takes git's
+ * credential for the host.
+ */
+async function apiFor(host: string, webUrl?: string, account?: string): Promise<rest.Api> {
   const explicit = (config.per_host?.[host.toLowerCase()]?.auth ?? config.auth) === "token";
-  const token = await auth.token(host, { git: explicit }).catch(() => null);
+  const token = await auth.token(host, { git: explicit && account === undefined, account }).catch(() => null);
   if (token === null) throw new ForgeError("auth", `No GitHub token for ${host}`, { host });
   return rest.apiOf(host, token, webUrl);
 }
 
-/** The API, when `host` is reached with a token; `null` for gh. */
+/** The API, when the project at `webUrl` on `host` is reached with a token; `null` for gh. */
 async function tokenApi(host: string, webUrl?: string): Promise<rest.Api | null> {
+  const account = await accountFor(host, webUrl);
+  if (account !== undefined) return apiFor(host, webUrl, account);
   return (await methodFor(host)) === "token" ? apiFor(host, webUrl) : null;
 }
 
@@ -523,9 +576,14 @@ function restState(pr: { state: string; draft?: boolean; merged_at?: string | nu
 }
 
 /** Who `host` knows the user as, and through what. */
-async function account(host: string, token?: string): Promise<Account> {
+async function account(host: string, token?: string, other?: string): Promise<Account> {
   if (token !== undefined) {
     return { method: "token", login: await rest.login(rest.apiOf(host, token)) };
+  }
+  // Another account is its token's, or nothing.
+  if (other !== undefined) {
+    if (!(await auth.accounts(host)).includes(other.toLowerCase())) return { method: null, login: null };
+    return { method: "token", login: await rest.login(await apiFor(host, undefined, other)) };
   }
   const signedOut = (error: unknown) =>
     error instanceof ForgeError && (error.kind === "auth" || error.kind === "missing-cli");
@@ -850,7 +908,7 @@ forge.register({
     return threads.filter((thread) => thread.comments.nodes.length > 0).map(reviewThread);
   },
 
-  async account(host, { token }) {
-    return account(host, token);
+  async account(host, { token, account: other }) {
+    return account(host, token, other);
   },
 });

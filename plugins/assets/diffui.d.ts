@@ -37,7 +37,7 @@
  *     host = { type = "string", default = "codeberg.org", label = "Host" }
  *
  * A setting's `type` is "string", "boolean", "number", "enum", "path" or "secret", and Settings draws a control
- * for each (Settings → Plugins → the plugin's pencil):
+ * for each (Settings → Plugins → the plugin's pencil; a forge's accounts are also under Settings → Accounts):
  *
  *     auth = { type = "enum", values = ["auto", "cli", "token"], default = "auto", label = "Sign in with", per_host = true }
  *     program = { type = "path", default = "gh", label = "The gh program" }   # a field with Browse; says when it isn't there
@@ -116,6 +116,7 @@
  * id>"`. diffui reads `server` (the command that is diffui-serve over there, default `["diffui-serve"]`) and
  * `env` (its environment) from it; every other key is one of the transport's `per_host` settings and reaches the
  * script as `host.options`. A transport with `hosts()` also offers the machines it finds without any table.
+ * (A table with `command` instead of `transport` needs no plugin: that whole command is started as written.)
  *
  * Hosts are named in two places that don't depend on each other. `[provides] forge.hosts` is what the plugin
  * claims: a repository whose remote is on one of them gets this forge. `[permissions] http` is what the script
@@ -262,9 +263,10 @@ declare module "diffui" {
      * Who the user is on `host`, and how this forge reaches it: for Settings' Account area. With `token`, check
      * that one instead (one the user pasted, before diffui keeps it): ask the API who it belongs to and throw a
      * `ForgeError` "auth" when the forge refuses it. Without, answer `{ method: null, login: null }` when
-     * nothing signs in to the host, rather than throwing.
+     * nothing signs in to the host, rather than throwing. With `account`, answer for that other account of the
+     * user's on the host (`auth.accounts`), which signs in with its own token or not at all.
      */
-    account?(host: string, options: { token?: string }): Promise<Account>;
+    account?(host: string, options: { token?: string; account?: string }): Promise<Account>;
   }
 
   export interface Account {
@@ -915,8 +917,11 @@ declare module "diffui" {
      * the user's `token_cmd` (`[plugins.<id>] token_cmd = ["pass", "show", "{host}"]` in config.toml), and
      * git's credential helpers (`git credential fill`), unless `git` is false. It never prompts: with none it
      * rejects ("NotFoundError" when only git was left out). Cached for five minutes.
+     *
+     * With `account`, the token of another of the user's sign-ins on the host, by its name (see `accounts`),
+     * and only that: it rejects with "NotFoundError" when that account has none.
      */
-    token(host: string, options?: { git?: boolean }): Promise<string>;
+    token(host: string, options?: { git?: boolean; account?: string }): Promise<string>;
     /**
      * The `secret` setting `key` of `[config.schema]`: from its `env` variables, else the store; `null` when
      * neither has it. A per-host secret takes `{ host }`.
@@ -924,6 +929,12 @@ declare module "diffui" {
     secret(key: string, options?: { host?: string }): Promise<string | null>;
     /** The hosts the user stored a token for, for this plugin: a forge's `hosts()` adds them. */
     hosts(): Promise<string[]>;
+    /**
+     * The names of the other accounts the user has on `host` (a work account beside a personal one), each with
+     * a token of its own: `auth.token(host, { account })`. An account's name says nothing about what it can
+     * see. A forge whose usual sign-in can't see a repository tries these and keeps the one that can.
+     */
+    accounts(host: string): Promise<string[]>;
   }
 
   /** A small JSON store that belongs to this plugin and survives restarts. At most 1 MB in total. */

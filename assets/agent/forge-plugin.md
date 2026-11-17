@@ -47,6 +47,13 @@ prints the token `auth.token` returns. A `secret` setting named `token` with
 rows set; its `page`, `scopes` and `env` say where to make one and which
 variables hold one.
 
+The user may have more than one account on a host (Settings' "Another
+account"): `auth.accounts(host)` names the others and
+`auth.token(host, { account })` is that one's token. Don't guess which a
+repository needs from who owns it. Ask the forge for the repository with the
+host's own sign-in, then with each other account, and use the first that
+sees it; the bundled `github` and `gitlab` plugins do this in `accountFor`.
+
 ## The provider
 
 `forge.register(provider)` takes:
@@ -60,8 +67,9 @@ variables hold one.
   own. The tab needs all four;
 - `reviewComments`: its review threads, shown read-only in its diff and on
   the revision whose bookmark has it;
-- `account`: who the user is on a host, or whose a pasted token is, for
-  Settings' Account rows.
+- `account`: who the user is on a host (as another account, when
+  `options.account` names one), or whose a pasted token is, for Settings'
+  Account rows.
 
 diffui hides what a missing method would serve; `diffui plugin check` names
 each one left out. Throw `ForgeError` with its kind (`auth`, `not-found`,

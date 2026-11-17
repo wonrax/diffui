@@ -84,6 +84,10 @@ enum Verb {
         /// The host (the forge's default host when left out)
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
+        /// Another account on the host, by the name it has in Settings
+        /// (the host's own sign-in when left out)
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
         /// Read a token from stdin, check it with the forge and keep it
         #[arg(long, conflicts_with_all = ["sign_out", "status"])]
         token_stdin: bool,
@@ -131,6 +135,7 @@ fn plugin_main() -> i32 {
         Verb::Auth {
             id,
             host,
+            account,
             token_stdin,
             sign_out,
             status: _,
@@ -146,7 +151,13 @@ fn plugin_main() -> i32 {
             } else {
                 AuthAsk::Status
             };
-            auth(&id, host.as_deref(), ask, &super::secret_store())
+            auth(
+                &id,
+                host.as_deref(),
+                account.as_deref(),
+                ask,
+                &super::secret_store(),
+            )
         }
     };
     match done {
@@ -538,6 +549,7 @@ fn manifest_by_id(id: &str) -> Result<Manifest, String> {
 fn auth(
     id: &str,
     host: Option<&str>,
+    other: Option<&str>,
     ask: AuthAsk,
     store: &Arc<dyn diffui_plugins::secrets::SecretStore>,
 ) -> Result<String, String> {
@@ -553,11 +565,20 @@ fn auth(
         Some(host) => host.trim().to_ascii_lowercase(),
         None => return Err(format!("{id} has no default host: pass --host")),
     };
-    let account = diffui_plugins::secrets::account(id, "token", Some(&host));
+    // Another account's token is kept under its name on the host.
+    let scope = diffui_plugins::secrets::scope(&host, other);
+    let other = diffui_plugins::secrets::split_scope(&scope)
+        .1
+        .map(str::to_owned);
+    let shown = match &other {
+        Some(name) => format!("{name} on {host}"),
+        None => host.clone(),
+    };
+    let account = diffui_plugins::secrets::account(id, "token", Some(&scope));
     let token = match ask {
         AuthAsk::SignOut => {
             store.delete(&account)?;
-            return Ok(format!("Removed the {} token for {host}\n", manifest.name));
+            return Ok(format!("Removed the {} token for {shown}\n", manifest.name));
         }
         AuthAsk::Token(token) if token.is_empty() => {
             return Err("no token on stdin".to_owned());
@@ -605,6 +626,7 @@ fn auth(
                     repo: super::forge::no_repository(None),
                     call: ForgeCall::Account {
                         host: host.clone(),
+                        account: other.clone(),
                         token: token.clone().map(Secret),
                     },
                 },
@@ -634,20 +656,20 @@ fn auth(
             store.set(&account, &token)?;
             let who = account_said.login.unwrap_or_else(|| "its owner".to_owned());
             Ok(format!(
-                "Kept a {name} token for {host}, signed in as {who}. A running diffui uses it once the plugin reloads (`diffui ctl reload`).\n"
+                "Kept a {name} token for {shown}, signed in as {who}. A running diffui uses it once the plugin reloads (`diffui ctl reload`).\n"
             ))
         }
         None => {
             let through = match account_said.method {
                 Some(AccountMethod::Cli) => forge.cli.clone().unwrap_or_else(|| "its CLI".into()),
                 Some(AccountMethod::Token) => "a token".to_owned(),
-                None => return Ok(format!("{host}: not signed in\n")),
+                None => return Ok(format!("{shown}: not signed in\n")),
             };
             let who = account_said
                 .login
                 .map(|login| format!(" as {login}"))
                 .unwrap_or_default();
-            Ok(format!("{host}: signed in{who} with {through}\n"))
+            Ok(format!("{shown}: signed in{who} with {through}\n"))
         }
     }
 }
