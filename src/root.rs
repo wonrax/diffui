@@ -578,6 +578,20 @@ impl Render for Diffui {
         };
         self.frame(theme, cx)
             .child(body)
+            // The welcome screen has no tab strip for the OS to move the window
+            // by, so a bare band takes its place.
+            .when(chrome::caption_buttons() && self.tabs.is_empty(), |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(tab_bar::height()))
+                        .window_control_area(gpui_kit::WindowControlArea::Drag),
+                )
+            })
+            .child(tab_bar::caption_buttons(theme, window))
             .when(frame_log::enabled(), |root| {
                 // Last in paint order, so it marks the end of the frame.
                 root.child(

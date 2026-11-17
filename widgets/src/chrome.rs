@@ -16,7 +16,12 @@
 //!     platform setting is the window's `app_id`, which ties it to our desktop
 //!     entry. A floating, undecorated WM is the natural next opt-in for the drag
 //!     handle.
-//!   * **Windows** — keeps its native title bar above the strip for now.
+//!   * **Windows** — the native title bar is hidden as on macOS, and we draw
+//!     the minimize / maximize / close buttons at the strip's trailing edge.
+//!     Unlike macOS, the OS still does the moving: the strip's gaps and the
+//!     buttons are tagged as caption areas, so Windows' own hit-testing gives
+//!     Aero Snap, Snap Layouts on the maximize button, the double-click zoom
+//!     and the system menu, none of which a hand-rolled drag would.
 //!
 //! Centralizing the policy here keeps `main` / `tab_bar` platform-agnostic, so
 //! extending to full custom chrome on Windows/Linux is a change in one place
@@ -51,6 +56,26 @@ pub fn drag_region() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Whether we draw the window's minimize / maximize / close buttons
+/// ourselves, and tag the strip's gaps as the OS caption so the OS moves the
+/// window from them (Windows).
+pub fn caption_buttons() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// One caption button's width: Windows 11's own.
+pub const CAPTION_BUTTON_WIDTH: f32 = 46.0;
+
+/// Width reserved at the trailing edge of the strip for the window's caption
+/// buttons. Zero where the OS draws none over our content.
+pub fn trailing_inset() -> f32 {
+    if caption_buttons() {
+        3.0 * CAPTION_BUTTON_WIDTH
+    } else {
+        0.0
+    }
+}
+
 /// Platform spelling of the primary command modifier for UI hints — `⌘` on
 /// macOS, `Ctrl` elsewhere, matching what the keyboard handlers actually
 /// bind (`modifiers.command()` maps to Ctrl off-mac).
@@ -79,11 +104,13 @@ pub fn title_bar_height() -> Option<f32> {
 
 /// The window's title bar. On macOS the bar is hidden and our content fills
 /// behind the (still-shown) traffic lights, which sit on the vertical center of
-/// the [`title_bar_height`] strip so they line up with the centered tabs.
+/// the [`title_bar_height`] strip so they line up with the centered tabs. On
+/// Windows it is hidden outright, the strip and [`caption_buttons`] taking
+/// its place.
 pub fn titlebar_options() -> TitlebarOptions {
     TitlebarOptions {
         title: Some("diffui".into()),
-        appears_transparent: cfg!(target_os = "macos"),
+        appears_transparent: cfg!(target_os = "macos") || caption_buttons(),
         traffic_light_position: traffic_light_position(),
     }
 }

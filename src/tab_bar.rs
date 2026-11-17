@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, Div, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Window,
-    canvas, deferred, div, px,
+    AnyElement, App, Bounds, Div, FontFallbacks, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, Window, WindowControlArea, canvas, deferred, div, px,
 };
 
 use crate::chrome;
@@ -45,7 +45,7 @@ const TAB_TEXT_SIZE: f32 = text_size::BODY;
 /// strip's other controls.
 const TAB_HEIGHT: f32 = 28.0;
 
-/// Room around the tabs' row inside its clip, so the active tab's drop
+/// Room around the tabs'  inside its clip, so the active tab's drop
 /// shadow (1px down, 2px of blur) isn't cut off at the strip's bottom.
 const TAB_RING_ROOM: f32 = 4.0;
 
@@ -538,11 +538,12 @@ pub(crate) fn build_tab_bar(
             .flex_shrink(1.0)
             .min_w(px(TAB_MIN_WIDTH.min(body.1)))
             .h(px(TAB_HEIGHT));
+        let body = body.0.when(chrome::caption_buttons(), |tab| tab.occlude());
         // The tab in the air paints above the labels it passes over.
         tabs = tabs.child(if lifted {
-            slot.child(deferred(body.0).with_priority(1))
+            slot.child(deferred(body).with_priority(1))
         } else {
-            slot.child(body.0)
+            slot.child(body)
         });
     }
     let recorded = strip.clone();
@@ -603,14 +604,17 @@ pub(crate) fn build_tab_bar(
     .size_0();
 
     // Everything centres on the strip, and so do the traffic lights where the
-    // strip stands in for the title bar (see `chrome::titlebar_options`).
+    // strip stands in for the title bar (see `chrome::titlebar_options`). The
+    // caption buttons, where we draw them, float over the trailing inset (see
+    // `caption_buttons`).
     let inset = chrome::leading_inset();
     let row = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(theme::space::MD))
-        .px(px(8.0))
+        .pl(px(8.0))
+        .pr(px(8.0 + chrome::trailing_inset()))
         .h_full()
         .w_full()
         .when(inset > 0.0, |row| row.child(div().w(px(inset)).flex_none()))
@@ -625,7 +629,12 @@ pub(crate) fn build_tab_bar(
                 .flex_shrink(1.0)
                 .min_w_0()
                 .child(tabs)
-                .child(add_button(look, cx)),
+                .child(
+                    div()
+                        .flex_none()
+                        .when(chrome::caption_buttons(), |wrapper| wrapper.occlude())
+                        .child(add_button(look, cx)),
+                ),
         )
         .child(div().flex_1().min_w_0())
         .child(palette_hint(look, cx));
@@ -641,6 +650,13 @@ pub(crate) fn build_tab_bar(
         .h(px(height()))
         .flex_none()
         .bg(chrome_fill(theme))
+        // Windows moves the window from whatever of the strip no control
+        // claims. It asks which area is under the pointer before any press
+        // reaches us, so every control on the strip occludes: that is what
+        // keeps the strip's caption area from answering for it.
+        .when(chrome::caption_buttons(), |bar| {
+            bar.window_control_area(WindowControlArea::Drag)
+        })
         .child(listeners)
         .child(row);
     let bar = if dragging {
@@ -907,6 +923,86 @@ fn add_button(look: Look, cx: &mut Cx) -> impl IntoElement {
         .on_click(Diffui::on_action(Action::OpenRepoDialog, cx))
 }
 
+/// The window's minimize / maximize / close buttons, where we draw them
+/// ([`chrome::caption_buttons`]): Windows 11's own glyphs, sizes and close
+/// red. Pinned over the strip's trailing inset from the window root, above
+/// every modal, so a dialog or menu never covers them. Each is tagged with
+/// its caption area, so the OS runs the button itself, and shows Snap
+/// Layouts over maximize.
+pub(crate) fn caption_buttons(theme: ThemeSpec, window: &Window) -> AnyElement {
+    if !chrome::caption_buttons() {
+        return div().into_any_element();
+    }
+    // Segoe MDL2 Assets is Windows 10's spelling of the same glyphs.
+    let font = gpui_kit::Font {
+        fallbacks: Some(FontFallbacks::from_fonts(vec!["Segoe MDL2 Assets".into()])),
+        ..gpui_kit::font("Segoe Fluent Icons")
+    };
+    let wash = theme::hover_wash(theme);
+    let close_red = Color {
+        r: 0.769,
+        g: 0.169,
+        b: 0.110,
+        a: 1.0,
+    };
+    let white = Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let button = |id: &'static str, glyph: &'static str, area, hover: Color, ink: Color| {
+        div()
+            .id(id)
+            .occlude()
+            .window_control_area(area)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(chrome::CAPTION_BUTTON_WIDTH))
+            .h_full()
+            .font(font.clone())
+            .text_size(px(10.0))
+            .text_color(theme.text)
+            .hover(move |style| style.bg(hover).text_color(ink))
+            .child(glyph)
+    };
+    let restore = if window.is_maximized() {
+        "\u{e923}" // ChromeRestore
+    } else {
+        "\u{e922}" // ChromeMaximize
+    };
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .h(px(height()))
+        .flex()
+        .flex_row()
+        .child(button(
+            "caption-minimize",
+            "\u{e921}", // ChromeMinimize
+            WindowControlArea::Min,
+            wash,
+            theme.text,
+        ))
+        .child(button(
+            "caption-maximize",
+            restore,
+            WindowControlArea::Max,
+            wash,
+            theme.text,
+        ))
+        .child(button(
+            "caption-close",
+            "\u{e8bb}", // ChromeClose
+            WindowControlArea::Close,
+            close_red,
+            white,
+        ))
+        .into_any_element()
+}
+
 /// The right-hand search field: opens the command palette, and says what it
 /// searches and its key.
 fn palette_hint(look: Look, cx: &mut Cx) -> impl IntoElement {
@@ -962,6 +1058,7 @@ fn palette_hint(look: Look, cx: &mut Cx) -> impl IntoElement {
         .child(keys)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(Diffui::on_action(Action::OpenPalette, cx))
+        .when(chrome::caption_buttons(), |field| field.occlude())
 }
 
 /// Modal confirmation for a guarded mutation (see [`crate::ConfirmDialog`]). Empty
