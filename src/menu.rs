@@ -353,14 +353,19 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
     // A right-click anchors on the bare cursor point; a toolbar caret on its
     // trigger rect, held off by [`MENU_ANCHOR_GAP`] on whichever side the card
     // ends up.
-    let (mut anchor, mut gap) = match menu.anchor {
+    let (anchor, gap) = match menu.anchor {
         AnchorSpec::Below(r) => (r, MENU_ANCHOR_GAP),
         AnchorSpec::At(p) => (Rectangle::new(p, Size::ZERO), 0.0),
     };
+    // Where the open flyout's top-left goes, once there is one.
+    let mut flyout_origin: Option<Point> = None;
 
     while let Some(entries) = entries_at(&menu.root, &prefix) {
         let size = Size::new(card_width(ui, entries), card_outer_height(entries, max_h));
-        let rect = card_rect(win, anchor, gap, size);
+        let rect = match flyout_origin {
+            None => card_rect(win, anchor, gap, size),
+            Some(origin) => flyout_card_rect(win, origin, size),
+        };
         out.push((prefix.clone(), rect));
 
         let level = prefix.len();
@@ -378,12 +383,11 @@ fn card_rects(ui: &Diffui, menu: &OverlayMenu) -> Vec<(Vec<usize>, Rectangle)> {
         } else {
             (rect.x - flyout_w + MENU_FLYOUT_OVERLAP).max(0.0)
         };
-        // The parent row *as drawn* — a scrolled parent card has slid its rows
-        // up by its scroll offset — as a zero-height anchor, so the flyout's
-        // first row lines up with it, or its last row does when it has to flip.
+        // Level with the parent row *as drawn* (a scrolled parent card has slid
+        // its rows up by its scroll offset), so the flyout's first row lines up
+        // with it.
         let row_y = rect.y + row_top_offset(entries, idx) - menu.card_scroll(level);
-        anchor = Rectangle::new(Point::new(x, row_y), Size::ZERO);
-        gap = 0.0;
+        flyout_origin = Some(Point::new(x, row_y));
         prefix.push(idx);
     }
     out
@@ -409,6 +413,19 @@ fn card_rect(win: Size, anchor: Rectangle, gap: f32, size: Size) -> Rectangle {
     Rectangle {
         x: anchor.x.min((win.width - size.width).max(0.0)).max(0.0),
         y,
+        width: size.width,
+        height: size.height,
+    }
+}
+
+/// Where a flyout of `size` lands: at `origin`, slid up just far enough to
+/// sit on the window's bottom edge when it would run off it. Unlike a root
+/// card it never flips, since flipping would hang it above its parent row; and
+/// sliding is safe here, as the cursor reaches a flyout only by moving onto it.
+fn flyout_card_rect(win: Size, origin: Point, size: Size) -> Rectangle {
+    Rectangle {
+        x: origin.x,
+        y: origin.y.min(win.height - size.height).max(0.0),
         width: size.width,
         height: size.height,
     }
@@ -1004,6 +1021,19 @@ mod tests {
         let rect = card_rect(WIN, at(100.0, 700.0), 0.0, card(220.0, 300.0));
         assert_eq!(rect.y, 400.0);
         assert!(rect.y + rect.height <= 700.0);
+    }
+
+    #[test]
+    fn flyout_slides_up_to_the_bottom_edge_rather_than_flipping() {
+        let fits = flyout_card_rect(WIN, Point::new(300.0, 200.0), card(220.0, 300.0));
+        assert_eq!(fits.y, 200.0);
+        // A parent row near the bottom: the flyout sits on the window's edge,
+        // not above the row.
+        let slid = flyout_card_rect(WIN, Point::new(300.0, 800.0), card(220.0, 300.0));
+        assert_eq!(slid.y + slid.height, WIN.height);
+        // Taller than the window: pinned to the top, and it scrolls.
+        let tall = flyout_card_rect(WIN, Point::new(300.0, 800.0), card(220.0, 1000.0));
+        assert_eq!(tall.y, 0.0);
     }
 
     #[test]
