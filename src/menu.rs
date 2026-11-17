@@ -42,6 +42,9 @@ use crate::{Cx, Diffui, icons, ui};
 const MENU_MIN_WIDTH: f32 = 200.0;
 const MENU_MAX_WIDTH: f32 = 460.0;
 const MENU_CARD_PAD: f32 = theme::list::INSET_TIGHT;
+/// From the card's outer edge to its rows, on each side: the surface's edge
+/// and the card's padding.
+const MENU_CARD_INSET: f32 = theme::SURFACE_EDGE + MENU_CARD_PAD;
 const MENU_ITEM_PAD_X: f32 = theme::list::PAD_X_TIGHT;
 /// Row text runs one step above the chrome default so menus read as content,
 /// not controls. Width measurement ([`card_width`]) keys off the same sizes.
@@ -509,7 +512,7 @@ fn point_in_triangle(p: Point, a: Point, b: Point, c: Point) -> bool {
 
 fn card_outer_height(entries: &[MenuEntry], max_height: f32) -> f32 {
     let content: f32 = entries.iter().map(MenuEntry::height).sum();
-    (content + MENU_CARD_PAD * 2.0).min(max_height)
+    (content + MENU_CARD_INSET * 2.0).min(max_height)
 }
 
 fn row_top_offset(entries: &[MenuEntry], idx: usize) -> f32 {
@@ -562,7 +565,7 @@ fn card_width(ui: &Diffui, entries: &[MenuEntry]) -> f32 {
 
     // A scrolling card's bar floats over the rows' right inset, which is as
     // wide as the bar's gutter, so it needs no width of its own.
-    let raw = MENU_CARD_PAD * 2.0 + MENU_ITEM_PAD_X * 2.0 + content + MENU_TEXT_SLACK;
+    let raw = MENU_CARD_INSET * 2.0 + MENU_ITEM_PAD_X * 2.0 + content + MENU_TEXT_SLACK;
     raw.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH).ceil()
 }
 
@@ -716,7 +719,7 @@ fn build_card(
     }
 
     let content_h: f32 = entries.iter().map(MenuEntry::height).sum();
-    let scrolls = content_h + MENU_CARD_PAD * 2.0 > menu_max_height(ui);
+    let scrolls = content_h + MENU_CARD_INSET * 2.0 > menu_max_height(ui);
     // The card swallows presses (either button) so a click inside it never reaches
     // the dismiss backdrop; rows carry their own hover/release handlers.
     let card = theme::surface(div(), theme::Elevation::Popover, theme)
@@ -724,14 +727,19 @@ fn build_card(
         .left(px(rect.x))
         .top(px(rect.y))
         .w(px(rect.width))
-        .h(px(rect.height))
         .overflow_hidden()
         .pt(px(MENU_CARD_PAD))
         .pb(px(MENU_CARD_PAD))
         .pl(px(MENU_CARD_PAD))
         .on_any_mouse_down(|_, _, cx| cx.stop_propagation());
     if !scrolls {
-        return card.pr(px(MENU_CARD_PAD)).child(list).into_any_element();
+        // Hugs its rows: `rect` only places the card, so a height that's off moves
+        // it a little rather than clipping a row.
+        return card
+            .max_h(px(rect.height))
+            .pr(px(MENU_CARD_PAD))
+            .child(list)
+            .into_any_element();
     }
 
     // The id is per *branch*, not per depth: switching between sibling submenus at
@@ -740,6 +748,8 @@ fn build_card(
     let depth = prefix.len();
     let id_path: Vec<String> = prefix.iter().map(usize::to_string).collect();
     let id = format!("menu-card-{}", id_path.join("-"));
+    // A scrolling card fills the height it was given, for the list to scroll in.
+    let card = card.h(px(rect.height));
     let handle = window
         .use_keyed_state(
             ElementId::Name(SharedString::from(id.clone())),

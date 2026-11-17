@@ -851,6 +851,10 @@ fn is_dark(theme: ThemeSpec) -> bool {
     canvas.r + canvas.g + canvas.b < 1.5
 }
 
+/// The width of a [`surface`]'s edge on each side. It's a real border in the
+/// layout, so a surface sized by hand counts it inside its width and height.
+pub const SURFACE_EDGE: f32 = 1.0;
+
 /// A floating surface at `elevation`: the raised fill and the border's edge in
 /// a squircle, and the step's drop shadow. Add its content after this: its
 /// squircle is the card's first child.
@@ -875,17 +879,22 @@ pub fn surface_with<E: Styled + gpui_kit::ParentElement>(
     // The transparent border keeps the card's layout and lets an
     // overflow-hidden card clip to its whole box, edge included. The shadow
     // keeps the circular corner GPUI shadows have, which the blur hides.
-    element
-        .border_1()
+    let mut element = element
         .border_color(TRANSPARENT)
         .rounded(px(radius))
-        .shadow(vec![elevation.shadow(theme)])
-        .child(background(
-            Fill::new(Corners::all(radius))
-                .background(theme.panel_background_elevated)
-                .border(1.0, edge),
-            1.0,
-        ))
+        .shadow(vec![elevation.shadow(theme)]);
+    element.style().border_widths = gpui_kit::EdgesRefinement {
+        top: Some(px(SURFACE_EDGE).into()),
+        right: Some(px(SURFACE_EDGE).into()),
+        bottom: Some(px(SURFACE_EDGE).into()),
+        left: Some(px(SURFACE_EDGE).into()),
+    };
+    element.child(background(
+        Fill::new(Corners::all(radius))
+            .background(theme.panel_background_elevated)
+            .border(SURFACE_EDGE, edge),
+        SURFACE_EDGE,
+    ))
 }
 
 /// Dimming layer behind modal surfaces. One alpha everywhere so stacked
