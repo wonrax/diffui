@@ -27,6 +27,13 @@ const HIGHLIGHTS_VERSION: &str = "0.2.0";
 const HIGHLIGHTS_SHA256: &str = "cf5fc4d83e7c1ddab19d163de096f787f87efe61504909aa469434f61ef51e2e";
 const HIGHLIGHTS_SIZE: u64 = 183_180;
 
+// The build script runs on the host, so `cfg!(windows)` is the host's.
+const WASM2C: &str = if cfg!(windows) {
+    "wasm2c.exe"
+} else {
+    "wasm2c"
+};
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=highlights/shim.c");
@@ -40,12 +47,13 @@ fn main() {
 
     let wabt = wabt_prefix();
     let translated = out.join("highlights.c");
-    let status = Command::new(wabt.join("bin/wasm2c"))
+    let wasm2c = wabt.join("bin").join(WASM2C);
+    let status = Command::new(&wasm2c)
         .arg(&wasm)
         .args(["-n", "highlights", "-o"])
         .arg(&translated)
         .status()
-        .unwrap_or_else(|err| panic!("running {}: {err}", wabt.join("bin/wasm2c").display()));
+        .unwrap_or_else(|err| panic!("running {}: {err}", wasm2c.display()));
     assert!(status.success(), "wasm2c failed on {}", wasm.display());
 
     let runtime = wabt.join("share/wabt/wasm2c");
@@ -137,7 +145,7 @@ fn wabt_prefix() -> PathBuf {
         return dir.into();
     }
     env::var_os("PATH")
-        .and_then(|path| env::split_paths(&path).find(|dir| dir.join("wasm2c").is_file()))
+        .and_then(|path| env::split_paths(&path).find(|dir| dir.join(WASM2C).is_file()))
         .and_then(|bin| bin.parent().map(Path::to_path_buf))
         .expect("wasm2c not found: install wabt or set WABT_DIR (the Nix shell provides both)")
 }

@@ -43,7 +43,7 @@ impl Font {
     /// The platform UI font.
     pub const DEFAULT: Self = Self::new(".SystemUIFont");
     /// The platform's monospaced font.
-    pub const MONOSPACE: Self = Self::new("Menlo");
+    pub const MONOSPACE: Self = Self::new(if cfg!(windows) { "Consolas" } else { "Menlo" });
 
     pub const fn new(family: &'static str) -> Self {
         Self {

@@ -19,6 +19,8 @@ fn embed_jj_lib_version() {
     println!("cargo:rerun-if-changed={}", lock.display());
     let version = fs::read_to_string(&lock)
         .ok()
+        // A Windows checkout may have CRLF line endings.
+        .map(|text| text.replace("\r\n", "\n"))
         .and_then(|text| {
             let (_, rest) = text.split_once("name = \"jj-lib\"\n")?;
             let line = rest.lines().next()?;

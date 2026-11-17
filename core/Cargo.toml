@@ -61,3 +61,8 @@ clap = "4.5"
 # repo commonly holds.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico", "bmp"] }
 resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+
+# jj-cli calls `Builder::enable_io`, which tokio only compiles with `net` on
+# Windows (on Unix, `process` turns the I/O driver on as well).
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1.44", features = ["net"] }
