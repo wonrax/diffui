@@ -241,14 +241,14 @@ fn ssh_says_what_a_failed_start_means() {
 #[test]
 fn wsl_carries_the_server_in_the_environment_and_evals_it_inside() {
     let dir = scratch("wsl");
-    // What wsl.exe does with what follows `--`: the user's shell inside runs
-    // it as one line, the variables WSLENV names carried across.
+    // What wsl.exe does with what follows `--exec`: runs it as argv, no shell
+    // of the user's in between, the variables WSLENV names carried across.
     let wsl = script(
         &dir,
         "wsl.exe",
         r#"case "$WSLENV" in DIFFUI_SERVE/u) ;; *) echo "WSLENV is $WSLENV" >&2; exit 9;; esac
-while [ "$1" != "--" ]; do shift; done; shift
-exec /bin/sh -c "$*""#,
+while [ "$1" != "--exec" ]; do shift; done; shift
+exec "$@""#,
     );
     let plugin = bundled("wsl", &format!("program = {:?}", wsl.to_string_lossy()));
 
@@ -269,22 +269,13 @@ exec /bin/sh -c "$*""#,
             "Ubuntu",
             "--user",
             "me",
-            "--shell-type",
-            "login",
             "--cd",
             "~",
-            "--",
-            "eval",
-            "exec",
-            "$DIFFUI_SERVE",
+            "--exec",
+            "/bin/sh",
+            "-lc",
+            r#"eval exec "$DIFFUI_SERVE""#,
         ]
-    );
-    // Nothing on the command line needs quoting on the Windows side.
-    assert!(
-        words
-            .iter()
-            .all(|word| !word.contains([' ', '"', '\'', '\\'])),
-        "{words:?}"
     );
     assert_eq!(launch.env.get("WSL_UTF8").map(String::as_str), Some("1"));
 
@@ -311,10 +302,10 @@ exec /bin/sh -c "$*""#,
             "Debian",
             "--cd",
             "~",
-            "--",
-            "eval",
-            "exec",
-            "$DIFFUI_SERVE"
+            "--exec",
+            "/bin/sh",
+            "-c",
+            r#"eval exec "$DIFFUI_SERVE""#,
         ]
     );
     assert_eq!(
@@ -377,14 +368,6 @@ fn wsl_says_what_a_failed_start_means() {
         missing.starts_with("Ubuntu has no diffui-serve to run."),
         "{missing}"
     );
-    let old = explain(
-        &plugin,
-        &host,
-        Some(1),
-        "Invalid command line option: --shell-type\n",
-    )
-    .unwrap();
-    assert!(old.contains("wsl --update"), "{old}");
     let gone = explain(
         &plugin,
         &host,

@@ -54,17 +54,19 @@ cargo install --path serve        # ~/.cargo/bin/diffui-serve
 
 Each distribution is offered as a host by its name (the chip in the open
 dialog, or `diffui Ubuntu:~/src/repo`). diffui starts
-`wsl.exe --distribution <name> --shell-type login` and looks for
-`diffui-serve` on the `PATH` a login shell gets there. Say where it is
+`wsl.exe --distribution <name> --exec /bin/sh -l` and looks for
+`diffui-serve` on the `PATH` that gets from `/etc/profile` and
+`~/.profile`, whatever your own shell is. A `PATH` only your interactive
+shell sets (`.zshrc`, a fish or nushell config) isn't seen. Say where it is
 otherwise, in Settings → Hosts (the pencil on the distribution's row, Server)
-or in diffui's config.toml (`%XDG_CONFIG_HOME%\diffui\config.toml`,
-else `%HOME%\.config\diffui\config.toml`):
+or in diffui's config.toml (`%XDG_CONFIG_HOME%\diffui\config.toml`, else
+`%HOME%\.config\diffui\config.toml`, else
+`%USERPROFILE%\.config\diffui\config.toml`):
 
 ```toml
 [hosts.Ubuntu]
 server = ["/home/me/src/diffui/result/bin/diffui-serve"]
 ```
 
-`--shell-type` needs the WSL from the Microsoft Store (`wsl --update`).
 `diffui skill remote` has the rest: every host setting, and what a remote
 tab doesn't do.
