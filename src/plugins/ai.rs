@@ -58,8 +58,8 @@ pub(crate) fn program_found(program: &str) -> bool {
     let path = std::path::Path::new(program);
     if program.contains('/') {
         let expanded = match program.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(rest))
+            Some(rest) => crate::app_files::home()
+                .map(|home| home.join(rest))
                 .unwrap_or_else(|| path.to_path_buf()),
             None => path.to_path_buf(),
         };

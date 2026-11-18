@@ -1512,7 +1512,7 @@ pub(crate) fn repo_label(root: &Path) -> (String, String) {
 /// `expand_user_path`, used so recent-repo rows show the short `~/code/foo`
 /// form rather than the absolute path.
 pub(crate) fn contract_user_path(path: &str) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = app_files::home() {
         let home = home.to_string_lossy();
         if let Some(rest) = path.strip_prefix(home.as_ref()) {
             return format!("~{rest}");
@@ -1526,13 +1526,16 @@ pub(crate) fn contract_user_path(path: &str) -> String {
 /// `prepare_repository` canonicalizes from there.
 pub(crate) fn expand_user_path(input: &str) -> PathBuf {
     if input == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
+        if let Some(home) = app_files::home() {
+            return home;
         }
-    } else if let Some(rest) = input.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    } else if let Some(rest) = input
+        .strip_prefix("~/")
+        // What `contract_user_path` makes of a Windows path.
+        .or_else(|| input.strip_prefix("~\\").filter(|_| cfg!(windows)))
+        && let Some(home) = app_files::home()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(input)
 }
@@ -1740,12 +1743,13 @@ mod tests {
 
     #[test]
     fn expand_user_path_expands_leading_tilde() {
-        // Only assert when HOME is available (it is in normal test runs);
-        // skip otherwise rather than mutate process-global env.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
+        // Skip rather than mutate process-global env when there's no home.
+        if let Some(home) = crate::app_files::home() {
             assert_eq!(expand_user_path("~"), home);
             assert_eq!(expand_user_path("~/code/repo"), home.join("code/repo"));
+            if cfg!(windows) {
+                assert_eq!(expand_user_path(r"~\code\repo"), home.join(r"code\repo"));
+            }
         }
     }
 }

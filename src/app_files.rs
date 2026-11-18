@@ -22,14 +22,19 @@ pub(crate) enum AppDir {
     Logs,
 }
 
+/// The user's home: `$HOME`, else the platform's own idea of it. Windows
+/// rarely sets `HOME` (Git Bash and MSYS do), so there it's usually
+/// `%USERPROFILE%`.
+pub(crate) fn home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(env::home_dir)
+}
+
 /// The path of the app's file `name` of kind `dir`, or `None` when the home
 /// directory it hangs off is unknown.
 pub(crate) fn app_file(dir: AppDir, name: &str) -> Option<PathBuf> {
-    let home = || {
-        env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-    };
     let xdg = |var: &str, default: &str| {
         env::var_os(var)
             .filter(|dir| !dir.is_empty())

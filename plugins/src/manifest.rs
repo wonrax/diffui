@@ -1289,6 +1289,7 @@ fn home_dir() -> &'static Path {
     HOME.get_or_init(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
+            .or_else(std::env::home_dir)
             .filter(|home| home.is_dir())
             .unwrap_or_else(std::env::temp_dir)
     })

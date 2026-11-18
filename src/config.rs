@@ -94,7 +94,6 @@ use crate::theme::Font;
 use diffui_core::RefreshMode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -814,7 +813,7 @@ fn describe_parse_error(path: &std::path::Path, text: &str, error: &toml::de::Er
 
 /// `path` with the home directory folded to `~`.
 pub(crate) fn display_path(path: &Path) -> String {
-    if let Some(home) = env::var_os("HOME").filter(|home| !home.is_empty())
+    if let Some(home) = crate::app_files::home()
         && let Ok(rest) = path.strip_prefix(&home)
     {
         return format!("~/{}", rest.display());
@@ -946,7 +945,7 @@ mod tests {
 
     impl Dir {
         fn new(name: &str, config: Option<&str>, settings: Option<&str>) -> Self {
-            let dir = env::temp_dir().join(format!("diffui-config-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("diffui-config-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("make the directory");
             let dir = Dir(dir);
